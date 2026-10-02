@@ -543,6 +543,22 @@ impl Cache {
         Ok(count as u32)
     }
 
+    /// The lowest UID cached for a folder, i.e. where the next history page starts.
+    ///
+    /// `None` means the folder has nothing cached. This is what the "load older mail" path asks for
+    /// before requesting `ImapClient::fetch_older_headers`.
+    pub fn oldest_uid(&self, account_id: &str, folder: &str) -> Result<Option<u32>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        let oldest: Option<i64> = conn.query_row(
+            "select min(uid) from messages where account_id = ?1 and folder = ?2",
+            params![account_id, folder],
+            |row| row.get(0),
+        )?;
+        Ok(oldest.map(|uid| uid as u32))
+    }
+
     /// Messages still marked unread anywhere in this account.
     ///
     /// Read from the cache rather than the server because the tray tooltip and the notification both

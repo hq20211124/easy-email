@@ -110,6 +110,18 @@ pub fn keep_oldest_page(mut summaries: Vec<MessageSummary>, limit: usize) -> Vec
     summaries
 }
 
+/// Trim a fetched batch to one page, **keeping the newest entries**.
+///
+/// The mirror of [`keep_oldest_page`], and the right rule for a *history* page: when looking
+/// backwards, the messages closest to what the user is reading are the ones to keep. No cursor is
+/// involved, so dropping the far end costs nothing but a repeat fetch if the user keeps scrolling.
+pub fn keep_newest_page(mut summaries: Vec<MessageSummary>, limit: usize) -> Vec<MessageSummary> {
+    if limit > 0 && summaries.len() > limit {
+        summaries = summaries.split_off(summaries.len() - limit);
+    }
+    summaries
+}
+
 /// Everything a transport must be, named once.
 ///
 /// `dyn AsyncRead + AsyncWrite + Debug` is not a legal trait object — Rust allows only one
@@ -493,6 +505,71 @@ impl ImapClient {
                 uidvalidity,
                 summaries,
             })
+        })
+        .await
+    }
+
+    /// One page of **history**: up to `limit` headers from the UIDs *below* `before_uid`.
+    ///
+    /// This is the primitive the "load older mail" button needs. It deliberately does **not** touch
+    /// the incremental cursor: `last_uid` keeps pointing at the newest stored message, so a backfill
+    /// pass can never make the updater skip anything (design/04 §5.3, and the gate in
+    /// `tools/check.ps1` that pins it).
+    ///
+    /// The two-step shape (`UID SEARCH` for the UIDs, then one `UID FETCH` for the chosen ones) is
+    /// what keeps it cheap: asking for `1:<before>` directly would make the server stream the entire
+    /// older mailbox and we would throw all but one page away. `SEARCH` returns only numbers.
+    pub async fn fetch_older_headers(
+        &mut self,
+        mailbox: &str,
+        before_uid: u32,
+        limit: usize,
+    ) -> Result<Vec<MessageSummary>> {
+        if before_uid <= 1 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        timed(async {
+            self.session.select(mailbox).await.map_err(imap_err)?;
+
+            // `1:<before-1>` — the older half. `before_uid - 1` cannot underflow because of the guard.
+            let query = format!("1:{}", before_uid - 1);
+            let mut uids: Vec<u32> = self
+                .session
+                .uid_search(query)
+                .await
+                .map_err(imap_err)?
+                .into_iter()
+                .collect();
+            uids.sort_unstable();
+            // The page closest to `before_uid`: those are the messages the list shows next.
+            if uids.len() > limit {
+                uids = uids.split_off(uids.len() - limit);
+            }
+            if uids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let set = uids
+                .iter()
+                .map(|uid| uid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stream = self
+                .session
+                .uid_fetch(&set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])")
+                .await
+                .map_err(imap_err)?;
+
+            let mut summaries = Vec::new();
+            while let Some(fetch) = stream.try_next().await.map_err(imap_err)? {
+                summaries.push(summarise(&fetch));
+            }
+            // A server is free to answer with more than asked (or in any order); the caller wants
+            // exactly this window, oldest first.
+            summaries.retain(|m| m.uid < before_uid);
+            summaries.sort_by_key(|m| m.uid);
+            let summaries = keep_newest_page(summaries, limit);
+            Ok(summaries)
         })
         .await
     }

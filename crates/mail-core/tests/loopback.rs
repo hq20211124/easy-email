@@ -453,7 +453,19 @@ async fn serve_imap(
                             ok(&mut write, &tag, "UID SEARCH completed").await?;
                             continue;
                         }
-                        let ids: Vec<String> = (1..=available()).map(|n| n.to_string()).collect();
+                        // Honour the range: a real server answers `UID SEARCH 1:100` with those UIDs
+                        // only, and `UID SEARCH ALL` with the whole mailbox. Returning everything for
+                        // any query (as this fixture used to) hides bugs in a caller that trusts the
+                        // result to be the range it asked for.
+                        let set = tokens.get(3).copied().unwrap_or("1:*");
+                        let ids: Vec<String> = if set.eq_ignore_ascii_case("ALL") {
+                            (1..=available()).map(|n| n.to_string()).collect()
+                        } else {
+                            parse_uid_set(set, available())
+                                .into_iter()
+                                .map(|n| n.to_string())
+                                .collect()
+                        };
                         write
                             .write_all(format!("* SEARCH {}\r\n", ids.join(" ")).as_bytes())
                             .await?;
@@ -1547,6 +1559,102 @@ fn cached_uids(cache: &Cache, account_id: &str) -> Vec<u32> {
         .collect();
     uids.sort_unstable();
     uids
+}
+
+/// **M1a history backfill.** Loading older mail must page backwards through the mailbox **without
+/// touching the incremental cursor**.
+///
+/// The fixture is grown to 104 messages and the cache is given a cursor at 100, which is what a real
+/// mailbox looks like after the first window sync: the newest few are cached, everything older is
+/// still on the server. The two invariants under test are the ones a mail client gets wrong:
+///   * the page returned is the mail *just above* what the user is looking at (not the oldest mail),
+///   * `last_uid` stays where it was, so the updater can never be pushed past unstored messages.
+#[tokio::test]
+async fn history_pages_backwards_without_moving_the_cursor() {
+    let extra = Arc::new(AtomicU32::new(100));
+    let (addr, _log) = spawn_server(Server {
+        uidplus: true,
+        extra: Arc::clone(&extra),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+
+    // A mailbox of 104, with the cache already knowing about the newest four. The folder row has to
+    // exist first: `set_cursor` updates it, and a missing row would leave the driver on its cold path
+    // — which takes the newest window and hides the very case under test.
+    cache
+        .upsert_folder(&cfg.id, &inbox(), 1)
+        .expect("folder row");
+    cache.set_cursor(&cfg.id, "INBOX", 1, 100).expect("cursor");
+
+    let first = within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    assert_eq!(
+        first.total_cached, 4,
+        "only the newest four are in the window"
+    );
+    assert_eq!(first.last_uid, 104);
+    assert_eq!(
+        cache.oldest_uid(&cfg.id, "INBOX").expect("oldest"),
+        Some(101),
+        "the oldest cached message is where history starts"
+    );
+
+    // Page one: the ten messages immediately older than 101.
+    let page = within(client.fetch_older_headers("INBOX", 101, 10))
+        .await
+        .expect("history page");
+    let uids: Vec<u32> = page.iter().map(|m| m.uid).collect();
+    assert_eq!(
+        uids,
+        (91..=100).collect::<Vec<u32>>(),
+        "history must return the mail closest to the reading position, oldest first"
+    );
+
+    // Store it the way the app does — plain upsert, no cursor involvement.
+    cache
+        .upsert_summaries(&cfg.id, "INBOX", &page)
+        .expect("store history");
+    assert_eq!(cache.summary_count(&cfg.id, "INBOX").expect("count"), 14);
+    assert_eq!(
+        cache.oldest_uid(&cfg.id, "INBOX").expect("oldest"),
+        Some(91)
+    );
+    assert_eq!(
+        cache
+            .folder_state(&cfg.id, "INBOX")
+            .expect("state")
+            .map(|s| s.last_uid),
+        Some(104),
+        "**the incremental cursor must not move**: history is added below it, never past it"
+    );
+
+    // Page two continues from there.
+    let page = within(client.fetch_older_headers("INBOX", 91, 10))
+        .await
+        .expect("second page");
+    assert_eq!(
+        page.iter().map(|m| m.uid).collect::<Vec<u32>>(),
+        (81..=90).collect::<Vec<u32>>()
+    );
+
+    // Rewinding far enough reaches the bottom and says so by returning nothing.
+    let bottom = within(client.fetch_older_headers("INBOX", 6, 10))
+        .await
+        .expect("bottom page");
+    assert_eq!(
+        bottom.iter().map(|m| m.uid).collect::<Vec<u32>>(),
+        (1..=5).collect::<Vec<u32>>(),
+        "the last page is short rather than padded"
+    );
+    let done = within(client.fetch_older_headers("INBOX", 1, 10))
+        .await
+        .expect("done");
+    assert!(done.is_empty(), "there is nothing older than UID 1");
 }
 
 #[tokio::test]
