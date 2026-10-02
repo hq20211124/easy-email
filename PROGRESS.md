@@ -26,10 +26,24 @@
 
 ---
 
+### M1a-6 发件箱的决策逻辑（纯函数 + 7 条测试）✅（第 12 轮，最后一个自动轮）
+新模块 `outbox.rs` 把发件箱 worker 里**该做决定的部分**从 I/O 里拆出来，变成可单测的纯函数：
+- `OutboxState`（queued / sending / sent / failed / cancelled / **needs_attention**）+ `parse_state`：
+  **读不懂的状态一律落到 needs_attention，绝不能变成 queued**（一条无法解释的行不该被自动发出去）。
+- `next_attempt_delay_secs`：30 秒起、翻倍、**6 小时封顶**；断言"永不回缩、到顶不再涨"，
+  并覆盖 `u32::MAX` 这种被写坏的尝试次数（不会溢出成负数延迟）。
+- `is_permanent_failure`：4xx 可重试；**421/450/451/452 虽然属于 5xx/4xx 的边界但按可重试处理**；
+  5xx 属永久（含 **552 "邮件太大"** —— 重试只会再失败）；**超出 SMTP 范围的码按可重试**，
+  免得一个解析小毛病把排队的邮件悄悄丢掉。
+- `needs_user_decision`：附件被改/丢失、服务器嫌太大 ⇒ 交给用户，不自动重试。
+- 测试 **163**（lib 129 + loopback 30 + reachability 4）；`check.ps1` 全绿。
+
+**未做**：worker 本体（SMTP 发送、撤销窗口、开机时先查已发送再决定重发）与前端发件箱界面。
+
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **14 步全绿**；`cargo test --workspace` **156 通过、0 失败**
-（122 lib + 30 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+**当前状态**：`tools/check.ps1` **14 步全绿**；`cargo test --workspace` **163 通过、0 失败**
+（129 lib + 30 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
 应用启动冒烟通过（7–10 秒存活）。所有改动都在 git 里（基线 `83c1b0c`，共 22 个提交）。
 
 **磁盘上已验证的两件事**（不是文档结论，是真机查过的）：
