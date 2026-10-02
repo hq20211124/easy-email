@@ -28,6 +28,7 @@ pub mod providers;
 pub mod secret;
 pub mod smtp;
 pub mod sync;
+pub mod userdb;
 
 pub use cache::{Cache, FolderState, SearchHit};
 pub use error::{AuthHint, MailError, Result};

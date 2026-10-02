@@ -22,7 +22,7 @@ extern crate mail_core;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, ConnectionReport, MailError, MailboxInfo, MessageDetail,
     MessageSummary, OutgoingAttachment, OutgoingMail, PushEvent, SearchHit, SyncDriver,
-    SyncOutcome, account_with_login, secret, watch,
+    SyncOutcome, account_with_login, secret, userdb::UserStore, watch,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -57,6 +57,12 @@ struct AppState {
     watchers: Mutex<HashMap<String, Watcher>>,
     /// Where attachments are saved. Resolved once at startup from Tauri's path resolver.
     download_dir: PathBuf,
+    /// The **user** database: drafts, queued sends and offline actions.
+    ///
+    /// A separate file from the cache because it holds things that cannot be re-fetched. That is also
+    /// why "just delete cache.db" is safe advice and "delete user.db" is not — the two must never be
+    /// the same file (`design/03` §3.1).
+    user: UserStore,
 }
 
 /// The two tasks that make up one account's push pipeline.
@@ -485,10 +491,18 @@ async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<S
         }
         total
     };
+    // Counts from the user database: the UI shows "drafts (2)" and "waiting to send (1)", and both
+    // have to survive a restart — which is exactly what this file is for.
+    let user = state.user.clone();
+    let drafts = user.draft_count().map_err(describe)?;
+    let pending = user.pending_op_count().map_err(describe)?;
+
     Ok(SyncStatus {
         offline: last_error.is_some(),
         last_error,
         cached_total,
+        drafts,
+        pending_ops: pending,
     })
 }
 
@@ -518,6 +532,10 @@ struct SyncStatus {
     offline: bool,
     last_error: Option<String>,
     cached_total: u32,
+    /// Drafts on disk (they are the reason the user database exists).
+    drafts: u32,
+    /// Offline actions still waiting to reach the server.
+    pending_ops: u32,
 }
 
 #[tauri::command]
@@ -1141,6 +1159,18 @@ pub fn run() {
                 });
             }
 
+            // `user.db` lives beside the cache but is **not** part of it: drafts, queued sends and
+            // offline actions cannot be re-fetched, so they must survive "delete the cache". Same
+            // rule as above: a failure must not stop the window from opening.
+            let user_path = dir.join("user.db");
+            let user = match UserStore::open(&user_path) {
+                Ok(store) => store,
+                Err(e) => {
+                    log_line(&format!("[easy-email] 用户数据不可用：{e}"));
+                    UserStore::open_in_memory().expect("in-memory user store must be available")
+                }
+            };
+
             app.manage(AppState {
                 accounts_path,
                 accounts: Mutex::new(accounts),
@@ -1149,6 +1179,7 @@ pub fn run() {
                 pool: Arc::new(ConnectionPool::new()),
                 watchers: Mutex::new(HashMap::new()),
                 download_dir,
+                user,
             });
 
             // The tray icon. Built here rather than in config so the menu can drive the app.
