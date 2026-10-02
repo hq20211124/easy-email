@@ -20,9 +20,10 @@ use mail_core::providers::{self, Provider};
 #[macro_use]
 extern crate mail_core;
 use mail_core::{
-    AccountConfig, Cache, ConnectionPool, ConnectionReport, MailError, MailboxInfo, MessageDetail,
-    MessageSummary, OutgoingAttachment, OutgoingMail, PushEvent, SearchHit, SyncDriver,
-    SyncOutcome, SyncWindow, account_with_login, secret, userdb::UserStore, watch,
+    AccountConfig, BackfillBudget, BackfillReport, Cache, ConnectionPool, ConnectionReport,
+    MailError, MailboxInfo, MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMail,
+    PushEvent, SearchHit, SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older,
+    secret, userdb::UserStore, watch,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -470,6 +471,55 @@ async fn fetch_message(
         .put_detail(&account_id, &mailbox, &detail)
         .map_err(describe)?;
     Ok(detail)
+}
+
+/// Walk backwards until the **chosen sync window** is satisfied, and report where it stopped.
+///
+/// This is what makes the window a setting rather than a stored preference: the button (or a future
+/// scheduled job) calls this, and `Years(2)` stops at the date boundary while `Count(n)` stops once
+/// `n` messages are cached. The walk is bounded, so one click can never become an open-ended download;
+/// the daily byte budget (`design/04` §5.7) will pace the automatic version.
+#[tauri::command]
+async fn backfill_to_window(
+    state: State<'_, AppState>,
+    account_id: String,
+    mailbox: String,
+) -> Result<BackfillReport, String> {
+    let cfg = state.find(&account_id)?;
+    let window = state.user.sync_window().map_err(describe)?;
+    let cache = state.cache.clone();
+    let password = password_for(&account_id)?;
+
+    let report = pool_op!(&state.pool, &cfg, &password, |client| {
+        backfill_older(
+            &mut client,
+            &cache,
+            &account_id,
+            &mailbox,
+            window,
+            BackfillBudget::generous(),
+            now_seconds(),
+        )
+        .await
+    })
+    .map_err(describe)?;
+
+    log_line(&format!(
+        "[easy-email] 回填到窗口边界 {}：{} 页 / {} 封（{:?}）",
+        window.as_key(),
+        report.pages,
+        report.fetched,
+        report.stop
+    ));
+    Ok(report)
+}
+
+/// Seconds since the epoch, for the window's date boundary.
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The sync window the user chose (how far back the client keeps mail).
@@ -1264,6 +1314,7 @@ pub fn run() {
             list_messages,
             get_sync_window,
             set_sync_window,
+            backfill_to_window,
             load_more_messages,
             fetch_message,
             mark_seen,

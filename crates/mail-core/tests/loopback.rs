@@ -24,6 +24,7 @@ use mail_core::{
     AccountConfig, Cache, ConnectionPool, Endpoint, ImapClient, MailboxInfo, OutgoingAttachment,
     OutgoingMail, PushEvent, Security, SyncDriver, SyncOutcome, pool_op, watch_every,
 };
+use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -1656,6 +1657,111 @@ async fn history_pages_backwards_without_moving_the_cursor() {
         .expect("done");
     assert!(done.is_empty(), "there is nothing older than UID 1");
 }
+
+/// **M1a-3b: the window now decides when the walk stops.**
+///
+/// Same fixture as the paging test (104 messages, cursor at 100), but the walk is driven by
+/// `backfill_older` instead of by hand. `Count(20)` must stop after the cache holds twenty messages —
+/// **not** after reaching the bottom of the mailbox — and `Years(2)` must stop at the date boundary.
+/// A window that does not change where the walk stops is a preference that does nothing.
+#[tokio::test]
+async fn the_sync_window_decides_where_the_walk_stops() {
+    let extra = Arc::new(AtomicU32::new(100));
+    let (addr, _log) = spawn_server(Server {
+        uidplus: true,
+        extra: Arc::clone(&extra),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let cache = Cache::open_in_memory().expect("cache");
+    cache
+        .upsert_folder(&cfg.id, &inbox(), 1)
+        .expect("folder row");
+    cache.set_cursor(&cfg.id, "INBOX", 1, 100).expect("cursor");
+
+    // Count(20): the newest four are cached first — a cursor without rows would leave nothing to
+    // walk back from, which is exactly what `oldest_uid` returning `None` means.
+    {
+        let mut client = within(ImapClient::connect(&cfg, "app-password"))
+            .await
+            .expect("connect");
+        let first = within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+        assert_eq!(first.total_cached, 4);
+        assert_eq!(first.last_uid, 104);
+        let report = within(backfill_older(
+            &mut client,
+            &cache,
+            &cfg.id,
+            "INBOX",
+            SyncWindow::Count(20),
+            BackfillBudget::generous(),
+            NOW,
+        ))
+        .await
+        .expect("backfill");
+        assert_eq!(
+            report.stop,
+            BackfillStop::WindowSatisfied,
+            "twenty messages is the window, so the walk stops there"
+        );
+        assert_eq!(cache.summary_count(&cfg.id, "INBOX").expect("count"), 20);
+        assert_eq!(
+            cache.oldest_uid(&cfg.id, "INBOX").expect("oldest"),
+            Some(85),
+            "UIDs 85..=104: the count bound, not the bottom of the mailbox"
+        );
+    }
+
+    // Years(2) on the same fixture: every message is dated 2024-01-01, which is outside a two-year
+    // window from NOW, so the very first page crosses the boundary and the walk stops immediately.
+    {
+        // The same 104-message mailbox, so the page below the cursor is real: a four-message fixture
+        // would make "one page crosses the boundary" vacuously true.
+        let extra2 = Arc::new(AtomicU32::new(100));
+        let (addr2, _log2) = spawn_server(Server {
+            uidplus: true,
+            extra: Arc::clone(&extra2),
+            ..Server::default()
+        })
+        .await;
+        let cfg2 = account(addr2, addr2);
+        let cache2 = Cache::open_in_memory().expect("cache");
+        cache2
+            .upsert_folder(&cfg2.id, &inbox(), 1)
+            .expect("folder row");
+        cache2.set_cursor(&cfg2.id, "INBOX", 1, 3).expect("cursor");
+        let mut client = within(ImapClient::connect(&cfg2, "app-password"))
+            .await
+            .expect("connect");
+        let first = within(sync_once(&mut client, &cache2, &cfg2.id, &inbox())).await;
+        assert_eq!(
+            first.total_cached, 101,
+            "everything from 4 upwards, so the walk starts at UID 3"
+        );
+
+        let report = within(backfill_older(
+            &mut client,
+            &cache2,
+            &cfg2.id,
+            "INBOX",
+            SyncWindow::Years(2),
+            BackfillBudget::generous(),
+            NOW,
+        ))
+        .await
+        .expect("backfill");
+        assert_eq!(
+            report.stop,
+            BackfillStop::WindowSatisfied,
+            "crossing the two-year boundary ends the walk"
+        );
+        assert_eq!(report.pages, 1, "one page was enough to cross it");
+    }
+}
+
+/// Fixed "now" for the window tests: 2026-10-03, so the fixture's 2024 dates are outside Years(2).
+const NOW: i64 = 1_793_000_000;
 
 #[tokio::test]
 async fn a_uidvalidity_change_wipes_the_folder_and_refills_it() {
