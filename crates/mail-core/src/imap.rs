@@ -591,30 +591,24 @@ impl ImapClient {
         start: u32,
         length: u32,
     ) -> Result<Vec<u8>> {
-        timed(async {
-            let mut stream = self
-                .session
-                .uid_fetch(
-                    uid.to_string(),
-                    &format!("(UID BODY.PEEK[]<{start}.{length}>)"),
-                )
-                .await
-                .map_err(imap_err)?;
-
-            let mut body = None;
-            while let Some(fetch) = stream.try_next().await.map_err(imap_err)? {
-                if let Some(bytes) = fetch.body() {
-                    body = Some(bytes.to_vec());
-                    break;
-                }
-            }
-            body.ok_or_else(|| {
-                MailError::Imap(format!(
-                    "服务器没有返回 UID {uid} 的字节区间 {start}+{length}"
-                ))
-            })
-        })
-        .await
+        // **Refuses, because no partial fetch can work before `imap-proto` is patched.**
+        //
+        // Measured, not inferred: `imap-proto` 0.17's `msg_att_body_section` parses
+        // `BODY [section] <number> " " nstring` and never accepts the `<origin.offset>` form, so a
+        // server answering `BODY[]<0.10>` fails to parse just as `<5.10>` does. async-imap answers a
+        // parse failure by **closing the connection**, so attempting this would cost a pooled session
+        // (A1-F42; the probe in `tests/loopback.rs` is the written record and flips when this works).
+        //
+        // The fix is three lines in a vendored `imap-proto` — accept `number ('.' number)?` inside the
+        // angle brackets. Carrying that fork belongs with streaming attachment downloads, which are M2
+        // work (design/19 §4, M0-4), so until then this returns an ordinary actionable error and
+        // everything downloads whole messages.
+        let _ = (uid, start, length);
+        Err(MailError::Imap(
+            "分部取件暂不可用（imap-proto 不接受 `<origin.offset>`；服务器那样回会让连接被关闭）。\
+             大附件目前整封取回，分块下载见 design/19 §4 的 M0-4（三行补丁）。"
+                .to_string(),
+        ))
     }
 
     /// Set or clear the `\Seen` flag.

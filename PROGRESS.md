@@ -71,6 +71,51 @@ HANDOFF/README 里"async-imap 不投递 EXISTS / 推送最多 50 秒"全部改�
   （启动），且必须有多处共享；当前输出：`cache opened once at startup, shared by 11 call sites`。
 - **启动冒烟**：`target\debug\easy-email.exe` 启动后 8~10 秒仍存活（没有"启动即消失"）✓
 
+
+### M0-4 imap-proto 分部取件：**已决策**（不 vendor，改为拒绝 + 记录）✅
+- 实测收紧（比研究结论更严重）：`imap-proto` 0.17 的 `msg_att_body_section` 只认
+  `BODY [section] <number> " " nstring`，**连 `BODY[]<0.10>` 都解析失败** ⇒ 服务器回答分部取件时
+  通常带 `.offset`，所以**补丁前分部取件完全不可用**（原研究只说"不接受 offset"，不够准）。
+- 决定：**M1 不 vendor fork**（fork 的维护成本应记在流式附件这一功能上，而它是 M2）。改为把
+  `fetch_message_range` 变成**直接返回可行动错误**，不再尝试——因为尝试会让解析失败并**关闭连接**，
+  等于拿一条连接池会话去换一次必然失败。
+- 书面记录：探针 `probe_partial_fetch_is_refused_instead_of_killing_the_connection` 断言
+  "拒绝 + 连接仍可用"；补丁位置写在 `design/19` M0-4（`imap-proto-0.17.0/src/rfc3501/body.rs`
+  的 `msg_att_body_section`，约 3 行：把 `<` 后的 `number` 改成 `number ('.' number)?`）。
+
+### M0-6 WinAppSDK 通知 spike：**离线阻塞**（已量清前置条件）⚠️
+实测本机情况（2026-10-03 夜）：
+- `src-tauri/Cargo.toml` **没有 `windows` crate 依赖**（只有 `tauri-plugin-notification`），
+  要调 `Microsoft.Windows.AppNotifications` 得先加该 crate 与对应 feature。
+- 本机**未安装 Windows App SDK 运行时**（`%ProgramFiles%\WindowsApps` 与
+  `%LOCALAPPDATA%\Microsoft\WindowsApps` 下都没有 `WindowsAppRuntime*`）。
+⇒ 这套 spike 需要两样当前环境不具备的东西（新依赖 + 运行时），**按纪律如实记为阻塞**，不假装做完。
+**恢复时照着做**（两条分支已在 `design/19` M0-6 写清）：
+1. `winget install Microsoft.WindowsAppRuntime.1.7`（或对应版本）装运行时；
+2. `src-tauri` 加 `windows = { version = "0.6x", features = ["Microsoft.Windows.AppNotifications",
+   "Microsoft.Windows.AppNotifications.Builder", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }`；
+3. 最小 spike：`AppNotificationManager::Default().Register()` → `AppNotificationBuilder` 加两个按钮
+   → 发一条 → 点按钮断言 `NotificationInvoked` 回调里的参数；
+4. 量体积：框架依赖 vs 自包含（后者会影响 17 §5 的 ≤20 MB 预算）。
+
+### M0-8 OAuth 端点探测：**需要你的凭据**（命令已写好）⚠️
+要回答的问题只有一个：**Google 的令牌端点是否接受"只有 `client_id` + PKCE、不带 `client_secret`"**
+（决定 BYO-Gmail 的向导要不要多一个输入框，见 `design/05` §3.1.0）。有网+自己的 client_id 时跑：
+```
+# 1) 授权码：浏览器打开（把 <CLIENT_ID> 换成你自己的，redirect_uri 是桌面客户端的回环地址）
+https://accounts.google.com/o/oauth2/v2/auth?client_id=<CLIENT_ID>&response_type=code
+  &scope=https%3A%2F%2Fmail.google.com%2F&redirect_uri=http%3A%2F%2F127.0.0.1%3A<PORT>
+  &code_challenge=<S256>&code_challenge_method=S256&access_type=offline&prompt=consent
+# 2) 换令牌：故意不带 client_secret
+curl -s -X POST https://oauth2.googleapis.com/token \
+  -d client_id=<CLIENT_ID> -d code=<CODE> -d code_verifier=<VERIFIER> \
+  -d grant_type=authorization_code -d redirect_uri=http://127.0.0.1:<PORT>
+```
+- 返回 `access_token` + `refresh_token` ⇒ **PKCE 足够**，向导只问 client_id（少一步）。
+- 返回 `invalid_client` / `client_secret is missing` ⇒ **必须带 secret**，向导要加一个输入框
+  （存进 DPAPI vault，与令牌同级保护）。
+把结论写进 `design/A1`（带日期）与 `design/05` §3.1.0，然后 M0-8 关闭。
+
 ---
 
 ## 下一步

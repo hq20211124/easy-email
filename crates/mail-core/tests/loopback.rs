@@ -2099,42 +2099,51 @@ async fn probe_append_uid_is_parsed_and_then_discarded() {
     );
 }
 
-/// **A1-F42** — a partial fetch that carries an *offset* (not just a length) kills the connection.
+/// **A1-F42** — no partial fetch is possible before `imap-proto` is patched, so the client refuses.
 ///
-/// This one is written as an experiment rather than an assertion of the finding: it performs the
-/// call and records what actually happens, failing only if the outcome is neither "ok" nor "a clean
-/// error" (i.e. if it silently returns the wrong bytes, which is the dangerous middle).
+/// `imap-proto` 0.17's `msg_att_body_section` parses `BODY [section] <number> " " nstring` and never
+/// accepts the `<origin.offset>` form a server uses to answer a partial fetch — **not even `<0.10>`**
+/// (measured here, not inferred). A parse failure makes async-imap close the connection, so the guard
+/// exists to turn a session-killing landmine into an ordinary error.
+///
+/// This test is the written record of what has to change: when the three-line `imap-proto` patch
+/// (design/19 §4, M0-4) lands, both assertions below flip and streaming attachment downloads become
+/// possible.
 #[tokio::test]
-async fn probe_partial_fetch_with_offset_is_an_experiment() {
+async fn probe_partial_fetch_is_refused_instead_of_killing_the_connection() {
     let (addr, _log) = spawn_imap(true).await;
     let cfg = account(addr, addr);
     let mut client = within(ImapClient::connect(&cfg, "app-password"))
         .await
         .expect("connect");
 
-    let outcome = within(client.fetch_message_range(1, 5, 10)).await;
-    match outcome {
-        Ok(bytes) => {
-            // If it works, the bytes must be the requested slice (header block is longer than 15
-            // bytes for message one, so this is a real slice and not the whole message).
-            let raw = message_one();
-            assert!(
-                raw.len() > 15,
-                "the fixture must be long enough for the slice to be meaningful"
-            );
-            assert_eq!(
-                bytes,
-                raw[5..15].to_vec(),
-                "an offset fetch that succeeds must return exactly that slice"
-            );
-            eprintln!("probe A1-F42: offset partial fetch SUCCEEDED (finding needs updating)");
-        }
-        Err(err) => {
-            // The connection being closed is the documented outcome; the important part is that the
-            // failure is *visible* rather than silent corruption.
-            eprintln!("probe A1-F42: offset partial fetch failed as documented: {err}");
+    // Both shapes are refused: a non-zero offset, and a zero origin with a length (which a server
+    // still echoes as `<0.10>`).
+    for start in [5u32, 0u32] {
+        match within(client.fetch_message_range(1, start, 10)).await {
+            Ok(_) => panic!(
+                "a partial fetch (start={start}) must not be attempted: the reply would fail to \
+                 parse and the connection would be closed"
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("分部取件"),
+                    "the error must be actionable and name the limitation, got: {message}"
+                );
+            }
         }
     }
+
+    // The whole point of refusing: the session survives, which a server-side parse error would not
+    // have allowed.
+    let mailboxes = within(client.list_mailboxes())
+        .await
+        .expect("the connection must still be usable after the refusal");
+    assert!(
+        mailboxes.iter().any(|m| m.name == "INBOX"),
+        "the connection must still list folders"
+    );
 }
 
 /// **A1-F46** — `mail-parser`'s `references()` has three shapes, and `as_text()` loses all but the

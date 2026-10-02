@@ -49,12 +49,12 @@ M0 库探针 + DB 读池 ──┬─► 03 存储 v3（双库/迁移）──�
 | M0-1 | `tests/library_probe.rs`：IDLE 1 s 内收到 `NewData`（A1-F41）、APPEND 后拿不到 UID（A1-F43）、分部取件会关连接（A1-F42）、`References` 三态（A1-F46）、**lettre 不发 `SIZE=` 也读不到服务器 `SIZE`（A1-F45 的更正）** | 探针全绿；结论写进 A1 与 HANDOFF；删掉 `imap.rs`/`idle.rs` 的错误注释 |
 | M0-2 | DB 句柄（`DbSet` + 单写线程 + 读池，02 §4.1）替换"每条命令开连接"；**写线程用 `std::thread`，`Db` 内不得 `tokio::spawn`**（`setup()` 没有 Tokio 上下文，HANDOFF §3 的"启动即消失"就是这么来的） | 现存测试全绿；10 万封头部写入 ≤ 8 分钟（**与 04/15 一致，不再写 5 分钟**） |
 | M0-3 | 修 README/HANDOFF 里**已被推翻**的结论（"推送 50 秒延迟"、"缓存只覆盖最新 500 封"在窗口落地前仍准、测试数字、命令数） | 文档与探针一致；见 A2 §3.5 的文档债清单 |
-| M0-4 | （决策）是否 `[patch.crates-io]` 修 imap-proto 的 `<origin.offset>` | 若修：附件下载可流式；若不修：维持"整封取回"并写清代价 |
+| M0-4 | （决策）是否 `[patch.crates-io]` 修 imap-proto 的 `<origin.offset>` | **已决（2026-10-03）：M1 不 vendor fork，改为「拒绝 + 记录」** —— `fetch_message_range` 现在直接返回可行动的错误（不再尝试：尝试会让服务器回 `<0.10>`、解析失败、连接被关），探针 `probe_partial_fetch_is_refused_instead_of_killing_the_connection` 是书面记录。补丁位置：`imap-proto-0.17.0/src/rfc3501/body.rs` 的 `msg_att_body_section`，把 `<` 后那处 `opt(delimited(char('<'), number, char('>')))` 改成接受 `number ('.' number)?`（约 3 行）—— **M2 做流式附件时连同 fork 一起做** |
 | **M0-5（新增）** | **修增量同步的截断方向**（BLOCKER：现在保留的是**最新**一批，一次来 500 封以上会留下永久空洞；`imap.rs` + `sync.rs`）—— 改 `truncate(limit)`，并加"截断保留最旧"的断言 | 夹具一次推 >limit 封：断言库里是最旧那批、游标停在它上界、无空洞 |
-| **M0-6（新增）** | **WinAppSDK 通知 spike（≤2 天）**：从 Rust 经 `windows` crate 调通 `AppNotificationManager.Register()` + 带按钮的通知 + 激活回调；量出"框架依赖 vs 自包含"的体积代价 | **两条结论分支都要预先写清**：<br>**通** → 按 13 §3.1 实现（按钮 + 激活路由 + `AppInstance` 转发），安装包体积预算按实测调整（17 §5 的 ≤20 MB 可能要放宽到 ≤35 MB）；<br>**不通** → 退回 `tauri-plugin-notification`（**无按钮、无激活路由**），13 §2 的"通知里直接归档/已读"降级为"点通知打开主窗口"，README 的差异点列表同步删掉这一条 |
+| **M0-6（新增，⚠️ 离线阻塞）** | **WinAppSDK 通知 spike（≤2 天）**：从 Rust 经 `windows` crate 调通 `AppNotificationManager.Register()` + 带按钮的通知 + 激活回调；量出"框架依赖 vs 自包含"的体积代价 | **两条结论分支都要预先写清**：<br>**通** → 按 13 §3.1 实现（按钮 + 激活路由 + `AppInstance` 转发），安装包体积预算按实测调整（17 §5 的 ≤20 MB 可能要放宽到 ≤35 MB）；<br>**不通** → 退回 `tauri-plugin-notification`（**无按钮、无激活路由**），13 §2 的"通知里直接归档/已读"降级为"点通知打开主窗口"，README 的差异点列表同步删掉这一条 |
 | **M0-7（新增）** | **建库 pragma 定稿**：`auto_vacuum=incremental` **必须在建表前设**（第二轮评审实测：建库后再设会被静默忽略）；老库安排一次显式全量 `VACUUM` | 新库 `pragma auto_vacuum` 读回 2；老库清理后**文件真的变小**（有断言） |
 
-| **M0-8（新增）** | **OAuth 令牌端点探测**：用真实端点确认"只给 `client_id` + PKCE（不带 `client_secret`）能否换到令牌"，Google 与微软各一次；结论写进 A1（带日期） | 结论决定 BYO-Gmail 是否需要让用户填 secret（05 §3.1 的 `client_secret` 字段与 §2 的向导文案随之定稿） |
+| **M0-8（新增，⚠️ 需凭据）** | **OAuth 令牌端点探测**：用真实端点确认"只给 `client_id` + PKCE（不带 `client_secret`）能否换到令牌"，Google 与微软各一次；结论写进 A1（带日期） | 结论决定 BYO-Gmail 是否需要让用户填 secret（05 §3.1 的 `client_secret` 字段与 §2 的向导文案随之定稿） |
 
 ### M1a 能换过来（3-5 人月）
 > **本块的门禁硬要求**：`tools/bench.ps1` 必须**跑满 16 项**（与 15 §4 的 P1-P16 一一对应，脚本自己断言条数）。
