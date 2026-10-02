@@ -30,6 +30,14 @@ const state = {
   mailboxLabel: null,
   messages: [],
   limit: PAGE_SIZE,
+  /**
+   * Set once the server says there is nothing older than what we already have.
+   *
+   * Without it the "load more" button would keep asking forever on a folder whose oldest message
+   * has been reached — each click a wasted round trip, and no way for the user to tell "still
+   * loading" from "this is everything".
+   */
+  historyDone: false,
   selectedUid: null,
   /**
    * Folder the selected message lives in.
@@ -181,10 +189,7 @@ function wireGlobalEvents() {
   });
   $('btn-add-account').addEventListener('click', () => openAccountWizard());
   $('btn-refresh').addEventListener('click', () => loadMessages({ reset: true }));
-  $('btn-load-more').addEventListener('click', () => {
-    state.limit += PAGE_SIZE;
-    loadMessages();
-  });
+  $('btn-load-more').addEventListener('click', loadOlder);
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
   $('btn-forward').addEventListener('click', () => openComposer({ mode: 'forward' }));
@@ -436,12 +441,66 @@ function renderMailboxes() {
 
 /* ---------------------------------------------------------------- messages */
 
+/**
+ * Fetch the page of mail just older than what the cache holds, and prepend it.
+ *
+ * The list only ever holds the newest window, so this is the only way back into an old mailbox. The
+ * backend does the "which UIDs" work (`load_more_messages` -> `fetch_older_headers`); this function
+ * only decides what the user sees, and it keeps the incremental cursor out of the picture entirely.
+ */
+async function loadOlder() {
+  if (state.historyDone || !state.accountId || !state.mailbox) return;
+
+  const button = $('btn-load-more');
+  button.disabled = true;
+  button.textContent = '正在加载更早的邮件…';
+
+  const page = await run('加载更早的邮件', () =>
+    invoke('load_more_messages', {
+      accountId: state.accountId,
+      mailbox: state.mailbox,
+      limit: PAGE_SIZE,
+    })
+  );
+
+  if (page === null) {
+    // Failed: put the button back so the user can retry, and leave the list alone.
+    button.disabled = false;
+    renderHistoryButton();
+    return;
+  }
+
+  if (page.messages.length > 0) {
+    const known = new Set(state.messages.map((m) => m.uid));
+    const added = page.messages.filter((m) => !known.has(m.uid));
+    state.messages = state.messages.concat(added).sort((a, b) => b.uid - a.uid);
+    renderMessages();
+  }
+
+  if (page.done || page.messages.length === 0) {
+    state.historyDone = true;
+  }
+  renderHistoryButton();
+}
+
+/** Put the load-more button into the state the current knowledge implies. */
+function renderHistoryButton() {
+  const button = $('btn-load-more');
+  if (!button) return;
+  button.disabled = state.historyDone;
+  button.textContent = state.historyDone ? '没有更早的邮件了' : '加载更多';
+}
+
 async function loadMessages({ reset = false } = {}) {
   if (!state.accountId || !state.mailbox) return;
   if (reset) {
     state.limit = PAGE_SIZE;
     state.selectedUid = null;
     state.detail = null;
+    // A new folder (or a refresh) starts over: whatever we learned about the bottom of the previous
+    // one does not apply here.
+    state.historyDone = false;
+    renderHistoryButton();
     renderReader();
   }
 

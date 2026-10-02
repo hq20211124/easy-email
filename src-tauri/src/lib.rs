@@ -223,6 +223,65 @@ async fn verify_account(
 
 // ---------------------------------------------------------------- receive
 
+/// One page of **older** mail, fetched from the server and cached.
+///
+/// The list only ever holds the newest window, so a mailbox used for years needs a way back. This is
+/// that way: ask the server for the messages just below the oldest cached one, store them, and hand
+/// them back for the list to prepend.
+///
+/// It deliberately does **not** touch the incremental cursor — `last_uid` keeps pointing at the
+/// newest stored message, so scrolling into history can never make the updater skip mail it never
+/// stored. `Cache::oldest_uid` is the only cursor it reads, and `tools/check.ps1` pins that.
+#[tauri::command]
+async fn load_more_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    mailbox: String,
+    limit: usize,
+) -> Result<HistoryPage, String> {
+    let cfg = state.find(&account_id)?;
+    let limit = limit.clamp(1, 200);
+    let cache = state.cache.clone();
+
+    let before_uid = cache
+        .oldest_uid(&account_id, &mailbox)
+        .map_err(describe)?
+        .ok_or_else(|| "这个文件夹还没有缓存内容，请先刷新一次。".to_string())?;
+
+    let password = password_for(&account_id)?;
+    let page = pool_op!(&state.pool, &cfg, &password, |client| {
+        client
+            .fetch_older_headers(&mailbox, before_uid, limit)
+            .await
+    })
+    .map_err(describe)?;
+
+    if page.is_empty() {
+        // The bottom of the mailbox. Not an error: the UI says "no older mail" and drops the button.
+        return Ok(HistoryPage {
+            messages: Vec::new(),
+            done: true,
+        });
+    }
+
+    cache
+        .upsert_summaries(&account_id, &mailbox, &page)
+        .map_err(describe)?;
+
+    Ok(HistoryPage {
+        messages: page,
+        done: false,
+    })
+}
+
+/// What `load_more_messages` gives the list.
+#[derive(serde::Serialize)]
+struct HistoryPage {
+    messages: Vec<MessageSummary>,
+    /// True when there is nothing older on the server, so the button can be disabled for good.
+    done: bool,
+}
+
 /// Refresh one folder from the server into the cache.
 ///
 /// Best effort by design: a mail client that shows nothing when the network is down is worse than
@@ -1154,6 +1213,7 @@ pub fn run() {
             verify_account,
             list_mailboxes,
             list_messages,
+            load_more_messages,
             fetch_message,
             mark_seen,
             delete_message,

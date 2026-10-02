@@ -267,6 +267,41 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'history backfill never advances the incremental cursor' {
+        # The rule that keeps "load older mail" from becoming a mail-loss bug: the cursor advances only
+        # inside the incremental sync, where the driver has just stored what it is advancing past.
+        # A backfill path that called `set_cursor` would push `last_uid` past messages that were never
+        # stored, and `UID FETCH <last_uid+1>:*` would never ask for them again (design/04 §5.3).
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $problems = @()
+
+        # The command's body, between its own signature and the next `#[tauri::command]`.
+        $start = $lib.IndexOf('async fn load_more_messages(')
+        if ($start -lt 0) {
+            $problems += 'load_more_messages is missing: the "load older mail" button would have no backend'
+        } else {
+            $next = $lib.IndexOf('#[tauri::command]', $start)
+            $body = if ($next -gt $start) { $lib.Substring($start, $next - $start) } else { $lib.Substring($start) }
+            if ($body -match 'set_cursor') {
+                $problems += 'load_more_messages must not call set_cursor: history is stored *below* the incremental cursor'
+            }
+            if ($body -notmatch 'fetch_older_headers') {
+                $problems += 'load_more_messages must use fetch_older_headers'
+            }
+            if ($body -match 'last_uid\s*=') {
+                $problems += 'load_more_messages must not assign last_uid'
+            }
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'backfill reads oldest_uid and never writes the cursor'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'cargo fmt --check' {
         cargo fmt --check 2>&1
         if ($LASTEXITCODE -ne 0) {
