@@ -7,19 +7,22 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **135**（103 lib + 28 loopback + 4 reachability）。
-  `tools/check.ps1` **全绿**：13 步（7 项前端不变量 + **新增"命令共享一个数据库句柄"** + fmt +
-  clippy -D warnings + build + test + PE=2）。
+- **测试数量**：基线 116 → 现在 **156**（122 lib + 30 loopback + 4 reachability）。
+  `tools/check.ps1` **全绿**：**14 步**（7 项前端不变量 + "命令共享一个数据库句柄" +
+  "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
 ## 提交记录
+共 **22 个提交**，从基线到最新（`git log --oneline` 看全量；下表只列里程碑）：
+
 | SHA | 内容 |
 |---|---|
+| 最新 | M1a-5 草稿命令 + 交接摘要 |
+| — | M1a-4 草稿落库 / M1a-3b 窗口生效 / M1a-3 窗口模型 / M1a-2 `user.db` / M1a-1b 回填接线 / M1a-1a 回填原语 |
 | `62d806c` | M0-2b `Cache`/`src-tauri` 切到共享 `Db`（去掉每条命令开连接）+ 新门禁 |
-| `9d95c6f` | PROGRESS 记录 |
 | `1cc4aef` | M0-2a `db.rs`：单写线程 + 读池 + `DbSet` |
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
-| `83c1b0c` | baseline |
+| `83c1b0c` | baseline（开工前的可回滚点） |
 
 ---
 
