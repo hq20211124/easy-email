@@ -118,6 +118,23 @@ curl -s -X POST https://oauth2.googleapis.com/token \
 
 ---
 
+### M1a-1a 历史回填的后端原语 ✅（2026-10-03 夜，第 5 轮）
+`imap::fetch_older_headers(mailbox, before_uid, limit)` + `cache::oldest_uid()` + `keep_newest_page()`。
+**两条不变量**都写进了端到端测试：
+1. **往前看要拿"离阅读位置最近"的那一批**（不是最老的）——两步走：`UID SEARCH 1:<before-1>` 拿 UID 编号，
+   再 `UID FETCH <编号集合>` 只取这一页（直接 `FETCH 1:<before>` 会让服务器把整个旧邮箱推过来）。
+2. **历史页绝不动增量游标**：`last_uid` 始终指向最新已存邮件，所以回填永远不可能让增量同步跳过邮件。
+   测试断言 `last_uid` 在回填后仍是 104（`probe`/`gate` 层面也会钉住，见下）。
+顺带修了夹具的一处不真实：`UID SEARCH` 以前无视范围、永远返回整箱 UID，**恰好会掩盖**
+"调用方信任范围"的 bug —— 现在 `ALL` 与 `<n>:<m>` 都按规格回答。
+
+**未完（下一步，照 `PLAN.md` §6/§7/§8 做）**：
+- `src-tauri` 新命令 `load_more_messages`（读 `oldest_uid` → `fetch_older_headers` → `upsert_summaries`
+  → 返回这一页 + `history_done`），并把 `list_messages` 的 `MAX_LIST_ROWS` 上限换成"分页"语义。
+- `src/app.js`：`btn-load-more` 现在只是把 `state.limit` 加大后重新列缓存（超过窗口就没东西了）；
+  改成调用新命令并把结果**前置**到列表，`history_done` 时禁用按钮并显示"没有更早的邮件了"。
+- `tools/check.ps1`：加一条门禁 —— 源码里不得出现"回填路径调用 `set_cursor`"（游标只能由增量同步推进）。
+
 ## 下一步（M0 只剩两个被外部条件卡住的项，主线转到 M1a）
 
 **M0 收口情况**：M0-1/2/3/4/5/7 **已完成且全绿**；M0-6（WinAppSDK 通知）与 M0-8（OAuth 端点探测）
