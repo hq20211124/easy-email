@@ -26,6 +26,72 @@ pub const SYNC_WINDOW_KEY: &str = "sync_window";
 /// Tables this database owns, in the order the diagnostics screen lists them.
 pub const USER_TABLES: &[&str] = &["schema_migrations", "kv", "drafts", "outbox", "pending_ops"];
 
+/// A draft, as stored in `user.db`.
+///
+/// Attachments are **paths plus metadata**, never bytes: a draft with a 100 MB attachment must not
+/// turn the user database into a second copy of the mail. `sha256` is what lets the send path notice
+/// that a file changed under it (design/07 §5.3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Draft {
+    pub id: String,
+    pub account_id: String,
+    pub to_addrs: String,
+    pub cc_addrs: String,
+    pub bcc_addrs: String,
+    pub subject: String,
+    pub body_text: String,
+    pub body_html: Option<String>,
+    /// JSON array of `{path,name,mime,size,sha256}`.
+    pub attachments_json: String,
+    pub in_reply_to: Option<String>,
+    /// JSON array of message-ids.
+    pub references: String,
+    pub identity: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl Draft {
+    /// A new, empty draft for an account. The id is the caller's (a UUID in the app).
+    pub fn new(id: impl Into<String>, account_id: impl Into<String>, now: i64) -> Self {
+        Self {
+            id: id.into(),
+            account_id: account_id.into(),
+            to_addrs: String::new(),
+            cc_addrs: String::new(),
+            bcc_addrs: String::new(),
+            subject: String::new(),
+            body_text: String::new(),
+            body_html: None,
+            attachments_json: "[]".to_string(),
+            in_reply_to: None,
+            references: "[]".to_string(),
+            identity: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+fn row_to_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
+    Ok(Draft {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        to_addrs: row.get(2)?,
+        cc_addrs: row.get(3)?,
+        bcc_addrs: row.get(4)?,
+        subject: row.get(5)?,
+        body_text: row.get(6)?,
+        body_html: row.get(7)?,
+        attachments_json: row.get(8)?,
+        in_reply_to: row.get(9)?,
+        references: row.get(10)?,
+        identity: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
 /// Handle to `user.db`.
 #[derive(Clone)]
 pub struct UserStore {
@@ -114,6 +180,90 @@ impl UserStore {
                 rusqlite::params![key, value],
             )?;
             Ok(())
+        })
+    }
+
+    // ------------------------------------------------------------------ drafts
+
+    /// Insert or update a draft.
+    ///
+    /// Upsert, not insert: the composer saves on a timer and on every meaningful edit, and the same
+    /// draft id arrives repeatedly. A duplicate-key error there would be a lost keystroke.
+    pub fn save_draft(&self, draft: &Draft) -> Result<()> {
+        let draft = draft.clone();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "insert into drafts
+                     (id, account_id, to_addrs, cc_addrs, bcc_addrs, subject, body_text, body_html,
+                      attachments_json, in_reply_to, \"references\", identity, created_at, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 on conflict(id) do update set
+                     to_addrs = excluded.to_addrs,
+                     cc_addrs = excluded.cc_addrs,
+                     bcc_addrs = excluded.bcc_addrs,
+                     subject = excluded.subject,
+                     body_text = excluded.body_text,
+                     body_html = excluded.body_html,
+                     attachments_json = excluded.attachments_json,
+                     in_reply_to = excluded.in_reply_to,
+                     \"references\" = excluded.\"references\",
+                     identity = excluded.identity,
+                     updated_at = excluded.updated_at",
+                rusqlite::params![
+                    draft.id,
+                    draft.account_id,
+                    draft.to_addrs,
+                    draft.cc_addrs,
+                    draft.bcc_addrs,
+                    draft.subject,
+                    draft.body_text,
+                    draft.body_html,
+                    draft.attachments_json,
+                    draft.in_reply_to,
+                    draft.references,
+                    draft.identity,
+                    draft.created_at,
+                    draft.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// One draft, if it exists.
+    pub fn load_draft(&self, id: &str) -> Result<Option<Draft>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn
+            .query_row(
+                "select id, account_id, to_addrs, cc_addrs, bcc_addrs, subject, body_text, body_html,
+                        attachments_json, in_reply_to, \"references\", identity, created_at, updated_at
+                 from drafts where id = ?1",
+                [id],
+                row_to_draft,
+            )
+            .optional()?)
+    }
+
+    /// Every draft for one account, most recently touched first — the order the "drafts (2)" list
+    /// wants.
+    pub fn list_drafts(&self, account_id: &str) -> Result<Vec<Draft>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select id, account_id, to_addrs, cc_addrs, bcc_addrs, subject, body_text, body_html,
+                    attachments_json, in_reply_to, \"references\", identity, created_at, updated_at
+             from drafts where account_id = ?1 order by updated_at desc, id",
+        )?;
+        let rows = stmt.query_map([account_id], row_to_draft)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Remove a draft. Permanent on purpose: this is "discard", and there is no undo for it in the UI.
+    pub fn delete_draft(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        self.db.write_blocking(move |conn| {
+            Ok(conn.execute("delete from drafts where id = ?1", [id])? > 0)
         })
     }
 
@@ -365,6 +515,106 @@ mod tests {
             again.kv_get("keep").expect("kv").as_deref(),
             Some("me"),
             "re-opening must not wipe user data"
+        );
+        drop(again);
+        let _ = std::fs::remove_file(&path);
+    }
+    // ------------------------------------------------------------------- drafts
+
+    fn draft(id: &str, account: &str, now: i64) -> Draft {
+        Draft::new(id, account, now)
+    }
+
+    #[test]
+    fn a_draft_round_trips_with_every_field() {
+        let store = UserStore::open_in_memory().expect("open");
+        let mut d = draft("d1", "acc", 100);
+        d.subject = "十月报销".to_string();
+        d.body_text = "见附件".to_string();
+        d.to_addrs = "a@example.com".to_string();
+        d.attachments_json = r#"[{"path":"C:\x.pdf","name":"x.pdf","mime":"application/pdf","size":10,"sha256":"ab"}]"#.to_string();
+        d.references = r#"["<m1@example.com>"]"#.to_string();
+        store.save_draft(&d).expect("save");
+
+        let loaded = store.load_draft("d1").expect("load").expect("present");
+        assert_eq!(
+            loaded, d,
+            "every field must survive, including the JSON columns"
+        );
+        assert_eq!(store.draft_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn saving_the_same_draft_twice_updates_it_instead_of_failing() {
+        // The composer autosaves; a duplicate-key error here would be a lost keystroke.
+        let store = UserStore::open_in_memory().expect("open");
+        let mut d = draft("d1", "acc", 100);
+        d.subject = "first".to_string();
+        store.save_draft(&d).expect("save");
+
+        d.subject = "second".to_string();
+        d.updated_at = 200;
+        store.save_draft(&d).expect("save again");
+
+        assert_eq!(store.draft_count().expect("count"), 1, "still one row");
+        let loaded = store.load_draft("d1").expect("load").expect("present");
+        assert_eq!(loaded.subject, "second");
+        assert_eq!(loaded.created_at, 100, "the original creation time is kept");
+        assert_eq!(loaded.updated_at, 200);
+    }
+
+    #[test]
+    fn drafts_are_listed_newest_first_and_scoped_to_their_account() {
+        let store = UserStore::open_in_memory().expect("open");
+        for (id, account, at) in [("a", "acc", 10), ("b", "acc", 30), ("c", "other", 99)] {
+            store.save_draft(&draft(id, account, at)).expect("save");
+        }
+
+        let mine: Vec<String> = store
+            .list_drafts("acc")
+            .expect("list")
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(
+            mine,
+            vec!["b", "a"],
+            "most recently touched first, and never another account's drafts"
+        );
+    }
+
+    #[test]
+    fn deleting_a_draft_is_permanent_and_reports_whether_it_existed() {
+        let store = UserStore::open_in_memory().expect("open");
+        store.save_draft(&draft("d1", "acc", 1)).expect("save");
+
+        assert!(store.delete_draft("d1").expect("delete"));
+        assert_eq!(store.load_draft("d1").expect("load"), None);
+        assert!(
+            !store.delete_draft("d1").expect("delete again"),
+            "a second delete must say 'nothing was there', not pretend to work"
+        );
+    }
+
+    #[test]
+    fn drafts_outlive_a_restart() {
+        // The whole reason drafts are not in the deletable cache: the app closing, or the machine
+        // restarting, must not lose what somebody was writing.
+        let path = temp_path("drafts");
+        {
+            let store = UserStore::open(&path).expect("open");
+            let mut d = draft("d1", "acc", 1);
+            d.body_text = "半句话".to_string();
+            store.save_draft(&d).expect("save");
+        }
+        let again = UserStore::open(&path).expect("reopen");
+        assert_eq!(
+            again
+                .load_draft("d1")
+                .expect("load")
+                .expect("present")
+                .body_text,
+            "半句话"
         );
         drop(again);
         let _ = std::fs::remove_file(&path);
