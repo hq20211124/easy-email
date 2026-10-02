@@ -24,6 +24,7 @@ pub mod idle;
 pub mod imap;
 pub mod model;
 pub mod mutf7;
+pub mod outbox;
 pub mod pool;
 pub mod providers;
 pub mod secret;
@@ -40,6 +41,7 @@ pub use model::{
     AccountConfig, AttachmentMeta, AuthKind, ConnectionReport, Endpoint, InlineImage, MailboxInfo,
     MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMail, Region, Security,
 };
+pub use outbox::{OutboxState, is_permanent_failure, needs_user_decision, next_attempt_delay_secs};
 pub use pool::{ConnectionPool, PooledClient};
 pub use providers::Provider;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
