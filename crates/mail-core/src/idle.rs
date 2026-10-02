@@ -26,11 +26,20 @@ use crate::model::AccountConfig;
 
 /// How long to sit in IDLE before asking the server for the mailbox size again.
 ///
-/// This is the notification latency, and it is a real limitation rather than a tuning choice: see
-/// the note on `ImapClient::idle_then_count` — async-imap does not surface a pushed `EXISTS`, so the
-/// change can only be noticed when the idle window ends. Fifty seconds keeps the promise of "within
-/// a minute" while costing one `IDLE` + one `SELECT` per cycle.
-const IDLE_CHECK_AFTER: Duration = Duration::from_secs(50);
+/// **This is a heartbeat, not the notification latency.** An earlier version of this file claimed
+/// that async-imap never surfaces a pushed `EXISTS`, which would have made this window the delay
+/// users feel. That claim was wrong (corrected 2026-10-03 by the M0-1 probe): a pushed
+/// `* n EXISTS` arrives as `IdleResponse::NewData` in roughly 0.2 s, so new mail is reported as soon
+/// as the server says anything.
+///
+/// The window still has to be bounded because
+/// * RFC 2177 lets a server drop an idle connection after 30 minutes of silence, and
+/// * a half-open TCP connection only shows up when something is sent — without a periodic `DONE`
+///   the watcher could sit on a dead socket indefinitely, looking healthy.
+///
+/// 120 s is the design's value (`design/04-sync.md` §5.4 / DECISIONS D6): long enough that the
+/// per-cycle cost is one `IDLE` plus one `SELECT`, short enough to notice a dead connection.
+const IDLE_CHECK_AFTER: Duration = Duration::from_secs(120);
 
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -63,7 +72,7 @@ pub async fn watch(
     watch_every(cfg, password, mailbox, IDLE_CHECK_AFTER, events).await
 }
 
-/// [`watch`] with an explicit idle window, so tests do not have to wait fifty seconds per cycle.
+/// [`watch`] with an explicit idle window, so tests do not have to wait two minutes per cycle.
 pub async fn watch_every(
     cfg: AccountConfig,
     password: String,

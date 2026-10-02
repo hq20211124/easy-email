@@ -22,7 +22,7 @@
 前端语法（`src/*.js` + `tools/*.mjs`）→ index.html 引用的资源是否真的存在 → 前端 id 引用 → 正文默认仍然拦截远程图片
 → 正文的宽度规则仍然放过百分比布局 → 本地搜索仍然用能搜中文的分词器 → **前端调的每个命令都已定义且已注册**
 → `fmt` → `clippy -D warnings` → `cargo build`（抓 linker 警告，clippy 看不到）→ `cargo test`
-→ **exe 的 PE 头 Subsystem 必须是 2**（GUI，否则会有 cmd 窗口）。目前 **111 passed**（3 + 83 + 21 + 4）。
+→ **exe 的 PE 头 Subsystem 必须是 2**（GUI，否则会有 cmd 窗口）。目前 **126 passed**（4 + 94 + 28 + 0，见 `tools/check.ps1`）。
 加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。
 
 改任何东西后跑它。加新 crate 依赖后也要跑，因为 `cargo build` 那一步会抓 MSVC linker 警告
@@ -64,11 +64,13 @@
   - **Tauri 命令的返回类型必须是 `IpcResponse`**，也就是里面每个类型都要 `Serialize`。
     漏一个会报成 `the method `async_kind` exists ... but its trait bounds were not satisfied`，
     很容易误读成 `Send` 问题 —— 看完整错误里的 `IpcResponse` 那一行才是真因。
-  - **async-imap 0.12 的 IDLE 不投递 `* n EXISTS`。** `Handle::wait_with_timeout` 把它归到
-    `Response::Data { status: Ok, .. }` 那一支并 `continue`，所以 `IdleResponse::NewData` 永远不会
-    为"新邮件"触发。**不要试图等 `NewData`**（实测过：夹具推了 `* 5 EXISTS`，10 秒无结果）。
-    现在的做法是「有界 IDLE 窗口 + DONE 后重新 `SELECT` 比对 `Mailbox::exists`」，窗口 =
-    通知延迟（当前 50 秒）。`ResponseData` 是私有类型，也不要在外面 match 它。
+  - **（2026-10-03 更正，M0-1 探针实测推翻）async-imap 0.12 的 IDLE *会* 投递 `* n EXISTS`。**
+    旧结论（"`wait_with_timeout` 把它归到 `Response::Data { status: Ok, .. }` 那一支并 `continue`，
+    所以 `NewData` 永远不会为新邮件触发"）**是错的**，实测与源码都不支持它：
+    `MailboxData(Exists)` 落到通配分支 ⇒ `IdleResponse::NewData` 在推送后约 **0.2 秒**就返回
+    （`tests/loopback.rs::probe_idle_delivers_exists_before_the_window_closes`，5 秒窗口下断言 < 2 秒）。
+    ⇒ 通知延迟**不再由窗口决定**：窗口只是心跳与"连接还活着吗"的兜底（设计里定为 **120 s**），
+    及时性来自推送本身。判断"有变化"时仍然要刷新基线，否则一次推送会被心跳再触发一次同步。
   - **`setup()` 不在 Tokio 运行时上下文里。** 在那里 `tokio::spawn` 会 panic
     （`there is no reactor running`）—— 而且因为没有控制台，现象就是"应用启动即消失"。
     用 `tauri::async_runtime::spawn`，它的 `JoinHandle` 也有 `abort()`。
@@ -171,7 +173,7 @@
 
 ## 6. 已经验到什么程度
 
-**已验证**：**104 个测试**；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
+**已验证**：**126 个测试**；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
 
 **并且已经用真实 QQ 邮箱账号跑通了完整收信闭环**（2026-10-02）：
 登录 → 文件夹列表 → 邮件列表 → 显示真实邮件。过程中发现并修掉了三个真实问题，见 README。
@@ -242,7 +244,7 @@
 `watch_inbox`/`stop_watching`、托盘菜单、Rust 侧 Windows 通知、前端 `mail:new` 监听。
 真机验证见上一节。
 
-**② 可以再补的**：只监听 INBOX（其他文件夹不通知）；推送延迟 50 秒受库限制；
+**② 可以再补的**：只监听 INBOX（其他文件夹不通知）；~~推送延迟 50 秒受库限制~~（已更正为亚秒级推送）；
 托盘图标可能被折叠。这三条都写进了 README 的已知限制。
 
 ### ③ 附件下载 / 上传 —— ✅ 都完成了（2026-10-03）

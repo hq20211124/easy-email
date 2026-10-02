@@ -130,15 +130,83 @@ impl Cache {
         Ok(cache)
     }
 
-    fn migrate(&self) -> Result<()> {
-        // WAL keeps a reader (the UI) from blocking the sync writer. `synchronous = NORMAL` is the
-        // usual pairing: a crash can lose the last transaction but cannot corrupt the database,
-        // and this data is a cache — it can always be re-fetched.
+    /// Connection-level pragmas, applied on every open before anything else runs.
+    ///
+    /// Two of them have to happen **before the first table is created**:
+    ///
+    /// * `auto_vacuum = incremental` — SQLite only accepts this on an empty database (or after a
+    ///   full `VACUUM`). Setting it later is silently ignored, which is exactly how "we clean up
+    ///   200 MB" ends up not shrinking the file at all: `pragma incremental_vacuum` then does
+    ///   nothing. Databases created before this line existed therefore keep `auto_vacuum = 0`; see
+    ///   [`Cache::auto_vacuum_state`] and [`Cache::vacuum_into_freelist`].
+    /// * `journal_mode = wal` — a reader (the UI) must not block the sync writer.
+    ///
+    /// `synchronous = normal` is the usual WAL pairing: a crash can lose the last transaction but
+    /// cannot corrupt the database, and this data is a cache — it can always be re-fetched.
+    fn apply_pragmas(&self) -> Result<()> {
         self.conn.execute_batch(
             "pragma journal_mode = wal;
+             pragma auto_vacuum = incremental;
              pragma synchronous = normal;
              pragma busy_timeout = 5000;",
         )?;
+        Ok(())
+    }
+
+    /// What SQLite actually thinks the auto-vacuum mode is (`0` none, `1` full, `2` incremental).
+    ///
+    /// Read back rather than assumed: an existing database keeps whatever it was created with, and
+    /// that difference is the difference between "cleanup frees disk" and "cleanup does nothing".
+    pub fn auto_vacuum_state(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("pragma auto_vacuum", [], |row| row.get(0))?)
+    }
+
+    /// Bytes sitting on the freelist, i.e. pages that are free but still part of the file.
+    pub fn freelist_bytes(&self) -> Result<i64> {
+        let pages: i64 = self
+            .conn
+            .query_row("pragma freelist_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .query_row("pragma page_size", [], |row| row.get(0))?;
+        Ok(pages * page_size)
+    }
+
+    /// Run an incremental vacuum, which is a no-op unless auto-vacuum is incremental.
+    ///
+    /// Returns the number of freelist pages that remain (0 on an auto-vacuum database means the
+    /// space really did come back).
+    pub fn vacuum_into_freelist(&self) -> Result<i64> {
+        self.conn.execute_batch("pragma incremental_vacuum;")?;
+        Ok(self
+            .conn
+            .query_row("pragma freelist_count", [], |row| row.get(0))?)
+    }
+
+    /// One-off, **blocking** full `VACUUM`, the only way to turn on auto-vacuum for a database that
+    /// already has tables (SQLite rejects the pragma change otherwise).
+    ///
+    /// Deliberately not called during startup: it rewrites the whole file, so the caller decides
+    /// when to pay for it (design/03 §8: an explicit, interruptible, user-visible step).
+    pub fn rebuild_with_auto_vacuum(&self) -> Result<()> {
+        let current: i64 = self
+            .conn
+            .query_row("pragma auto_vacuum", [], |row| row.get(0))?;
+        if current == 2 {
+            return Ok(());
+        }
+        self.conn.execute_batch(
+            "pragma auto_vacuum = incremental;
+             vacuum;
+             pragma auto_vacuum = incremental;",
+        )?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<()> {
+        self.apply_pragmas()?;
 
         let version: i64 = self
             .conn
@@ -753,6 +821,106 @@ mod tests {
         // A quote would otherwise be FTS5 syntax and blow up the whole MATCH expression.
         assert_eq!(to_query("\"账单\""), "\"账 单\"");
         assert_eq!(to_query("   "), "");
+    }
+
+    // ============================================================== pragmas / vacuum (M0-7)
+
+    /// A database this code creates must come back with auto-vacuum actually on.
+    ///
+    /// The failure this pins is silent: `pragma auto_vacuum = incremental` on a database that
+    /// already has tables is **ignored** (SQLite only honours it on an empty file or after a full
+    /// VACUUM), so the setting looks applied while `incremental_vacuum` keeps doing nothing.
+    #[test]
+    fn a_new_database_really_gets_incremental_auto_vacuum() {
+        let cache = Cache::open_in_memory().expect("open");
+        assert_eq!(
+            cache.auto_vacuum_state().expect("state"),
+            2,
+            "auto_vacuum must read back as incremental (2), not 0 — the pragma has to precede DDL"
+        );
+    }
+
+    /// Deleting rows must hand pages back to the freelist, and the incremental vacuum must then
+    /// release them. This is what makes "清理缓存释放了 N MB" true on disk rather than only in the
+    /// UI's arithmetic.
+    #[test]
+    fn cleanup_frees_pages_and_incremental_vacuum_releases_them() {
+        let cache = Cache::open_in_memory().expect("open");
+        let chunky = "x".repeat(4096);
+        for uid in 1..=400u32 {
+            cache
+                .upsert_summaries("acc", "INBOX", &[mail_core_model_summary(uid, &chunky)])
+                .expect("insert");
+        }
+        let before = cache.freelist_bytes().expect("freelist");
+
+        cache
+            .conn
+            .execute("delete from messages", [])
+            .expect("delete the rows");
+        let freed = cache.freelist_bytes().expect("freelist after delete");
+        assert!(
+            freed > before,
+            "deleting rows must put pages on the freelist ({before} -> {freed})"
+        );
+
+        let remaining = cache.vacuum_into_freelist().expect("incremental vacuum");
+        assert!(
+            remaining < freed.max(1),
+            "an incremental vacuum must consume freelist pages on an auto-vacuum database \
+             (freelist went {freed} pages -> {remaining})"
+        );
+    }
+
+    /// The upgrade path for databases created before M0-7: the pragma cannot be enabled in place,
+    /// so the only correct answer is a full rebuild — and the helper must be idempotent.
+    #[test]
+    fn an_old_database_can_be_rebuilt_into_auto_vacuum() {
+        // Simulate a v0.2 database: tables first, auto-vacuum left at its default.
+        let cache = Cache {
+            conn: Connection::open_in_memory().expect("open"),
+        };
+        cache
+            .conn
+            .execute_batch(
+                "pragma auto_vacuum = none;
+                 create table messages (uid integer);",
+            )
+            .expect("legacy schema");
+        assert_eq!(cache.auto_vacuum_state().expect("state"), 0);
+
+        // Turning it on directly is silently ignored — that is the trap, so assert it rather than
+        // trusting the documentation.
+        cache
+            .conn
+            .execute_batch("pragma auto_vacuum = incremental;")
+            .expect("pragma");
+        assert_eq!(
+            cache.auto_vacuum_state().expect("state"),
+            0,
+            "SQLite must ignore the pragma on a non-empty database; if this ever passes, the \
+             rebuild step below is no longer needed"
+        );
+
+        cache.rebuild_with_auto_vacuum().expect("rebuild");
+        assert_eq!(cache.auto_vacuum_state().expect("state"), 2);
+        cache
+            .rebuild_with_auto_vacuum()
+            .expect("rebuild is idempotent");
+        assert_eq!(cache.auto_vacuum_state().expect("state"), 2);
+    }
+
+    fn mail_core_model_summary(uid: u32, subject: &str) -> crate::model::MessageSummary {
+        crate::model::MessageSummary {
+            uid,
+            subject: subject.to_string(),
+            from_name: None,
+            from_addr: Some("a@example.com".to_string()),
+            date: Some(1_700_000_000 + uid as i64),
+            size: Some(4096),
+            seen: false,
+            flagged: false,
+        }
     }
 
     #[test]

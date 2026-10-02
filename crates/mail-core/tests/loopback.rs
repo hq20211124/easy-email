@@ -1809,7 +1809,7 @@ async fn idle_push_reports_a_change_without_polling() {
         cfg.clone(),
         "app-password".to_string(),
         "INBOX".to_string(),
-        // The real window is fifty seconds; these tests only care about ordering and recovery.
+        // The real window is 120 s; these tests only care about ordering and recovery.
         Duration::from_millis(300),
         tx,
     ));
@@ -1847,7 +1847,7 @@ async fn idle_recovers_after_the_server_drops_the_connection() {
         cfg.clone(),
         "app-password".to_string(),
         "INBOX".to_string(),
-        // The real window is fifty seconds; these tests only care about ordering and recovery.
+        // The real window is 120 s; these tests only care about ordering and recovery.
         Duration::from_millis(300),
         tx,
     ));

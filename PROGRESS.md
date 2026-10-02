@@ -44,9 +44,31 @@
 
 ---
 
+### M0-1 库能力探针 ✅（2026-10-03 夜）
+把设计依赖的**库事实**钉成可执行断言（放在 `tests/loopback.rs` 末尾的"库能力探针（M0-1）"一节，
+复用同一套假服务器 —— 另开一个文件就得再维护一份夹具）。
+
+| 探针 | 结论 | 对应 |
+|---|---|---|
+| `probe_idle_delivers_exists_before_the_window_closes` | **成立**：5 s 的 idle 窗口下，一次 `* n EXISTS` 推送在 **< 2 s** 内就变成 `PushEvent::Changed`（实测约 0.2 s）；"推送延迟 = 窗口"的旧说法彻底作废 | A1-F41 |
+| `probe_append_uid_is_parsed_and_then_discarded` | **成立**：假服务器回了 `[APPENDUID 1 4242]`，而 `append` 返回 `()` ⇒ 唯一拿回 UID 的路是 `find_uid_by_message_id`（`UID SEARCH HEADER Message-ID`），探针证明它能取回 4242 | A1-F43 |
+| `probe_partial_fetch_with_offset_is_an_experiment` | **成立（实测复核）**：`BODY[]<5.10>` 让 imap-proto 解析失败（`TakeWhile1`），错误从 `fetch_message_range(1, 5, 10)` 冒出来 ⇒ 设计里"附件无法真正流式下载"的判断是对的 | A1-F42 |
+| `probe_references_has_three_shapes` | **原文一半是错的**：0.11.9 下 `as_text_list()` 对单 id 也返回 `Some(1)`（不是 None）；真正的坑是 `as_text()` 在多 id 上只返回**最后一个**。已更正 A1-F46，规则改为"读引用一律用 `as_text_list()`" | A1-F46 |
+| `probe_lettre_never_sends_size` | **成立**：假服务器 EHLO 宣告 `SIZE 10485760`，转录里 `MAIL FROM` **没有** `SIZE=` ⇒ 发送前预检只能靠本地表 + 硬上限 | A1-F45 |
+
+**顺带实现的两个 M1a 原语**（探针需要它们，反正 07 §5.4 也要）：
+- `ImapClient::append(mailbox, raw, seen)` —— 明确返回 `()`，文档写清"拿不到 UID，必须用搜索找回"。
+- `ImapClient::find_uid_by_message_id(mailbox, message_id) -> Option<u32>` —— 取最大 UID（同一 Message-ID 可能多份）。
+
+**夹具改造**：新增 APPEND（**必须先回 `+` 续行再读 literal** —— 顺序错会死锁，这是我第一次写错的地方）、
+`UID SEARCH HEADER Message-ID`、SMTP 命令转录。
+
+**证据**：`cargo test -p mail-core` → 94 lib + 28 loopback + 4 reachability = **126 通过**；
+`tools/check.ps1` **全绿**（fmt / clippy -D warnings / build / test / PE=2）。
+
+---
+
 ## 待办（按 design/19-roadmap.md §4 的 M0 顺序）
-- [ ] **M0-1** 库能力探针 `tests/library_probe.rs`：IDLE 的 `NewData`（A1-F41）、APPEND 拿不到 UID（A1-F43）、
-      分部取件（A1-F42）、`References` 三态（A1-F46）、lettre 不发 `SIZE=` 也读不到服务器 `SIZE`（A1-F45 更正）
 - [ ] **M0-2** `DbSet`（cache/user 双句柄 + 单写线程 + 读池）替换"每条命令开连接"
 - [ ] **M0-7** 建库 pragma 定稿（`auto_vacuum=incremental` 必须在建表前设）
 - [ ] **M0-3** 更正 README/HANDOFF 与代码注释里**已被推翻**的结论（"推送 50 秒延迟"等）
