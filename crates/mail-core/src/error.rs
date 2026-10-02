@@ -53,6 +53,12 @@ pub enum MailError {
     #[error("本地缓存错误 — {0}")]
     Cache(String),
 
+    /// The database was locked by another writer. Separate from `Cache` because it is *retryable*:
+    /// the caller (see `Db::write_retry`) can run the same transaction again, whereas a corrupt file
+    /// or a missing table cannot be fixed by waiting.
+    #[error("数据库正忙：{0}")]
+    Busy(String),
+
     #[error("操作超时（{0} 秒）")]
     Timeout(u64),
 }
@@ -60,8 +66,30 @@ pub enum MailError {
 /// So cache code can use `?` instead of mapping at every call site.
 impl From<rusqlite::Error> for MailError {
     fn from(error: rusqlite::Error) -> Self {
-        MailError::Cache(error.to_string())
+        // Classify lock contention here, once, so every `?` in the codebase benefits: retry loops
+        // need to tell "wait and try again" apart from "this will never work".
+        if is_lock_error(&error) {
+            MailError::Busy(error.to_string())
+        } else {
+            MailError::Cache(error.to_string())
+        }
     }
+}
+
+/// Whether a SQLite error is pure lock contention (`SQLITE_BUSY` / `SQLITE_LOCKED`).
+///
+/// `busy_timeout` only covers `SQLITE_BUSY`; `SQLITE_LOCKED` (another connection writing a different
+/// table on a shared-cache database) is not retried by SQLite at all, which is why the connection
+/// helper tells callers to use `write_retry`.
+fn is_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 /// Which piece of guidance the UI should surface for an authentication failure.
@@ -158,6 +186,7 @@ impl MailError {
                  或服务器地址/端口填错了。",
             ),
             MailError::Timeout(_) => Some("服务器响应超时，请稍后重试或检查网络。"),
+            MailError::Busy(_) => Some("本地数据库正忙（另一个操作正在写入），稍后会自动重试。"),
             MailError::Cache(_) => Some(
                 "本地缓存数据库读写失败。可以删掉缓存文件后重启 —— \
                  服务器上的邮件不受影响，只是需要重新同步一次。",

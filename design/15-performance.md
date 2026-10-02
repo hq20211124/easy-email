@@ -87,7 +87,8 @@ pragma mmap_size = 268435456;       -- 256 MB（按可用内存可调）
 pragma page_size = 4096;            -- 建库时定（默认即可）
 pragma foreign_keys = off;          -- 我们自己做级联删除（性能更好、语义更可控）
 pragma wal_autocheckpoint = 1000;   -- 约 4 MB 触发一次 checkpoint
-pragma auto_vacuum = incremental;   -- **必须在建表之前设**（第二轮评审实测：建库后再设会被静默忽略，
+pragma auto_vacuum = incremental;   -- **必须是第一条 pragma，排在 journal_mode=wal 之前**
+                                    --  （M0-7 实测：切 WAL 会写数据库头，之后就静默忽略；建库后再设同样无效）
                                     --  于是 incremental_vacuum 变空操作、配额清理腾不出磁盘）；
                                     --  v1/v2 老库只能靠一次显式全量 VACUUM
 ```

@@ -144,9 +144,12 @@ impl Cache {
     /// `synchronous = normal` is the usual WAL pairing: a crash can lose the last transaction but
     /// cannot corrupt the database, and this data is a cache — it can always be re-fetched.
     fn apply_pragmas(&self) -> Result<()> {
+        // Order matters: `auto_vacuum` first. Switching the journal mode writes the database
+        // header, after which SQLite silently ignores an auto-vacuum change (measured — see the note
+        // in `db::open_connection`).
         self.conn.execute_batch(
-            "pragma journal_mode = wal;
-             pragma auto_vacuum = incremental;
+            "pragma auto_vacuum = incremental;
+             pragma journal_mode = wal;
              pragma synchronous = normal;
              pragma busy_timeout = 5000;",
         )?;

@@ -16,6 +16,7 @@
 //! - [`secret`] — Windows Credential Manager access.
 
 pub mod cache;
+pub mod db;
 pub mod error;
 pub mod folders;
 pub mod idle;
