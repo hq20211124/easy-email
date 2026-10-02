@@ -135,6 +135,21 @@ curl -s -X POST https://oauth2.googleapis.com/token \
   改成调用新命令并把结果**前置**到列表，`history_done` 时禁用按钮并显示"没有更早的邮件了"。
 - `tools/check.ps1`：加一条门禁 —— 源码里不得出现"回填路径调用 `set_cursor`"（游标只能由增量同步推进）。
 
+### M1a-1b 历史回填接通（命令 + 前端 + 门禁）✅（第 6 轮）
+- **命令**：`load_more_messages(accountId, mailbox, limit)` —— 读 `oldest_uid` → `fetch_older_headers`
+  → `upsert_summaries` → 返回这一页与 `done`。**只读 `oldest_uid`，不碰增量游标**。
+- **前端**：`btn-load-more` 以前是"把 `limit` 加大后重新列缓存"（超过窗口就没东西了），现在调用新命令
+  并把结果**前置**到列表；新增 `state.historyDone` —— 到底时按钮变「没有更早的邮件了」并禁用，
+  失败时恢复可重试，切文件夹/刷新时重置。
+- **新门禁**：`check.ps1` 检查 `load_more_messages` 的函数体里**没有** `set_cursor`、没有 `last_uid` 赋值，
+  且**必须**用 `fetch_older_headers` —— 把"回填不得推进游标"这条不变量钉成机器检查（不靠人记）。
+- **接线证明**：门禁"每个前端命令都已注册"数出 **15** 个命令（原 14），全部已定义并注册。
+- 启动冒烟：7 秒存活 ✓；`check.ps1` 全绿；测试 **136**。
+
+**M1a 第一步（窗口同步 + 历史回填）到此完整可用**：后端往前翻页 → 命令 → 按钮 → 门禁。
+剩下的 M1a 部分：可配同步窗口（`design/04` 的 `SyncWindow`，让"最近 2 年/全部"真的可选）、
+`user.db` 落地（草稿/发件箱/规则/联系人）、认证轴、会话串、通知托盘、安装包。
+
 ## 下一步（M0 只剩两个被外部条件卡住的项，主线转到 M1a）
 
 **M0 收口情况**：M0-1/2/3/4/5/7 **已完成且全绿**；M0-6（WinAppSDK 通知）与 M0-8（OAuth 端点探测）
