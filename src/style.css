@@ -1,0 +1,877 @@
+/* Easy Email — desktop shell styling.
+   Light and dark are both driven by the same custom properties so nothing is duplicated.
+   Light is the default; dark is opt-in via `data-theme`, which src/theme.js sets before first
+   paint. See the note on the dark block below for why this is not `prefers-color-scheme`. */
+
+:root {
+  --bg: #f4f6fb;
+  --surface: #ffffff;
+  --surface-2: #eef1f8;
+  --border: #dfe3ee;
+  --text: #16203a;
+  --text-muted: #6b7691;
+  --accent: #2563eb;
+  --accent-soft: #e3ecff;
+  --danger: #c0392b;
+  --danger-soft: #fdecea;
+  --unread: #2563eb;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.06);
+  /* Tells the engine to draw native widgets — <select> popups, scrollbars, spinners — for a
+     light background. Without this the dropdown list keeps its light-mode text colour and
+     renders black-on-dark against our dark surface. */
+  color-scheme: light;
+}
+
+/*
+  Dark is opt-in, not automatic.
+
+  This block used to be `@media (prefers-color-scheme: dark)`, which made the app follow the
+  operating system. On a machine with Windows set to dark there was then no way to get a light UI at
+  all — the media query outranks any rule driven by a class, so a toggle could not have overridden
+  it either. Keying off an attribute instead makes the app's own setting authoritative and keeps
+  light as the default for everyone.
+
+  `color-scheme` must move with the theme: it is what tells the engine how to draw native widgets
+  (`<select>` popups, scrollbars). Leaving it at `light` while the surfaces go dark is exactly the
+  bug that produced a black-on-dark provider dropdown.
+*/
+:root[data-theme='dark'] {
+  --bg: #10151f;
+  --surface: #171d29;
+  --surface-2: #1f2635;
+  --border: #2a3345;
+  --text: #e6eaf3;
+  --text-muted: #98a2b8;
+  --accent: #6098ff;
+  --accent-soft: #1d2c48;
+  --danger: #ff7b6b;
+  --danger-soft: #3a2320;
+  --unread: #6098ff;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+  The `hidden` attribute must win over any display rule below. Without !important, an id or
+  class selector such as `#reader-body { display: flex }` has higher specificity than the user
+  agent's `[hidden] { display: none }`, so elements toggled with `.hidden = true` would silently
+  stay visible.
+*/
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+/* ---------------------------------------------------------------- layout */
+
+#app {
+  display: grid;
+  /*
+    minmax() rather than fixed widths: on a small or high-DPI display the window can be only
+    ~650 CSS px wide, and a fixed `232px 340px 1fr` leaves the reading pane with nothing. With
+    these minimums the side panes give way first and the reader keeps a usable 240px.
+  */
+  /*
+    Both side panes are deliberately narrow: this is a reading app, and the mail itself is the only
+    thing that needs room. At the 993 CSS px this machine provides, these maximums leave the reader
+    ~569px instead of the ~421px the previous 232/340 gave it. Labels that no longer fit ellipsize
+    (`.row .label`) and carry a `title`, so nothing becomes unreachable.
+  */
+  grid-template-columns: minmax(116px, 180px) minmax(168px, 244px) minmax(280px, 1fr);
+  /*
+    The row must be pinned too. With `grid-auto-rows: auto` the single implicit row is sized by
+    content, so the panes grew to their full content height (~3363px on a real mailbox) and
+    overflowed the viewport, where `body { overflow: hidden }` silently clipped them. That also
+    starved each pane's own `overflow-y: auto`, since a flex child only scrolls when its height
+    is constrained. `minmax(0, 1fr)` supplies the constraint: `1fr` alone would keep an `auto`
+    minimum and let the content win again.
+  */
+  grid-template-rows: minmax(0, 1fr);
+  height: 100vh;
+}
+
+#sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 8px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+  padding: 2px 4px 6px;
+}
+
+.brand-mark {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: linear-gradient(160deg, #2563eb, #1d4ed8);
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.85);
+}
+
+/* The theme toggle sits at the end of the brand row. `margin-left: auto` keeps it right-aligned
+   without adding a wrapper element to the flex row. */
+.brand .btn.icon {
+  margin-left: auto;
+  padding: 4px 7px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+.section.grow {
+  flex: 1;
+}
+
+.section-title {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.account-list,
+.mailbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* ---------------------------------------------------------------- buttons */
+
+.btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 8px;
+  padding: 5px 9px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn.block {
+  width: 100%;
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.btn.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.btn.ghost {
+  background: transparent;
+}
+
+/* ---------------------------------------------------------------- list rows */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  text-align: left;
+  width: 100%;
+  background: transparent;
+}
+
+.row:hover {
+  background: var(--surface-2);
+}
+
+.row.active {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.row .label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row .count {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.row .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--unread);
+  flex: none;
+}
+
+/* ---------------------------------------------------------------- message list */
+
+#list-pane {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  min-width: 0;
+}
+
+.pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.pane-header h1 {
+  font-size: 13.5px;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* Search runs against the local cache only, so it needs no spinner and no network state. */
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 7px;
+}
+
+.search-bar input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+
+.search-bar input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface);
+}
+
+/* A `type="search"` input gets a native clear button in Chromium, which sat next to ours and gave
+   the row two ✕s. Ours is the one that also leaves search mode, so the native one goes. */
+.search-bar input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.search-status {
+  padding: 0 10px 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Which folder a search hit came from, shown only while searching. */
+.msg-folder {
+  font-size: 10px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-right: 4px;
+}
+
+.message-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.msg {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+
+.msg:hover {
+  background: var(--surface-2);
+}
+
+.msg.selected {
+  background: var(--accent-soft);
+}
+
+.msg-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.msg-from {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-date {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.msg-subject {
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg.unread .msg-from,
+.msg.unread .msg-subject {
+  font-weight: 700;
+}
+
+.msg.unread {
+  box-shadow: inset 3px 0 0 var(--unread);
+}
+
+.list-footer {
+  padding: 10px;
+  border-top: 1px solid var(--border);  flex: none;
+}
+
+/* ---------------------------------------------------------------- reader */
+
+#reader {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.placeholder {
+  margin: auto;
+  color: var(--text-muted);
+}
+
+#reader-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.reader-header {
+  padding: 11px 14px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex: none;
+}
+
+.reader-header h2 {
+  margin: 0 0 6px;
+  font-size: 15.5px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.reader-meta {
+  display: flex;
+  /* Wrapping keeps a long sender block from ever being forced into the date. */
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  align-items: baseline;
+}
+
+.reader-from {
+  display: flex;
+  /* If the name and the address cannot share a line, the address drops to the next one instead of
+     overflowing sideways. */
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  align-items: baseline;
+  /* Must stay 0. A flex item's automatic minimum size is its min-content width, so without this
+     the block could not shrink below the sender address's full unbreakable width — it grew past
+     the date and the two rendered on top of each other. */
+  min-width: 0;
+}
+
+#reader-from-name {
+  font-weight: 600;
+  /* A name wrapped mid-word reads as a layout failure, not as a name. */
+  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#reader-from-addr {
+  /* Clamp rather than push: `min-width: 0` lets it shrink, and the ellipsis keeps the row tidy.
+     app.js sets a `title` so the full address stays reachable. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#reader-date {
+  /* The date anchors this row: never squeeze it, never let it wrap. */
+  flex: none;
+  white-space: nowrap;
+}
+
+.reader-to {
+  margin-top: 4px;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.reader-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.attachment-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  max-width: 320px;
+  /* It is a button now: clicking saves the file, so it has to look and behave like one. */
+  cursor: pointer;
+  font-family: inherit;
+  color: inherit;
+}
+
+.attachment:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+
+.attachment:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.attachment .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Attachment chips inside the composer: the same chip, plus a way to take it off again. */
+.compose-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.compose-attachments .attachment .remove {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+}
+
+.compose-attachments .attachment .remove:hover {
+  color: var(--danger);
+}
+
+.body-switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.tab {
+  border: none;
+  background: transparent;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.tab.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.remote-note {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Shown only when the body actually references remote images and the user has not opted in. */
+.remote-image-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, #d97706 12%, var(--surface));
+  font-size: 12.5px;
+  flex: none;
+}
+
+.remote-image-bar span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.body-frame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: #fff;
+  min-height: 0;
+}
+
+.body-text {
+  flex: 1;
+  margin: 0;
+  padding: 16px 20px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 13px/1.65 "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+  background: var(--surface);
+}
+
+/* ---------------------------------------------------------------- modal */
+
+.modal-root {
+  position: fixed;
+  inset: 0;
+  background: rgba(12, 18, 32, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 40;
+}
+
+.modal {
+  background: var(--surface);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  width: min(640px, 100%);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-head {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.modal-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.modal-body {
+  padding: 18px 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.modal-foot {
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  align-items: center;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.field label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.field input,
+.field textarea,
+.field select {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+  /* Set explicitly: form controls do not reliably inherit `color`, and a dark background with
+     the engine's default black text is unreadable. */
+  color: var(--text);
+  width: 100%;
+}
+
+/* The dropdown list is painted by the engine, not by our box, so it needs its own colours.
+   `color-scheme` on :root handles the common case; these rules cover engines that do not. */
+.field select option {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.field textarea {
+  resize: vertical;
+  min-height: 160px;
+  font: 13px/1.6 "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+}
+
+.field .hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.detected {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.detected .k {
+  color: var(--text-muted);
+  font-size: 12px;
+  min-width: 68px;
+  display: inline-block;
+}
+
+.mono {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.callout {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  /* Server responses contain long unbroken URLs. Without this they overflow the dialog and the
+     end of the message — often the most useful part — is clipped and unreadable. */
+  overflow-wrap: anywhere;
+}
+
+.callout.warn {
+  border-left-color: #d97706;
+  background: color-mix(in srgb, #d97706 12%, var(--surface));
+}
+
+.report {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.report.ok {
+  border-color: color-mix(in srgb, #16a34a 40%, var(--border));
+}
+
+.report.bad {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+/* ---------------------------------------------------------------- toast */
+
+.toast-root {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 60;
+  max-width: 420px;
+}
+
+.toast {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 11px 14px;
+  font-size: 13px;
+  white-space: pre-wrap;
+  animation: slide-in 0.16s ease;
+}
+
+.toast.ok {
+  border-left-color: #16a34a;
+}
+
+.toast.err {
+  border-left-color: var(--danger);
+}
+
+.toast.info {
+  border-left-color: var(--accent);
+}
+
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.empty {
+  padding: 24px 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: -2px;
+  margin-right: 6px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

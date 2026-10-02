@@ -1,0 +1,36 @@
+[package]
+name = "mail-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocol layer for Easy Email: provider presets, IMAP receive, SMTP send"
+
+[dependencies]
+# NOTE: both crates default to a non-tokio runtime; Tauri is tokio-based so we must
+# opt in explicitly and turn the defaults off.
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
+async-native-tls = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "builder",
+    "native-tls",
+    "hostname",
+] }
+# `full_encoding` pulls in encoding_rs. Without it mail-parser only handles a small charset set
+# and legacy GB2312/GBK Chinese mail decodes to mojibake, which is the single most common shape
+# of real mail in this market.
+mail-parser = { version = "0.11", features = ["full_encoding"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+# Inline (`cid:`) images are handed to the webview as `data:` URIs, which requires base64.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["full"] }

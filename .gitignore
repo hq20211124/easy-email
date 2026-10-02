@@ -1,0 +1,15 @@
+# Build output
+/target
+/src-tauri/gen
+/src-tauri/icons/*.png.tmp
+
+# Generated artifacts kept out of history
+/src-tauri/target
+*.log
+
+# Sahara / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

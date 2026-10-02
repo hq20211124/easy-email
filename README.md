@@ -1,0 +1,516 @@
+# Easy Email
+
+轻量级 Windows 邮件桌面客户端。**用户只需要填邮箱地址和授权码 —— 服务器地址、端口、加密方式全部内置。**
+
+技术栈：Tauri v2 + Rust。没有 Node 构建步骤，前端是静态 HTML/JS，整个项目一次 `cargo build` 搞定。
+
+---
+
+## 当前进度（v0.2 进行中）
+
+已完成：**单账号收发闭环** · 经过真实服务器验证的内置邮箱配置库 · **本地缓存与离线可读** · **本地全文搜索**。
+
+| 能力 | 状态 |
+|---|---|
+| 内置 21 个主流国内外邮箱配置（含授权码引导与 quirks） | ✅ 已用真机 TCP+TLS+协议握手验证 |
+| 按邮箱地址自动识别服务商 | ✅ |
+| 文件夹名本地化（收件箱/草稿箱/已发送/垃圾邮件/已删除）+ 按习惯排序 | ✅ RFC 6154 属性优先，英文名回退 |
+| IMAP：文件夹列表、邮件列表、读正文（含附件元数据） | ✅ |
+| SMTP：发信、回复、转发（含正确的会话头） | ✅ |
+| 删除、标为已读/未读、移动到文件夹 | ✅ |
+| 账号保存 + 密码存入 Windows 凭据管理器 | ✅ |
+| 添加账号时用真实连接验证 IMAP + SMTP | ✅ |
+| 安全渲染邮件正文（沙箱 iframe，默认拦截远程图片） | ✅ 含"显示图片"按封邮件解锁 |
+| 浅色 / 深色主题切换（默认浅色，记住选择） | ✅ |
+| **SQLite 本地缓存 + 增量同步（UIDVALIDITY 游标）** | ✅ 真机验证：149 封首次、二次 0 封 |
+| **断网可读**：列表、正文、文件夹列表都来自本地 | ✅ |
+| **本地全文搜索（FTS5，中文可用）** | ✅ 命令行 200 条命中上限 |
+| **连接池**：复用 IMAP 连接，不再每条命令握一次手 | ✅ 坏连接自动丢弃并重试一次 |
+| **IMAP IDLE 推送**：新邮件自动出现，不用轮询 | ✅ 真机验证：自发一封 20 秒内被推送 |
+| **系统托盘**：菜单（打开主窗口/立即检查/退出）+ 未读数提示 | ✅ 图标创建成功，显示位置取决于 Windows |
+| **Windows 通知** | ✅ 由 Rust 侧调用 |
+| **附件下载**：点附件标签即存入"下载 / Easy Email"文件夹 | ✅ 真机验证：真实 PDF 存下且头部是 `%PDF-` |
+| **附件上传**：写信时可添加本地文件 | ✅ 真机验证：40KB 经真实 SMTP 发出、IMAP 取回逐字节一致 |
+| 历史邮件回填（缓存最新 500 封以外的部分） | ❌ 下一步 |
+| OAuth2 登录（Outlook / Microsoft 365） | ❌ v0.2 |
+| 自动发现（ISPDB / SRV / Autodiscover） | ❌ v0.3 |
+
+---
+
+## 跑起来
+
+需要 Rust 1.88+（本项目使用 edition 2024）、VS 2022 Build Tools、WebView2 Runtime。
+
+```powershell
+cargo run -p easy-email
+```
+
+**没有控制台窗口。** exe 现在是 GUI 子系统的（Tauri 模板默认只有 release 才是，于是每次双击 debug
+exe 都会跟一个 cmd 窗口）。要看启动期的输出：
+
+```powershell
+# 挂回当前终端（UTF-8，中文不会乱码）
+.\target\debug\easy-email.exe --console
+
+# 或者重定向 —— GUI 子系统进程会继承调用者给的句柄，不需要 --console
+.\target\debug\easy-email.exe > target\app.log 2>&1
+```
+
+**panic 会写进 `%APPDATA%\com.easyemail.desktop\startup-error.log`**，所以"窗口出来了但一片空白、
+又没有任何输出"这种情况不会无迹可寻。`tools/check.ps1` 里有一项直接读 PE 头的 Subsystem 字段
+来防止这个设置被改回去。
+
+改完 `src/` 下的文件**必须重新 `cargo build`**：前端资源在编译期嵌进二进制，运行时不会再读磁盘。
+（实测：把 `src/theme.js` 改名移走、不重新构建直接启动已构建的 exe，界面仍然完全正常 ——
+如果它读磁盘，缺文件会让 `boot()` 抛错、邮箱列表根本不会出现。）
+
+提交前跑一遍全部检查（前端语法、元素 id 引用、fmt、clippy、单测）：
+
+```powershell
+.\tools\check.ps1              # 离线，约 30 秒
+.\tools\check.ps1 -Network     # 额外对着真实服务器验证内置配置库
+```
+
+单独跑某一项：
+
+```powershell
+node --check src/app.js        # 前端语法
+cargo test --workspace         # 单元测试（不需要网络）
+cargo test -p mail-core --test provider_reachability -- --ignored --nocapture
+```
+
+重新生成图标：
+
+```powershell
+python tools/make_icon.py
+```
+
+抓一张运行中的窗口截图（调试 UI 用）：
+
+```powershell
+.\tools\capture-window.ps1     # 输出 target\screenshot.png
+```
+
+---
+
+## 目录结构
+
+```
+crates/mail-core/          协议层：不含任何 UI，可以单独测试
+  src/providers.rs         内置邮箱配置库（21 个服务商 + quirks + 授权码引导）
+  src/imap.rs              IMAP：连接、文件夹、列表、读信、删除、移动
+  src/smtp.rs              SMTP：组信与发信（含 In-Reply-To / References）
+  src/secret.rs            Windows 凭据管理器封装
+  src/error.rs             错误分类：把 AUTHENTICATIONFAILED 变成可操作的中文提示
+  src/model.rs             与 UI 共享的可序列化类型
+  tests/loopback.rs        进程内假 IMAP/SMTP 服务器，驱动真实客户端跑完整收发闭环
+  tests/provider_reachability.rs   对着真实服务器验证配置库
+src-tauri/                 Tauri 外壳
+  src/lib.rs               14 个 Tauri 命令 + 状态管理
+  src/store.rs             账号持久化（原子写入 + 损坏文件自动备份）
+src/                       前端（静态 HTML/JS/CSS，无需打包）
+tools/make_icon.py         生成多分辨率 .ico
+```
+
+## 两层验证，各管一件事
+
+| 测试 | 证明什么 | 需要凭据吗 |
+|---|---|---|
+| `tests/loopback.rs` | 客户端的协议交互是对的：问候语握手、`ID` 在 `LOGIN` 之前、`UID FETCH` 分帧、附件与 GB2312 解码、SMTP 认证与发信头。有 8 个用例，包括"服务器不支持 UIDPLUS"和"密码被拒"两条错误路径 | 不需要 |
+| `tests/provider_reachability.rs` | 内置配置库指向的 40 个端点是真的存在、端口和加密方式没写错 | 不需要 |
+
+两层都不需要真实邮箱，所以 CI 里能全跑。`loopback` 用的是一个只实现必要协议子集的进程内服务器 ——
+这已足够覆盖客户端自己的行为，也正是它第一次运行时抓到下面第 4 个 bug。
+
+---
+
+## 内置配置库
+
+数据在 `crates/mail-core/src/providers.rs`，21 个服务商：
+
+**国内**：QQ 邮箱/Foxmail、网易 163、网易 126、网易 yeah.net、腾讯企业邮、网易企业邮、
+阿里邮箱（个人版）、阿里企业邮、新浪邮箱、中国移动 139 邮箱
+
+**国际**：Gmail、Outlook/Microsoft 365、Yahoo、iCloud、Zoho、Yandex、AOL、GMX、Fastmail、
+Proton Mail（需 Bridge）、Tuta（不支持 IMAP，明确标注）
+
+每个条目包含服务器地址、端口、加密方式、认证类型、开通授权码的图文引导、跳转链接，
+以及 **quirks（服务端脾气）**：
+
+- `needs_id` —— 网易系（163/126/yeah/企业邮）要求客户端先发 RFC 2971 `ID` 命令，
+  否则登录后所有命令都被拒。代码在 `LOGIN` 之前自动发送。
+- `max_connections` —— QQ 和网易对并发连接限制很严，超了会直接拒连。
+
+### 验证状态
+
+`verified` 标记表示**已经完成真实的 TCP + TLS + 协议握手**（IMAP 收到 `* OK`，SMTP 收到 `220`），
+由 `tests/provider_reachability.rs` 执行，所以这个标记是证据而不是乐观。
+
+最近一次全量验证（2026-10-02，40 个端点，耗时 43 秒，全部通过）：
+
+```
+qq        IMAP imap.qq.com:993            OK  * OK [CAPABILITY IMAP4 IMAP4rev1 ID AUTH=PLAIN ...
+qq        SMTP smtp.qq.com:465            OK  220 ... QQ Mail Server
+163       IMAP imap.163.com:993           OK  * OK Coremail System IMap Server Ready
+126       IMAP imap.126.com:993           OK  * OK Coremail System IMap Server Ready
+yeah      IMAP imap.yeah.net:993          OK  * OK Coremail System IMap Server Ready
+exmail    IMAP imap.exmail.qq.com:993     OK
+qiye163   IMAP imap.qiye.163.com:993      OK  * OK IMAP4 ready
+aliyun    IMAP imap.aliyun.com:993        OK  * OK AliYun IMAP Server Ready
+sina      IMAP imap.sina.com:993          OK  * OK [CAPABILITY IMAP4rev1 ID] sina imap server ready
+139       IMAP imap.139.com:993           OK  * OK RICHINFO System IMap Server Ready
+gmail     IMAP imap.gmail.com:993         OK  * OK Gimap ready for requests from 203.0.113.9
+outlook   IMAP outlook.office365.com:993  OK  * OK Microsoft Exchange IMAP4 service ready
+yahoo     IMAP imap.mail.yahoo.com:993    OK  * OK Welcome! IMAP Server up and ready
+icloud    IMAP imap.mail.me.com:993       OK
+zoho / yandex / aol / gmx / fastmail      OK  （IMAP 与 SMTP 全部通过）
+
+gmail     SMTP smtp.gmail.com:465         不可达  连接超时（中国大陆网络，非数据错误）
+```
+
+Gmail 的 IMAP 是通的，但 SMTP 的 465 端口从大陆网络经常连不上 —— 这是网络事实，不是配置错误，
+所以 `verified` 保持 `true`，同时客户端会把"连不上"当成一种可解释的结果而不是 bug 抛给用户。
+
+只有 Proton（本机 Bridge，无法在 CI 验证）和 Tuta（无 IMAP 端点）保持 `verified: false`。
+
+### 这个测试的判定标准（以及一次踩坑）
+
+它把结论分成三类，并且**只有两类里的第一类会判定失败**：
+
+- **协议不符** —— 连上了、TLS 也握上手了，但对方说的话不是 IMAP/SMTP 该说的话。
+  这才是"内置数据错了"的证据，会直接 fail。
+- **不可达** —— 连不上、或者 TLS 握手超时。**超时不含任何关于对方的信息**，所以只告警。
+- **OK** —— 收到 `* OK` / `220` 问候语。
+
+一开始我把「TLS 握手超时」也归成了"协议不符"，结果一次网络抖动就让整个门禁变红 ——
+这跟前面那句「不能把网络问题和数据错误混为一谈」是同一个错误，只是换了一层。
+现在超时一律算不可达，并且一个"协议不符"结论会有**第二次机会**（重试一次才判失败），
+因为宣布一个端点数据过时是个很强的断言，值得多看一眼。
+
+---
+
+## 三个值得注意的实现细节
+
+这些都是踩过之后才写对的，测试里有对应的回归用例：
+
+1. **mail-parser 默认不认 GB2312/GBK。** 它的 `default = []`，不开 `full_encoding` 特性时
+   中文老邮件全部解析成乱码。`Cargo.toml` 里已经打开。
+
+2. **SMTP 组信不能用 `MessageBuilder::body()`。** 它只写 `Content-Transfer-Encoding`，
+   完全不写 `Content-Type` —— 中文正文会以 base64 发出但没有 charset 声明，收件人看到的是乱码。
+   必须用 `singlepart(SinglePart::plain(..))`。
+
+3. **`references()` 是覆盖而不是追加。** 循环调用会把 References 链截断成最后一个 Message-Id，
+   导致回复在对方客户端里不成为会话。必须一次性把整条链用空格拼好传进去。
+
+另外两个库层面的坑：`async-imap` 0.12 **没有 `connect()` 函数**（文档示例是 `ignore` 的，
+引用了已删除的函数），必须自己搭 TCP+TLS；而 `Client<T>` 要求 `T: Debug`，
+但 `async_native_tls::TlsStream` 故意没实现 `Debug`，所以需要一个 `DebugStream` 包装。
+
+4. **错误分类必须同时用在 `send` 和 `test_connection` 上。** 一开始只有 `send` 走了
+   `classify_smtp`，`test_connection` 直接构造 `MailError::Smtp`。而添加账号向导走的是
+   `verify_account` → `test_connection` —— 也就是说**用户输错授权码时，最需要"你应该填授权码"
+   这句提示的那条路径，恰好是唯一没接上分类的**。
+
+## 四个只有真的把程序跑起来才会发现的 bug
+
+第 1-3 个是截图看界面时抓到的，第 4 个是写集成测试、第一次真正执行客户端协议代码时抓到的。
+四个都不会被 `cargo build` 或单元测试发现：
+
+1. **模板字符串里写了反引号。** 我在一段 HTML 注释里用了 `` `off` `` 和 `` `new-password` ``，
+   而这段 HTML 本身是 JS 模板字符串 —— 反引号直接把字符串截断了，
+   `SyntaxError: Unexpected token 'new'`。整个 `app.js` 拒绝执行，表现是"界面出来了但一片空白"：
+   静态 HTML 正常渲染，所有 JS 填充的内容全都没有。
+   `cargo build` 全程绿色。现在 `tools/check.ps1` 第一项就是 `node --check`。
+
+2. **`[hidden]` 被自己的 CSS 覆盖了。** `#reader-body { display: flex }` 的优先级高于浏览器
+   默认的 `[hidden] { display: none }`，所以 `element.hidden = true` 完全不起作用 ——
+   读信面板和模态遮罩永远显示。修法是全局加一条 `[hidden] { display: none !important }`。
+
+3. **三栏布局在小屏/高 DPI 上会把读信栏压成 0。** `grid-template-columns: 232px 340px 1fr`
+   在窗口只有 640 逻辑像素宽时，前两栏吃掉 572px，读信栏只剩几十像素，正文完全看不见。
+   改成 `minmax()`，让侧栏先让位。
+
+4. **不支持 UIDPLUS 的服务器上，删除会静默失败。**（最严重的一个，数据一致性问题）
+   原来靠 `if self.expunge_uid(uid).await.is_err()` 决定要不要回退到 `EXPUNGE`。
+   但 `async-imap` 从 0.11.1 起"命令被拒就关流"，被拒的命令可能表现为一个**干净结束的 stream**
+   （0 个元素、没有 `Err`），于是 `try_collect` 返回 `Ok(vec![])`、`.is_err()` 是 `false` ——
+   不回退，直接返回 `Ok(())`。
+   用户看到的是：点了删除，邮件从列表消失，但服务器上只是被打上了 `\Deleted` 标记、永远没清掉。
+   现在改成登录后用 `capabilities().has_str("UIDPLUS")` **一次性决定策略**，
+   而不是先试错再回退 —— 试错本身会触发 async-imap 关流，所以是双重错误。
+
+顺带还发现 WebView2 的自动填充会往"显示名称"里塞 Windows 账户名，
+已经用 `autocomplete` 属性加 `additionalBrowserArgs` 关掉。
+
+## 第一次用真实邮箱跑通时发现的三个问题
+
+QQ 邮箱真实账号（QQ 号地址 + 16 位授权码）登录成功之后，界面立刻暴露了两个问题；
+第三个是排查登录失败时发现的。
+
+5. **文件夹名没有从 IMAP modified UTF-7 解码。** 中文文件夹在协议里不是 UTF-8：
+   可打印 ASCII 原样传，`&` 写成 `&-`，其余字符是 UTF-16BE 走一套「用 `,` 代替 `/`、
+   不带 padding」的 base64，夹在 `&`…`-` 之间。结果 `其他文件夹/QQ邮件订阅` 在界面上显示成
+   `&UXZO1mWHTvZZOQ-/QQ...`。修法是新增 `src/mutf7.rs` 解码，并且让 `MailboxInfo` **同时带两个名字**：
+   `name` 是线路上的原始编码（所有命令必须原样发回去），`display_name` 才是给人看的。
+   只解码、不回编码，是为了避免在命令路径上引入新的出错可能。
+
+   这里还踩了一个自己挖的坑：我最初用 `if name.is_ascii() { 不解码 }` 来省一次分配 ——
+   但**编码后的名字本身就是纯 ASCII**，这个判断会把所有真正需要解码的名字全部跳过。
+   正确的判断是"含不含 `&`"。测试里专门留了一个用例把这个错误钉死。
+
+6. **登录名和邮箱地址被硬绑在一起。** `AccountConfig` 本来就有独立的 `username` 字段，
+   但向导从来没让用户填过，永远等于邮箱地址。而有些账号的登录名和地址确实不一样 ——
+   `@foxmail.com` 别名、VIP 账号、企业下发的单独登录名。
+   现在向导多了「登录用户名（可选）」一栏，留空就还是用地址；「检测结果」里会显示最终用哪个名字登录。
+
+7. **错误提示里的 async-imap 包装层直接暴露给了用户。** 服务器拒绝命令时，
+   async-imap 渲染成 `no response: code: None, info: Some("...")`，用户看到的是这坨，
+   而服务器真正写的那句话（QQ 的还带帮助链接）被埋在 `Some("` 里面，
+   再加上没有自动换行，右半边直接被裁掉。现在会把这层剥掉、并且 `overflow-wrap: anywhere`。
+
+---
+
+## 只有真的点开一封真实邮件才会暴露的三个问题
+
+这三个不在 `cargo build`、单元测试、甚至 loopback 集成测试的覆盖范围内 —— 它们只在真的把一封
+HTML 邮件渲染进 WebView2 时才出现。第 8 个是靠 CDP 探针进入沙箱 iframe 读 `img.naturalWidth`
+才定位的，第 10 个是对着真实邮件逐个候选注入 CSS 测出来的（正文在 `sandbox` iframe 里，
+应用自己的 JS 碰不到它）。
+
+8. **"显示图片"按钮从来没生效过 —— `srcdoc` iframe 会继承父文档的 CSP。**（本轮最严重的一个）
+
+   现象很有迷惑性：点了"显示图片"，iframe 自己的 CSP 确实变成了
+   `img-src data: blob: https: http:`（探针读 `srcdoc` 确认过），提示条也正确地消失了，
+   但 14 张图**全部** `complete: true` 且 `naturalWidth: 0` —— 加载失败，不是还在下载。
+   同样的 URL 用 PowerShell 请求返回 200，所以不是网络问题。
+
+   根因：**通过 `srcdoc` 加载的文档会继承嵌入它的文档的 CSP，两条策略取交集。**
+   外壳那条 `img-src 'self' data:`（`index.html` 的 meta 和 `tauri.conf.json` 的 `security.csp`
+   各有一条）因此成了真正的约束 —— 无论里层策略放多宽，远程图片都过不去。而 `data:` 图片能正常显示，
+   正因为它在外壳的允许列表里。
+
+   修法是让外壳不再成为约束：两处 `img-src` 都加上 `https: http:`。
+   **默认拦截并没有被削弱** —— 实际把关的是 iframe 自己那条策略，它的默认值仍是
+   `img-src data: blob:`，只有用户为这一封邮件点过"显示图片"才会变成宽松的。
+   `tools/check.ps1` 现在把这个不变量钉住了（外壳必须允许 https，且
+   `allowRemoteImages` 三元分支必须仍然选择宽松策略）。
+
+   顺带一个说明性细节：这封 uSMART 邮件里有一个 `naturalWidth: 1` 的 1×1 图片，
+   来自 `hz.yxzq.com/news-shorturl/api/v1/images/MTY5NTM6...`，而那段 base64 解出来是
+   `16953:reader@example.com:usmart:0101.jpg` —— 它就是追踪像素。
+   用户点"显示图片"的那一刻，它就会上报"这封邮件被打开了"。这正是默认拦截存在的理由。
+
+9. **读信头部里发件人和日期会叠在一起。** 长地址把发件人名挤成 54px 宽、折成三行，
+   而地址块的右边缘（892）压到了日期的左边缘（881）—— **重叠 11px**。
+   这不是肉眼判断的，是 CDP 量 `getBoundingClientRect()` 量出来的。
+
+   根因：`#reader-from-addr` 没有 `min-width: 0`。flex item 的自动最小尺寸是它的
+   min-content 宽度，所以那一整串不可断的地址把 `.reader-from` 撑出了容器，直接压到日期上。
+   修法是给会被裁的部分加 `min-width: 0` + 省略号，并让 `.reader-meta` / `.reader-from`
+   可以换行 —— 现在地址太长时日期会自己落到第二行，而不是互相覆盖。
+
+10. **邮件是固定宽度的桌面布局，塞进窄读信栏会被裁掉。** 真实广发银行那封：内容宽 752px 落在
+   406px 的读信栏里，**142 个元素越过右边缘** —— 横幅右半截被切掉，底部出现横向滚动条。
+   宽度是写在 `<td style="width:720px">` 和 `width="720px"` 里的，而 `table { max-width: 100% }`
+   **管不住它**：表格的实际宽度由单元格的 min-content 撑着，加不加 `max-width` 都是 720px。
+
+   修法是中和固定像素宽度，而中和内联样式必须用 `!important` —— 风险也正在这里。**一刀切地
+   `width: auto !important` 会把 `<table width="100%">` 压成读信栏的 6%**，那会毁掉正常邮件的排版。
+   所以规则集显式排除百分比形式：
+
+   ```css
+   table[width]:not([width$="%"]), td[width]:not([width$="%"]), /* … */ { width: auto !important; }
+   table[style*="width:"]:not([style*="%"]), /* … */              { width: auto !important; }
+   table, td, th, div, p { max-width: 100% !important; }
+   img { max-width: 100% !important; height: auto !important; }
+   ```
+
+   这不是推理出来的，是对着**真实那封邮件**逐个候选注入测量出来的（752 → 406，零溢出），
+   同时用一个合成夹具确认 `width="100%"` 仍是 1.00、`width="50%"` 仍是 0.50。
+   `check.ps1` 把这个不变量钉住了。
+
+   同一轮还测出**不要给图片加高度上限**：800×3765 的竖版横幅限到 420px 高之后，
+   因为等比缩放会变成 **89px 宽的一条细缝**，比不限还糟。所以只限宽度。
+
+   顺带：上面第 1 条那个"模板字符串里写反引号"的坑**又踩了一次** —— 这次的 CSS 注释里用了
+   `` `width: auto` ``，同样让整个 `app.js` 解析失败、界面看起来一片空白，而 `cargo build` 全绿。
+   区别在于这次是 `node --check` 立刻定位到的（我改完没先跑门禁就构建，所以第一眼看到的是"界面空白"）。
+   门禁第一项存在的意义就在这里。
+
+---
+
+## 本地缓存与搜索（v0.2）
+
+`%APPDATA%\com.easyemail.desktop\cache.db`（SQLite，紧挨着 `accounts.json`，不想要就直接删）。
+缓存里**没有任何密码或授权码** —— 那些只在 Windows 凭据管理器里。
+
+### 增量同步靠 `UIDVALIDITY` + UID 游标
+
+* **首次**同步取最新 500 封的头部（不是从 UID 1 全量拉 —— 两万封的文件夹会让首屏不可用）。
+* **之后**每次同步就是 `UID FETCH <last_uid+1>:*`，一次往返，与文件夹大小无关。
+* 游标是 `(UIDVALIDITY, last_uid)` 的组合。**`UIDVALIDITY` 一变，缓存里所有 UID 都可能指向别的邮件**，
+  所以整个文件夹会被清空重建，而不是拿旧头部去配新邮件。
+
+真实账号实测（QQ，149 封）：
+
+```
+第一次：同步 INBOX：新增 149 封，缓存共 149 封
+第二次：同步 INBOX：新增 0 封，缓存共 149 封
+```
+
+### 搜索能搜到什么，搜不到什么
+
+搜**全部已同步邮件的主题、发件人、收件人**，加上**已打开过的邮件的正文**。
+正文不在同步范围内 —— 要索引全部正文就得把整个文件夹的正文下载一遍，那是另一个量级的开销。
+所以界面上那句提示是"正文只搜已打开过的邮件"，空结果时也会说明，不会让你误以为邮箱里没有。
+
+搜索完全走本地，**断网可用**，也不会因为服务器慢而卡住。
+
+### 中文搜索为什么不能用官方推荐的 `trigram`
+
+FTS5 的默认分词器 `unicode61` 把连续的汉字当成**一个** token，所以搜「账单」在
+「这是您十月的账单」里命中 0。所有资料都会推荐改用 `trigram` 分词器 —— **这里它也是错的**：
+trigram 要求至少 3 个字符，而中文词大量是两个字。三条路都实测过：
+
+| 方案 | `账单`（2 字） | `invoi` | `2724` |
+|---|---|---|---|
+| `unicode61` 默认 | ❌ 0 命中 | — | — |
+| `trigram` | ❌ 0 命中 | ✅ | ✅ |
+| **逐字符空格化 + `unicode61`** | ✅ | ✅ | ✅ |
+
+所以索引侧和查询侧都做逐字符空格化（`to_tokens` / `to_query`，见 `cache.rs`）。
+**两边必须用同一套变换**，这一点由两个单元测试钉住，`check.ps1` 还有一项专门拦 trigram 回归。
+
+---
+
+## 连接池与推送（v0.2）
+
+### 连接池：每个账号最多 `max_connections` 条空闲连接
+
+以前**每条命令都新建一次连接** —— TCP + TLS + LOGIN，几百毫秒一次，而且 `max_connections`
+从来没有被真正执行过。现在空闲连接会被复用，`list_messages` 这类操作只花一次往返。
+
+两个细节值得写下来：
+
+* **复用前会发一条 `NOOP` 验活**，因为服务器会悄悄关掉空闲连接，而 IMAP 里这不会表现为任何
+  错误 —— 要等下一条命令才失败，而且往往是一条不相干的命令。
+* **但 `NOOP` 不足以判定连接可用**，这是实测结论：服务器刚关闭时，客户端**写入仍可能成功**，
+  而 async-imap 把"流结束"读成了空响应，于是 `noop()` 返回 `Ok`。真正失败的会是下一条命令
+  （实测 `os error 10053`）。所以池子还会在命令失败时把那条连接标记为坏、丢弃，**换新连接重试一次**。
+
+### 推送：IMAP IDLE，但有 50 秒的时间粒度
+
+新邮件不再靠轮询。流程是「连上 → SELECT → IDLE → 等 → DONE → 重新 SELECT 比对数量 → 有变化就同步」，
+断线按 1s→2s→…→60s 指数退避重连，成功空转一轮就重置。
+
+**为什么是"重新 SELECT 比对"而不是等服务器推送的消息？** 因为 async-imap 0.12 把服务器推来的
+`* n EXISTS` 归类成 `Response::Data { status: Ok, .. }` 并在那一支直接 `continue` ——
+它**永远不会变成 `IdleResponse::NewData`**。夹具明确推送了 `* 5 EXISTS`，十秒内没有任何 `NewData`。
+所以通知延迟由 IDLE 窗口决定，当前设为 **50 秒**；一个周期只有 1 条 IDLE + 1 条 SELECT，
+而真正昂贵的同步只在数量变化时才发生。
+
+真机验证（QQ 邮箱，给自己发一封）：
+
+```
+已开始监听 me@example.com 的 INBOX
+同步 INBOX：新增 1 封，缓存共 150 封        ← 20 秒后检测到
+推送：me@example.com 的 INBOX 新增 1 封（未读 53）
+```
+
+### 托盘与通知
+
+托盘菜单：打开主窗口 / 立即检查新邮件 / 退出；左键点击唤出窗口；tooltip 显示未读数。
+Windows 通知**由 Rust 侧调用**（`tauri-plugin-notification`）—— 前端没有打包器，插件的 JS 包
+进不来，而推送本来就发生在 Rust 里。
+
+---
+
+## 附件下载（v0.2）
+
+读信时点附件标签即保存到 `下载\Easy Email\`，文件名由后端消毒后决定。
+
+**文件名是敌意输入。** `filename="..\..\Startup\x.exe"` 是发件人可以随便写的合法值，所以名字会被
+压成单个路径分量、替换掉 Windows 不接受与所有控制字符、超长截断、`CON`/`NUL` 这类设备名加前缀，
+空名则退回 `attachment-<part>`。已存在的文件不会被覆盖，而是加 ` (2)` 后缀 —— 静默覆盖会丢掉
+用户可能还没看过的文件。
+
+**已知代价：下载会把整封邮件取回来。** 也就是说峰值内存与**邮件大小**成正比，而不是与附件大小成正比。
+这是库的限制而非疏忽，而且尝试过更省的路：
+
+* **IMAP 分部取件**（`BODY.PEEK[]<0.196608>`）可以真正流式，但**响应解析不了**。
+  `imap-proto` 0.17 的 section 语法里没有 `<origin.offset>`，所以服务器按 RFC 回显的
+  `BODY[]<0.196608>` 会让解析器直接报 `TakeWhile1`（实测）。让夹具不回显那个后缀能让测试变绿，
+  但会在每一个真实服务器上失败 —— 那比不做优化更糟。
+* **按 IMAP part 路径取单个 part**（`BODY.PEEK[2]`）能少缓冲一部分，但 `mail-parser` 暴露的是
+  附件在文档顺序里的下标，不是协议用的 `1.2.3` 点分路径；靠遍历 MIME 树去推导，正是那种在真实邮件上
+  会崩的"聪明代码"。
+
+所以选择：一次取回、用 `mail-parser` 已经解好码的字节直接落盘，并把限制写在这里。
+
+真机验证（QQ 邮箱，一份发票 PDF）：
+
+```
+uid=5809 name="Invoice-XKOGBCCQ-0001.pdf" declared=23477 written=23477 on_disk=23477 head=25 50 44 46 2D
+```
+
+`25 50 44 46 2D` 就是 `%PDF-`：声明长度、写入长度、磁盘长度三者一致，文件头也对。
+
+---
+
+## 附件上传（v0.2）
+
+写信窗口点「📎 添加附件」选本地文件；文件**从磁盘读取**，不经过界面 —— `OutgoingAttachment`
+传的是路径，`smtp` 在组装时才读，所以 20MB 的附件不会先变成一串 JSON 穿过 IPC。
+
+MIME 类型按扩展名猜；猜不出来就用 `application/octet-stream`。**猜错的类型不会中止发送** ——
+把文件当成不透明字节发出去，永远好过因为一个没人会看的细节丢掉用户的附件。
+
+组装形状：有附件时是 `multipart/mixed`，第一个 part 是正文（有 HTML 时是 `multipart/alternative`），
+其余是附件。纯文本正文**直接放进去**，而不是套一层只有单个 part 的 `multipart/mixed` —— 那合法但没必要。
+
+真机往返验证（QQ 邮箱，发给自己一封带 40KB 非 7bit 内容的邮件，再从 IMAP 取回）：
+
+```
+sent 40000 bytes
+attempt 0: uid=5814 attachments=1 names=["roundtrip.bin"] sizes=[40000]
+back=40000 written=40000 identical=true
+```
+
+也就是说：出去的编码、进来的解码、两边的大小，全都对得上，逐字节一致。
+
+---
+
+## 安全设计
+
+- **密码不进配置文件。** 账号信息写 `%APPDATA%/easy-email/accounts.json`，
+  密码/授权码进 Windows 凭据管理器。
+- **邮件正文用双重沙箱渲染。** `iframe sandbox`（禁脚本、禁表单、禁同源、禁顶层跳转）
+  加独立 CSP `default-src 'none'`。**远程图片默认不加载** —— 那正是追踪像素上报"已读"的方式。
+  内联样式和 `data:` 图片保留，所以邮件排版和嵌入 logo 正常。
+  "显示图片"只为**当前这一封**解锁（切到别的邮件会立刻恢复拦截），而且必须点一次才生效。
+- **CSP 的约束关系是"取交集"，而且 `srcdoc` 文档会继承父文档的策略。**
+  所以外壳的 `img-src`（`index.html` + `tauri.conf.json`）不能比正文策略更严，
+  否则正文策略再宽松也没用（这就是上面第 8 条那个 bug）。
+  真正的把关点在 `buildSandboxedDocument()` 的默认分支，`check.ps1` 有一项专门盯着它别被改坏。
+- **CSP 锁死渲染进程**：脚本只能来自本地，`connect-src` 只留 IPC。
+
+---
+
+## 已知限制 / 下一步
+
+- **每个操作新建一次 IMAP 连接。** ~~一次 TLS 握手换掉整个连接池子系统，v0.1 的取舍。~~
+  已解决：见「连接池与推送」。`max_connections` 现在作用在空闲连接数上。
+- **推送有最多 50 秒延迟**，原因见上一节（库不投递 `EXISTS`）。这是当前版本的通知时间粒度。
+- **只监听 INBOX。** 其他文件夹有新邮件不会触发通知。
+- **托盘图标的位置由 Windows 决定**，可能被折叠进"隐藏的图标"溢出区。
+- **缓存只覆盖最新 500 封。** 更早的历史没有回填机制，"加载更多"超过这个范围就没有了。
+- **搜索的正文只覆盖已打开过的邮件**（见上一节），且缓存里没有的邮件搜不到。
+- **离线时不会显式提示"离线"**：`sync_status` 命令已经能报告 `offline` 与失败原因，
+  但界面还没用它，所以离线时看到的是上次同步的数据、没有标注。
+- **Outlook 个人版登录不了。** 微软 2024-09-16 起对个人账号彻底关闭基本认证，只能走 OAuth2。
+- **附件上传没有大小上限检查**，超限时由服务器拒绝（错误会原样显示）。
+- **下载附件时峰值内存与整封邮件同量级**，原因见「附件下载」一节。
+- **删除是永久删除**（`UID EXPUNGE`，只在服务器不支持 UIDPLUS 时才退化成 `EXPUNGE`）。
+  还没有"移到垃圾箱"的自动行为。
+- 单账号视图，没有统一收件箱。

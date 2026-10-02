@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light" data-density="comfortable">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Easy Email · 设计原型 v2</title>
+<!--
+  design/12-ui-design-system.md 的可点击原型 v2。纯静态、无依赖、双击打开。
+  v2 相对 v1 的改动（来自独立评审的三条意见）：
+   1) 把**差异点画进界面**：覆盖率与同步窗口、仅本地徽标、配额停摆提示、无遥测/出站端点入口、非正常状态（骨架/离线）。
+   2) 让它**演示自己的交互模型**：顶栏主题与密度、可用的 J/K/Enter/E/R/#///?、真正会过滤的命令面板、
+      Shift 范围选择 + Ctrl+A + aria-multiselectable、容器焦点 + aria-activedescendant + setsize/posinset。
+   3) **令牌保真**：全部用 --sp-*/--dur-*/--radius-* 等变量，无硬编码 hex（SVG 用 currentColor），
+      补 prefers-reduced-motion，emoji 换成自绘 SVG，暗色主按钮用 --on-brand 修对比度。
+  参数：?theme=dark / ?density=compact / ?state=skeleton|offline 可直接看变体。
+-->
+<style>
+:root{
+  --brand-600:#2563eb; --brand-700:#1d4ed8; --brand-050:#eef4ff; --on-brand:#fff;
+  --danger-600:#c0392b; --danger-050:#fdecea; --success-600:#15803d; --warning-600:#b45309; --warning-050:#fef6e7;
+  --bg:#f6f7fb; --surface:#fff; --surface-2:#f0f2f8; --surface-3:#e8ebf4;
+  --border:#e2e6f0; --border-strong:#ccd3e3;
+  --text:#141b2d; --text-2:#4b5568; --text-3:#5f6a80;
+  --shadow-1:0 1px 2px rgba(16,24,40,.06); --shadow-2:0 6px 20px rgba(16,24,40,.10);
+  --radius-sm:6px; --radius:10px; --radius-lg:14px; --radius-pill:999px;
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:24px;
+  --font:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+  --fs-xs:11px; --fs-sm:12px; --fs-md:13px; --fs-lg:15px; --fs-xl:18px;
+  --lh-tight:1.35; --lh-normal:1.55; --lh-read:1.7;
+  --dur-fast:90ms; --dur:140ms; --ease:cubic-bezier(.2,.7,.3,1);
+  --row-h:40px; --nav-w:200px; --list-w:340px;
+  color-scheme:light;
+}
+:root[data-theme='dark']{
+  --brand-600:#6ea8ff; --brand-700:#8bb9ff; --brand-050:#16233b; --on-brand:#0f131b;
+  --danger-600:#ff8071; --danger-050:#3a2320; --success-600:#4ade80; --warning-600:#fbbf24; --warning-050:#3a2f1a;
+  --bg:#0f131b; --surface:#161b25; --surface-2:#1d2431; --surface-3:#242c3b;
+  --border:#2a3342; --border-strong:#3a4759;
+  --text:#e8ecf4; --text-2:#a9b3c6; --text-3:#8b96a8;
+  --shadow-1:0 1px 2px rgba(0,0,0,.35); --shadow-2:0 8px 24px rgba(0,0,0,.45);
+  color-scheme:dark;
+}
+:root[data-density='compact']{ --row-h:34px; }
+@media (prefers-reduced-motion: reduce){ :root{ --dur-fast:0ms; --dur:0ms; } }
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:var(--font);font-size:var(--fs-md);line-height:var(--lh-normal);color:var(--text);
+     background:var(--bg);-webkit-font-smoothing:antialiased;overflow:hidden}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--brand-600);outline-offset:2px;border-radius:var(--radius-sm)}
+.icon{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:1.5;
+      stroke-linecap:round;stroke-linejoin:round}
+.app{display:grid;grid-template-rows:auto 1fr auto;height:100vh}
+.mid{display:grid;grid-template-columns:var(--nav-w) var(--list-w) 1fr;min-height:0}
+@media (max-width:1180px){ .mid{grid-template-columns:56px var(--list-w) 1fr} .nav-label{display:none} }
+
+/* ── 顶栏（评审：主题/密度按钮要有位置；差异点也要有位置） ── */
+.topbar{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-2) var(--sp-3);
+        background:var(--surface);border-bottom:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:var(--sp-2);font-weight:600}
+.brand .mark{width:12px;height:12px;border-radius:4px;background:var(--brand-600)}
+.topbar .spacer{flex:1}
+.tbtn{display:flex;align-items:center;gap:var(--sp-1);padding:var(--sp-1) var(--sp-2);
+      border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-2);font-size:var(--fs-sm)}
+.tbtn:hover{border-color:var(--border-strong);color:var(--text)}
+.badge-local{font-size:var(--fs-xs);padding:0 var(--sp-1);border-radius:var(--radius-sm);
+             background:var(--warning-050);color:var(--warning-600);border:1px solid var(--border)}
+
+/* ── 导航 ── */
+.nav{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;overflow:auto}
+.nav-sec{padding:var(--sp-2) var(--sp-2) 0;color:var(--text-3);font-size:var(--fs-xs)}
+.nav-item{display:flex;align-items:center;gap:var(--sp-2);width:100%;padding:var(--sp-1) var(--sp-2);
+          border-radius:var(--radius-sm);text-align:left;color:var(--text-2)}
+.nav-item:hover{background:var(--surface-2)}
+.nav-item.active{background:var(--brand-050);color:var(--brand-700);font-weight:600}
+.nav-item .cnt{margin-left:auto;font-size:var(--fs-xs);color:var(--text-3)}
+.swatch{width:8px;height:8px;border-radius:50%;flex:none}
+.nav-foot{margin-top:auto;padding:var(--sp-2)}
+
+/* ── 列表 ── */
+.list{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0}
+.list-head{padding:var(--sp-2) var(--sp-3);border-bottom:1px solid var(--border)}
+.list-head h1{margin:0;font-size:var(--fs-lg);font-weight:650}
+.coverage{margin-top:var(--sp-1);font-size:var(--fs-xs);color:var(--text-3)}
+.searchbar{display:flex;gap:var(--sp-1);margin-top:var(--sp-2)}
+.searchbar input{flex:1;min-width:0;padding:var(--sp-1) var(--sp-2);border:1px solid var(--border);
+                 border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text);font:inherit}
+.rows{flex:1;overflow:auto;min-height:0}
+.row{display:block;width:100%;text-align:left;padding:var(--sp-1) var(--sp-3);border-bottom:1px solid var(--border);
+     height:var(--row-h);overflow:hidden;position:relative}
+.row:hover{background:var(--surface-2)}
+.row.sel{background:var(--brand-050)}
+.row.unread{box-shadow:inset 3px 0 0 var(--brand-600)}
+.row-top{display:flex;gap:var(--sp-2);align-items:baseline}
+.who{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:58%}
+.count{font-size:var(--fs-xs);color:var(--text-3)}
+.when{margin-left:auto;font-size:var(--fs-xs);color:var(--text-3);white-space:nowrap}
+.subj{color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bulk{display:none;align-items:center;gap:var(--sp-2);padding:var(--sp-2) var(--sp-3);
+      background:var(--brand-050);color:var(--brand-700);border-bottom:1px solid var(--border);font-size:var(--fs-sm)}
+.bulk.on{display:flex}
+.list-foot{padding:var(--sp-2) var(--sp-3);border-top:1px solid var(--border);color:var(--text-3);font-size:var(--fs-xs)}
+
+/* ── 阅读 ── */
+.reader{display:flex;flex-direction:column;min-width:0;background:var(--bg);overflow:auto}
+.reader-head{padding:var(--sp-3) var(--sp-4);border-bottom:1px solid var(--border);background:var(--surface)}
+.reader-head h2{margin:0 0 var(--sp-1);font-size:var(--fs-xl);font-weight:650}
+.meta{display:flex;gap:var(--sp-3);flex-wrap:wrap;color:var(--text-3);font-size:var(--fs-sm)}
+.toolbar{display:flex;gap:var(--sp-1);margin-top:var(--sp-2);flex-wrap:wrap;align-items:center}
+.btn{display:inline-flex;align-items:center;gap:var(--sp-1);padding:var(--sp-1) var(--sp-2);
+     border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface-2);color:var(--text-2);font-size:var(--fs-sm)}
+.btn:hover{border-color:var(--border-strong);color:var(--text)}
+.btn.primary{background:var(--brand-600);border-color:var(--brand-600);color:var(--on-brand);font-weight:600}
+.btn.danger{color:var(--danger-600)}
+.notice{margin:var(--sp-3) var(--sp-4) 0;padding:var(--sp-2) var(--sp-3);border:1px solid var(--border);
+        border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text-2);font-size:var(--fs-sm);
+        display:flex;gap:var(--sp-3);align-items:center}
+.notice.warn{background:var(--warning-050);border-color:var(--border);color:var(--warning-600)}
+.notice .grow{flex:1}
+.body{margin:var(--sp-3) var(--sp-4) var(--sp-5);padding:var(--sp-4);background:var(--surface);
+      border:1px solid var(--border);border-radius:var(--radius);max-width:720px;line-height:var(--lh-read);box-shadow:var(--shadow-1)}
+.body p{margin:0 0 var(--sp-3)}
+.quote{margin-top:var(--sp-3);padding-left:var(--sp-3);border-left:3px solid var(--border);color:var(--text-3)}
+.quote summary{cursor:pointer;font-size:var(--fs-sm)}
+.chip{display:inline-flex;align-items:center;gap:var(--sp-1);margin:var(--sp-1) var(--sp-2) 0 0;
+      padding:var(--sp-1) var(--sp-2);border:1px solid var(--border);border-radius:var(--radius-sm);
+      background:var(--surface-2);font-size:var(--fs-sm)}
+
+/* ── 状态栏（跨整窗，v1 里错放在阅读栏内） ── */
+.status{display:flex;align-items:center;gap:var(--sp-4);padding:0 var(--sp-3);height:26px;
+        border-top:1px solid var(--border);background:var(--surface);color:var(--text-3);font-size:var(--fs-xs)}
+.status .spin{width:10px;height:10px;border:2px solid var(--border-strong);border-top-color:var(--brand-600);
+              border-radius:50%;display:inline-block;animation:sp 900ms linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.status a{color:var(--brand-700);text-decoration:none}
+
+/* ── 骨架 / 离线的演示 ── */
+.skeleton .row{height:var(--row-h)}
+.sk{height:10px;border-radius:var(--radius-sm);background:var(--surface-3);margin:var(--sp-1) 0}
+.sk.w40{width:40%} .sk.w70{width:70%}
+
+/* ── 命令面板 / 快捷键总览 ── */
+.overlay{position:fixed;inset:0;background:rgba(10,14,22,.35);display:none;align-items:flex-start;
+         justify-content:center;padding-top:10vh}
+.overlay.on{display:flex}
+.panel{width:min(620px,92vw);background:var(--surface);border:1px solid var(--border);
+       border-radius:var(--radius-lg);box-shadow:var(--shadow-2);overflow:hidden}
+.panel input{width:100%;padding:var(--sp-3) var(--sp-4);border:0;border-bottom:1px solid var(--border);
+             background:transparent;color:var(--text);font-size:var(--fs-lg);outline:none}
+.panel ul{list-style:none;margin:0;padding:var(--sp-1);max-height:46vh;overflow:auto}
+.panel li{display:flex;gap:var(--sp-2);align-items:center;padding:var(--sp-2);border-radius:var(--radius-sm);color:var(--text-2)}
+.panel li[aria-selected="true"]{background:var(--brand-050);color:var(--brand-700)}
+.panel .kind{margin-left:auto;font-size:var(--fs-xs);color:var(--text-3)}
+.panel .empty{padding:var(--sp-4);color:var(--text-3)}
+</style>
+</head>
+<body>
+<!-- 图标精灵（评审：不要用 emoji；统一 1.5px 线宽、currentColor） -->
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></symbol>
+  <symbol id="i-reply" viewBox="0 0 24 24"><path d="M9 7L4 12l5 5"/><path d="M4 12h9a7 7 0 017 7"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 001 1h12a1 1 0 001-1V8"/><path d="M10 12h4"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-flag" viewBox="0 0 24 24"><path d="M6 3v18"/><path d="M6 4h11l-2 4 2 4H6"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></symbol>
+  <symbol id="i-rows" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 5-3 8-7 9-4-1-7-4-7-9V6z"/><path d="M9.5 12l2 2 3.5-4"/></symbol>
+</svg>
+
+<div class="app" id="app">
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <span class="brand"><span class="mark"></span>Easy Email</span>
+    <span class="badge-local" id="badge-local" hidden>本机存档 · 仅本地</span>
+    <span class="spacer"></span>
+    <button class="tbtn" id="btn-theme" title="切换主题（T）"><svg class="icon"><use href="#i-sun"/></svg><span>主题</span></button>
+    <button class="tbtn" id="btn-density" title="切换密度（D）"><svg class="icon"><use href="#i-rows"/></svg><span>密度</span></button>
+    <button class="tbtn" id="btn-state" title="演示：正常 / 骨架 / 离线"><svg class="icon"><use href="#i-shield"/></svg><span>状态</span></button>
+    <button class="tbtn" id="btn-help" title="快捷键（?）">?</button>
+  </header>
+
+  <div class="mid">
+    <!-- 导航 -->
+    <nav class="nav" aria-label="导航">
+      <div class="nav-sec">账号</div>
+      <button class="nav-item active" data-account="qq">
+        <span class="swatch" style="background:var(--brand-600)"></span><span class="nav-label">工作 · QQ</span><span class="cnt">12</span></button>
+      <button class="nav-item" data-account="gmail">
+        <span class="swatch" style="background:var(--brand-700)"></span><span class="nav-label">个人 · Gmail</span><span class="cnt">3</span></button>
+      <button class="nav-item" data-account="local">
+        <span class="swatch" style="background:var(--success-600)"></span><span class="nav-label">本机存档</span><span class="cnt">412</span></button>
+      <div class="nav-sec">文件夹</div>
+      <button class="nav-item active"><span class="nav-label">收件箱</span><span class="cnt">15</span></button>
+      <button class="nav-item"><span class="nav-label">已加旗标</span></button>
+      <button class="nav-item"><span class="nav-label">已发送</span></button>
+      <button class="nav-item"><span class="nav-label">草稿</span><span class="cnt">2</span></button>
+      <button class="nav-item"><span class="nav-label">垃圾邮件</span></button>
+      <button class="nav-item"><span class="nav-label">已删除</span></button>
+      <div class="nav-sec">保存的搜索</div>
+      <button class="nav-item"><span class="nav-label">待报销（发票+附件）</span></button>
+      <div class="nav-foot"><button class="btn primary" style="width:100%" id="btn-compose"><svg class="icon"><use href="#i-mail"/></svg>写邮件</button></div>
+    </nav>
+
+    <!-- 列表 -->
+    <section class="list" aria-label="邮件列表">
+      <div class="list-head">
+        <h1>收件箱</h1>
+        <!-- 评审：差异点之一 —— 覆盖率与同步窗口要看得见 -->
+        <div class="coverage" id="coverage">已缓存 149 / 共 8,420 · 最近 2 年 · 同步窗口可在设置里改</div>
+        <div class="searchbar">
+          <input id="q" placeholder="搜索已缓存邮件…（/ 聚焦 · Ctrl+K 命令）" aria-label="搜索" />
+          <button class="btn" id="btn-filter">未读</button>
+        </div>
+      </div>
+      <div class="bulk" id="bulk" role="status">
+        <strong id="bulk-count">已选 0 封</strong><span class="spacer" style="flex:1"></span>
+        <button class="btn" data-bulk="archive"><svg class="icon"><use href="#i-archive"/></svg>归档</button>
+        <button class="btn" data-bulk="flag"><svg class="icon"><use href="#i-flag"/></svg>旗标</button>
+        <button class="btn danger" data-bulk="trash"><svg class="icon"><use href="#i-trash"/></svg>删除</button>
+      </div>
+      <!-- 容器持有焦点：评审要求的 aria-activedescendant 模型 -->
+      <div class="rows" id="rows" role="listbox" tabindex="0" aria-label="会话列表" aria-activedescendant="row-0"></div>
+      <div class="list-foot" id="list-foot">已缓存 149 封 · 正在索引正文（62%）</div>
+    </section>
+
+    <!-- 阅读 -->
+    <section class="reader" aria-label="阅读">
+      <div class="reader-head">
+        <h2 id="subj" tabindex="-1">十月报销单已收到，发票请补 PDF 版</h2>
+        <div class="meta">
+          <span id="from">财务部 · 王敏 &lt;wangmin@example.com&gt;</span>
+          <span id="when">2026-10-03 09:41</span>
+          <span>收件人：我</span>
+        </div>
+        <div class="toolbar">
+          <button class="btn primary" data-act="reply"><svg class="icon"><use href="#i-reply"/></svg>回复</button>
+          <button class="btn" data-act="replyall">全部回复</button>
+          <button class="btn" data-act="forward">转发</button>
+          <button class="btn" data-act="archive"><svg class="icon"><use href="#i-archive"/></svg>归档</button>
+          <button class="btn" data-act="flag"><svg class="icon"><use href="#i-flag"/></svg>旗标</button>
+          <button class="btn danger" data-act="trash"><svg class="icon"><use href="#i-trash"/></svg>删除</button>
+          <span style="flex:1"></span>
+          <button class="btn" data-act="prev" title="上一封（K）">K</button>
+          <button class="btn" data-act="next" title="下一封（J）">J</button>
+        </div>
+      </div>
+      <div class="notice" id="remote-note">
+        <svg class="icon"><use href="#i-lock"/></svg>
+        <span class="grow" id="remote-text">已拦截 12 张远程图片、3 个外部样式与 1 个疑似跟踪像素（hz.example.com）</span>
+        <button class="btn" id="btn-allow-once">显示图片（仅本次）</button>
+        <button class="btn" id="btn-allow-sender">总是允许此发件人</button>
+      </div>
+      <div class="notice warn" id="quota-note" hidden>
+        <svg class="icon"><use href="#i-shield"/></svg>
+        <span class="grow">今日同步额度已用完（Gmail 每天约 2.3 GB）。明天自动继续，也可以在设置里改成"只同步最近 90 天"。</span>
+        <button class="btn">去设置</button>
+      </div>
+      <div class="body" id="body"></div>
+    </section>
+  </div>
+
+  <!-- 状态栏：跨整窗；把"差异点"（无遥测/端点透明）放这里 -->
+  <footer class="status">
+    <span id="st-sync"><span class="spin"></span> 正在索引正文 62%</span>
+    <span id="st-net">收件箱同步完成（2 分钟前）</span>
+    <span id="st-queue">待同步操作：1</span>
+    <span style="flex:1"></span>
+    <span id="st-privacy"><svg class="icon" style="vertical-align:-3px"><use href="#i-shield"/></svg>
+      无遥测 · 出站端点 3 <a href="#" id="link-endpoints">查看</a></span>
+    <span>本地占用 1.24 GB</span>
+    <span>v1.0.0</span>
+  </footer>
+</div>
+
+<!-- 命令面板 -->
+<div class="overlay" id="palette" role="dialog" aria-modal="true" aria-label="命令面板">
+  <div class="panel">
+    <input id="pq" placeholder="输入命令或搜索：写邮件 / 标记已读 / from:王敏 发票 …" aria-controls="plist" />
+    <ul id="plist" role="listbox" aria-label="命令与结果"></ul>
+  </div>
+</div>
+
+<!-- 快捷键总览 -->
+<div class="overlay" id="help" role="dialog" aria-modal="true" aria-label="快捷键">
+  <div class="panel">
+    <input value="快捷键（Esc 关闭）" readonly aria-label="标题" />
+    <ul>
+      <li>J / K<span class="kind">下一封 / 上一封</span></li>
+      <li>Enter / O<span class="kind">打开</span></li>
+      <li>E<span class="kind">归档</span></li>
+      <li>R / A / F<span class="kind">回复 / 全部回复 / 转发</span></li>
+      <li># / S<span class="kind">删除 / 旗标</span></li>
+      <li>/ <span class="kind">搜索</span></li>
+      <li>Ctrl+K<span class="kind">命令面板</span></li>
+      <li>Ctrl+A / Shift+点击 / Ctrl+点击<span class="kind">多选</span></li>
+      <li>T / D<span class="kind">主题 / 密度</span></li>
+      <li>?<span class="kind">本页</span></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+/* ── 数据（每封有自己的正文，避免 v1 里"标题换了正文没换"的误导） ── */
+const MESSAGES = [
+  { who:'财务部 · 王敏', count:3, when:'09:41', subj:'十月报销单已收到，发票请补 PDF 版', att:2, unread:true,
+    from:'财务部 · 王敏 <wangmin@example.com>', date:'2026-10-03 09:41',
+    body:'<p>你好，</p><p>十月的报销单我已经收到了，金额与出差记录一致。不过附件里只有拍照版，麻烦补一份 PDF 版的发票，财务系统只接受 PDF 与 OFD。</p><p>另外提醒一下：这周五之前提交的，当月就能走完流程。</p><p>谢谢！<br>王敏</p>' },
+  { who:'GitHub', when:'08:12', subj:'[easy-email] CI passed on main', unread:true,
+    from:'GitHub <noreply@github.com>', date:'2026-10-03 08:12',
+    body:'<p>All checks passed on <code>main</code>.</p><p>• 116 tests passed<br>• clippy: no warnings<br>• PE subsystem: 2</p>' },
+  { who:'张伟', count:7, when:'昨天', subj:'Re: 三季度复盘会议纪要与待办',
+    from:'张伟 <zhangwei@example.com>', date:'2026-10-02 17:05',
+    body:'<p>纪要我改了两处：把"附件流式上传"挪到 Q4，另外补上了风控那边的依赖。</p><p>你看还有没有要加的？</p>' },
+  { who:'招商银行', when:'昨天', subj:'您的电子对账单（2026 年 9 月）',
+    from:'招商银行 <no-reply@cmbchina.com>', date:'2026-10-02 09:00',
+    body:'<p>您 2026 年 9 月的电子对账单已生成。</p><p>本邮件由系统发出，请勿直接回复。</p>' },
+  { who:'Jira', when:'周一', subj:'EE-142 已分配给你：附件流式上传',
+    from:'Jira <jira@example.com>', date:'2026-09-30 11:20',
+    body:'<p><strong>EE-142</strong> 附件流式上传 · 优先级 高</p><p>验收：24 MB 附件峰值内存 ≤ 3× 已编码邮件。</p>' },
+  { who:'李娜', when:'周一', subj:'下周出差行程确认', att:1,
+    from:'李娜 <lina@example.com>', date:'2026-09-30 09:05',
+    body:'<p>下周的行程我按你上次说的订了，周二去、周四回。</p><p>行程单见附件。</p>' }
+];
+const QUOTE = '<details class="quote"><summary>显示引用内容（2 层）</summary>' +
+  '<p>—— 原始邮件 ——<br>发件人：我<br>时间：2026-10-02 18:20<br>主题：十月报销单</p>' +
+  '<p>附件是我十月的差旅发票（拍照版），请查收。</p></details>';
+const ATTACH = '<div><span class="chip"><svg class="icon"><use href="#i-file"/></svg>发票-1003.jpg · 842 KB</span>' +
+  '<span class="chip"><svg class="icon"><use href="#i-file"/></svg>报销单-1003.xlsx · 21 KB</span></div>';
+
+const COMMANDS = [
+  { icon:'i-mail', label:'写邮件', kind:'动作' },
+  { icon:'i-archive', label:'归档当前会话', kind:'动作' },
+  { icon:'i-trash', label:'删除当前会话', kind:'动作' },
+  { icon:'i-flag', label:'加旗标', kind:'动作' },
+  { icon:'i-rows', label:'打开收件箱', kind:'跳转' },
+  { icon:'i-shield', label:'同步与存储设置', kind:'设置' },
+  { icon:'i-lock', label:'隐私与出站端点', kind:'设置' }
+];
+
+/* ── 状态 ── */
+const params = new URLSearchParams(location.search);
+const root = document.documentElement;
+const state = {
+  theme: params.get('theme') || 'light',
+  density: params.get('density') || 'comfortable',
+  view: params.get('state') || 'normal',      // normal | skeleton | offline
+  active: 0,                                  // aria-activedescendant 指向的行
+  selected: new Set(), anchor: null,
+  multi: false
+};
+root.dataset.theme = state.theme; root.dataset.density = state.density;
+
+/* ── 列表渲染（虚拟列表语义：容器持焦 + activedescendant + setsize/posinset） ── */
+const rowsEl = document.getElementById('rows');
+function renderRows() {
+  if (state.view === 'skeleton') {
+    rowsEl.innerHTML = Array.from({ length: 8 }, () => '<div class="row" aria-hidden="true">' +
+      '<div class="sk w40"></div><div class="sk w70"></div></div>').join('');
+    document.getElementById('list-foot').textContent = '正在收取邮件…';
+    document.getElementById('st-sync').innerHTML = '<span class="spin"></span> 正在同步（阶段 A：最新 200 封）';
+    return;
+  }
+  rowsEl.innerHTML = MESSAGES.map((m, i) => {
+    const sel = state.selected.has(i) ? ' sel' : '';
+    const unread = m.unread ? ' unread' : '';
+    const current = i === state.active ? 'true' : 'false';
+    return '<button class="row' + sel + unread + '" id="row-' + i + '" role="option" tabindex="-1" ' +
+      'aria-selected="' + current + '" aria-setsize="' + MESSAGES.length + '" aria-posinset="' + (i + 1) + '" ' +
+      'aria-label="' + m.who + (m.unread ? '，未读' : '') + '，' + m.subj + '">' +
+      '<div class="row-top"><span class="who">' + m.who + '</span>' +
+      (m.count ? '<span class="count">(' + m.count + ')</span>' : '') +
+      '<span class="when">' + m.when + '</span></div>' +
+      '<div class="subj">' + m.subj + (m.att ? ' · ' + m.att + ' 个附件' : '') + '</div></button>';
+  }).join('');
+  rowsEl.setAttribute('aria-activedescendant', 'row-' + state.active);
+  document.getElementById('list-foot').textContent = state.view === 'offline'
+    ? '离线：显示本地缓存（149 封）· 恢复后自动补发与补齐'
+    : '已缓存 149 封 · 正在索引正文（62%）';
+}
+
+/* ── 阅读 ── */
+function openMessage(i) {
+  const m = MESSAGES[i]; if (!m) return;
+  state.active = i; m.unread = false;
+  document.getElementById('subj').textContent = m.subj;
+  document.getElementById('from').textContent = m.from;
+  document.getElementById('when').textContent = m.date;
+  document.getElementById('body').innerHTML = m.body + QUOTE + (m.att ? ATTACH : '');
+  document.getElementById('remote-note').hidden = false;
+  renderRows();
+  document.getElementById('subj').focus();
+}
+
+/* ── 多选 ── */
+function updateBulk() {
+  const bulk = document.getElementById('bulk');
+  bulk.classList.toggle('on', state.selected.size > 0);
+  document.getElementById('bulk-count').textContent = '已选 ' + state.selected.size + ' 封';
+  rowsEl.setAttribute('aria-multiselectable', state.selected.size > 0 ? 'true' : 'false');
+}
+rowsEl.addEventListener('click', (e) => {
+  const row = e.target.closest('.row'); if (!row) return;
+  const i = Number(row.id.slice(4));
+  if (e.ctrlKey || e.metaKey) {
+    state.selected.has(i) ? state.selected.delete(i) : state.selected.add(i);
+    state.anchor = i; state.multi = true; updateBulk(); renderRows(); rowsEl.focus();
+  } else if (e.shiftKey && state.anchor !== null) {
+    const [a, b] = [state.anchor, i].sort((x, y) => x - y);
+    for (let k = a; k <= b; k++) state.selected.add(k);
+    state.multi = true; updateBulk(); renderRows();
+  } else {
+    state.selected.clear(); state.multi = false; state.anchor = i; updateBulk(); openMessage(i);
+  }
+});
+
+/* ── 键盘（评审：让原型演示自己的交互模型） ── */
+addEventListener('keydown', (e) => {
+  const typing = ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName);
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); return; }
+  if (e.key === 'Escape') { closeOverlays(); return; }
+  if (typing) return;
+  switch (e.key) {
+    case 'j': move(1); break;
+    case 'k': move(-1); break;
+    case 'Enter': case 'o': openMessage(state.active); break;
+    case 'e': act('archive'); break;
+    case '#': act('trash'); break;
+    case 's': act('flag'); break;
+    case 'r': act('reply'); break;
+    case '/': e.preventDefault(); document.getElementById('q').focus(); break;
+    case '?': openHelp(); break;
+    case 't': toggleTheme(); break;
+    case 'd': toggleDensity(); break;
+    case 'a': if (e.ctrlKey || e.metaKey) { e.preventDefault(); MESSAGES.forEach((_, i) => state.selected.add(i)); updateBulk(); renderRows(); } break;
+    default: break;
+  }
+});
+function move(delta) {
+  state.active = Math.max(0, Math.min(MESSAGES.length - 1, state.active + delta));
+  renderRows();
+  document.getElementById('row-' + state.active).scrollIntoView({ block: 'nearest' });
+}
+function act(name) {
+  const m = MESSAGES[state.active];
+  const label = { archive:'归档', trash:'删除', flag:'加旗标', reply:'回复', replyall:'全部回复', forward:'转发', prev:'', next:'' }[name];
+  if (name === 'prev') return move(-1);
+  if (name === 'next') return move(1);
+  document.getElementById('st-queue').textContent = '待同步操作：2（' + label + '：' + (m ? m.subj.slice(0, 12) : '') + '…）';
+}
+document.querySelectorAll('.nav-item[data-account]').forEach((b) => b.addEventListener('click', () => {
+  document.querySelectorAll('.nav-item[data-account]').forEach((x) => x.classList.remove('active'));
+  b.classList.add('active');
+  const local = b.dataset.account === 'local';
+  const badge = document.getElementById('badge-local');
+  badge.hidden = !local;
+  badge.textContent = '本机存档 · 仅本地（不可再生，删除需确认）';
+  document.getElementById('coverage').textContent = local
+    ? '本机存档 412 封 · 不上传、不参与配额清理'
+    : '已缓存 149 / 共 8,420 · 最近 2 年 · 同步窗口可在设置里改';
+}));
+document.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset.act)));
+document.querySelectorAll('[data-bulk]').forEach((b) => b.addEventListener('click', () => {
+  act(b.dataset.bulk); state.selected.clear(); updateBulk(); renderRows();
+}));
+
+/* ── 顶栏 ── */
+function toggleTheme() {
+  state.theme = state.theme === 'dark' ? 'light' : 'dark';
+  root.dataset.theme = state.theme;
+  document.querySelector('#btn-theme span').textContent = state.theme === 'dark' ? '暗色' : '亮色';
+}
+function toggleDensity() {
+  state.density = state.density === 'compact' ? 'comfortable' : 'compact';
+  root.dataset.density = state.density;
+}
+function cycleView() {
+  state.view = state.view === 'normal' ? 'skeleton' : state.view === 'skeleton' ? 'offline' : 'normal';
+  document.getElementById('app').classList.toggle('skeleton', state.view === 'skeleton');
+  document.getElementById('quota-note').hidden = state.view !== 'offline';
+  document.getElementById('st-net').textContent = state.view === 'offline' ? '离线（显示本地缓存）' : '收件箱同步完成（2 分钟前）';
+  renderRows();
+}
+document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+document.getElementById('btn-density').addEventListener('click', toggleDensity);
+document.getElementById('btn-state').addEventListener('click', cycleView);
+document.getElementById('btn-help').addEventListener('click', openHelp);
+document.getElementById('btn-compose').addEventListener('click', () => act('reply'));
+document.getElementById('btn-allow-once').addEventListener('click', (e) => e.target.closest('.notice').hidden = true);
+document.getElementById('btn-allow-sender').addEventListener('click', () => {
+  document.getElementById('remote-text').textContent = '已加入白名单（仅对通过 DKIM/DMARC 的邮件生效，可在设置里撤销）';
+});
+
+/* ── 命令面板（评审：v1 的 filter() 只重选第 0 项，打字看不出变化） ── */
+const paletteEl = document.getElementById('palette');
+const plistEl = document.getElementById('plist');
+let pIndex = 0;
+function openPalette() { paletteEl.classList.add('on'); const q = document.getElementById('pq'); q.value = ''; renderPalette(''); q.focus(); }
+function renderPalette(q) {
+  const needle = q.trim().toLowerCase();
+  const items = COMMANDS.filter((c) => !needle || c.label.toLowerCase().includes(needle));
+  const extra = needle ? [{ icon:'i-mail', label:'搜索「' + q.trim() + '」', kind:'搜索' }] : [];
+  const all = extra.concat(items);
+  pIndex = Math.min(pIndex, Math.max(0, all.length - 1));
+  plistEl.innerHTML = all.length
+    ? all.map((c, i) => '<li role="option" aria-selected="' + (i === pIndex) + '">' +
+        '<svg class="icon"><use href="#' + c.icon + '"/></svg>' + c.label +
+        '<span class="kind">' + c.kind + '</span></li>').join('')
+    : '<li class="empty">没有匹配的命令</li>';
+}
+document.getElementById('pq').addEventListener('input', (e) => { pIndex = 0; renderPalette(e.target.value); });
+document.getElementById('pq').addEventListener('keydown', (e) => {
+  const n = plistEl.querySelectorAll('li[role="option"]').length;
+  if (e.key === 'ArrowDown') { e.preventDefault(); pIndex = Math.min(pIndex + 1, n - 1); renderPalette(e.target.value); }
+  if (e.key === 'ArrowUp') { e.preventDefault(); pIndex = Math.max(pIndex - 1, 0); renderPalette(e.target.value); }
+  if (e.key === 'Enter') { closeOverlays(); }
+});
+paletteEl.addEventListener('click', (e) => { if (e.target === paletteEl) closeOverlays(); });
+const helpEl = document.getElementById('help');
+function openHelp() { helpEl.classList.add('on'); }
+helpEl.addEventListener('click', (e) => { if (e.target === helpEl) closeOverlays(); });
+function closeOverlays() { paletteEl.classList.remove('on'); helpEl.classList.remove('on'); }
+
+/* ── 启动 ── */
+function applyView(v) {
+  state.view = v;
+  document.getElementById('app').classList.toggle('skeleton', v === 'skeleton');
+  document.getElementById('quota-note').hidden = v !== 'offline';
+  document.getElementById('st-net').textContent = v === 'offline' ? '离线（显示本地缓存）' : '收件箱同步完成（2 分钟前）';
+  renderRows();
+}
+applyView(state.view);                       // URL 里的 ?state= 直接生效
+document.querySelector('#btn-theme span').textContent = state.theme === 'dark' ? '暗色' : '亮色';
+document.getElementById('badge-local').hidden = true;   // 仅在选中"本机存档"时显示
+renderRows();
+openMessage(0);
+updateBulk();
+</script>
+</body>
+</html>

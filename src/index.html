@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      The shell's own CSP. Mail bodies never render in this document: they go into a sandboxed
+      iframe with its own stricter policy (see app.js -> buildSandboxedDocument).
+
+      `img-src` has to permit https/http even though this document never renders mail HTML. A
+      document loaded via `srcdoc` *inherits* the embedding document's CSP, and the two policies
+      intersect. The iframe's own meta policy is what actually gates remote images — `data: blob:`
+      by default, plus `https: http:` only after the user opts in for one message — so leaving
+      `img-src` narrow here does not add protection, it only makes that per-message opt-in
+      impossible: the shell's `img-src 'self' data:` won the intersection and every remote image
+      failed to load with `naturalWidth: 0` even after "显示图片" was clicked.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data: blob: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
+    />
+    <title>Easy Email</title>
+    <link rel="stylesheet" href="style.css" />
+    <!-- Must be synchronous and in <head>: it stamps `data-theme` before the first paint. See the
+         header comment in theme.js. -->
+    <script src="theme.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <!-- ---------------------------------------------------------------- accounts + folders -->
+      <aside id="sidebar">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <span>Easy Email</span>
+          <button id="btn-theme" class="btn ghost icon" title="切换到深色模式" aria-label="切换主题">🌙</button>
+        </div>
+
+        <div class="section">
+          <div class="section-title">账号</div>
+          <div id="account-list" class="account-list"></div>
+          <button id="btn-add-account" class="btn ghost block">＋ 添加邮箱账号</button>
+        </div>
+
+        <div class="section grow">
+          <div class="section-title">文件夹</div>
+          <div id="mailbox-list" class="mailbox-list"></div>
+        </div>
+
+        <button id="btn-compose" class="btn primary block">写邮件</button>
+      </aside>
+
+      <!-- ---------------------------------------------------------------- message list -->
+      <main id="list-pane">
+        <header class="pane-header">
+          <h1 id="mailbox-title">收件箱</h1>
+          <div class="pane-actions">
+            <button id="btn-refresh" class="btn ghost" title="重新拉取">↻ 刷新</button>
+          </div>
+        </header>
+        <!--
+          Search runs entirely against the local cache, so it keeps working offline and never waits
+          on the server. The placeholder says so, because "no results" here can mean "not cached
+          yet" rather than "not in your mailbox".
+        -->
+        <div class="search-bar">
+          <input
+            id="search-input"
+            type="search"
+            placeholder="搜索已缓存邮件…"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button id="btn-search-clear" class="btn ghost" hidden title="退出搜索">✕</button>
+        </div>
+        <div id="search-status" class="search-status" hidden></div>
+        <div id="message-list" class="message-list"></div>
+        <div id="list-footer" class="list-footer" hidden>
+          <button id="btn-load-more" class="btn ghost block">加载更多</button>
+        </div>
+      </main>
+
+      <!-- ---------------------------------------------------------------- reader -->
+      <section id="reader">
+        <div id="reader-placeholder" class="placeholder">
+          <p>选择一封邮件开始阅读</p>
+        </div>
+
+        <article id="reader-body" hidden>
+          <header class="reader-header">
+            <h2 id="reader-subject"></h2>
+            <div class="reader-meta">
+              <div class="reader-from">
+                <span id="reader-from-name"></span>
+                <span id="reader-from-addr" class="muted"></span>
+              </div>
+              <time id="reader-date" class="muted"></time>
+            </div>
+            <div id="reader-to" class="reader-to muted"></div>
+            <div class="reader-toolbar">
+              <button id="btn-reply" class="btn ghost">回复</button>
+              <button id="btn-forward" class="btn ghost">转发</button>
+              <button id="btn-toggle-read" class="btn ghost">标为未读</button>
+              <button id="btn-delete" class="btn danger">删除</button>
+            </div>
+          </header>
+
+          <div id="attachment-bar" class="attachment-bar" hidden></div>
+
+          <div class="body-switch">
+            <button id="tab-html" class="tab active">HTML</button>
+            <button id="tab-text" class="tab">纯文本</button>
+            <span class="remote-note">内嵌图片正常显示 · 远程图片默认拦截</span>
+          </div>
+
+          <div id="remote-image-bar" class="remote-image-bar" hidden>
+            <span id="remote-image-text"></span>
+            <button id="btn-show-remote" class="btn ghost">显示图片</button>
+          </div>
+
+          <iframe
+            id="body-frame"
+            class="body-frame"
+            sandbox
+            referrerpolicy="no-referrer"
+          ></iframe>
+          <pre id="body-text" class="body-text" hidden></pre>
+        </article>
+      </section>
+    </div>
+
+    <div id="modal-root" class="modal-root" hidden></div>
+    <div id="toast-root" class="toast-root"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
