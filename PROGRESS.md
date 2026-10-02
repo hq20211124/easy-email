@@ -168,6 +168,24 @@ curl -s -X POST https://oauth2.googleapis.com/token \
 2. 草稿与发件箱：`drafts` / `outbox` 表已就位，接写信与发送流程（含撤销窗口、定时、重试）。
 3. 认证轴（`AuthMethod` + 授权码/应用专用密码文案，P2 已拍板）、会话串、通知托盘、安装包与自动更新。
 
+### M1a-3 可配同步窗口（`SyncWindow`）：模型 + 契约 + 持久化 + 命令 ✅（第 8 轮）
+- **模型**：`SyncWindow{All, Years(u16), Count(u32), OnDemand}`，默认 `Years(2)`（设计 P9）。
+  `since_timestamp(now)` / `max_messages()` / `is_outside(date, now)` —— 其中
+  **日期未知的邮件一律保留**（把"未知"当成"太旧"会藏起真邮件，而代价只是多一行头部）。
+- **存储形式**：`as_key()`/`from_key()`；**读坏的值回退到默认而不是报错** —— 一个偏好不值得拒绝同步。
+- **序列化契约**：serde 用 `tag` + `content`（`{"kind":"years","value":2}`）。**这是一个只在运行期
+  才会炸的坑**：带载荷的 newtype 变体用内部 tag，serde 会拒绝序列化。所以加了 JSON 双向往返测试
+  把线格式钉死，并断言确切的字符串。
+- **持久化**：`UserStore::sync_window()/set_sync_window()`，存 `user.db` 的 `kv`（键 `sync_window`）
+  ⇒ 删缓存**不会**重置同步偏好。测试覆盖：新装默认 2 年、往返、重启后仍在。
+- **命令**：`get_sync_window` / `set_sync_window`（已注册）。设置窗口**不删已缓存的邮件** ——
+  收窄只是停止未来的回填，腾空间是另一个显式动作。
+- 测试 **148**（lib 115）；`check.ps1` 全绿；启动冒烟通过。
+
+**未完（下一步，M1a-3b）**：把窗口真正接进同步路径 —— `refresh_folder` 的初始窗口与历史回填循环
+按窗口边界停（Years 用邮件日期判断、Count 用条数、All 走配额账本），以及设置界面里的选择器。
+在那之前，窗口"存得住、读得出、传得通"，但**还没有改变同步行为**——这一步不能算完成。
+
 ## 下一步（M0 只剩两个被外部条件卡住的项，主线转到 M1a）
 
 **M0 收口情况**：M0-1/2/3/4/5/7 **已完成且全绿**；M0-6（WinAppSDK 通知）与 M0-8（OAuth 端点探测）
