@@ -23,6 +23,57 @@
 
 ---
 
+## 交接摘要（先读这里）
+
+**当前状态**：`tools/check.ps1` **14 步全绿**；`cargo test --workspace` **156 通过、0 失败**
+（122 lib + 30 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+应用启动冒烟通过（7–10 秒存活）。所有改动都在 git 里（基线 `83c1b0c`，共 22 个提交）。
+
+**磁盘上已验证的两件事**（不是文档结论，是真机查过的）：
+- `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
+  表与 `user_version` 完好 —— "清理缓存真的能腾出磁盘"这条对老用户也成立。
+- `%APPDATA%\com.easyemail.desktop\user.db`：`synchronous = 2 (FULL)`、五个表齐全
+  —— 与 `cache.db`（NORMAL）各自独立，草稿/待发送不会因为"删缓存"而丢。
+
+**已完成的块**
+| 块 | 内容 | 关键证据 |
+|---|---|---|
+| M0-5 | 修增量截断丢信（保留最旧 + 收窄取件区间） | 回归测试能证伪：还原旧行为即失败（`cursor 604 != 504`） |
+| M0-1 | 5 条库能力探针 | IDLE ~0.2 s；APPEND 拿不到 UID；`BODY[]<0.10>` 解析失败；A1-F46 一半被实测推翻；lettre 不发 `SIZE=` |
+| M0-2a/2b | 单写线程 + 读池 + `DbSet`；`Cache`/`src-tauri` 全部切到共享句柄 | 门禁：`Cache::open` 只许出现 1 次（当前 13 处共享） |
+| M0-7 | 建库 pragma 定稿（`auto_vacuum` 必须是第一条 pragma）+ 老库一次性重建 | 真机 cache.db 由 0 → 2 |
+| M0-3 | 更正 README/HANDOFF/注释里被推翻的推送结论（50 s → 亚秒级；窗口 120 s） | 探针引用写在注释里 |
+| M0-4 | 分部取件决策：不 vendor fork，改为"拒绝 + 记录"+ 写明三行补丁位置 | 探针断言"拒绝且连接仍可用" |
+| M1a-1 | 历史回填：`fetch_older_headers` + `oldest_uid` + `load_more_messages` + 前端按钮 | 门禁：回填不得推进游标 |
+| M1a-2 | `user.db` 落地（`UserStore`） | 真机 synchronous=2 |
+| M1a-3/3b | 可配同步窗口：模型 + 持久化 + `backfill_older` 窗口语义 + 命令 | `Count(20)` 停在正好 20 封；`Years(2)` 一页跨边界即停 |
+| M1a-4 | 草稿落库（upsert / 列表 / 删除 / 重启存活）+ 三个命令 | 5 条测试，含"重启后草稿还在" |
+
+**被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
+1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
+   恢复：`winget install Microsoft.WindowsAppRuntime.1.7` → 加 `windows` crate 的 AppNotifications
+   features → Register + 双按钮 + `NotificationInvoked` → 量框架依赖/自包含的体积。
+2. **M0-8 OAuth 端点探测**：需要你的 client_id 与网络。命令已写在本文档 M0-8 一节，
+   结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
+
+**下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
+1. **写信接草稿**：`src/app.js` 的 composer 目前把状态放在闭包里、不落库；
+   接 `save_draft` / `list_drafts` / `delete_draft` 三个命令（自动保存 + 关闭时保存 + 草稿箱列表）。
+2. **发件箱**：`outbox` 表已就位；`design/07` §5.3 的 worker（撤销窗口、退避重试、`needs_attention`）
+   与"发送后归档到已发送"（`append` + `find_uid_by_message_id` 已实现）。
+3. **窗口选择器界面** + 冷启动自动回填一页（并接配额账本，`design/04` §5.7）。
+4. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
+
+**运行方式**
+```
+.	ools\check.ps1                     # 14 步门禁（前端不变量 / fmt / clippy / build / test / PE=2）
+cargo test --workspace                # 156 个测试
+python design	oolsudit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
+git log --oneline                     # 22 个提交；git diff 83c1b0c HEAD 是本次全部改动
+```
+
+---
+
 ## 已完成
 
 ### M0-5 修"增量截断丢信"bug ✅

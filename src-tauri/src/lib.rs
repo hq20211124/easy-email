@@ -23,7 +23,9 @@ use mail_core::{
     AccountConfig, BackfillBudget, BackfillReport, Cache, ConnectionPool, ConnectionReport,
     MailError, MailboxInfo, MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMail,
     PushEvent, SearchHit, SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older,
-    secret, userdb::UserStore, watch,
+    secret,
+    userdb::{Draft, UserStore},
+    watch,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -471,6 +473,27 @@ async fn fetch_message(
         .put_detail(&account_id, &mailbox, &detail)
         .map_err(describe)?;
     Ok(detail)
+}
+
+/// Save (or update) a draft. Called on the composer's autosave timer.
+///
+/// Goes straight to `user.db`: a draft is the one thing in a mail client that must never be lost to a
+/// crash, a power cut or a cache cleanup, which is why it lives in the file that is never deleted.
+#[tauri::command]
+async fn save_draft(state: State<'_, AppState>, draft: Draft) -> Result<(), String> {
+    state.user.save_draft(&draft).map_err(describe)
+}
+
+/// Every draft for an account, most recently touched first.
+#[tauri::command]
+async fn list_drafts(state: State<'_, AppState>, account_id: String) -> Result<Vec<Draft>, String> {
+    state.user.list_drafts(&account_id).map_err(describe)
+}
+
+/// Discard a draft. Permanent, and it says whether anything was actually removed.
+#[tauri::command]
+async fn delete_draft(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    state.user.delete_draft(&id).map_err(describe)
 }
 
 /// Walk backwards until the **chosen sync window** is satisfied, and report where it stopped.
@@ -1315,6 +1338,9 @@ pub fn run() {
             get_sync_window,
             set_sync_window,
             backfill_to_window,
+            save_draft,
+            list_drafts,
+            delete_draft,
             load_more_messages,
             fetch_message,
             mark_seen,
