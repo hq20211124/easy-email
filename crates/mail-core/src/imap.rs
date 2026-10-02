@@ -71,6 +71,45 @@ pub struct HeaderPage {
     pub summaries: Vec<MessageSummary>,
 }
 
+/// The `UID FETCH` set for an incremental pass.
+///
+/// Bounded on purpose: `UID FETCH <n>:*` asks for *everything* above the cursor, so a mailbox that
+/// jumped by more messages than one batch would make the server stream headers we are about to
+/// discard. With `limit > 0` we ask for exactly one batch; `limit == 0` keeps the old unbounded
+/// behaviour for callers that really do want the rest of the folder.
+///
+/// A range whose high end is past the last message is legal — the server answers with whatever
+/// exists in it (RFC 3501), which is what makes this safe on a small folder.
+pub fn since_range(after_uid: u32, limit: usize) -> String {
+    let low = after_uid.saturating_add(1);
+    if limit == 0 {
+        return format!("{low}:*");
+    }
+    // `low + limit - 1` cannot overflow in practice (UIDs are 32-bit and mailboxes are not 2^32
+    // messages), but `saturating` keeps the type checker and a hostile server both happy.
+    // Write it as `low + (limit - 1)` rather than `(low + limit) - 1`: the latter saturates the sum
+    // first and then subtracts, which can produce a *reversed* range such as `MAX:MAX-1`.
+    format!(
+        "{low}:{}",
+        low.saturating_add((limit as u32).saturating_sub(1))
+    )
+}
+
+/// Trim a fetched batch to one page, **keeping the oldest entries**.
+///
+/// This is the rule that makes the incremental cursor safe. The cursor advances to the highest UID
+/// that was stored (`sync::advance_cursor`), so if we kept the newest instead, every UID between
+/// `after_uid + 1` and the first stored UID would sit *below* the cursor forever and could never be
+/// fetched again — silent, permanent mail loss with no error to show the user.
+///
+/// `limit == 0` means "no page limit" and returns the batch untouched.
+pub fn keep_oldest_page(mut summaries: Vec<MessageSummary>, limit: usize) -> Vec<MessageSummary> {
+    if limit > 0 && summaries.len() > limit {
+        summaries.truncate(limit);
+    }
+    summaries
+}
+
 /// Everything a transport must be, named once.
 ///
 /// `dyn AsyncRead + AsyncWrite + Debug` is not a legal trait object — Rust allows only one
@@ -422,7 +461,7 @@ impl ImapClient {
             // A public field in async-imap, not an accessor.
             let uidvalidity = selected.uid_validity.unwrap_or(0);
 
-            let set = format!("{}:*", after_uid.saturating_add(1));
+            let set = since_range(after_uid, limit);
             let mut stream = self
                 .session
                 .uid_fetch(&set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])")
@@ -438,11 +477,17 @@ impl ImapClient {
             }
             summaries.sort_by_key(|m| m.uid);
 
-            // Keep the newest `limit` when a folder has more new mail than we want in one go; the
-            // cursor only advances to what was actually stored, so the rest is picked up next time.
-            if limit > 0 && summaries.len() > limit {
-                summaries = summaries.split_off(summaries.len() - limit);
-            }
+            // **Keep the OLDEST `limit` of this batch, never the newest.** The cursor only advances
+            // to the highest UID we actually stored (`sync::advance_cursor`), so dropping the *old*
+            // end would move the cursor past messages that were never stored and they could never be
+            // fetched again — a permanent hole in the mailbox. Keeping the oldest makes the next
+            // pass start exactly where this one stopped.
+            //
+            // History: this used to keep the newest (`split_off`), which silently skipped every UID
+            // between `after_uid + 1` and the kept batch whenever more than `SYNC_BATCH` messages
+            // arrived at once (laptop offline for a week, a big label, a mail archive copy).
+            // See design/04-sync.md §5.3 and design/A2-final-review.md.
+            let summaries = keep_oldest_page(summaries, limit);
 
             Ok(HeaderPage {
                 uidvalidity,
@@ -635,6 +680,52 @@ impl ImapClient {
         timed(async {
             self.session.select(mailbox).await.map_err(imap_err)?;
             self.flag_deleted_and_expunge(uid).await
+        })
+        .await
+    }
+
+    /// Append a message to a mailbox: the "put a copy in Sent" and "upload an archive" primitives.
+    ///
+    /// **This deliberately returns no UID.** A UIDPLUS server answers `APPEND` with
+    /// `[APPENDUID <uidvalidity> <uid>]`, and async-imap parses that response and then discards it
+    /// (`append` only checks the tagged `OK`). So a caller that needs the new message's UID — which
+    /// every flow does: the Sent copy has to be linked, and a re-appended archive must not be
+    /// duplicated — has to look it up with [`ImapClient::find_uid_by_message_id`]. See
+    /// `design/07-compose-send.md` §5.4 and A1-F43.
+    ///
+    /// `seen` sets the `\Seen` flag, which is right for a Sent copy and wrong for a draft.
+    pub async fn append(&mut self, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
+        timed(async {
+            let flags = if seen { Some("(\\Seen)") } else { None };
+            self.session
+                .append(mailbox, flags, None, raw)
+                .await
+                .map_err(imap_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Find a message's UID by its `Message-ID`, inside one mailbox.
+    ///
+    /// This is the documented replacement for the UID that `APPEND` does not give us. It is also the
+    /// check that makes appends idempotent: searching *before* appending is what stops a retry from
+    /// leaving two copies in the mailbox (only Gmail deduplicates by `Message-ID` on storage).
+    ///
+    /// Returns the highest matching UID — a `Message-ID` can legitimately appear more than once
+    /// (Gmail keeps one copy per label; a forwarded message can carry the original header), and the
+    /// newest one is the copy we just wrote.
+    pub async fn find_uid_by_message_id(
+        &mut self,
+        mailbox: &str,
+        message_id: &str,
+    ) -> Result<Option<u32>> {
+        let id = normalise_msg_id(message_id);
+        timed(async {
+            self.session.select(mailbox).await.map_err(imap_err)?;
+            let query = format!("HEADER Message-ID \"{id}\"");
+            let found = self.session.uid_search(query).await.map_err(imap_err)?;
+            Ok(found.into_iter().max())
         })
         .await
     }
@@ -1077,5 +1168,75 @@ mod tests {
         assert_eq!(normalise_msg_id("abc@163.com"), "<abc@163.com>");
         assert_eq!(normalise_msg_id("<abc@163.com>"), "<abc@163.com>");
         assert_eq!(normalise_msg_id("  <a@b>  "), "<a@b>");
+    }
+
+    // ================================================================== page slicing (M0-5)
+    //
+    // The rule these pin down is the difference between "mail arrives late" and "mail is gone":
+    // the cursor only ever moves to the highest UID that was stored.
+
+    fn summary(uid: u32) -> MessageSummary {
+        MessageSummary {
+            uid,
+            subject: format!("s{uid}"),
+            from_name: None,
+            from_addr: Some(format!("s{uid}@example.com")),
+            date: Some(1_700_000_000),
+            size: Some(100),
+            seen: false,
+            flagged: false,
+        }
+    }
+
+    #[test]
+    fn a_page_keeps_the_oldest_entries() {
+        // 5 fetched, page of 2 ⇒ UIDs 1,2 — NOT 4,5. Keeping the newest would move the cursor to 5
+        // and UIDs 3,4 would never be fetched again.
+        let kept = keep_oldest_page(vec![summary(3), summary(4), summary(5)], 2);
+        assert_eq!(
+            kept.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![3, 4],
+            "the oldest entries must survive so the cursor stops before the gap"
+        );
+    }
+
+    #[test]
+    fn a_page_smaller_than_the_limit_is_returned_whole() {
+        let kept = keep_oldest_page(vec![summary(1), summary(2)], 500);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn a_limit_of_zero_means_no_page_limit() {
+        let kept = keep_oldest_page(vec![summary(1), summary(2), summary(3)], 0);
+        assert_eq!(kept.len(), 3, "0 is the documented 'unbounded' value");
+    }
+
+    #[test]
+    fn a_page_of_exactly_the_limit_is_untouched() {
+        let kept = keep_oldest_page(vec![summary(7), summary(8)], 2);
+        assert_eq!(kept.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![7, 8]);
+    }
+
+    #[test]
+    fn the_since_range_is_bounded_by_the_page_size() {
+        // 500 is SYNC_BATCH: asking for `501:1000` rather than `501:*` is what stops a big burst
+        // from streaming headers we are about to throw away.
+        assert_eq!(since_range(500, 500), "501:1000");
+        assert_eq!(since_range(0, 200), "1:200");
+    }
+
+    #[test]
+    fn the_since_range_stays_open_ended_without_a_limit() {
+        assert_eq!(since_range(500, 0), "501:*");
+        assert_eq!(since_range(0, 0), "1:*");
+    }
+
+    #[test]
+    fn the_since_range_does_not_overflow_at_the_top_of_the_uid_space() {
+        // A hostile or broken server could report UIDNEXT near u32::MAX; the range must stay a
+        // valid number rather than panicking in debug builds.
+        assert_eq!(since_range(u32::MAX, 10), "4294967295:4294967295");
+        assert_eq!(since_range(u32::MAX - 1, 10), "4294967295:4294967295");
     }
 }

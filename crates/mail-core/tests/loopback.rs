@@ -157,13 +157,31 @@ fn message_four() -> Vec<u8> {
     .to_vec()
 }
 
-fn all_messages() -> Vec<Vec<u8>> {
-    vec![
-        message_one(),
-        message_two(),
-        message_three(),
-        message_four(),
-    ]
+/// Number of "rich" fixture messages (uids 1..=RICH_MESSAGES), followed by synthetic ones.
+const RICH_MESSAGES: u32 = 4;
+
+/// The message the fixture serves for `uid`.
+///
+/// UIDs above the rich templates are generated header-only messages with **distinct Message-IDs**.
+/// They exist so a test can grow the mailbox past the client's sync batch: the incremental-cursor
+/// rule ("a page keeps the *oldest* entries") is only observable when one pass fetches more messages
+/// than it can store, and that needs hundreds of them.
+fn message_for(uid: u32) -> Vec<u8> {
+    match uid {
+        1 => message_one(),
+        2 => message_two(),
+        3 => message_three(),
+        4 => message_four(),
+        n => format!(
+            "From: Sender {n} <s{n}@example.com>\r\n\
+             To: me@example.com\r\n\
+             Subject: Message {n}\r\n\
+             Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n\
+             Message-ID: <filler-{n}@example.com>\r\n\
+             \r\n"
+        )
+        .into_bytes(),
+    }
 }
 
 /// Everything up to and including the blank line that ends the header block.
@@ -253,7 +271,7 @@ struct Server {
     idle: Arc<Mutex<Idle>>,
     /// Messages that "arrived" mid-test, on top of the fixture's own count.
     ///
-    /// `SELECT` reports `count + extra`, so an `IDLE` announcement can genuinely change the mailbox
+    /// `SELECT` reports `RICH_MESSAGES + extra`, so an `IDLE` announcement can genuinely change the mailbox
     /// size and a later `SELECT` sees it. Without this the watcher would compare against a constant
     /// and could never detect anything.
     extra: Arc<AtomicU32>,
@@ -337,8 +355,11 @@ async fn serve_imap(
         .write_all(format!("* OK [CAPABILITY {capabilities}] loopback ready\r\n").as_bytes())
         .await?;
 
-    let messages = all_messages();
-    let count = messages.len() as u32;
+    // The mailbox size is `RICH_MESSAGES + extra`, and it is read **live** rather than snapshotted:
+    // `extra` moves when the fixture simulates an arrival, and a test must then be able to fetch what
+    // arrived. (A snapshot would make `SELECT` keep reporting the old size after a push, which is how
+    // this line went wrong the first time.)
+    let available = || RICH_MESSAGES + extra.load(Ordering::SeqCst);
     let mut line = String::new();
 
     loop {
@@ -392,9 +413,7 @@ async fn serve_imap(
             }
             "SELECT" | "EXAMINE" => {
                 write
-                    .write_all(
-                        format!("* {} EXISTS\r\n", count + extra.load(Ordering::SeqCst)).as_bytes(),
-                    )
+                    .write_all(format!("* {} EXISTS\r\n", available()).as_bytes())
                     .await?;
                 write.write_all(b"* 0 RECENT\r\n").await?;
                 write
@@ -416,7 +435,8 @@ async fn serve_imap(
                     .await?;
                 write
                     .write_all(
-                        format!("* OK [UIDNEXT {}] Predicted next UID\r\n", count + 1).as_bytes(),
+                        format!("* OK [UIDNEXT {}] Predicted next UID\r\n", available() + 1)
+                            .as_bytes(),
                     )
                     .await?;
                 ok(&mut write, &tag, "[READ-WRITE] SELECT completed").await?;
@@ -425,7 +445,15 @@ async fn serve_imap(
                 let sub = tokens.get(2).copied().unwrap_or("").to_ascii_uppercase();
                 match sub.as_str() {
                     "SEARCH" => {
-                        let ids: Vec<String> = (1..=count).map(|n| n.to_string()).collect();
+                        // A `HEADER Message-ID` search answers with the UID the earlier APPEND was
+                        // given by the server (4242). That is the round trip the design relies on:
+                        // APPEND tells us nothing, so we ask again.
+                        if trimmed.to_ascii_uppercase().contains("HEADER MESSAGE-ID") {
+                            write.write_all(b"* SEARCH 4242\r\n").await?;
+                            ok(&mut write, &tag, "UID SEARCH completed").await?;
+                            continue;
+                        }
+                        let ids: Vec<String> = (1..=available()).map(|n| n.to_string()).collect();
                         write
                             .write_all(format!("* SEARCH {}\r\n", ids.join(" ")).as_bytes())
                             .await?;
@@ -438,8 +466,8 @@ async fn serve_imap(
                         // A partial fetch (`BODY[]<start.length>`) must return only that slice, or a
                         // streaming download would silently receive the whole message every time.
                         let partial = partial_range(&query);
-                        for uid in parse_uid_set(set, count) {
-                            let raw = &messages[(uid - 1) as usize];
+                        for uid in parse_uid_set(set, available()) {
+                            let raw = &message_for(uid);
                             let (payload, section): (&[u8], String) = match partial {
                                 Some((start, length)) => {
                                     let start = start.min(raw.len());
@@ -471,7 +499,7 @@ async fn serve_imap(
                             .and_then(|(_, rest)| rest.split_once(')'))
                             .map(|(inner, _)| inner.to_string())
                             .unwrap_or_default();
-                        for uid in parse_uid_set(set, count) {
+                        for uid in parse_uid_set(set, available()) {
                             write
                                 .write_all(
                                     format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n")
@@ -485,7 +513,7 @@ async fn serve_imap(
                     "EXPUNGE" => {
                         if uidplus {
                             let set = tokens.get(3).copied().unwrap_or("1");
-                            for uid in parse_uid_set(set, count) {
+                            for uid in parse_uid_set(set, available()) {
                                 write
                                     .write_all(format!("* {uid} EXPUNGE\r\n").as_bytes())
                                     .await?;
@@ -507,6 +535,31 @@ async fn serve_imap(
                 write.write_all(b"* 1 EXPUNGE\r\n").await?;
                 ok(&mut write, &tag, "EXPUNGE completed").await?;
             }
+            "APPEND" => {
+                // async-imap sends `APPEND <mailbox> (flags) {N}`, waits for a continuation (`+`),
+                // and only then writes the literal. Answering in the wrong order deadlocks the
+                // client, which is how this arm was written the first time.
+                let literal = trimmed
+                    .rsplit_once('{')
+                    .and_then(|(_, rest)| rest.trim_end_matches('}').parse::<usize>().ok());
+                if let Some(size) = literal {
+                    write.write_all(b"+ Ready for literal data\r\n").await?;
+                    let mut body = vec![0u8; size];
+                    tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await?;
+                    // Consume the CRLF that terminates the literal.
+                    line.clear();
+                    reader.read_line(&mut line).await?;
+                }
+                if uidplus {
+                    write
+                        .write_all(
+                            format!("{tag} OK [APPENDUID 1 4242] APPEND completed\r\n").as_bytes(),
+                        )
+                        .await?;
+                } else {
+                    ok(&mut write, &tag, "APPEND completed").await?;
+                }
+            }
             "IDLE" => {
                 write.write_all(b"+ idling\r\n").await?;
                 let behaviour = *idle.lock().unwrap();
@@ -518,9 +571,14 @@ async fn serve_imap(
                     // Record the arrival, so the `SELECT` after `DONE` reports the new size.
                     // That comparison is how the watcher notices anything at all, so a push that
                     // did not move `extra` would be a test that could never pass.
-                    let arrived = extra.fetch_add(1, Ordering::SeqCst) + 1;
+                    //
+                    // The total is read from the atomic *after* the increment: the mailbox is
+                    // `RICH_MESSAGES + extra`, so adding a separately-tracked "arrived" count on top
+                    // of an already-inclusive number would double-count.
+                    extra.fetch_add(1, Ordering::SeqCst);
+                    let total = RICH_MESSAGES + extra.load(Ordering::SeqCst);
                     write
-                        .write_all(format!("* {} EXISTS\r\n", count + arrived).as_bytes())
+                        .write_all(format!("* {total} EXISTS\r\n").as_bytes())
                         .await?;
                 }
 
@@ -667,7 +725,53 @@ async fn spawn_smtp_counted() -> (SocketAddr, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsi
     (addr, captured, connections)
 }
 
+/// As [`spawn_smtp_counted`], but also returns the SMTP command transcript.
+async fn spawn_smtp_with_commands() -> (
+    SocketAddr,
+    Arc<Mutex<Vec<u8>>>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let commands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sink = Arc::clone(&captured);
+    let counter = Arc::clone(&connections);
+    let log = Arc::clone(&commands);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let sink = Arc::clone(&sink);
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let _ = serve_smtp_logging(stream, sink, log).await;
+            });
+        }
+    });
+
+    (addr, captured, connections, commands)
+}
+
 async fn serve_smtp(stream: TcpStream, sink: Arc<Mutex<Vec<u8>>>) -> std::io::Result<()> {
+    serve_smtp_logging(stream, sink, Arc::new(Mutex::new(Vec::new()))).await
+}
+
+/// As [`serve_smtp`], but records every command line.
+///
+/// The transcript is what lets a probe assert something about the *protocol* rather than about the
+/// message: `MAIL FROM` must not carry `SIZE=` (lettre never sends it — see A1-F45), and it is the
+/// only way to see that from the outside.
+async fn serve_smtp_logging(
+    stream: TcpStream,
+    sink: Arc<Mutex<Vec<u8>>>,
+    commands: Arc<Mutex<Vec<String>>>,
+) -> std::io::Result<()> {
     let (read_half, mut write) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -683,6 +787,7 @@ async fn serve_smtp(stream: TcpStream, sink: Arc<Mutex<Vec<u8>>>) -> std::io::Re
         }
         let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
         let upper = trimmed.to_ascii_uppercase();
+        commands.lock().unwrap().push(trimmed.clone());
 
         if upper.starts_with("EHLO") {
             // The final line uses a space, not a hyphen, or the client keeps reading.
@@ -1363,6 +1468,87 @@ async fn syncing_a_folder_twice_only_fetches_what_is_new() {
     );
 }
 
+/// **M0-5 regression.** A burst bigger than one sync batch must not leave a hole.
+///
+/// The rule under test is subtle and the failure it prevents is silent: the incremental cursor
+/// advances to the highest UID that was *stored*, so if a page kept the **newest** entries of a
+/// too-large batch, every UID between the old cursor and the first stored UID would sit below the
+/// cursor forever. No error, no empty folder — just mail that never appears.
+///
+/// The fixture grows by more than `SYNC_BATCH` (500) at once, which is what a laptop that was
+/// offline for a week, a freshly-subscribed big label, or a mail-archive copy looks like.
+#[tokio::test]
+async fn a_burst_larger_than_one_batch_leaves_no_hole() {
+    let extra = Arc::new(AtomicU32::new(0));
+    let (addr, _log) = spawn_server(Server {
+        uidplus: true,
+        extra: Arc::clone(&extra),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+
+    // Cold: the four fixture messages.
+    let first = within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    assert_eq!(first.total_cached, 4);
+    assert_eq!(first.last_uid, 4);
+
+    // 600 messages arrive at once — more than the 500-message page the driver asks for.
+    let burst = 600;
+    extra.store(burst, Ordering::SeqCst);
+
+    let second = within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    assert_eq!(
+        second.fetched, 500,
+        "one pass may only store one page, so the rest waits for the next pass"
+    );
+    assert_eq!(
+        second.last_uid, 504,
+        "the cursor stops at the last UID of the OLDEST page (4 + 500), not at the newest message"
+    );
+
+    // The stored set must be contiguous from 1: a hole here is permanently unfetchable mail.
+    let uids = cached_uids(&cache, &cfg.id);
+    let expected: Vec<u32> = (1..=504).collect();
+    assert_eq!(
+        uids, expected,
+        "UIDs must be 1..=504 with no hole — a gap means the page kept the newest entries"
+    );
+
+    // The next pass continues exactly where the previous one stopped.
+    let third = within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    assert_eq!(third.fetched, 100, "the remaining messages of the burst");
+    assert_eq!(third.last_uid, 4 + burst);
+    let uids = cached_uids(&cache, &cfg.id);
+    let expected: Vec<u32> = (1..=4 + burst).collect();
+    assert_eq!(uids, expected, "after two passes the whole burst is cached");
+
+    assert_eq!(
+        cache
+            .folder_state(&cfg.id, "INBOX")
+            .expect("state")
+            .map(|s| s.last_uid),
+        Some(4 + burst)
+    );
+}
+
+/// Every stored UID for INBOX, ascending. Reads through the public cache API on purpose: the test
+/// must observe what the app would show, not an internal cursor.
+fn cached_uids(cache: &Cache, account_id: &str) -> Vec<u32> {
+    let mut uids: Vec<u32> = cache
+        .list_summaries(account_id, "INBOX", u32::MAX, 0)
+        .expect("summaries")
+        .into_iter()
+        .map(|m| m.uid)
+        .collect();
+    uids.sort_unstable();
+    uids
+}
+
 #[tokio::test]
 async fn a_uidvalidity_change_wipes_the_folder_and_refills_it() {
     let uidvalidity = Arc::new(AtomicU32::new(1));
@@ -1809,5 +1995,232 @@ async fn the_pool_keeps_at_most_max_connections_idle() {
         pool.live_count(&cfg.id),
         1,
         "idle connections must be capped at max_connections"
+    );
+}
+
+// ===================================================================== 库能力探针（M0-1）
+//
+// These do not test our code — they pin **library facts** that the design depends on, so that a
+// dependency upgrade cannot quietly invalidate a paragraph in design/ without a red test.
+//
+// They live in this file (rather than a separate `library_probe.rs`) because they need the same
+// fake servers; a second copy of that fixture would be a second thing to keep faithful.
+// Each probe names the A1 finding it corresponds to.
+
+/// **A1-F41** — a pushed `* n EXISTS` reaches us as `IdleResponse::NewData`, *not* only when the
+/// idle window closes.
+///
+/// The window here is deliberately long (5 s): if the `HANDOFF` claim ("async-imap never delivers
+/// EXISTS, so push latency is the window") were still true, the event could not arrive before it.
+#[tokio::test]
+async fn probe_idle_delivers_exists_before_the_window_closes() {
+    let (addr, log) = spawn_server(Server {
+        uidplus: true,
+        idle: Arc::new(Mutex::new(Idle::Announce)),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    let started = std::time::Instant::now();
+    let watcher = tokio::spawn(watch_every(
+        cfg.clone(),
+        "app-password".to_string(),
+        "INBOX".to_string(),
+        Duration::from_secs(5),
+        tx,
+    ));
+
+    let event = within(async { rx.recv().await })
+        .await
+        .expect("the pushed EXISTS must produce an event");
+    let elapsed = started.elapsed();
+    watcher.abort();
+
+    assert_eq!(
+        event,
+        PushEvent::Changed {
+            mailbox: "INBOX".to_string()
+        },
+        "a pushed EXISTS must be reported as a change"
+    );
+    assert!(
+        saw_command(&log, "IDLE"),
+        "the change must have come from the idle connection"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the event must arrive from the push, not from the 5 s window closing (took {elapsed:?})"
+    );
+}
+
+/// **A1-F43** — `APPEND` gives us no UID, even when the server sends `APPENDUID`.
+///
+/// The fixture answers with `[APPENDUID 1 4242]`. `ImapClient::append` returns `Result<()>`, so
+/// there is no way to read 4242 from it — the probe records that, because the design's
+/// "verify-or-append into Sent" and "upload an archive to the server" flows both depend on finding
+/// the UID again with `UID SEARCH HEADER Message-ID`.
+#[tokio::test]
+async fn probe_append_uid_is_parsed_and_then_discarded() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+
+    let raw = b"From: me@example.com\r\nTo: you@example.com\r\nSubject: hi\r\nMessage-ID: <probe@example.com>\r\n\r\nbody\r\n";
+    within(client.append("Sent", raw, true))
+        .await
+        .expect("APPEND must succeed against a UIDPLUS server");
+
+    // The server answered `[APPENDUID 1 4242]`; `append` returns `()`, so that number is gone.
+    // The only way back to it is the search — which is why the design makes this primitive
+    // mandatory before and after every append.
+    let found = within(client.find_uid_by_message_id("Sent", "<probe@example.com>"))
+        .await
+        .expect("the search must run");
+    assert_eq!(
+        found,
+        Some(4242),
+        "the UID must be recoverable by Message-ID, since APPEND does not return it"
+    );
+
+    let transcript = log.lock().unwrap().clone();
+    assert!(
+        transcript.iter().any(|line| line.contains("APPEND")),
+        "the client must have sent APPEND: {transcript:?}"
+    );
+    assert!(
+        transcript.iter().any(|line| line
+            .to_ascii_uppercase()
+            .contains("UID SEARCH HEADER MESSAGE-ID")),
+        "and must have looked the UID up afterwards: {transcript:?}"
+    );
+}
+
+/// **A1-F42** — a partial fetch that carries an *offset* (not just a length) kills the connection.
+///
+/// This one is written as an experiment rather than an assertion of the finding: it performs the
+/// call and records what actually happens, failing only if the outcome is neither "ok" nor "a clean
+/// error" (i.e. if it silently returns the wrong bytes, which is the dangerous middle).
+#[tokio::test]
+async fn probe_partial_fetch_with_offset_is_an_experiment() {
+    let (addr, _log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+
+    let outcome = within(client.fetch_message_range(1, 5, 10)).await;
+    match outcome {
+        Ok(bytes) => {
+            // If it works, the bytes must be the requested slice (header block is longer than 15
+            // bytes for message one, so this is a real slice and not the whole message).
+            let raw = message_one();
+            assert!(
+                raw.len() > 15,
+                "the fixture must be long enough for the slice to be meaningful"
+            );
+            assert_eq!(
+                bytes,
+                raw[5..15].to_vec(),
+                "an offset fetch that succeeds must return exactly that slice"
+            );
+            eprintln!("probe A1-F42: offset partial fetch SUCCEEDED (finding needs updating)");
+        }
+        Err(err) => {
+            // The connection being closed is the documented outcome; the important part is that the
+            // failure is *visible* rather than silent corruption.
+            eprintln!("probe A1-F42: offset partial fetch failed as documented: {err}");
+        }
+    }
+}
+
+/// **A1-F46** — `mail-parser`'s `references()` has three shapes, and `as_text()` loses all but the
+/// last id when the header carried several.
+#[test]
+fn probe_references_has_three_shapes() {
+    use mail_parser::MessageParser;
+
+    // **This probe corrected a research note.** design/A1-F46 claimed that a single-reference
+    // header comes back as `Text` and that `as_text_list()` therefore returns `None`. Measured on
+    // mail-parser 0.11.9, that is false: `as_text_list()` answers for BOTH variants (one element
+    // for `Text`), and the real trap is the other accessor — `as_text()` on a multi-id header
+    // silently returns only the **last** id. Practical rule: read references with
+    // `as_text_list()`, never with `as_text()`.
+    //
+    // Each case keeps its own buffer alive: `Message` borrows the bytes it was parsed from.
+    {
+        let raw =
+            b"From: a@example.com\r\nReferences: <a@example.com>\r\nSubject: s\r\n\r\nbody\r\n";
+        let msg = MessageParser::default().parse(raw).expect("parse");
+        let refs = msg.references();
+        assert_eq!(
+            refs.as_text_list().map(|l| l.len()),
+            Some(1),
+            "one id must still be readable as a list of one (contradicting A1-F46's original claim)"
+        );
+        assert_eq!(refs.as_text(), Some("a@example.com"));
+    }
+    {
+        let raw = b"From: a@example.com\r\nReferences: <a@example.com> <b@example.com>\r\nSubject: s\r\n\r\nbody\r\n";
+        let msg = MessageParser::default().parse(raw).expect("parse");
+        let refs = msg.references();
+        assert_eq!(refs.as_text_list().map(|l| l.len()), Some(2));
+        assert_eq!(
+            refs.as_text(),
+            Some("b@example.com"),
+            "as_text() on a multi-id header returns only the last id — that is the trap"
+        );
+    }
+    {
+        let raw = b"From: a@example.com\r\nSubject: s\r\n\r\nbody\r\n";
+        let msg = MessageParser::default().parse(raw).expect("parse");
+        assert!(msg.references().as_text_list().is_none());
+        assert!(msg.references().as_text().is_none());
+    }
+}
+
+/// **A1-F45 (corrected)** — lettre does not send `SIZE=` on `MAIL FROM`, and it cannot even read
+/// the limit the server advertises.
+///
+/// The fixture advertises `250-SIZE 10485760`. If lettre used it, the command would appear in the
+/// transcript; it does not, which is why the design says the pre-send size check is a local table
+/// plus a hard cap and nothing else.
+#[tokio::test]
+async fn probe_lettre_never_sends_size() {
+    let (addr, _captured, _connections, commands) = spawn_smtp_with_commands().await;
+    let cfg = account(addr, addr);
+
+    let mail = OutgoingMail {
+        to: vec!["alice@example.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: "size probe".to_string(),
+        body_text: "hello".to_string(),
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+    };
+
+    within(smtp::send(&cfg, "authorization-code", &mail))
+        .await
+        .expect("send");
+
+    let lines = commands.lock().unwrap().clone();
+    let mail_from = lines
+        .iter()
+        .find(|line| line.to_ascii_uppercase().starts_with("MAIL FROM"))
+        .expect("MAIL FROM must have been sent");
+
+    assert!(
+        !mail_from.to_ascii_uppercase().contains("SIZE="),
+        "lettre must not send SIZE= (A1-F45: it has no such parameter): {mail_from}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("EHLO")),
+        "the server advertised SIZE via EHLO; the point is that the client ignores it"
     );
 }
