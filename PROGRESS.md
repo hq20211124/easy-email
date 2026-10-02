@@ -118,19 +118,23 @@ curl -s -X POST https://oauth2.googleapis.com/token \
 
 ---
 
-## 下一步
-### M0 剩余
-- [ ] **M0-4** imap-proto 的 `<origin.offset>` 决策：M0-1 已证实"不修就不能真流式取附件"。
-  明天做：评估 `[patch.crates-io]` 挂本地 fork（3 行改动）的维护成本，做就顺手实现
-  `fetch_message_range` 的分块下载；不做就把"整封取回"的代价写进 README。
-- [ ] **M0-6** WinAppSDK 通知 spike：需要 Windows App SDK 运行时（离线可能装不上）。
-  做不了会如实记录，并保留 13 §3.1 的回退分支。
-- [ ] **M0-8** OAuth 端点探测：需要真实端点 + 你的凭据 ⇒ 把探针写好、标明"待有网+凭据时跑"。
+## 下一步（M0 只剩两个被外部条件卡住的项，主线转到 M1a）
 
-### M1a（按 design/19 §4）
-1. **窗口同步 + 历史回填**：根 `PLAN.md` 里已有逐行改造计划（before/after 代码、锚点、验收），
-   直接执行；它同时解锁 README 里"缓存只覆盖最新 500 封"这条限制。
-2. `user.db` 第一次真正落地：`drafts`/`outbox`/`pending_ops`/`rules`/`contacts` 表（design/03 §3.1）
-   —— `DbSet` 已经在 `db.rs` 里，接线即可。
-3. 认证轴（`AuthMethod` + 授权码/应用专用密码文案，P2 已拍板）→ 草稿与发件箱 → 会话串 →
-   通知托盘 → 安装包与自动更新。
+**M0 收口情况**：M0-1/2/3/4/5/7 **已完成且全绿**；M0-6（WinAppSDK 通知）与 M0-8（OAuth 端点探测）
+**不是没做，而是当前环境做不了**：前者缺运行时与依赖、后者缺你的凭据 —— 两者的恢复步骤与判定标准
+都已写在本文件上面（含可直接复制的命令）。按纪律，它们**不阻塞** M1a 的开工。
+
+### M1a 第一步：窗口同步 + 历史回填（根 `PLAN.md` 的既有计划）
+`PLAN.md`（约 2300 行）已经写了逐行改造：before/after 代码、精确锚点、每步验收。
+**开工前必须先做一件事**：`PLAN.md` 是 M0-2 之前写的，里面的 `cache_page`/`Cache` 调用要对着
+现在共享句柄（`state.cache.clone()`、`write_blocking`）核一遍——凡是"每条命令开连接"的写法都要改掉，
+否则会把刚拆掉的东西又装回去。核完就按它的步骤执行（它同时解锁 README 里"缓存只覆盖最新 500 封"）。
+
+### M1a 第二步：`user.db` 第一次真正落地
+`DbSet` 已经在 `db.rs` 里；按 `design/03` §3.1 建 `drafts`/`outbox`/`pending_ops`/`rules`/`contacts`
+（`user.db` 用 `synchronous = full`，与 `cache.db` 分开），并把「清理缓存只清 `origin='server'`」这条
+接进清理入口。
+
+### 之后
+认证轴（`AuthMethod` + 授权码/应用专用密码文案，P2 已拍板）→ 草稿与发件箱 → 会话串 →
+通知托盘 → 安装包与自动更新（`design/19` M1a 的块顺序）。
