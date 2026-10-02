@@ -123,6 +123,9 @@ pub struct DbStats {
 }
 
 struct Shared {
+    /// `Some` for an in-memory handle: there is exactly one connection and no threads, so reads and
+    /// writes both take this lock. Production handles have `None` and use the writer thread below.
+    direct: Option<Mutex<Connection>>,
     writer: Mutex<Option<Sender<Job>>>,
     readers: Vec<Mutex<Connection>>,
     next_reader: AtomicU64,
@@ -166,10 +169,11 @@ impl Db {
             readers.push(Mutex::new(open_connection(path, kind, &opts)?));
         }
         Ok(Self::assemble(
-            writer,
+            Some(writer),
             readers,
             opts,
             Some(path.to_path_buf()),
+            None,
         ))
     }
 
@@ -189,19 +193,21 @@ impl Db {
             label: label.to_string(),
             ..DbOptions::default()
         };
-        Ok(Self::assemble(conn, Vec::new(), opts, None))
+        Ok(Self::assemble(None, Vec::new(), opts, None, Some(conn)))
     }
 
     fn assemble(
-        writer: Connection,
+        writer: Option<Connection>,
         readers: Vec<Mutex<Connection>>,
         opts: DbOptions,
         path: Option<PathBuf>,
+        direct: Option<Connection>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let label = opts.label.clone();
         let slow = opts.slow_query_ms;
         let shared = Arc::new(Shared {
+            direct: direct.map(Mutex::new),
             writer: Mutex::new(Some(tx)),
             readers,
             next_reader: AtomicU64::new(0),
@@ -212,19 +218,21 @@ impl Db {
             path,
         });
 
-        let thread_shared = Arc::clone(&shared);
-        thread::Builder::new()
-            .name(format!("db-writer-{}", opts.label))
-            .spawn(move || {
-                let mut conn = writer;
-                // `recv` ends when every `Db` clone is dropped, which is exactly when the thread
-                // should exit: the sender lives inside `Shared`.
-                while let Ok(job) = rx.recv() {
-                    job(&mut conn);
-                }
-                let _ = thread_shared;
-            })
-            .expect("spawning the database writer thread");
+        if let Some(writer) = writer {
+            let thread_shared = Arc::clone(&shared);
+            thread::Builder::new()
+                .name(format!("db-writer-{}", opts.label))
+                .spawn(move || {
+                    let mut conn = writer;
+                    // `recv` ends when every `Db` clone is dropped, which is exactly when the thread
+                    // should exit: the sender lives inside `Shared`.
+                    while let Ok(job) = rx.recv() {
+                        job(&mut conn);
+                    }
+                    let _ = thread_shared;
+                })
+                .expect("spawning the database writer thread");
+        }
 
         Self { shared }
     }
@@ -240,6 +248,20 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if let Some(direct) = &self.shared.direct {
+            let conn = direct.lock().expect("direct connection");
+            let tx = conn.unchecked_transaction()?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            return Ok(out);
+        }
+        if let Some(direct) = &self.shared.direct {
+            let conn = direct.lock().expect("direct connection");
+            let tx = conn.unchecked_transaction()?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            return Ok(out);
+        }
         // `unchecked_transaction` (rather than `transaction`) because it takes `&Connection`: a
         // `Transaction` only implements `Deref`, not `DerefMut`, so a `&mut Connection` closure
         // cannot be handed one. "Unchecked" only means it does not verify that a transaction is
@@ -251,6 +273,95 @@ impl Db {
             Ok(out)
         })
         .await
+    }
+
+    /// Synchronous [`Db::write`]: the same transaction, run on the writer thread, **blocking** the
+    /// calling thread until it finishes.
+    ///
+    /// Exists because most of the storage API is synchronous and is called from the sync driver,
+    /// which is not an `async fn`. Waiting is done on a channel rather than by spinning, so a slow
+    /// batch costs nothing but a parked thread.
+    ///
+    /// Do not call this from a Tokio worker thread — it blocks it.
+    pub fn write_blocking<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(direct) = &self.shared.direct {
+            let conn = direct.lock().expect("direct connection");
+            let tx = conn.unchecked_transaction()?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            return Ok(out);
+        }
+        if let Some(direct) = &self.shared.direct {
+            let conn = direct.lock().expect("direct connection");
+            let tx = conn.unchecked_transaction()?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            return Ok(out);
+        }
+        let (tx, rx) = mpsc::channel::<Result<T>>();
+        let label = self.shared.label.clone();
+        self.shared.pending_writes.fetch_add(1, Ordering::Relaxed);
+        let pending = Arc::clone(&self.shared);
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            // `txn` rather than `tx`: the outer `tx` is the reply channel, and shadowing it here
+            // sends the result into a transaction that is about to be dropped.
+            let result = match conn.unchecked_transaction() {
+                Ok(txn) => match f(&txn) {
+                    Ok(out) => txn.commit().map(|_| out).map_err(MailError::from),
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(MailError::from(err)),
+            };
+            pending.pending_writes.fetch_sub(1, Ordering::Relaxed);
+            let _ = tx.send(result);
+        });
+        {
+            let sender = self.shared.writer.lock().expect("writer lock");
+            let Some(sender) = sender.as_ref() else {
+                return Err(MailError::Cache(format!("{label} 的写线程已关闭")));
+            };
+            sender
+                .send(job)
+                .map_err(|_| MailError::Cache(format!("{label} 的写线程已退出")))?;
+        }
+        rx.recv()
+            .map_err(|_| MailError::Cache(format!("{label} 的写线程没有返回结果")))?
+    }
+
+    /// Run `f` on the writer **without a transaction**.
+    ///
+    /// Needed because some statements cannot run inside one: `VACUUM` is the one that matters here
+    /// (turning auto-vacuum on for an existing database requires a full `VACUUM`). Everything that
+    /// *can* be transactional should use [`Db::write_blocking`] instead.
+    pub fn exec_blocking<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(direct) = &self.shared.direct {
+            let conn = direct.lock().expect("direct connection");
+            return f(&conn);
+        }
+        let (tx, rx) = mpsc::channel::<Result<T>>();
+        let label = self.shared.label.clone();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let _ = tx.send(f(conn));
+        });
+        {
+            let sender = self.shared.writer.lock().expect("writer lock");
+            let Some(sender) = sender.as_ref() else {
+                return Err(MailError::Cache(format!("{label} 的写线程已关闭")));
+            };
+            sender
+                .send(job)
+                .map_err(|_| MailError::Cache(format!("{label} 的写线程已退出")))?;
+        }
+        rx.recv()
+            .map_err(|_| MailError::Cache(format!("{label} 的写线程没有返回结果")))?
     }
 
     /// Run `f` in a transaction, retrying the whole closure on `SQLITE_BUSY`.
@@ -333,6 +444,23 @@ impl Db {
         out
     }
 
+    /// Borrow a connection for a **synchronous** read, from the pool when there is one.
+    ///
+    /// This is what lets the storage API stay synchronous without either opening a connection per
+    /// call or wrapping every read in a `Send + 'static` closure. The guard is a `MutexGuard` over
+    /// one pooled connection, so concurrent callers still use different connections.
+    ///
+    /// Do not do blocking work (network, big file I/O) while holding it, and never call a write
+    /// through the same handle while a guard is alive: the guard is a live borrow of the pool slot.
+    pub fn read_guard(&self) -> std::sync::MutexGuard<'_, Connection> {
+        if let Some(direct) = &self.shared.direct {
+            return direct.lock().expect("direct connection");
+        }
+        let index = self.shared.next_reader.fetch_add(1, Ordering::Relaxed) as usize
+            % self.shared.readers.len().max(1);
+        self.shared.readers[index].lock().expect("reader lock")
+    }
+
     /// Blocking read, for startup paths that run before the Tokio runtime exists.
     ///
     /// Never call this from inside a task on the runtime's worker threads — it blocks one.
@@ -341,6 +469,10 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if let Some(direct) = &self.shared.direct {
+            let conn = direct.lock().expect("direct connection");
+            return f(&conn);
+        }
         if self.shared.readers.is_empty() {
             // In-memory handle: there is one connection and it belongs to the writer. Taking the
             // writer lock would deadlock, so the caller's closure runs against a read-only view…
@@ -359,9 +491,6 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        // Wrap in a `Send` slot so the value can travel back from the writer thread.
-        let slot: Arc<Mutex<Option<Result<T>>>> = Arc::new(Mutex::new(None));
-        let out = Arc::clone(&slot);
         let sender = {
             let guard = self.shared.writer.lock().expect("writer lock");
             guard
@@ -369,21 +498,16 @@ impl Db {
                 .cloned()
                 .ok_or_else(|| MailError::Cache("写线程已关闭".to_string()))?
         };
+        let (tx, rx) = mpsc::channel::<Result<T>>();
         let job: Job = Box::new(move |conn: &mut Connection| {
             let result = f(conn);
-            *out.lock().expect("slot") = Some(result);
+            let _ = tx.send(result);
         });
         sender
             .send(job)
             .map_err(|_| MailError::Cache("写线程已退出".to_string()))?;
-        // Wait for the writer to run it. A spin with a yield is fine: this path is startup-only and
-        // the writer has nothing else queued.
-        loop {
-            if let Some(result) = slot.lock().expect("slot").take() {
-                return result;
-            }
-            std::thread::yield_now();
-        }
+        rx.recv()
+            .map_err(|_| MailError::Cache("写线程没有返回结果".to_string()))?
     }
 
     /// What SQLite actually stored for auto-vacuum (`0` none, `1` full, `2` incremental).

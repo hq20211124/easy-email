@@ -239,8 +239,42 @@ try {
 
     # ------------------------------------------------------------ rust
 
+    Step 'Tauri commands share one database handle (no connection per command)' {
+        # v0.2 opened a `Cache` (one SQLite connection) inside almost every command. That shape cannot
+        # batch — every row became its own transaction — and it is the thing M0-2 removed: the app
+        # opens the handle once in `setup` and clones it. A command that goes back to opening its own
+        # connection would silently undo that, so it is a gate rather than a convention.
+        #
+        # The one legitimate `Cache::open` is the startup call; everything else must clone.
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $opens = [regex]::Matches($lib, 'Cache::open\(')
+        $clones = [regex]::Matches($lib, 'state\s*\.cache\s*\n?\s*\.clone\(\)')
+        $problems = @()
+        if ($opens.Count -gt 1) {
+            $problems += "src-tauri/src/lib.rs opens the cache $($opens.Count) times; only the startup call in setup() may open it (commands must clone the shared handle)"
+        }
+        if ($clones.Count -lt 5) {
+            # A floor, not a target: it catches "the field was removed but the call sites still open
+            # their own connection", which the count above would not see if they used another path.
+            $problems += "expected commands to share the handle (found $($clones.Count) clones of state.cache; a handful of commands read mail)"
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host "cache opened once at startup, shared by $($clones.Count) call sites"
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'cargo fmt --check' {
-        cargo fmt --all -- --check 2>&1
+        cargo fmt --check 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'formatting drift: run `cargo fmt` and commit the result' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
     }
 
     Step 'cargo clippy (-D warnings)' {

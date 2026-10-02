@@ -21,6 +21,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::db::{Db, DbKind, DbOptions};
 use crate::error::{MailError, Result};
 use crate::model::{MailboxInfo, MessageDetail, MessageSummary};
 
@@ -97,8 +98,12 @@ pub fn to_query(input: &str) -> String {
     terms.join(" AND ")
 }
 
+#[derive(Clone)]
 pub struct Cache {
-    conn: Connection,
+    /// Shared handle: one writer thread plus a read pool (`db.rs`). Not a bare `Connection`, because
+    /// the app must not open a connection per command — and because a batch has to be one
+    /// transaction.
+    db: Db,
 }
 
 impl Cache {
@@ -109,14 +114,16 @@ impl Cache {
     /// future non-`Send`. A `busy_timeout` is set so a search running while a sync writes waits for
     /// the writer instead of failing outright with `SQLITE_BUSY`.
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                MailError::Cache(format!("无法创建缓存目录 {}：{e}", parent.display()))
-            })?;
-        }
         let cache = Self {
-            conn: Connection::open(path)?,
+            db: Db::open(path, DbKind::Cache, DbOptions::for_kind(DbKind::Cache))?,
         };
+        cache.migrate()?;
+        Ok(cache)
+    }
+
+    /// Wrap an already-open handle (used when the app owns a [`DbSet`]).
+    pub fn from_db(db: Db) -> Result<Self> {
+        let cache = Self { db };
         cache.migrate()?;
         Ok(cache)
     }
@@ -124,36 +131,10 @@ impl Cache {
     /// In-memory cache, for tests.
     pub fn open_in_memory() -> Result<Self> {
         let cache = Self {
-            conn: Connection::open_in_memory()?,
+            db: Db::open_in_memory("cache")?,
         };
         cache.migrate()?;
         Ok(cache)
-    }
-
-    /// Connection-level pragmas, applied on every open before anything else runs.
-    ///
-    /// Two of them have to happen **before the first table is created**:
-    ///
-    /// * `auto_vacuum = incremental` — SQLite only accepts this on an empty database (or after a
-    ///   full `VACUUM`). Setting it later is silently ignored, which is exactly how "we clean up
-    ///   200 MB" ends up not shrinking the file at all: `pragma incremental_vacuum` then does
-    ///   nothing. Databases created before this line existed therefore keep `auto_vacuum = 0`; see
-    ///   [`Cache::auto_vacuum_state`] and [`Cache::vacuum_into_freelist`].
-    /// * `journal_mode = wal` — a reader (the UI) must not block the sync writer.
-    ///
-    /// `synchronous = normal` is the usual WAL pairing: a crash can lose the last transaction but
-    /// cannot corrupt the database, and this data is a cache — it can always be re-fetched.
-    fn apply_pragmas(&self) -> Result<()> {
-        // Order matters: `auto_vacuum` first. Switching the journal mode writes the database
-        // header, after which SQLite silently ignores an auto-vacuum change (measured — see the note
-        // in `db::open_connection`).
-        self.conn.execute_batch(
-            "pragma auto_vacuum = incremental;
-             pragma journal_mode = wal;
-             pragma synchronous = normal;
-             pragma busy_timeout = 5000;",
-        )?;
-        Ok(())
     }
 
     /// What SQLite actually thinks the auto-vacuum mode is (`0` none, `1` full, `2` incremental).
@@ -161,20 +142,17 @@ impl Cache {
     /// Read back rather than assumed: an existing database keeps whatever it was created with, and
     /// that difference is the difference between "cleanup frees disk" and "cleanup does nothing".
     pub fn auto_vacuum_state(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("pragma auto_vacuum", [], |row| row.get(0))?)
+        self.db
+            .write_blocking(|conn| Ok(conn.query_row("pragma auto_vacuum", [], |row| row.get(0))?))
     }
 
     /// Bytes sitting on the freelist, i.e. pages that are free but still part of the file.
     pub fn freelist_bytes(&self) -> Result<i64> {
-        let pages: i64 = self
-            .conn
-            .query_row("pragma freelist_count", [], |row| row.get(0))?;
-        let page_size: i64 = self
-            .conn
-            .query_row("pragma page_size", [], |row| row.get(0))?;
-        Ok(pages * page_size)
+        self.db.read_blocking(|conn| {
+            let pages: i64 = conn.query_row("pragma freelist_count", [], |row| row.get(0))?;
+            let page_size: i64 = conn.query_row("pragma page_size", [], |row| row.get(0))?;
+            Ok(pages * page_size)
+        })
     }
 
     /// Run an incremental vacuum, which is a no-op unless auto-vacuum is incremental.
@@ -182,10 +160,19 @@ impl Cache {
     /// Returns the number of freelist pages that remain (0 on an auto-vacuum database means the
     /// space really did come back).
     pub fn vacuum_into_freelist(&self) -> Result<i64> {
-        self.conn.execute_batch("pragma incremental_vacuum;")?;
-        Ok(self
-            .conn
-            .query_row("pragma freelist_count", [], |row| row.get(0))?)
+        self.db.write_blocking(|conn| {
+            conn.execute_batch("pragma incremental_vacuum;")?;
+            Ok(conn.query_row("pragma freelist_count", [], |row| row.get(0))?)
+        })
+    }
+
+    /// Whether this database predates the auto-vacuum pragma and therefore needs the one-time
+    /// rebuild before "cleanup freed N MB" can be true on disk.
+    ///
+    /// Real instances of this exist: any cache created by v0.2 reports `auto_vacuum = 0`, because
+    /// SQLite only accepts the setting on an empty database (or after a full `VACUUM`).
+    pub fn needs_auto_vacuum_rebuild(&self) -> Result<bool> {
+        Ok(self.auto_vacuum_state()? != 2)
     }
 
     /// One-off, **blocking** full `VACUUM`, the only way to turn on auto-vacuum for a database that
@@ -194,90 +181,96 @@ impl Cache {
     /// Deliberately not called during startup: it rewrites the whole file, so the caller decides
     /// when to pay for it (design/03 §8: an explicit, interruptible, user-visible step).
     pub fn rebuild_with_auto_vacuum(&self) -> Result<()> {
-        let current: i64 = self
-            .conn
-            .query_row("pragma auto_vacuum", [], |row| row.get(0))?;
-        if current == 2 {
-            return Ok(());
-        }
-        self.conn.execute_batch(
-            "pragma auto_vacuum = incremental;
-             vacuum;
-             pragma auto_vacuum = incremental;",
-        )?;
-        Ok(())
+        // `exec_blocking`, not `write_blocking`: `VACUUM` refuses to run inside a transaction, and
+        // this is the one operation in the storage API whose whole purpose is to rewrite the file.
+        self.db.exec_blocking(|conn| {
+            let current: i64 = conn.query_row("pragma auto_vacuum", [], |row| row.get(0))?;
+            if current == 2 {
+                return Ok(());
+            }
+            conn.execute_batch(
+                "pragma auto_vacuum = incremental;
+                 vacuum;
+                 pragma auto_vacuum = incremental;",
+            )?;
+            Ok(())
+        })
     }
 
     fn migrate(&self) -> Result<()> {
-        self.apply_pragmas()?;
+        // One transaction: the whole schema appears or none of it does, which is what makes
+        // "the version says v3" a statement about a complete schema.
+        self.db.write_blocking(move |conn: &Connection| {
 
-        let version: i64 = self
-            .conn
-            .query_row("pragma user_version", [], |row| row.get(0))?;
-        if version == SCHEMA_VERSION {
-            return Ok(());
-        }
 
-        // v1 is the first schema, so there is nothing to migrate from — a database from the future
-        // is the only case worth refusing.
-        if version > SCHEMA_VERSION {
-            return Err(MailError::Cache(format!(
-                "缓存数据库版本 {version} 比程序支持的 {SCHEMA_VERSION} 更新，请升级程序"
-            )));
-        }
+            let version: i64 = conn
+                .query_row("pragma user_version", [], |row| row.get(0))?;
+            if version == SCHEMA_VERSION {
+                return Ok(());
+            }
 
-        self.conn.execute_batch(
-            "create table if not exists folders (
-                 account_id   text not null,
-                 name         text not null,
-                 display_name text not null,
-                 delimiter    text,
-                 selectable   integer not null default 1,
-                 uidvalidity  integer not null default 0,
-                 last_uid     integer not null default 0,
-                 synced_at    integer,
-                 primary key (account_id, name)
-             );
+            // v1 is the first schema, so there is nothing to migrate from — a database from the future
+            // is the only case worth refusing.
+            if version > SCHEMA_VERSION {
+                return Err(MailError::Cache(format!(
+                    "缓存数据库版本 {version} 比程序支持的 {SCHEMA_VERSION} 更新，请升级程序"
+                )));
+            }
 
-             create table if not exists messages (
-                 account_id text not null,
-                 folder     text not null,
-                 uid        integer not null,
-                 subject    text not null default '',
-                 from_name  text,
-                 from_addr  text,
-                 to_addrs   text,
-                 date       integer,
-                 size       integer,
-                 seen       integer not null default 0,
-                 flagged    integer not null default 0,
-                 primary key (account_id, folder, uid)
-             );
+            conn.execute_batch(
+                "create table if not exists folders (
+                     account_id   text not null,
+                     name         text not null,
+                     display_name text not null,
+                     delimiter    text,
+                     selectable   integer not null default 1,
+                     uidvalidity  integer not null default 0,
+                     last_uid     integer not null default 0,
+                     synced_at    integer,
+                     primary key (account_id, name)
+                 );
 
-             create index if not exists messages_by_date
-                 on messages(account_id, folder, date desc, uid desc);
+                 create table if not exists messages (
+                     account_id text not null,
+                     folder     text not null,
+                     uid        integer not null,
+                     subject    text not null default '',
+                     from_name  text,
+                     from_addr  text,
+                     to_addrs   text,
+                     date       integer,
+                     size       integer,
+                     seen       integer not null default 0,
+                     flagged    integer not null default 0,
+                     primary key (account_id, folder, uid)
+                 );
 
-             create table if not exists bodies (
-                 account_id text not null,
-                 folder     text not null,
-                 uid        integer not null,
-                 detail     text not null,
-                 fetched_at integer not null,
-                 primary key (account_id, folder, uid)
-             );
+                 create index if not exists messages_by_date
+                     on messages(account_id, folder, date desc, uid desc);
 
-             -- Standalone (not external-content) on purpose: it stores the tokenised text, which is
-             -- not the same text as in `messages`. Independent of `unicode61`'s defaults.
-             create virtual table if not exists search using fts5(
-                 subject, from_name, from_addr, to_addrs, body,
-                 account_id unindexed, folder unindexed, uid unindexed,
-                 tokenize = 'unicode61'
-             );",
-        )?;
+                 create table if not exists bodies (
+                     account_id text not null,
+                     folder     text not null,
+                     uid        integer not null,
+                     detail     text not null,
+                     fetched_at integer not null,
+                     primary key (account_id, folder, uid)
+                 );
 
-        self.conn
-            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(())
+                 -- Standalone (not external-content) on purpose: it stores the tokenised text, which is
+                 -- not the same text as in `messages`. Independent of `unicode61`'s defaults.
+                 create virtual table if not exists search using fts5(
+                     subject, from_name, from_addr, to_addrs, body,
+                     account_id unindexed, folder unindexed, uid unindexed,
+                     tokenize = 'unicode61'
+                 );",
+            )?;
+
+            conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            Ok(())
+
+        })
     }
 
     // ------------------------------------------------------------------ folders
@@ -289,29 +282,38 @@ impl Cache {
         mailbox: &MailboxInfo,
         uidvalidity: u32,
     ) -> Result<()> {
-        self.conn.execute(
-            "insert into folders (account_id, name, display_name, delimiter, selectable, uidvalidity)
-             values (?1, ?2, ?3, ?4, ?5, ?6)
-             on conflict(account_id, name) do update set
-                 display_name = excluded.display_name,
-                 delimiter    = excluded.delimiter,
-                 selectable   = excluded.selectable,
-                 uidvalidity  = excluded.uidvalidity",
-            params![
-                account_id,
-                mailbox.name,
-                mailbox.display_name,
-                mailbox.delimiter,
-                i64::from(mailbox.selectable),
-                i64::from(uidvalidity),
-            ],
-        )?;
-        Ok(())
+        let account_id = account_id.to_string();
+        let mailbox = mailbox.clone();
+        self.db.write_blocking(move |conn: &Connection| {
+
+            conn.execute(
+                "insert into folders (account_id, name, display_name, delimiter, selectable, uidvalidity)
+                 values (?1, ?2, ?3, ?4, ?5, ?6)
+                 on conflict(account_id, name) do update set
+                     display_name = excluded.display_name,
+                     delimiter    = excluded.delimiter,
+                     selectable   = excluded.selectable,
+                     uidvalidity  = excluded.uidvalidity",
+                params![
+                    account_id,
+                    mailbox.name,
+                    mailbox.display_name,
+                    mailbox.delimiter,
+                    i64::from(mailbox.selectable),
+                    i64::from(uidvalidity),
+                ],
+            )?;
+            Ok(())
+
+        })
     }
 
     /// The folder list as last seen, for offline startup.
     pub fn list_folders(&self, account_id: &str) -> Result<Vec<MailboxInfo>> {
-        let mut stmt = self.conn.prepare(
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        let mut stmt = conn.prepare(
             "select name, display_name, delimiter, selectable
              from folders where account_id = ?1 order by name",
         )?;
@@ -331,8 +333,10 @@ impl Cache {
     /// Lets a sync reuse the display name and delimiter already known instead of issuing `LIST`
     /// again on every single message-list refresh.
     pub fn get_folder(&self, account_id: &str, name: &str) -> Result<Option<MailboxInfo>> {
-        Ok(self
-            .conn
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        Ok(conn
             .query_row(
                 "select name, display_name, delimiter, selectable
                  from folders where account_id = ?1 and name = ?2",
@@ -350,8 +354,10 @@ impl Cache {
     }
 
     pub fn folder_state(&self, account_id: &str, folder: &str) -> Result<Option<FolderState>> {
-        Ok(self
-            .conn
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        Ok(conn
             .query_row(
                 "select uidvalidity, last_uid from folders where account_id = ?1 and name = ?2",
                 params![account_id, folder],
@@ -373,22 +379,26 @@ impl Cache {
         uidvalidity: u32,
         last_uid: u32,
     ) -> Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.conn.execute(
-            "update folders set uidvalidity = ?3, last_uid = ?4, synced_at = ?5
-             where account_id = ?1 and name = ?2",
-            params![
-                account_id,
-                folder,
-                i64::from(uidvalidity),
-                i64::from(last_uid),
-                now
-            ],
-        )?;
-        Ok(())
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            conn.execute(
+                "update folders set uidvalidity = ?3, last_uid = ?4, synced_at = ?5
+                 where account_id = ?1 and name = ?2",
+                params![
+                    account_id,
+                    folder,
+                    i64::from(uidvalidity),
+                    i64::from(last_uid),
+                    now
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Drop everything cached for one folder and reset its cursor.
@@ -399,34 +409,43 @@ impl Cache {
     /// The stored `uidvalidity` is zeroed as well, which is what tells the sync driver that the
     /// next pass must start from a fresh window rather than trusting a cursor it no longer has.
     pub fn invalidate_folder(&self, account_id: &str, folder: &str) -> Result<()> {
-        self.conn.execute(
-            "delete from search where account_id = ?1 and folder = ?2",
-            params![account_id, folder],
-        )?;
-        self.conn.execute(
-            "delete from bodies where account_id = ?1 and folder = ?2",
-            params![account_id, folder],
-        )?;
-        self.conn.execute(
-            "delete from messages where account_id = ?1 and folder = ?2",
-            params![account_id, folder],
-        )?;
-        self.conn.execute(
-            "update folders set uidvalidity = 0, last_uid = 0 where account_id = ?1 and name = ?2",
-            params![account_id, folder],
-        )?;
-        Ok(())
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+
+            conn.execute(
+                "delete from search where account_id = ?1 and folder = ?2",
+                params![account_id, folder],
+            )?;
+            conn.execute(
+                "delete from bodies where account_id = ?1 and folder = ?2",
+                params![account_id, folder],
+            )?;
+            conn.execute(
+                "delete from messages where account_id = ?1 and folder = ?2",
+                params![account_id, folder],
+            )?;
+            conn.execute(
+                "update folders set uidvalidity = 0, last_uid = 0 where account_id = ?1 and name = ?2",
+                params![account_id, folder],
+            )?;
+            Ok(())
+
+        })
     }
 
     /// Forget an account entirely (uninstalled / removed account).
     pub fn forget_account(&self, account_id: &str) -> Result<()> {
-        for table in ["search", "bodies", "messages", "folders"] {
-            self.conn.execute(
-                &format!("delete from {table} where account_id = ?1"),
-                params![account_id],
-            )?;
-        }
-        Ok(())
+        let account_id = account_id.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+            for table in ["search", "bodies", "messages", "folders"] {
+                conn.execute(
+                    &format!("delete from {table} where account_id = ?1"),
+                    params![account_id],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------------ messages
@@ -438,35 +457,42 @@ impl Cache {
         folder: &str,
         summaries: &[MessageSummary],
     ) -> Result<()> {
-        for summary in summaries {
-            self.conn.execute(
-                "insert into messages
-                     (account_id, folder, uid, subject, from_name, from_addr, date, size, seen, flagged)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 on conflict(account_id, folder, uid) do update set
-                     subject   = excluded.subject,
-                     from_name = excluded.from_name,
-                     from_addr = excluded.from_addr,
-                     date      = excluded.date,
-                     size      = excluded.size,
-                     seen      = excluded.seen,
-                     flagged   = excluded.flagged",
-                params![
-                    account_id,
-                    folder,
-                    i64::from(summary.uid),
-                    summary.subject,
-                    summary.from_name,
-                    summary.from_addr,
-                    summary.date,
-                    summary.size.map(i64::from),
-                    i64::from(summary.seen),
-                    i64::from(summary.flagged),
-                ],
-            )?;
-            self.refresh_search_row(account_id, folder, summary.uid)?;
-        }
-        Ok(())
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        let summaries = summaries.to_vec();
+        self.db.write_blocking(move |conn: &Connection| {
+
+            for summary in summaries {
+                conn.execute(
+                    "insert into messages
+                         (account_id, folder, uid, subject, from_name, from_addr, date, size, seen, flagged)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     on conflict(account_id, folder, uid) do update set
+                         subject   = excluded.subject,
+                         from_name = excluded.from_name,
+                         from_addr = excluded.from_addr,
+                         date      = excluded.date,
+                         size      = excluded.size,
+                         seen      = excluded.seen,
+                         flagged   = excluded.flagged",
+                    params![
+                        account_id,
+                        folder,
+                        i64::from(summary.uid),
+                        summary.subject,
+                        summary.from_name,
+                        summary.from_addr,
+                        summary.date,
+                        summary.size.map(i64::from),
+                        i64::from(summary.seen),
+                        i64::from(summary.flagged),
+                    ],
+                )?;
+                Self::refresh_search_row(conn, &account_id, &folder, summary.uid)?;
+            }
+            Ok(())
+
+        })
     }
 
     /// Newest first, matching what the UI shows.
@@ -477,7 +503,10 @@ impl Cache {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<MessageSummary>> {
-        let mut stmt = self.conn.prepare(
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        let mut stmt = conn.prepare(
             "select uid, subject, from_name, from_addr, date, size, seen, flagged
              from messages
              where account_id = ?1 and folder = ?2
@@ -503,7 +532,10 @@ impl Cache {
     }
 
     pub fn summary_count(&self, account_id: &str, folder: &str) -> Result<u32> {
-        let count: i64 = self.conn.query_row(
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        let count: i64 = conn.query_row(
             "select count(*) from messages where account_id = ?1 and folder = ?2",
             params![account_id, folder],
             |row| row.get(0),
@@ -517,7 +549,10 @@ impl Cache {
     /// need a number immediately, and a round trip per refresh would make them lag the event they
     /// are reporting.
     pub fn unread_count(&self, account_id: &str) -> Result<u32> {
-        let count: i64 = self.conn.query_row(
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        let count: i64 = conn.query_row(
             "select count(*) from messages where account_id = ?1 and seen = 0",
             params![account_id],
             |row| row.get(0),
@@ -527,63 +562,76 @@ impl Cache {
 
     /// Reflect a flag change locally so the list does not disagree with the server.
     pub fn set_seen(&self, account_id: &str, folder: &str, uid: u32, seen: bool) -> Result<()> {
-        self.conn.execute(
-            "update messages set seen = ?4 where account_id = ?1 and folder = ?2 and uid = ?3",
-            params![account_id, folder, i64::from(uid), i64::from(seen)],
-        )?;
-        Ok(())
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+            conn.execute(
+                "update messages set seen = ?4 where account_id = ?1 and folder = ?2 and uid = ?3",
+                params![account_id, folder, i64::from(uid), i64::from(seen)],
+            )?;
+            Ok(())
+        })
     }
 
     /// Remove a message (deleted or moved) from the cache.
     pub fn delete_message(&self, account_id: &str, folder: &str, uid: u32) -> Result<()> {
-        self.conn.execute(
-            "delete from messages where account_id = ?1 and folder = ?2 and uid = ?3",
-            params![account_id, folder, i64::from(uid)],
-        )?;
-        self.conn.execute(
-            "delete from bodies where account_id = ?1 and folder = ?2 and uid = ?3",
-            params![account_id, folder, i64::from(uid)],
-        )?;
-        self.conn.execute(
-            "delete from search where account_id = ?1 and folder = ?2 and uid = ?3",
-            params![account_id, folder, i64::from(uid)],
-        )?;
-        Ok(())
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+            conn.execute(
+                "delete from messages where account_id = ?1 and folder = ?2 and uid = ?3",
+                params![account_id, folder, i64::from(uid)],
+            )?;
+            conn.execute(
+                "delete from bodies where account_id = ?1 and folder = ?2 and uid = ?3",
+                params![account_id, folder, i64::from(uid)],
+            )?;
+            conn.execute(
+                "delete from search where account_id = ?1 and folder = ?2 and uid = ?3",
+                params![account_id, folder, i64::from(uid)],
+            )?;
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------------ bodies
 
     /// Store a parsed message so it can be read again without touching the network.
     pub fn put_detail(&self, account_id: &str, folder: &str, detail: &MessageDetail) -> Result<()> {
-        let detail_json = serde_json::to_string(detail)
-            .map_err(|e| MailError::Cache(format!("序列化正文失败：{e}")))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        let detail = detail.clone();
+        self.db.write_blocking(move |conn: &Connection| {
+            let detail_json = serde_json::to_string(&detail)
+                .map_err(|e| MailError::Cache(format!("序列化正文失败：{e}")))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
 
-        self.conn.execute(
-            "insert into bodies (account_id, folder, uid, detail, fetched_at)
-             values (?1, ?2, ?3, ?4, ?5)
-             on conflict(account_id, folder, uid) do update set
-                 detail = excluded.detail, fetched_at = excluded.fetched_at",
-            params![account_id, folder, i64::from(detail.uid), detail_json, now],
-        )?;
-
-        // The summary table may not carry `to_addrs` yet (headers alone do not include it), and
-        // the body is where we learn it. Write it back so recipient search works.
-        if !detail.to.is_empty() {
-            let to_json = serde_json::to_string(&detail.to)
-                .map_err(|e| MailError::Cache(format!("序列化收件人失败：{e}")))?;
-            self.conn.execute(
-                "update messages set to_addrs = ?4
-                 where account_id = ?1 and folder = ?2 and uid = ?3",
-                params![account_id, folder, i64::from(detail.uid), to_json],
+            conn.execute(
+                "insert into bodies (account_id, folder, uid, detail, fetched_at)
+                 values (?1, ?2, ?3, ?4, ?5)
+                 on conflict(account_id, folder, uid) do update set
+                     detail = excluded.detail, fetched_at = excluded.fetched_at",
+                params![account_id, folder, i64::from(detail.uid), detail_json, now],
             )?;
-        }
 
-        self.refresh_search_row(account_id, folder, detail.uid)?;
-        Ok(())
+            // The summary table may not carry `to_addrs` yet (headers alone do not include it), and
+            // the body is where we learn it. Write it back so recipient search works.
+            if !detail.to.is_empty() {
+                let to_json = serde_json::to_string(&detail.to)
+                    .map_err(|e| MailError::Cache(format!("序列化收件人失败：{e}")))?;
+                conn.execute(
+                    "update messages set to_addrs = ?4
+                     where account_id = ?1 and folder = ?2 and uid = ?3",
+                    params![account_id, folder, i64::from(detail.uid), to_json],
+                )?;
+            }
+
+            Self::refresh_search_row(conn, &account_id, &folder, detail.uid)?;
+            Ok(())
+        })
     }
 
     pub fn get_detail(
@@ -592,8 +640,10 @@ impl Cache {
         folder: &str,
         uid: u32,
     ) -> Result<Option<MessageDetail>> {
-        let raw: Option<String> = self
-            .conn
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        let raw: Option<String> = conn
             .query_row(
                 "select detail from bodies where account_id = ?1 and folder = ?2 and uid = ?3",
                 params![account_id, folder, i64::from(uid)],
@@ -613,12 +663,15 @@ impl Cache {
 
     /// Local full-text search over headers (always) and bodies (for messages already read).
     pub fn search(&self, account_id: &str, query: &str, limit: u32) -> Result<Vec<SearchHit>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
         let expression = to_query(query);
         if expression.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
              from search
              join messages m using (account_id, folder, uid)
@@ -644,9 +697,18 @@ impl Cache {
     ///
     /// FTS5 has no upsert, so this deletes then inserts. Done inside the caller's flow rather than
     /// with triggers because the indexed text has to be transformed in Rust first.
-    fn refresh_search_row(&self, account_id: &str, folder: &str, uid: u32) -> Result<()> {
-        let row: Option<IndexSource> = self
-            .conn
+    /// Rebuild one FTS row **inside the caller's transaction**.
+    ///
+    /// An associated function taking `conn` rather than a `&self` method: a `&self` call from inside
+    /// a `write_blocking` closure would capture the handle and turn "one transaction per batch" back
+    /// into one per row (and would not compile, since the closure must be `'static`).
+    fn refresh_search_row(
+        conn: &Connection,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+    ) -> Result<()> {
+        let row: Option<IndexSource> = conn
             .query_row(
                 "select m.subject, m.from_name, m.from_addr, m.to_addrs, b.detail
                      from messages m
@@ -666,7 +728,7 @@ impl Cache {
             )
             .optional()?;
 
-        self.conn.execute(
+        conn.execute(
             "delete from search where account_id = ?1 and folder = ?2 and uid = ?3",
             params![account_id, folder, i64::from(uid)],
         )?;
@@ -683,7 +745,7 @@ impl Cache {
             .and_then(|detail| detail.body_text)
             .unwrap_or_default();
 
-        self.conn.execute(
+        conn.execute(
             "insert into search
                  (subject, from_name, from_addr, to_addrs, body, account_id, folder, uid)
              values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -835,12 +897,31 @@ mod tests {
     /// VACUUM), so the setting looks applied while `incremental_vacuum` keeps doing nothing.
     #[test]
     fn a_new_database_really_gets_incremental_auto_vacuum() {
-        let cache = Cache::open_in_memory().expect("open");
+        // A **file**, not `open_in_memory`: auto-vacuum lives in the database header, and an
+        // in-memory database has no header — it always reports 0, so testing it there would be
+        // testing nothing.
+        let (cache, path) = temp_cache("auto-vacuum");
         assert_eq!(
             cache.auto_vacuum_state().expect("state"),
             2,
             "auto_vacuum must read back as incremental (2), not 0 — the pragma has to precede DDL"
         );
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A cache in a temporary file, plus its path. File-backed because half of the storage
+    /// behaviour under test (auto-vacuum, freelist reclamation) does not exist in memory.
+    fn temp_cache(name: &str) -> (Cache, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-{name}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        (Cache::open(&path).expect("open"), path)
     }
 
     /// Deleting rows must hand pages back to the freelist, and the incremental vacuum must then
@@ -848,7 +929,7 @@ mod tests {
     /// UI's arithmetic.
     #[test]
     fn cleanup_frees_pages_and_incremental_vacuum_releases_them() {
-        let cache = Cache::open_in_memory().expect("open");
+        let (cache, path) = temp_cache("freelist");
         let chunky = "x".repeat(4096);
         for uid in 1..=400u32 {
             cache
@@ -857,10 +938,9 @@ mod tests {
         }
         let before = cache.freelist_bytes().expect("freelist");
 
-        cache
-            .conn
-            .execute("delete from messages", [])
-            .expect("delete the rows");
+        // Through the public API: the test is about what cleanup does to the file, not about the
+        // storage internals.
+        cache.forget_account("acc").expect("delete the rows");
         let freed = cache.freelist_bytes().expect("freelist after delete");
         assert!(
             freed > before,
@@ -873,30 +953,89 @@ mod tests {
             "an incremental vacuum must consume freelist pages on an auto-vacuum database \
              (freelist went {freed} pages -> {remaining})"
         );
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A cache from v0.2 must be *detected*, not silently left unable to reclaim space.
+    #[test]
+    fn an_old_cache_is_flagged_for_the_one_time_rebuild() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-needs-rebuild-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        {
+            let conn = Connection::open(&path).expect("legacy open");
+            conn.execute_batch(&format!(
+                "pragma auto_vacuum = none;
+                 pragma user_version = {SCHEMA_VERSION};
+                 create table messages (
+                     account_id text not null, folder text not null, uid integer not null,
+                     date integer, primary key (account_id, folder, uid)
+                 );"
+            ))
+            .expect("legacy schema");
+        }
+
+        let cache = Cache::open(&path).expect("open");
+        assert!(
+            cache.needs_auto_vacuum_rebuild().expect("check"),
+            "a v0.2 file must be flagged so the app can rebuild it once"
+        );
+        cache.rebuild_with_auto_vacuum().expect("rebuild");
+        assert!(!cache.needs_auto_vacuum_rebuild().expect("check"));
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The upgrade path for databases created before M0-7: the pragma cannot be enabled in place,
     /// so the only correct answer is a full rebuild — and the helper must be idempotent.
     #[test]
     fn an_old_database_can_be_rebuilt_into_auto_vacuum() {
-        // Simulate a v0.2 database: tables first, auto-vacuum left at its default.
-        let cache = Cache {
-            conn: Connection::open_in_memory().expect("open"),
-        };
-        cache
-            .conn
-            .execute_batch(
+        // Simulate a v0.2 database **as a file**: tables first, auto-vacuum left at its default.
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-legacy-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        {
+            let conn = Connection::open(&path).expect("legacy open");
+            // A realistic v0.2 shape: `pragma user_version` at the current value (so the migration
+            // is a no-op) and a `messages` table with the columns the schema's indexes need —
+            // otherwise `migrate` would fail on an index over missing columns, which is a different
+            // test than the one intended here.
+            conn.execute_batch(&format!(
                 "pragma auto_vacuum = none;
-                 create table messages (uid integer);",
-            )
+                 pragma user_version = {SCHEMA_VERSION};
+                 create table messages (
+                     account_id text not null,
+                     folder     text not null,
+                     uid        integer not null,
+                     date       integer,
+                     primary key (account_id, folder, uid)
+                 );"
+            ))
             .expect("legacy schema");
+        }
+
+        let cache = Cache::open(&path).expect("open the legacy file");
         assert_eq!(cache.auto_vacuum_state().expect("state"), 0);
 
         // Turning it on directly is silently ignored — that is the trap, so assert it rather than
         // trusting the documentation.
         cache
-            .conn
-            .execute_batch("pragma auto_vacuum = incremental;")
+            .db
+            .exec_blocking(|conn| {
+                conn.execute_batch("pragma auto_vacuum = incremental;")?;
+                Ok(())
+            })
             .expect("pragma");
         assert_eq!(
             cache.auto_vacuum_state().expect("state"),
@@ -911,6 +1050,8 @@ mod tests {
             .rebuild_with_auto_vacuum()
             .expect("rebuild is idempotent");
         assert_eq!(cache.auto_vacuum_state().expect("state"), 2);
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
     }
 
     fn mail_core_model_summary(uid: u32, subject: &str) -> crate::model::MessageSummary {
@@ -1109,11 +1250,24 @@ mod tests {
 
     #[test]
     fn a_cache_from_a_newer_schema_is_refused_rather_than_misread() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
-            .unwrap();
-        let cache = Cache { conn };
-        let error = cache.migrate().unwrap_err();
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-future-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let error = match Cache::open(&path) {
+            Ok(_) => panic!("a newer schema must not be opened"),
+            Err(error) => error,
+        };
         assert!(matches!(error, MailError::Cache(_)), "got {error:?}");
+        let _ = std::fs::remove_file(&path);
     }
 }

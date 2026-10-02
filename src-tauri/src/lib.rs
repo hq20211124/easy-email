@@ -35,14 +35,14 @@ struct AppState {
     /// Where the non-secret account list is persisted.
     accounts_path: PathBuf,
     accounts: Mutex<Vec<AccountConfig>>,
-    /// Where the cache database lives.
+    /// The open cache handle, shared by every command.
     ///
-    /// The **path**, not an open connection: `rusqlite::Connection` is `!Sync`, so an open
-    /// connection in shared state touched from an `async` command would make that command's future
-    /// non-`Send`. A `tokio` mutex does not help either — its guard is only `Send` when the guarded
-    /// type is `Sync`. Each command therefore opens a connection for its synchronous phases and
-    /// drops it before awaiting.
-    cache_path: PathBuf,
+    /// A handle rather than a bare connection (and rather than a path): `Cache` is `Clone + Send +
+    /// Sync` because it owns a [`mail_core::db::Db`] — one writer thread plus a pool of readers — so
+    /// an `async` command can hold it across an `.await` without its future becoming non-`Send`.
+    /// Cloning it per command is what removed v0.2's "one SQLite connection per command, one implicit
+    /// transaction per row" shape.
+    cache: Cache,
     /// Why the last attempt to refresh from the server failed, if it did.
     ///
     /// Exists so the UI can say "showing cached mail" instead of silently presenting data of
@@ -204,10 +204,7 @@ async fn delete_account(state: State<'_, AppState>, account_id: String) -> Resul
     state.pool.clear(&account_id);
     // The cache is keyed by account id and would otherwise sit there forever. A failure here is
     // logged rather than returned: it must not block removing the account.
-    if let Err(error) = Cache::open(&state.cache_path)
-        .map_err(describe)?
-        .forget_account(&account_id)
-    {
+    if let Err(error) = state.cache.clone().forget_account(&account_id) {
         log_line(&format!("[easy-email] 清理账号缓存失败：{error}"));
     }
     Ok(())
@@ -233,16 +230,13 @@ async fn verify_account(
 /// whatever is on disk and surface [`AppState::last_sync_error`] when it fails.
 async fn refresh_folder(
     pool: &ConnectionPool,
-    cache_path: &Path,
+    cache: &Cache,
     cfg: &AccountConfig,
     mailbox: &str,
 ) -> Result<SyncOutcome, String> {
     // Reuse the display name and delimiter we already know; only ask the server for `LIST` when
     // this folder has never been seen, so a normal refresh costs no extra round trip.
-    let known = Cache::open(cache_path)
-        .map_err(describe)?
-        .get_folder(&cfg.id, mailbox)
-        .map_err(describe)?;
+    let known = cache.get_folder(&cfg.id, mailbox).map_err(describe)?;
 
     let info = match known {
         Some(info) => info,
@@ -258,10 +252,7 @@ async fn refresh_folder(
                 .find(|m| m.name == mailbox)
                 .ok_or_else(|| format!("服务器上找不到文件夹「{mailbox}」"))?;
             // Record it with a zero generation; the sync below reports the real one.
-            Cache::open(cache_path)
-                .map_err(describe)?
-                .upsert_folder(&cfg.id, &found, 0)
-                .map_err(describe)?;
+            cache.upsert_folder(&cfg.id, &found, 0).map_err(describe)?;
             found
         }
     };
@@ -273,14 +264,10 @@ async fn refresh_folder(
     // `SyncDriver::start` re-reads the cursor, so a half-applied first attempt is simply resumed.
     // Everything here works in `mail_core::Result`, so `?` maps nothing.
     let outcome = pool_op!(pool, cfg, &password, |client| {
-        let mut driver = {
-            let cache = Cache::open(cache_path)?;
-            SyncDriver::start(&cache, &cfg.id, &info)?
-        };
+        let mut driver = SyncDriver::start(cache, &cfg.id, &info)?;
         loop {
             let page = driver.execute(&mut client).await?;
-            let cache = Cache::open(cache_path)?;
-            if let Some(outcome) = driver.absorb(&cache, &page)? {
+            if let Some(outcome) = driver.absorb(cache, &page)? {
                 break Ok(outcome);
             }
             // A generation change: the folder was discarded and the driver wants a fresh window.
@@ -318,7 +305,7 @@ async fn list_mailboxes(
         Ok(mailboxes) => {
             // Take the opportunity to record the folder list, so an offline start still has one.
             // Every phase that touches the cache opens its own short-lived connection.
-            let cache = Cache::open(&state.cache_path).map_err(describe)?;
+            let cache = state.cache.clone();
             for mailbox in &mailboxes {
                 let generation = cache
                     .folder_state(&cfg.id, &mailbox.name)
@@ -332,8 +319,9 @@ async fn list_mailboxes(
         }
         Err(error) => {
             // Offline: serve the folder list from the last successful `LIST`.
-            let cached = Cache::open(&state.cache_path)
-                .map_err(describe)?
+            let cached = state
+                .cache
+                .clone()
                 .list_folders(&cfg.id)
                 .map_err(describe)?;
             if cached.is_empty() {
@@ -360,13 +348,14 @@ async fn list_messages(
     // Guard against a caller asking for the whole mailbox; the UI pages at 50.
     let limit = limit.clamp(1, 500);
 
-    let sync_failure = refresh_folder(&state.pool, &state.cache_path, &cfg, &mailbox)
+    let sync_failure = refresh_folder(&state.pool, &state.cache, &cfg, &mailbox)
         .await
         .err();
     *state.last_sync_error.lock().expect("sync error mutex") = sync_failure.clone();
 
-    let cached = Cache::open(&state.cache_path)
-        .map_err(describe)?
+    let cached = state
+        .cache
+        .clone()
         .list_summaries(&account_id, &mailbox, limit as u32, 0)
         .map_err(describe)?;
 
@@ -392,8 +381,9 @@ async fn fetch_message(
     // Cache first: a message that has been read once is readable again with no round trip, and
     // remains readable offline. This is also what makes the day-1 case slow and every later one
     // instant.
-    if let Some(detail) = Cache::open(&state.cache_path)
-        .map_err(describe)?
+    if let Some(detail) = state
+        .cache
+        .clone()
         .get_detail(&account_id, &mailbox, uid)
         .map_err(describe)?
     {
@@ -409,8 +399,9 @@ async fn fetch_message(
     })
     .map_err(describe)?;
 
-    Cache::open(&state.cache_path)
-        .map_err(describe)?
+    state
+        .cache
+        .clone()
         .put_detail(&account_id, &mailbox, &detail)
         .map_err(describe)?;
     Ok(detail)
@@ -425,7 +416,7 @@ async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<S
         .expect("sync error mutex")
         .clone();
     let cached_total = {
-        let cache = Cache::open(&state.cache_path).map_err(describe)?;
+        let cache = state.cache.clone();
         let folders = cache.list_folders(&account_id).map_err(describe)?;
         let mut total = 0;
         for folder in folders {
@@ -451,8 +442,9 @@ async fn search_messages(
     limit: usize,
 ) -> Result<Vec<SearchHit>, String> {
     let limit = limit.clamp(1, 200) as u32;
-    let hits = Cache::open(&state.cache_path)
-        .map_err(describe)?
+    let hits = state
+        .cache
+        .clone()
         .search(&account_id, &query, limit)
         .map_err(describe)?;
     log_line(&format!(
@@ -488,8 +480,9 @@ async fn mark_seen(
 
     // Mirror it locally, or the cached list keeps showing the old flag next time it is opened
     // offline and the UI disagrees with the server.
-    Cache::open(&state.cache_path)
-        .map_err(describe)?
+    state
+        .cache
+        .clone()
         .set_seen(&account_id, &mailbox, uid, seen)
         .map_err(describe)?;
     Ok(())
@@ -511,8 +504,9 @@ async fn delete_message(
     .map_err(describe)?;
 
     // Drop it from the cache as well, so a deleted message cannot reappear from disk.
-    Cache::open(&state.cache_path)
-        .map_err(describe)?
+    state
+        .cache
+        .clone()
         .delete_message(&account_id, &mailbox, uid)
         .map_err(describe)?;
     Ok(())
@@ -557,7 +551,7 @@ fn start_watcher(
 ) -> Result<(), String> {
     let password = password_for(&cfg.id)?;
     let pool = Arc::clone(&state.pool);
-    let cache_path = state.cache_path.clone();
+    let cache = state.cache.clone();
     let account_id = cfg.id.clone();
 
     stop_watcher(state, &account_id);
@@ -580,9 +574,9 @@ fn start_watcher(
             match event {
                 PushEvent::Changed { mailbox } => {
                     // Sync on a *different* pooled connection; the IDLE connection stays idle.
-                    match refresh_folder(&pool, &cache_path, &cfg, &mailbox).await {
+                    match refresh_folder(&pool, &cache, &cfg, &mailbox).await {
                         Ok(outcome) if outcome.fetched > 0 => {
-                            announce(&app, &cfg, &mailbox, &cache_path, &outcome);
+                            announce(&app, &cfg, &mailbox, &cache, &outcome);
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -663,12 +657,10 @@ fn announce(
     app: &AppHandle,
     cfg: &AccountConfig,
     mailbox: &str,
-    cache_path: &Path,
+    cache: &Cache,
     outcome: &SyncOutcome,
 ) {
-    let unread = Cache::open(cache_path)
-        .and_then(|cache| cache.unread_count(&cfg.id))
-        .unwrap_or(0);
+    let unread = cache.unread_count(&cfg.id).unwrap_or(0);
 
     log_line(&format!(
         "[easy-email] 推送：{} 的 {mailbox} 新增 {} 封（未读 {}）",
@@ -1055,18 +1047,45 @@ pub fn run() {
                 }
             };
 
-            // Prove the cache can be opened before the window comes up, but do not keep the
-            // connection: a corrupt or locked database must not stop the app, because it would be a
-            // mail client that refuses to start over its own scratch data, and the connection
-            // cannot be shared across `async` commands anyway.
-            if let Err(e) = Cache::open(&cache_path) {
-                log_line(&format!("[easy-email] 本地缓存不可用：{e}"));
+            // Open the cache **once** and keep the handle. It owns a writer thread and a read pool,
+            // and it is `Clone + Send + Sync`, so `async` commands share it instead of opening a
+            // connection each (v0.2's shape: one connection per command, one implicit transaction per
+            // row).
+            //
+            // A failure here must not stop the app: a mail client that refuses to start over its own
+            // scratch data is worse than one running without a cache. The commands that need it
+            // report the failure themselves.
+            let cache = match Cache::open(&cache_path) {
+                Ok(cache) => cache,
+                Err(e) => {
+                    log_line(&format!("[easy-email] 本地缓存不可用：{e}"));
+                    // Fall back to an in-memory cache: the app runs, nothing persists, and every
+                    // command that reads mail reports "no cached mail" rather than hanging.
+                    Cache::open_in_memory().expect("in-memory cache must be available")
+                }
+            };
+
+            // A cache created before the auto-vacuum pragma cannot reclaim space: SQLite only
+            // accepts the setting on an empty database, so "cleanup freed 200 MB" would be a lie on
+            // disk. Detect it and rebuild **in the background** — a full `VACUUM` rewrites the file,
+            // which must not happen before the window opens (and the design asks for it to be
+            // explicit rather than hidden; the result is logged either way).
+            if cache.needs_auto_vacuum_rebuild().unwrap_or(false) {
+                let rebuild = cache.clone();
+                std::thread::spawn(move || {
+                    // `std::thread`, not `tokio::spawn`: this can run before the runtime exists, and
+                    // `Db::exec_blocking` parks this thread rather than a runtime worker.
+                    match rebuild.rebuild_with_auto_vacuum() {
+                        Ok(()) => log_line("[easy-email] 已为老缓存启用 incremental auto-vacuum"),
+                        Err(e) => log_line(&format!("[easy-email] 老缓存重建失败：{e}")),
+                    }
+                });
             }
 
             app.manage(AppState {
                 accounts_path,
                 accounts: Mutex::new(accounts),
-                cache_path,
+                cache,
                 last_sync_error: Mutex::new(None),
                 pool: Arc::new(ConnectionPool::new()),
                 watchers: Mutex::new(HashMap::new()),
