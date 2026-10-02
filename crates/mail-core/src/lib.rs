@@ -40,7 +40,7 @@ pub use model::{
 };
 pub use pool::{ConnectionPool, PooledClient};
 pub use providers::Provider;
-pub use sync::{Fetch, SyncDriver, SyncOutcome};
+pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
 
 /// Build a ready-to-use account from a provider preset.
 ///

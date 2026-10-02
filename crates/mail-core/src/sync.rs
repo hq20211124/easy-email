@@ -32,7 +32,7 @@
 //!
 //! `src-tauri` and the loopback tests both drive it this way, so the tested path is the shipped one.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
 use crate::error::Result;
@@ -44,6 +44,99 @@ use crate::model::MailboxInfo;
 /// Headers only, so this is on the order of a few hundred kilobytes. History beyond this is not
 /// cached yet — see the note in README about what search can and cannot see.
 pub const INITIAL_SYNC: usize = 500;
+
+/// How much of a mailbox the user asked us to keep.
+///
+/// This is the answer to the honest question "how far back should this client go?", and it is the
+/// user's to make: a 15-year archive is gigabytes and days of downloading, while somebody who only
+/// wants this year's mail should not pay for either. The design defaults to
+/// [`SyncWindow::Years(2)`] (`design/04` §3, decision P9) because it fits in a reasonable download
+/// budget while still covering "I need that invoice from last spring".
+///
+/// `Count` and `Years` bound how far back a *backfill* walks; `All` is the same walk with no bound,
+/// so it is only as fast as the server and the daily byte budget allow — which is why the quota
+/// ledger exists (`design/04` §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `tag` + `content`, not `tag` alone: a newtype variant (`Years(u16)`) cannot be serialised with
+// internal tagging — serde rejects it at *run time*, not at compile time. The JSON is
+// `{"kind":"years","value":2}`, which is also what the frontend sends back.
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SyncWindow {
+    /// Everything the server has.
+    All,
+    /// The last `n` years, judged by each message's own date.
+    Years(u16),
+    /// The newest `n` messages per folder.
+    Count(u32),
+    /// Nothing beyond what the user opens; bodies and older headers arrive on demand only.
+    OnDemand,
+}
+
+impl Default for SyncWindow {
+    fn default() -> Self {
+        // P9: the balance between "usable on day one" and "does not download my life".
+        Self::Years(2)
+    }
+}
+
+impl SyncWindow {
+    /// How many years back this window reaches, as a timestamp, if it is year-bounded.
+    ///
+    /// `now` is passed in rather than read from the clock so the behaviour is testable.
+    pub fn since_timestamp(self, now: i64) -> Option<i64> {
+        match self {
+            Self::Years(years) => Some(now - i64::from(years) * 365 * 24 * 60 * 60),
+            _ => None,
+        }
+    }
+
+    /// How many messages per folder this window keeps, if it is count-bounded.
+    pub fn max_messages(self) -> Option<u32> {
+        match self {
+            Self::Count(n) => Some(n),
+            // `OnDemand` keeps nothing unopened: the list still needs its first page, and one page is
+            // what the user will actually look at.
+            Self::OnDemand => Some(INITIAL_SYNC as u32),
+            _ => None,
+        }
+    }
+
+    /// Whether this message is old enough to fall outside the window.
+    ///
+    /// A message with no date is **kept**: treating "unknown" as "too old" would hide real mail, and
+    /// the only cost of keeping it is one header row.
+    pub fn is_outside(self, date: Option<i64>, now: i64) -> bool {
+        match (self.since_timestamp(now), date) {
+            (Some(since), Some(date)) => date < since,
+            _ => false,
+        }
+    }
+
+    /// The stored form: one short string, because it lives in a `kv` row a human may inspect.
+    pub fn as_key(self) -> String {
+        match self {
+            Self::All => "all".to_string(),
+            Self::Years(years) => format!("years:{years}"),
+            Self::Count(n) => format!("count:{n}"),
+            Self::OnDemand => "on_demand".to_string(),
+        }
+    }
+
+    /// Parse [`SyncWindow::as_key`]. An unreadable value falls back to the default rather than
+    /// failing: a corrupt preference must not stop the app from syncing.
+    pub fn from_key(raw: &str) -> Self {
+        let raw = raw.trim();
+        let (head, tail) = raw.split_once(':').unwrap_or((raw, ""));
+        let number = tail.trim().parse::<u32>().ok();
+        match (head, number) {
+            ("all", _) => Self::All,
+            ("years", Some(n)) if (1..=100).contains(&n) => Self::Years(n as u16),
+            ("count", Some(n)) if n > 0 => Self::Count(n),
+            ("on_demand", _) => Self::OnDemand,
+            _ => Self::default(),
+        }
+    }
+}
 
 /// Upper bound on how many new headers one incremental pass will store.
 const SYNC_BATCH: usize = 500;
@@ -191,6 +284,116 @@ fn advance_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================== sync window (M1a-3)
+
+    #[test]
+    fn the_default_window_is_two_years() {
+        // P9. If this ever changes, the README's "what does it download on day one" answer changes too.
+        assert_eq!(SyncWindow::default(), SyncWindow::Years(2));
+    }
+
+    #[test]
+    fn a_year_window_turns_into_a_timestamp() {
+        let now = 1_700_000_000i64;
+        assert_eq!(
+            SyncWindow::Years(2).since_timestamp(now),
+            Some(now - 2 * 365 * 24 * 60 * 60)
+        );
+        assert_eq!(SyncWindow::All.since_timestamp(now), None);
+        assert_eq!(SyncWindow::Count(10).since_timestamp(now), None);
+    }
+
+    #[test]
+    fn outside_the_window_means_older_than_the_cutoff_only() {
+        let now = 1_700_000_000i64;
+        let window = SyncWindow::Years(2);
+        let cutoff = window.since_timestamp(now).expect("cutoff");
+
+        assert!(
+            window.is_outside(Some(cutoff - 1), now),
+            "a day older is outside"
+        );
+        assert!(
+            !window.is_outside(Some(cutoff + 1), now),
+            "a day newer is inside"
+        );
+        assert!(
+            !window.is_outside(None, now),
+            "an unknown date must be kept: calling it 'too old' would hide real mail"
+        );
+    }
+
+    #[test]
+    fn every_window_survives_a_round_trip_through_its_stored_form() {
+        for window in [
+            SyncWindow::All,
+            SyncWindow::Years(2),
+            SyncWindow::Years(15),
+            SyncWindow::Count(5_000),
+            SyncWindow::OnDemand,
+        ] {
+            let key = window.as_key();
+            assert_eq!(
+                SyncWindow::from_key(&key),
+                window,
+                "round trip failed for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_window_survives_json_in_both_directions() {
+        // The commands hand these to the webview as JSON. A newtype variant with internal tagging
+        // compiles fine and then fails at runtime, so the shape is pinned here.
+        for window in [
+            SyncWindow::All,
+            SyncWindow::Years(2),
+            SyncWindow::Count(5_000),
+            SyncWindow::OnDemand,
+        ] {
+            let json = serde_json::to_string(&window).expect("serialise");
+            let back: SyncWindow = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(back, window, "round trip failed for {json}");
+        }
+        assert_eq!(
+            serde_json::to_string(&SyncWindow::Years(2)).expect("serialise"),
+            r#"{"kind":"years","value":2}"#,
+            "the wire shape is part of the frontend contract"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_stored_window_falls_back_to_the_default() {
+        // A preference is not worth refusing to sync over.
+        for bad in [
+            "",
+            "years:",
+            "years:0",
+            "years:9999",
+            "count:0",
+            "wat",
+            "навсегда",
+        ] {
+            assert_eq!(
+                SyncWindow::from_key(bad),
+                SyncWindow::default(),
+                "{bad:?} must fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn on_demand_still_keeps_one_page() {
+        assert_eq!(
+            SyncWindow::OnDemand.max_messages(),
+            Some(INITIAL_SYNC as u32),
+            "the list needs something to show even when nothing is prefetched"
+        );
+        assert_eq!(SyncWindow::Years(2).max_messages(), None);
+        assert_eq!(SyncWindow::Count(7).max_messages(), Some(7));
+    }
+
     use crate::model::MessageSummary;
 
     fn summary(uid: u32) -> MessageSummary {

@@ -22,7 +22,7 @@ extern crate mail_core;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, ConnectionReport, MailError, MailboxInfo, MessageDetail,
     MessageSummary, OutgoingAttachment, OutgoingMail, PushEvent, SearchHit, SyncDriver,
-    SyncOutcome, account_with_login, secret, userdb::UserStore, watch,
+    SyncOutcome, SyncWindow, account_with_login, secret, userdb::UserStore, watch,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -470,6 +470,24 @@ async fn fetch_message(
         .put_detail(&account_id, &mailbox, &detail)
         .map_err(describe)?;
     Ok(detail)
+}
+
+/// The sync window the user chose (how far back the client keeps mail).
+#[tauri::command]
+async fn get_sync_window(state: State<'_, AppState>) -> Result<SyncWindow, String> {
+    state.user.sync_window().map_err(describe)
+}
+
+/// Remember a new sync window. The next sync honours it; nothing already cached is deleted.
+///
+/// Deliberately **not** destructive: narrowing the window stops future backfill, it does not wipe
+/// mail the user may still be reading. Reclaiming space is a separate, explicit action
+/// (`design/03` §5.4).
+#[tauri::command]
+async fn set_sync_window(state: State<'_, AppState>, window: SyncWindow) -> Result<(), String> {
+    state.user.set_sync_window(window).map_err(describe)?;
+    log_line(&format!("[easy-email] 同步窗口改为 {}", window.as_key()));
+    Ok(())
 }
 
 /// Why the last server refresh failed, and how much is cached. Drives the "offline" notice.
@@ -1244,6 +1262,8 @@ pub fn run() {
             verify_account,
             list_mailboxes,
             list_messages,
+            get_sync_window,
+            set_sync_window,
             load_more_messages,
             fetch_message,
             mark_seen,

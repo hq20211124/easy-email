@@ -15,9 +15,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::db::{Db, DbKind, DbOptions};
 use crate::error::Result;
+use crate::sync::SyncWindow;
 
 /// Schema version of `user.db`. Bump when the statements in [`UserStore::migrate`] change.
 pub const USER_SCHEMA_VERSION: i64 = 1;
+
+/// `kv` key holding the chosen sync window.
+pub const SYNC_WINDOW_KEY: &str = "sync_window";
 
 /// Tables this database owns, in the order the diagnostics screen lists them.
 pub const USER_TABLES: &[&str] = &["schema_migrations", "kv", "drafts", "outbox", "pending_ops"];
@@ -111,6 +115,22 @@ impl UserStore {
             )?;
             Ok(())
         })
+    }
+
+    /// The sync window the user chose, or the default when they never chose one.
+    ///
+    /// Stored in `user.db` rather than the cache on purpose: it is a preference, and re-downloading a
+    /// mailbox because a cache file was deleted is exactly the surprise this split exists to avoid.
+    pub fn sync_window(&self) -> Result<SyncWindow> {
+        Ok(self
+            .kv_get(SYNC_WINDOW_KEY)?
+            .map(|raw| SyncWindow::from_key(&raw))
+            .unwrap_or_default())
+    }
+
+    /// Remember the user's choice.
+    pub fn set_sync_window(&self, window: SyncWindow) -> Result<()> {
+        self.kv_set(SYNC_WINDOW_KEY, &window.as_key())
     }
 
     /// How many drafts are stored. Used by the UI's "drafts (2)" badge and by tests.
@@ -288,6 +308,29 @@ mod tests {
              cache stays NORMAL (1)"
         );
         drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_sync_window_defaults_to_two_years_and_is_remembered() {
+        let path = temp_path("window");
+        let store = UserStore::open(&path).expect("open");
+        assert_eq!(
+            store.sync_window().expect("window"),
+            SyncWindow::default(),
+            "a fresh install must not download fifteen years of mail"
+        );
+
+        store
+            .set_sync_window(SyncWindow::Years(5))
+            .expect("set window");
+        assert_eq!(store.sync_window().expect("window"), SyncWindow::Years(5));
+        drop(store);
+
+        // And it survives a restart, because it lives in the user database.
+        let again = UserStore::open(&path).expect("reopen");
+        assert_eq!(again.sync_window().expect("window"), SyncWindow::Years(5));
+        drop(again);
         let _ = std::fs::remove_file(&path);
     }
 
