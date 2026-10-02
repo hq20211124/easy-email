@@ -150,6 +150,24 @@ curl -s -X POST https://oauth2.googleapis.com/token \
 剩下的 M1a 部分：可配同步窗口（`design/04` 的 `SyncWindow`，让"最近 2 年/全部"真的可选）、
 `user.db` 落地（草稿/发件箱/规则/联系人）、认证轴、会话串、通知托盘、安装包。
 
+### M1a-2 `user.db` 落地 ✅（第 7 轮）
+`design/03` §3.1 的 D4 决定（**双库分家**）现在在磁盘上成立了，而不只是文档里：
+- 新模块 `crates/mail-core/src/userdb.rs`（`UserStore`）：表 `schema_migrations` / `kv` / `drafts` /
+  `outbox` / `pending_ops`；迁移全程一个事务（版本号必须描述一套完整 schema）。
+- `outbox` 的 `undo_until` / `scheduled_at` / `next_attempt_at` 都是 **NOT NULL DEFAULT 0** ——
+  第二轮评审实测过 `null <= now` 恒为 NULL，可空列会让待发送邮件永远取不到。
+- `src-tauri`：启动时同时打开两个句柄（各自失败都不拦启动，退回内存实现），`AppState.user`；
+  `sync_status` 增加 `drafts` / `pending_ops` 计数。
+- **真机验证**：`%APPDATA%\com.easyemail.desktop\user.db` 已生成 —— `user_version=1`、
+  **`synchronous=2 (FULL)`**、五个表齐全；而 `cache.db` 仍是 `NORMAL`（1）。
+  这正是"草稿/待发送不能因掉电丢、缓存可以重建"这条设计在磁盘上的体现。
+- 测试 **140**（新增 4 条）；`check.ps1` 全绿；启动冒烟 8 秒存活。
+
+**M1a 剩下的部分**（下一轮起）：
+1. 可配同步窗口（`SyncWindow`：全部 / 最近 N 年 / 最近 N 封），落进 `user.db` 的 `kv`（键 `sync_window`）。
+2. 草稿与发件箱：`drafts` / `outbox` 表已就位，接写信与发送流程（含撤销窗口、定时、重试）。
+3. 认证轴（`AuthMethod` + 授权码/应用专用密码文案，P2 已拍板）、会话串、通知托盘、安装包与自动更新。
+
 ## 下一步（M0 只剩两个被外部条件卡住的项，主线转到 M1a）
 
 **M0 收口情况**：M0-1/2/3/4/5/7 **已完成且全绿**；M0-6（WinAppSDK 通知）与 M0-8（OAuth 端点探测）
