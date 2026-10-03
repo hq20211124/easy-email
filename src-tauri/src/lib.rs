@@ -958,6 +958,76 @@ async fn set_notify_enabled(
         .set_notify_enabled(&account_id, enabled)
         .map_err(describe)
 }
+/// Refresh tokens live beside the account list, in their own subdirectory.
+///
+/// Derived from `accounts_path` rather than stored as a second field: two paths that must agree are
+/// two chances to disagree, and the account list is already in the directory the tokens belong to.
+fn token_store(state: &AppState) -> std::result::Result<mail_core::tokenstore::TokenStore, String> {
+    let dir = state
+        .accounts_path
+        .parent()
+        .ok_or_else(|| "无法确定数据目录，OAuth 令牌无处保存".to_string())?;
+    Ok(mail_core::tokenstore::TokenStore::new(dir))
+}
+
+/// One HTTP client per sign-in: the flow happens once, by hand, and a pooled client kept alive for it
+/// would be a connection to a token endpoint that nobody is using.
+fn http_tokens() -> std::result::Result<mail_core::oauth::HttpTokens, String> {
+    mail_core::oauth::HttpTokens::new().map_err(describe)
+}
+/// Sign in with OAuth and stow the refresh token.
+///
+/// The wizard calls this when the address belongs to a provider that requires OAuth (Google, Microsoft)
+/// and the user has supplied their own client id — M0-8's open question is whether the token endpoint
+/// also demands a `client_secret`, so that is a parameter rather than an assumption.
+///
+/// The whole protocol lives in `mail_core::oauth`; this function only supplies the three things the
+/// library cannot know: the account's identity, the app's data directory, and the provider's id.
+#[tauri::command]
+async fn oauth_sign_in(
+    state: State<'_, AppState>,
+    email: String,
+    provider_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+) -> Result<mail_core::oauth::TokenSet, String> {
+    let provider = match provider_id.as_str() {
+        "gmail" => mail_core::oauth::GOOGLE,
+        "outlook" => mail_core::oauth::MICROSOFT,
+        other => {
+            return Err(format!("{other} 不支持 OAuth 登录，请使用密码或授权码。"));
+        }
+    };
+
+    // 120 seconds: the user has to find the browser, pick an account, and consent. Long enough to be
+    // usable, short enough that a window left open does not hold a listening socket for ever.
+    let tokens = mail_core::oauth::sign_in(
+        &http_tokens()?,
+        &mail_core::oauth::SystemBrowser,
+        provider,
+        &client_id,
+        client_secret.as_deref(),
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .map_err(describe)?;
+
+    // A1-F34: a refresh token that is not persisted signs the user out at the next launch — and with
+    // Microsoft's rotation, it also invalidates the one we would otherwise have kept.
+    match tokens.refresh_token.as_deref() {
+        Some(refresh) => {
+            token_store(&state)?
+                .save(&email, refresh)
+                .map_err(describe)?;
+            log_line(&format!("[easy-email] {email} 的 OAuth 刷新令牌已保存"));
+        }
+        None => log_line(&format!(
+            "[easy-email] {email} 的 OAuth 登录没有返回刷新令牌（access_type/prompt 可能没生效）"
+        )),
+    }
+
+    Ok(tokens)
+}
 /// What the account has downloaded today, and what it is allowed to (`design/04` §5.7).
 ///
 /// The ledger decides when the sync stops; this is the same number, shown to the user. Without it the
@@ -2193,6 +2263,7 @@ pub fn run() {
             set_notify_enabled,
             refresh_thread_keys,
             quota_status,
+            oauth_sign_in,
             enqueue_send,
             list_outbox,
             cancel_send,

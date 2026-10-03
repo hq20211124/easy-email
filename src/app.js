@@ -2343,6 +2343,20 @@ function openAccountWizard() {
         <input id="wiz-name" placeholder="张三" autocomplete="off" spellcheck="false" />
       </div>
     </div>
+    <!--
+      OAuth sign-in, shown only for the providers that require it (design/05 §3.1). The client id is
+      a field rather than a constant because M0-8 is still open: whether Google accepts a desktop
+      client without a secret has to be answered against the real endpoint, and until then the honest
+      shape is "bring your own registration" — which is also what the design's BYO wizard anticipates.
+    -->
+    <div id="wiz-oauth" class="field" hidden>
+      <label>OAuth 登录（可选，推荐）</label>
+      <input id="wiz-client-id" placeholder="你的 OAuth 客户端 ID（client_id）" autocomplete="off" spellcheck="false" />
+      <input id="wiz-client-secret" placeholder="客户端密钥（只有在服务商要求时填）" autocomplete="off" spellcheck="false" />
+      <span class="hint">这类邮箱不能只用密码登录。点下面的按钮会在**系统浏览器**里完成授权，
+        我们只拿到一个可撤销的授权码，密码不经过我们。</span>
+      <button id="wiz-oauth-go" class="btn" type="button">在浏览器里登录</button>
+    </div>
     <div id="wiz-detected" class="detected" hidden></div>
     <div id="wiz-note" class="callout" hidden></div>
     <div class="field">
@@ -2441,6 +2455,50 @@ function openAccountWizard() {
     const detected = modal.querySelector('#wiz-detected');
     const note = modal.querySelector('#wiz-note');
 
+    // The OAuth block appears exactly for the accounts that cannot sign in with a password: showing it
+    // for a QQ account would offer a flow that does not exist for it, and hiding it for Gmail would
+    // leave the user typing a password that can never work (`design/05` §3.1).
+    const oauth = modal.querySelector('#wiz-oauth');
+    const oauthEligible = provider.auth === 'oauth2';
+    oauth.hidden = !oauthEligible;
+    const go = modal.querySelector('#wiz-oauth-go');
+    if (oauthEligible && !go.dataset.wired) {
+      go.dataset.wired = '1';
+      go.addEventListener('click', async () => {
+        const address = emailInput.value.trim();
+        if (!address) {
+          toast('先填邮箱地址', 'err');
+          return;
+        }
+        const clientId = modal.querySelector('#wiz-client-id').value.trim();
+        if (!clientId) {
+          toast('这类邮箱需要你自己的 OAuth 客户端 ID（见上方说明）', 'err', 9000);
+          return;
+        }
+        const secret = modal.querySelector('#wiz-client-secret').value.trim();
+
+        toast('已打开系统浏览器，请在其中完成登录（两分钟内）', 'info', 9000);
+        const tokens = await run('OAuth 登录', () =>
+          invoke('oauth_sign_in', {
+            email: address,
+            providerId: provider.id,
+            clientId,
+            clientSecret: secret || null,
+          })
+        );
+        if (!tokens) return;
+
+        // The refresh token is already stored by the backend (A1-F34); the wizard only has to say so.
+        toast(
+          tokens.refresh_token
+            ? '登录成功，授权已保存。现在填邮箱密码的位置可以留空，直接点「验证并保存」。'
+            : '登录成功了，但服务商没有返回刷新令牌 —— 下次启动可能需要重新登录。',
+          'ok',
+          12000
+        );
+      });
+    }
+
     detected.hidden = false;
     detected.innerHTML = `
       <div><span class="k">IMAP</span><span class="mono">${escapeHtml(provider.imap_host)}:${
@@ -2451,7 +2509,7 @@ function openAccountWizard() {
       } (${provider.smtp_security})</span></div>
       <div><span class="k">认证</span>${
         provider.auth === 'oauth2'
-          ? '<strong>需要 OAuth2（当前版本尚不支持）</strong>'
+          ? '<strong>需要 OAuth2</strong>（用下面的按钮登录，或填应用专用密码）'
           : provider.auth === 'app_password'
             ? '需要授权码 / 应用专用密码'
             : '邮箱登录密码'
