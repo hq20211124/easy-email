@@ -131,8 +131,10 @@
   // command body runs, so a wrong field name fails with "missing field" and a correct one fails
   // with "找不到账号" — the second is the proof, and no SMTP connection is ever attempted.
   // This is the exact bug M1a-7 fixed: the composer sent `bodyText`, so every send failed with
-  // `missing field \`body_text\`` while the 发送 button looked perfectly wired.
-  const sendError = await invoke('send_mail', {
+  // `missing field \`body_text\`` while the 发送 button looked perfectly wired. M1a-9 moved the
+  // composer onto `enqueue_send`, which takes the same `OutgoingMail`, so the contract is the same
+  // one — and this probe is what keeps a future edit from quietly changing it.
+  const sendError = await invoke('enqueue_send', {
     accountId: 'dsh-no-such-account',
     mail: outgoingMail({
       to: ['nobody@example.com'],
@@ -141,6 +143,8 @@
       references: [],
       attachments: [],
     }),
+    draftId: null,
+    undoSeconds: 5,
   }).then(
     () => '',
     (error) => errText(error)
@@ -153,7 +157,7 @@
 
   // The falsification half: the shape v0.1 actually sent must still be refused. If this one is
   // accepted, the check above is not checking anything.
-  const oldShapeError = await invoke('send_mail', {
+  const oldShapeError = await invoke('enqueue_send', {
     accountId: 'dsh-no-such-account',
     mail: {
       to: ['nobody@example.com'],

@@ -31,6 +31,14 @@ const SEARCH_DEBOUNCE_MS = 250;
 /** Typing pause before the open composer writes itself to `user.db` (design/07 §3). */
 const DRAFT_AUTOSAVE_MS = 2000;
 
+/**
+ * How long a queued message can still be called back before the worker sends it (design/07 §5.2).
+ *
+ * The same number the backend defaults to, and shown to the user while it counts down: an undo that
+ * has already silently expired would be worse than no undo at all.
+ */
+const UNDO_SECONDS = 5;
+
 const state = {
   providers: [],
   accounts: [],
@@ -38,15 +46,17 @@ const state = {
   mailboxes: [],
   mailbox: null,
   /**
-   * What the middle pane is showing: 'mail' (a folder, or search hits) or 'drafts'.
+   * What the middle pane is showing: 'mail' (a folder, or search hits), 'drafts' or 'outbox'.
    *
-   * Kept in state rather than inferred from `mailbox`, because the drafts list is not a folder:
-   * it has no UID, it survives the server being unreachable, and clicking a row opens a composer
-   * instead of a reader.
+   * Kept in state rather than inferred from `mailbox`, because neither local list is a folder: they
+   * have no UID, they survive the server being unreachable, and clicking a row opens a composer or a
+   * retry rather than a reader.
    */
   view: 'mail',
   /** Local drafts for the current account, most recently edited first. */
   drafts: [],
+  /** Queued and finished sends for the current account, newest first. */
+  outbox: [],
   /** Decoded mailbox name for display; `mailbox` stays in wire form for commands. */
   mailboxLabel: null,
   messages: [],
@@ -89,12 +99,29 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function toast(message, kind = 'info', ttl = 5000) {
+function toast(message, kind = 'info', ttl = 5000, action = null) {
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
   el.textContent = message;
+
+  // An action turns a notification into a decision. The undo window is the reason this exists: the
+  // message is already committed to the outbox, and for a few seconds the user can still call it
+  // back — but only if the button is in front of them while the window is open.
+  if (action) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn ghost toast-action';
+    button.textContent = action.label;
+    button.addEventListener('click', () => {
+      el.remove();
+      action.onClick();
+    });
+    el.appendChild(button);
+  }
+
   $('toast-root').appendChild(el);
   setTimeout(() => el.remove(), ttl);
+  return el;
 }
 
 /** Unwrap a Tauri command error into a readable string. */
@@ -152,6 +179,9 @@ async function boot() {
   wireGlobalEvents();
   syncThemeButton();
   await wirePushEvents();
+  // One timer for the whole window, rather than one per open composer or per outbox row: it is a
+  // text update on whatever countdown is on screen, and it does nothing when none is.
+  setInterval(updateUndoCountdowns, 1000);
   if (state.accounts.length === 0) {
     openAccountWizard();
   }
@@ -186,6 +216,16 @@ async function wirePushEvents() {
   await listen('mail:check', () => {
     if (state.accountId && state.mailbox) loadMessages({ reset: true });
   });
+
+  // The outbox worker → "something in the queue moved".
+  //
+  // The message may have been sent, failed, or given up after a retry, and the window has no way to
+  // know which: it re-reads `user.db` and shows what is actually there. Drafts come along because a
+  // successful send deletes the draft it came from.
+  await listen('outbox:changed', () => {
+    refreshOutbox();
+    refreshDrafts();
+  });
 }
 
 /**
@@ -210,12 +250,14 @@ function wireGlobalEvents() {
   });
   $('btn-add-account').addEventListener('click', () => openAccountWizard());
   $('btn-refresh').addEventListener('click', () => {
-    // Refresh means "re-read what this pane is showing": in the drafts view that is `user.db`,
-    // not the server, so it must not silently jump back to the folder.
+    // Refresh means "re-read what this pane is showing": for a local list that is `user.db`, not the
+    // server, so it must not silently jump back to the folder.
     if (state.view === 'drafts') showDrafts();
+    else if (state.view === 'outbox') showOutbox();
     else loadMessages({ reset: true });
   });
   $('btn-drafts').addEventListener('click', showDrafts);
+  $('btn-outbox').addEventListener('click', showOutbox);
   $('btn-load-more').addEventListener('click', loadOlder);
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
@@ -296,13 +338,20 @@ async function selectAccount(accountId) {
   }
 
   if (changed || state.mailboxes.length === 0) {
-    // The drafts list belongs to one account, so switching accounts has to re-read it — and it must
-    // not fall back to the folder on the way, or the sidebar would disagree with the pane.
-    const wasDrafts = state.view === 'drafts';
+    // Both local lists belong to one account, so switching accounts has to re-read them — and it
+    // must not fall back to the folder on the way, or the sidebar would disagree with the pane.
+    const wasShowing = state.view;
     await loadMailboxes();
-    if (wasDrafts) await showDrafts();
+    if (wasShowing === 'drafts') await showDrafts();
+    else if (wasShowing === 'outbox') await showOutbox();
   } else if (state.view === 'drafts') {
     await showDrafts();
+  } else if (state.view === 'outbox') {
+    await showOutbox();
+  } else {
+    // Still refresh the badges: they belong to this account whatever the pane shows.
+    await refreshDrafts();
+    await refreshOutbox();
   }
 }
 
@@ -485,16 +534,20 @@ function renderMailboxes() {
 }
 
 /**
- * Keep the two sidebar rows honest about which one the pane is showing.
+ * Keep the two local sidebar rows honest about which one the pane is showing.
  *
- * The drafts row is not a mailbox, so `renderMailboxes` cannot own its highlight; without this the
- * folder you left would stay lit while the pane showed drafts.
+ * Neither local list is a mailbox, so `renderMailboxes` cannot own their highlight; without this the
+ * folder you left would stay lit while the pane showed drafts or the outbox.
  */
 function syncMailboxRows() {
-  const draftsRow = $('btn-drafts');
-  draftsRow.classList.toggle('active', state.view === 'drafts');
+  $('btn-drafts').classList.toggle('active', state.view === 'drafts');
+  $('btn-outbox').classList.toggle('active', state.view === 'outbox');
   // Empty rather than "0": a badge reading 0 is noise on a list that is already visibly empty.
   $('drafts-count').textContent = state.drafts.length > 0 ? String(state.drafts.length) : '';
+  // Only the still-open sends: the table keeps sent and cancelled rows as history, and counting
+  // those would leave a badge on screen forever.
+  const open = state.outbox.filter((item) => item.state === 'queued' || item.state === 'sending');
+  $('outbox-count').textContent = open.length > 0 ? String(open.length) : '';
 
   for (const row of document.querySelectorAll('#mailbox-list .row')) {
     row.classList.toggle('active', state.view === 'mail' && row.dataset.mailbox === state.mailbox);
@@ -614,6 +667,200 @@ async function discardDraft(draft) {
   await refreshDrafts();
 }
 
+/* ---------------------------------------------------------------- outbox */
+
+/** How the stored state reads to a person. */
+const OUTBOX_LABELS = {
+  queued: '等待发送',
+  sending: '正在发送',
+  sent: '已发送',
+  failed: '发送失败',
+  cancelled: '已撤销',
+  needs_attention: '需要你决定',
+};
+
+/**
+ * Show what the outbox is holding for the current account.
+ *
+ * Everything here comes from `user.db`, so a message queued offline is visible immediately, and the
+ * list still works with the network down — which is precisely when a user wants to know whether
+ * their mail left.
+ */
+async function showOutbox() {
+  if (!state.accountId) {
+    toast('请先添加一个邮箱账号。', 'err');
+    return;
+  }
+
+  exitSearchMode({ reload: false });
+  $('search-input').value = '';
+  $('message-list').innerHTML = '<div class="empty"><span class="spinner"></span>正在读发件箱…</div>';
+
+  const items = await run('读取发件箱', () => invoke('list_outbox', { accountId: state.accountId }));
+  if (items === null) {
+    renderMessages();
+    return;
+  }
+
+  state.view = 'outbox';
+  state.outbox = items;
+  state.selectedUid = null;
+  state.detail = null;
+  $('mailbox-title').textContent = '发件箱';
+  renderReader();
+  syncMailboxRows();
+  renderMessages();
+}
+
+/** Re-read the outbox and keep the sidebar badge honest. */
+async function refreshOutbox() {
+  if (!state.accountId) return;
+  const items = await invoke('list_outbox', { accountId: state.accountId }).catch(() => null);
+  if (items === null) return;
+
+  state.outbox = items;
+  syncMailboxRows();
+  if (state.view === 'outbox') renderMessages();
+}
+
+function renderOutbox(list) {
+  $('list-footer').hidden = true;
+
+  if (state.outbox.length === 0) {
+    list.innerHTML = '<div class="empty">发件箱是空的。发送的邮件会先排在这里，再一封封送出去。</div>';
+    return;
+  }
+
+  for (const item of state.outbox) {
+    const state_ = item.state;
+    const preview = outboxPreview(item);
+    const row = document.createElement('div');
+    row.className = 'msg' + (state_ === 'failed' || state_ === 'needs_attention' ? ' outbox-trouble' : '');
+    row.dataset.outboxId = String(item.id);
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+
+    const undo = undoCountdown(item);
+    row.innerHTML = `
+      <div class="msg-top">
+        <span class="msg-from">${escapeHtml(preview.destinations)}</span>
+        <span class="msg-date">${escapeHtml(formatDate(item.created_at))}</span>
+      </div>
+      <div class="msg-subject">${escapeHtml(preview.subject)}</div>
+      <div class="draft-actions">
+        <span class="muted outbox-state">${escapeHtml(OUTBOX_LABELS[state_] ?? state_)}${
+          item.attempts > 0 ? ` · 已试 ${item.attempts} 次` : ''
+        }</span>
+        <span class="outbox-buttons"></span>
+      </div>
+      ${
+        undo
+          ? `<div class="outbox-note" data-undo="1" data-until="${item.undo_until}">${escapeHtml(undo)}</div>`
+          : ''
+      }
+      ${
+        item.last_error && (state_ === 'failed' || state_ === 'needs_attention')
+          ? `<div class="outbox-error">${escapeHtml(item.last_error)}</div>`
+          : ''
+      }`;
+
+    const buttons = row.querySelector('.outbox-buttons');
+    // Undo exists only while the message has not been attempted; afterwards the honest offer is
+    // "try again", not a button that pretends the send can be taken back (design/07 §5.2).
+    if (state_ === 'queued') {
+      buttons.appendChild(rowButton('撤销', () => cancelSend(item.id)));
+    } else if (state_ === 'failed' || state_ === 'needs_attention' || state_ === 'cancelled') {
+      buttons.appendChild(rowButton('重试', () => retrySend(item.id)));
+    }
+    if (state_ !== 'sending') {
+      buttons.appendChild(rowButton('删除', () => discardOutboxItem(item.id)));
+    }
+
+    // The row itself is not clickable: an outbox item has no reader to open. Keeping it a div with
+    // a role means the buttons inside are the only targets.
+    list.appendChild(row);
+  }
+
+  updateUndoCountdowns();
+}
+
+function rowButton(label, onClick) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn ghost';
+  button.textContent = label;
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    onClick();
+  });
+  return button;
+}
+
+/** "N 秒内可撤销", or nothing when the window has already passed. */
+function undoCountdown(item) {
+  if (item.state !== 'queued') return '';
+  const remaining = Math.ceil(item.undo_until - nowSeconds());
+  if (remaining <= 0) return '';
+  return `${remaining} 秒内可撤销`;
+}
+
+/**
+ * What to show for one outbox row.
+ *
+ * The row stores the payload it was built from rather than a subject and a recipient list, so the
+ * preview is read back out of it. That is on purpose — one copy of the message, the one that will
+ * actually be sent — and it is why a row whose payload cannot be parsed must still render.
+ */
+function outboxPreview(item) {
+  try {
+    const mail = JSON.parse(item.payload_json);
+    const destinations = [...(mail.to ?? []), ...(mail.cc ?? [])].join(', ');
+    return {
+      destinations: destinations || '(未填收件人)',
+      subject: mail.subject || '(无主题)',
+    };
+  } catch {
+    return { destinations: '(内容读不出来)', subject: '(内容读不出来)' };
+  }
+}
+
+/**
+ * Keep the countdown honest without re-rendering the list.
+ *
+ * Re-building the rows once a second would replace the node under the pointer, so the click that
+ * was about to land on 撤销 would miss. Only the text of the countdown is touched.
+ */
+function updateUndoCountdowns() {
+  if (state.view !== 'outbox') return;
+  for (const element of document.querySelectorAll('#message-list [data-undo]')) {
+    const remaining = Math.ceil(Number(element.dataset.until) - nowSeconds());
+    element.textContent = remaining > 0 ? `${remaining} 秒内可撤销` : '正在发送…';
+  }
+}
+
+async function cancelSend(id) {
+  const cancelled = await run('撤销发送', () => invoke('cancel_send', { id }));
+  if (cancelled === null) return;
+
+  toast(cancelled ? '已撤销，这封信没有发出去' : '已经交给服务器了，撤不回来了', cancelled ? 'ok' : 'err');
+  await refreshOutbox();
+}
+
+async function retrySend(id) {
+  const queued = await run('重新发送', () => invoke('retry_send', { id }));
+  if (queued === null) return;
+  toast(queued ? '已重新排队' : '这封信的状态不允许重试', queued ? 'ok' : 'err');
+  await refreshOutbox();
+}
+
+async function discardOutboxItem(id) {
+  if (!confirm('删除这条发件记录？\n删除后这封信不会再尝试发送。')) return;
+  const removed = await run('删除发件记录', () => invoke('discard_outbox', { id }));
+  if (removed === null) return;
+  toast('已删除', 'ok');
+  await refreshOutbox();
+}
+
 /* ---------------------------------------------------------------- messages */
 
 /**
@@ -668,9 +915,9 @@ function renderHistoryButton() {
 
 async function loadMessages({ reset = false } = {}) {
   if (!state.accountId || !state.mailbox) return;
-  // The drafts list is not backed by the server: fetching a folder here would both waste a round
+  // The local lists are not backed by the server: fetching a folder here would both waste a round
   // trip and paint mail over the list the user is looking at.
-  if (state.view === 'drafts') return;
+  if (state.view !== 'mail') return;
   if (reset) {
     state.limit = PAGE_SIZE;
     state.selectedUid = null;
@@ -718,6 +965,12 @@ function renderMessages() {
   // Same element again, third role: the local drafts list.
   if (state.view === 'drafts') {
     renderDrafts(list);
+    return;
+  }
+
+  // And fourth: the outbox, which is also local-only.
+  if (state.view === 'outbox') {
+    renderOutbox(list);
     return;
   }
 
@@ -1362,7 +1615,8 @@ function openComposer({ mode = 'new', draft = null } = {}) {
     onClose: (modal) => {
       clearTimeout(saveTimer);
       saveTimer = null;
-      // A successful send already deleted the draft; saving it again here would resurrect it.
+      // A queued send kept the draft on purpose — the worker deletes it once the message is really
+      // out — so there is nothing to save again here.
       if (sent) return;
       const fields = readFields(modal);
       if (isBlank(fields) && !persisted) return;
@@ -1370,8 +1624,7 @@ function openComposer({ mode = 'new', draft = null } = {}) {
     },
     onConfirm: async (modal) => {
       const fields = readFields(modal);
-      // Any queued autosave must land before the draft is deleted below, or a save that finishes
-      // after the delete would leave a ghost row in the drafts list.
+      // Any queued autosave must land before anything else touches the row.
       clearTimeout(saveTimer);
       saveTimer = null;
       await inFlight;
@@ -1381,6 +1634,11 @@ function openComposer({ mode = 'new', draft = null } = {}) {
         toast('请填写收件人。', 'err');
         return false;
       }
+
+      // Save the draft as it stands *now*, before queueing. The row is not deleted here any more
+      // (the worker does that once the message is delivered), so this is what makes 草稿箱 show the
+      // last edit rather than the one from two seconds ago if the send later fails.
+      await saveDraft(fields);
 
       const outgoing = payload.outgoingMail({
         to: toList,
@@ -1402,24 +1660,57 @@ function openComposer({ mode = 'new', draft = null } = {}) {
         })),
       });
 
-      const ok = await run('发送邮件', async () => {
-        await invoke('send_mail', { accountId, mail: outgoing });
+      const ok = await run('加入发件箱', async () => {
+        // Through the outbox, not straight to SMTP: that is what the undo window needs, and it is
+        // also what makes a send survive closing the app or losing the network mid-transfer. The
+        // worker owns the actual delivery from here on.
+        await invoke('enqueue_send', {
+          accountId,
+          mail: outgoing,
+          draftId: persisted ? draftId : null,
+          undoSeconds: UNDO_SECONDS,
+        });
         return true;
       });
       if (!ok) return false;
 
       sent = true;
-      if (persisted) {
-        // On its way: keeping the draft would offer to send a second copy of the same message.
-        await invoke('delete_draft', { id: draftId }).catch(() =>
-          toast('草稿未能删除，可在草稿箱里手动丢弃。', 'err')
-        );
-      }
-      toast('邮件已发送', 'ok');
-      refreshDrafts();
+      toast(`已加入发件箱（${UNDO_SECONDS} 秒内可撤销）`, 'ok', 6000, {
+        label: '撤销',
+        onClick: () => cancelNewestSend(),
+      });
+      refreshOutbox();
       return true;
     },
   });
+}
+
+/**
+ * Undo the message that was just queued.
+ *
+ * Looks up the newest open row rather than remembering an id: the composer is closed by the time
+ * this runs, and the row it created is the one at the top of the queue. `cancel_send` reports false
+ * when the worker got there first, which is the honest answer — the message is gone.
+ */
+async function cancelNewestSend() {
+  const open = state.outbox
+    .filter((item) => item.state === 'queued')
+    .sort((a, b) => b.id - a.id);
+  const newest = open[0];
+  if (!newest) {
+    // The badge may simply be stale: re-read before telling the user anything.
+    await refreshOutbox();
+    const again = state.outbox
+      .filter((item) => item.state === 'queued')
+      .sort((a, b) => b.id - a.id)[0];
+    if (!again) {
+      toast('这封信已经交给服务器了，撤不回来', 'err');
+      return;
+    }
+    await cancelSend(again.id);
+    return;
+  }
+  await cancelSend(newest.id);
 }
 
 /** Comma/semicolon separated addresses, both the ASCII and the full-width forms. */

@@ -1328,24 +1328,12 @@ fn unique_path(directory: &Path, name: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------- send
-
-#[tauri::command]
-async fn send_mail(
-    state: State<'_, AppState>,
-    account_id: String,
-    mail: OutgoingMail,
-) -> Result<(), String> {
-    let cfg = state.find(&account_id)?;
-    let password = password_for(&cfg.id)?;
-
-    if mail.to.is_empty() && mail.cc.is_empty() && mail.bcc.is_empty() {
-        return Err("请至少填写一个收件人。".to_string());
-    }
-
-    mail_core::smtp::send(&cfg, &password, &mail)
-        .await
-        .map_err(describe)
-}
+//
+// There is deliberately no "send this now, synchronously" command any more. `design/07` §5.1 has
+// exactly one send path — validate → freeze the bytes → enqueue with an undo window — and a second
+// entry point that went straight to SMTP would silently skip the undo window, the retry/backoff
+// policy and the "did it already go out?" recovery. `smtp::send` still exists for the tests that
+// compare the spool path against a straightforward send.
 
 /// Directory that `startup-error.log` is written to.
 ///
@@ -1614,7 +1602,6 @@ pub fn run() {
             mark_seen,
             delete_message,
             move_message,
-            send_mail,
             search_messages,
             sync_status,
             save_attachment,

@@ -428,6 +428,36 @@ textarea {
   font-size: 11px;
 }
 
+/* Outbox rows reuse `.msg` and `.draft-actions` too. What they add is a state line, the undo
+   countdown, and — for a message that failed — the server's reason and a red edge so it is not lost
+   among the delivered ones. */
+.outbox-trouble {
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
+.outbox-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.outbox-buttons .btn {
+  padding: 1px 7px;
+  font-size: 11px;
+}
+
+.outbox-note {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.outbox-error {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+
 .list-footer {
   padding: 10px;
   border-top: 1px solid var(--border);  flex: none;
@@ -871,6 +901,15 @@ textarea {
 
 .toast.info {
   border-left-color: var(--accent);
+}
+
+/* The button in a toast with an action (the undo window). Block-level so it sits under the message
+   rather than being squeezed onto the end of the sentence. */
+.toast-action {
+  display: block;
+  margin-top: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
 }
 
 @keyframes slide-in {
