@@ -495,6 +495,41 @@ impl UserStore {
         })
     }
 
+    /// Sends that are delivered but whose Sent copy has not been filed yet.
+    ///
+    /// The spool file **is** the marker: a successful send keeps it, and the filing pass removes it
+    /// once the copy is in the folder. Which makes "the bytes are still here" and "this has not been
+    /// archived yet" the same statement — so a crash in between needs no extra bookkeeping, the next
+    /// pass simply does it. Searching before appending is what keeps that from producing two copies
+    /// (`design/07` §5.4).
+    pub fn sent_awaiting_copy(&self) -> Result<Vec<OutboxItem>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(&format!(
+            "select {OUTBOX_COLUMNS} from outbox
+             where state = 'sent' and spool_path is not null
+             order by sent_at asc, id asc"
+        ))?;
+        let rows = stmt.query_map([], row_to_outbox_item)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// Forget a row's spool file: either it has been filed, or the bytes are gone for good and
+    /// retrying forever would be a loop with nothing in it.
+    pub fn clear_outbox_spool(&self, id: i64) -> Result<()> {
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update outbox set spool_path = null, spool_bytes = 0 where id = ?1",
+                [id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// The message is on its way out.
     pub fn mark_outbox_sent(&self, id: i64, message_id: Option<&str>, now: i64) -> Result<()> {
         let message_id = message_id.map(str::to_string);

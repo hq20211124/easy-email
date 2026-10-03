@@ -23,7 +23,8 @@ use mail_core::smtp;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, Draft, Endpoint, ImapClient, MailboxInfo, NewOutbox,
     OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryRun, Security, Spool,
-    SyncDriver, SyncOutcome, UserStore, pool_op, recover_in_flight, run_due, watch_every,
+    SyncDriver, SyncOutcome, UserStore, ensure_sent_copy, pool_op, recover_in_flight, run_due,
+    watch_every,
 };
 use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -978,7 +979,15 @@ async fn a_queued_message_reaches_smtp_through_the_worker() {
         Some("<frozen@example.com>"),
         "the id is recorded for the Sent copy and for crash recovery"
     );
-    assert!(!path.exists(), "the spool is cleaned up after a send");
+    assert!(
+        path.exists(),
+        "the bytes stay until the Sent copy is filed (design/07 §5.4)"
+    );
+    assert_eq!(
+        store.sent_awaiting_copy().expect("awaiting").len(),
+        1,
+        "the row is queued up for the filing pass"
+    );
     assert!(
         store.load_draft("d-outbox").expect("draft").is_none(),
         "the draft is removed once the message is out"
@@ -1204,6 +1213,48 @@ async fn crash_recovery_finds_the_message_in_the_sent_folder_and_does_not_resend
     );
 
     let _ = std::fs::remove_dir_all(&spool_dir);
+}
+
+// ===================================================================== Sent copy
+
+/// `design/07` §5.4 against a real folder: a message the server already filed must be **found**, not
+/// appended again. The duplicate is the failure mode this rule exists to prevent, and the only way to
+/// see it is to check that no `APPEND` happened at all.
+#[tokio::test]
+async fn an_already_filed_message_is_found_instead_of_appended_again() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+
+    let raw = b"From: me@example.com\r\nTo: them@example.com\r\n\
+                Message-ID: <filed@example.com>\r\nSubject: hi\r\n\r\nbody\r\n";
+    let copy = within(ensure_sent_copy(&mut client, raw, "<filed@example.com>"))
+        .await
+        .expect("filing must succeed")
+        .expect("the fixture has a Sent folder");
+
+    assert_eq!(copy.folder, "Sent");
+    assert!(
+        !copy.appended,
+        "the server had it already; appending would leave two copies in 已发送"
+    );
+
+    let lines = transcript(&log);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("MESSAGE-ID")),
+        "it has to look before it writes: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("APPEND")),
+        "and it must not write when the lookup succeeded: {lines:?}"
+    );
 }
 
 // ===================================================================== helpers

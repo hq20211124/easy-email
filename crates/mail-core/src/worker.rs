@@ -17,6 +17,7 @@ use std::path::Path;
 use crate::error::{MailError, Result};
 use crate::model::{AccountConfig, OutgoingMail};
 use crate::outbox::{Verdict, next_attempt_delay_secs, verdict_for_failure};
+use crate::sentcopy::SentCopy;
 use crate::smtp;
 use crate::spool::Spool;
 use crate::userdb::{OutboxItem, UserStore};
@@ -165,9 +166,10 @@ where
             Ok(()) => {
                 run.store
                     .mark_outbox_sent(item.id, message_id.as_deref(), run.now)?;
-                if let Some(path) = item.spool_path.as_deref() {
-                    run.spool.remove(Path::new(path));
-                }
+                // The spool is **kept**: the Sent copy is filed from these bytes afterwards, and its
+                // presence is what marks the row as "delivered but not archived yet" (`design/07`
+                // §5.4). [`file_sent_copies`] removes it.
+                //
                 // The draft has served its purpose. Leaving it would offer to send the same message
                 // a second time (`design/07` §5.1: 成功 → 删草稿).
                 if let Some(draft_id) = item.draft_id.as_deref() {
@@ -364,6 +366,78 @@ where
     Ok(report)
 }
 
+/// Everything the filing pass needs.
+pub struct FilingRun<'a> {
+    pub store: &'a UserStore,
+    pub spool: &'a Spool,
+}
+
+/// What one filing pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FilingReport {
+    /// Messages the Sent folder turned out to have (or now has) a copy of.
+    pub filed: usize,
+    /// Messages this pass will never file: no Sent folder, or the frozen bytes are gone.
+    pub skipped: usize,
+    /// Messages to try again later — the account could not be reached, so nothing was decided.
+    pub deferred: usize,
+}
+
+/// Put the Sent copy of every delivered message where it belongs (`design/07` §5.4).
+///
+/// `file_one` is handed the frozen `Message-ID` and the frozen bytes and answers where the copy
+/// ended up, or `None` when the account has no Sent folder. It is injected for the same reason
+/// [`run_due`]'s transport is: the interesting cases are the ones a live server rarely produces.
+///
+/// A pass that cannot reach the server decides nothing and leaves the spool in place, so the next
+/// pass tries again — the spool's existence is the whole state machine.
+pub async fn file_sent_copies<F, Fut>(run: FilingRun<'_>, file_one: F) -> Result<FilingReport>
+where
+    F: Fn(String, Vec<u8>) -> Fut,
+    Fut: Future<Output = Result<Option<SentCopy>>>,
+{
+    let mut report = FilingReport::default();
+
+    for item in run.store.sent_awaiting_copy()? {
+        let Some(path) = item.spool_path.clone() else {
+            continue;
+        };
+        let bytes = match run.spool.read(Path::new(&path)) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // The bytes are gone, so there is nothing to file and nothing to retry. Clear the
+                // marker rather than looping over it at every pass.
+                run.store.clear_outbox_spool(item.id)?;
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let Some(message_id) = frozen_message_id(&bytes) else {
+            run.store.clear_outbox_spool(item.id)?;
+            report.skipped += 1;
+            continue;
+        };
+
+        match file_one(message_id, bytes).await {
+            Ok(Some(_copy)) => {
+                run.spool.remove(Path::new(&path));
+                run.store.clear_outbox_spool(item.id)?;
+                report.filed += 1;
+            }
+            Ok(None) => {
+                // No Sent folder on this account: there is nowhere a copy could go, so this is
+                // settled rather than pending.
+                run.spool.remove(Path::new(&path));
+                run.store.clear_outbox_spool(item.id)?;
+                report.skipped += 1;
+            }
+            Err(_) => report.deferred += 1,
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,13 +599,131 @@ mod tests {
             !String::from_utf8_lossy(&calls[0].0).contains("secret@example.com"),
             "a Bcc address in the headers would leak it to every recipient"
         );
-        assert!(
-            !Path::new(&item.spool_path.expect("path")).exists(),
-            "the spool is cleaned up"
+        // The bytes stay: they are what the Sent copy is written from, and their presence is what
+        // marks this row as "delivered but not archived yet" (design/07 §5.4).
+        let path = item.spool_path.expect("path");
+        assert!(Path::new(&path).exists(), "the spool is kept for the copy");
+        assert_eq!(
+            store.sent_awaiting_copy().expect("awaiting").len(),
+            1,
+            "and the row is queued up for the filing pass"
         );
         assert!(
             store.load_draft("d1").expect("draft").is_none(),
             "the draft is gone: leaving it would offer to send a second copy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn filing_a_copy_clears_the_marker_and_the_bytes() {
+        let dir = temp_dir("file");
+        let spool = Spool::open(&dir).expect("spool");
+        let (store, id) = queued(&spool, 0, 1_000);
+        let cfg = account();
+
+        // Delivered first: the filing pass only ever looks at rows that are already sent.
+        run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
+            Ok(())
+        })
+        .await
+        .expect("run");
+        let path = store
+            .outbox_item(id)
+            .expect("item")
+            .expect("present")
+            .spool_path
+            .expect("path");
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let report = file_sent_copies(
+            FilingRun {
+                store: &store,
+                spool: &spool,
+            },
+            move |message_id, _bytes| {
+                log.lock().expect("lock").push(message_id);
+                async {
+                    Ok(Some(crate::sentcopy::SentCopy {
+                        folder: "Sent".into(),
+                        uid: Some(4242),
+                        appended: false,
+                    }))
+                }
+            },
+        )
+        .await
+        .expect("file");
+
+        assert_eq!(report.filed, 1, "{report:?}");
+        assert_eq!(
+            asked.lock().expect("lock").len(),
+            1,
+            "the copy is looked up by the frozen Message-ID"
+        );
+        assert!(!Path::new(&path).exists(), "the bytes are gone once filed");
+        assert!(
+            store.sent_awaiting_copy().expect("awaiting").is_empty(),
+            "and the row is not picked up again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn filing_defers_when_the_server_cannot_be_reached() {
+        // Offline is not a decision. Keeping the bytes is what lets the next pass finish the job.
+        let dir = temp_dir("file-offline");
+        let spool = Spool::open(&dir).expect("spool");
+        let (store, _id) = queued(&spool, 0, 1_000);
+        let cfg = account();
+        run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
+            Ok(())
+        })
+        .await
+        .expect("run");
+
+        let report = file_sent_copies(
+            FilingRun {
+                store: &store,
+                spool: &spool,
+            },
+            |_, _| async { Err(MailError::Smtp("connection refused".into())) },
+        )
+        .await
+        .expect("file");
+
+        assert_eq!(report.deferred, 1, "{report:?}");
+        assert_eq!(store.sent_awaiting_copy().expect("awaiting").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_account_with_no_sent_folder_is_settled_not_retried() {
+        let dir = temp_dir("file-no-folder");
+        let spool = Spool::open(&dir).expect("spool");
+        let (store, _id) = queued(&spool, 0, 1_000);
+        let cfg = account();
+        run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
+            Ok(())
+        })
+        .await
+        .expect("run");
+
+        let report = file_sent_copies(
+            FilingRun {
+                store: &store,
+                spool: &spool,
+            },
+            |_, _| async { Ok(None) },
+        )
+        .await
+        .expect("file");
+
+        assert_eq!(report.skipped, 1, "{report:?}");
+        assert!(
+            store.sent_awaiting_copy().expect("awaiting").is_empty(),
+            "there is nowhere to file it, so retrying forever would be a loop with nothing in it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

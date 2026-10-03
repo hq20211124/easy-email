@@ -21,10 +21,11 @@ use mail_core::providers::{self, Provider};
 extern crate mail_core;
 use mail_core::{
     AccountConfig, BackfillBudget, BackfillReport, Cache, ConnectionPool, ConnectionReport,
-    MailError, MailboxInfo, MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun,
-    OutgoingAttachment, OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit,
-    Spool, SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older,
-    recover_in_flight, run_due, secret, smtp,
+    FilingReport, FilingRun, MailError, MailboxInfo, MessageDetail, MessageSummary, NewOutbox,
+    OutboxItem, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryReport,
+    RecoveryRun, RunReport, SearchHit, SentCopy, Spool, SyncDriver, SyncOutcome, SyncWindow,
+    account_with_login, backfill_older, ensure_sent_copy, file_sent_copies, recover_in_flight,
+    run_due, secret, smtp,
     userdb::{Draft, UserStore},
     watch,
 };
@@ -704,13 +705,19 @@ async fn discard_outbox(state: State<'_, AppState>, id: i64) -> Result<bool, Str
 ///
 /// One account at a time on purpose: the connection budget in `design/04` is per account, and a
 /// mailbox that is being rate-limited should not be sent two connections' worth of work at once.
-async fn outbox_pass(app: &AppHandle) -> Result<RunReport, String> {
-    let (accounts, store, spool) = {
+async fn outbox_pass(app: &AppHandle) -> Result<(RunReport, FilingReport), String> {
+    let (accounts, store, spool, pool) = {
         let state = app.state::<AppState>();
-        (state.snapshot(), state.user.clone(), state.spool.clone())
+        (
+            state.snapshot(),
+            state.user.clone(),
+            state.spool.clone(),
+            state.pool.clone(),
+        )
     };
 
     let mut total = RunReport::default();
+    let mut filed = FilingReport::default();
     for account in accounts {
         // No credential means no send, and the row must stay queued rather than be marked failed:
         // the user may simply not have typed the authorization code yet.
@@ -740,9 +747,44 @@ async fn outbox_pass(app: &AppHandle) -> Result<RunReport, String> {
         total.retried += report.retried;
         total.gave_up += report.gave_up;
         total.needs_attention += report.needs_attention;
+
+        // Sent copies (`design/07` §5.4). Deliberately after the sends and never instead of one:
+        // the message is delivered either way, and a failure here leaves the frozen bytes in place
+        // for the next pass rather than un-sending anything.
+        let filing = file_sent_copies(
+            FilingRun {
+                store: &store,
+                spool: &spool,
+            },
+            |message_id, bytes| {
+                let pool = pool.clone();
+                let cfg = account.clone();
+                let password = password.clone();
+                async move { file_one_copy(&pool, &cfg, &password, &message_id, bytes).await }
+            },
+        )
+        .await
+        .map_err(describe)?;
+
+        filed.filed += filing.filed;
+        filed.skipped += filing.skipped;
+        filed.deferred += filing.deferred;
     }
 
-    Ok(total)
+    Ok((total, filed))
+}
+
+/// Put one delivered message's copy where it belongs, or find the one the server wrote.
+async fn file_one_copy(
+    pool: &ConnectionPool,
+    cfg: &AccountConfig,
+    password: &str,
+    message_id: &str,
+    bytes: Vec<u8>,
+) -> mail_core::Result<Option<SentCopy>> {
+    pool_op!(pool, cfg, password, |client| {
+        ensure_sent_copy(&mut client, &bytes, message_id).await
+    })
 }
 
 /// Keep the queue moving for as long as the app runs.
@@ -779,15 +821,19 @@ fn start_outbox_worker(app: AppHandle) {
             }
 
             match outbox_pass(&app).await {
-                Ok(report) => {
+                Ok((report, filed)) => {
                     if report.attempted > 0 {
                         log_line(&format!(
-                            "[easy-email] 发件箱：本轮尝试 {} 封（成功 {} / 重试 {} / 放弃 {} / 待处理 {}）",
+                            "[easy-email] 发件箱：本轮尝试 {} 封（成功 {} / 重试 {} / 放弃 {} / 待处理 {}）；\
+                             已发送副本：归档 {} / 无法归档 {} / 待重试 {}",
                             report.attempted,
                             report.sent,
                             report.retried,
                             report.gave_up,
-                            report.needs_attention
+                            report.needs_attention,
+                            filed.filed,
+                            filed.skipped,
+                            filed.deferred
                         ));
                     }
                     if report.sent > 0

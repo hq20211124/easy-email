@@ -28,6 +28,7 @@ pub mod outbox;
 pub mod pool;
 pub mod providers;
 pub mod secret;
+pub mod sentcopy;
 pub mod smtp;
 pub mod spool;
 pub mod sync;
@@ -49,12 +50,13 @@ pub use outbox::{
 };
 pub use pool::{ConnectionPool, PooledClient};
 pub use providers::Provider;
+pub use sentcopy::{SentCopy, ensure_sent_copy};
 pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
 pub use userdb::{Draft, NewOutbox, OutboxItem, UserStore};
 pub use worker::{
-    DEFAULT_CRASH_RESEND_LIMIT, OutboxRun, Recovery, RecoveryQuestion, RecoveryReport, RecoveryRun,
-    RunReport, recover_in_flight, run_due,
+    DEFAULT_CRASH_RESEND_LIMIT, FilingReport, FilingRun, OutboxRun, Recovery, RecoveryQuestion,
+    RecoveryReport, RecoveryRun, RunReport, file_sent_copies, recover_in_flight, run_due,
 };
 
 /// Build a ready-to-use account from a provider preset.
