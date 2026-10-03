@@ -727,23 +727,44 @@ mod tests {
         .await
         .expect("seed");
 
-        // A long write transaction on the writer thread.
+        // The writer parks **inside** its transaction until this test lets it go. That is what makes
+        // the assertion below causal instead of a stopwatch: if the read were waiting on the writer,
+        // it would not return at all, and the timeout would say so.
+        //
+        // The previous version slept 40 ms and then asserted the read finished within 120 ms. It was
+        // flaky — two failures in three runs on a machine that was busy compiling — because it
+        // measured the *machine*, not the behaviour: WAL keeps readers off the writer's lock, but it
+        // cannot make a slow machine fast.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let writer = {
             let db = db.clone();
             tokio::spawn(async move {
-                // No explicit BEGIN: `write` wraps the closure in a transaction, which is what
-                // holds the write lock for the duration of the sleep.
-                db.write(|conn| {
+                // No explicit BEGIN: `write` wraps the closure in a transaction, which is what holds
+                // the write lock for as long as this closure runs.
+                db.write(move |conn| {
                     conn.execute("insert into m (v) values (2)", [])?;
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let _ = entered_tx.send(());
+                    // Released by the test once it has read. The timeout is a deadlock guard, not a
+                    // schedule.
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
                     Ok(())
                 })
                 .await
             })
         };
 
-        // While it is open, a read must still succeed promptly (WAL, not a shared lock).
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        // Wait for the writer to be *inside* its transaction, so the read below happens while the
+        // write lock is provably held. The wait runs on a blocking thread on purpose: this test is a
+        // current-thread runtime, and parking its only thread here would stop `db.write` from ever
+        // being polled — a deadlock of the test's own making.
+        let entered = tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .expect("join");
+        entered.expect("the writer must reach its transaction");
+
         let started = std::time::Instant::now();
         let count: i64 = db
             .read(|conn| Ok(conn.query_row("select count(*) from m", [], |r| r.get(0))?))
@@ -752,10 +773,11 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(count, 1, "the uncommitted row must not be visible");
         assert!(
-            elapsed < std::time::Duration::from_millis(120),
+            elapsed < std::time::Duration::from_secs(2),
             "reading during a write must not wait for it (took {elapsed:?})"
         );
 
+        release_tx.send(()).expect("release the writer");
         writer.await.expect("join").expect("write");
         let _ = std::fs::remove_file(&path);
     }
