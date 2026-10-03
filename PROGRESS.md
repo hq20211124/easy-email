@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-21 草稿镜像每 30 秒（§5.1 的第二半） |
+| 最新 | M1a-22 镜像失焦触发 + 设计审计实测 / M1a-21 镜像每 30 秒 |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -34,6 +34,18 @@
 
 ---
 
+### M1a-22 镜像的"失焦"触发 + 设计审计在本会话内实测 ✅（第 28 轮）
+
+- **失焦也镜像**（`design/07` §5.1 的另一半："每 30 秒**或**失焦"）：窗口失焦时镜像一次——那正是
+  "用户跑去干别的、可能顺手在手机上打开同一份草稿"的时刻。监听器随写信窗口挂上、关窗时摘掉
+  （留着的监听器会去镜像一份已经不在的草稿）。至此 §5.1 的两条触发都齐了。
+- **顺手把一条一直"继承"的绿灯实测了**：交接摘要每轮都写"`python design/tools/audit.py` 0 失败"，
+  那是上一个会话的结论。本会话**真的跑了一遍**：`失败项：0`（含"DDL 可执行：5 块 / 43 个对象"、
+  原型 JS 语法与设计令牌检查）。现在这条是有本轮证据的。
+
+**证据**：`check.ps1` 15 步全绿；测试 **225**；审计 0 失败（本轮实测）。
+
+---
 ### M1a-21 草稿镜像的"每 30 秒"（§5.1 的第二半）✅（第 27 轮）
 
 原来只在**关闭写信窗口**时镜像一次。`design/07` §5.1 要的是"每 30 秒**或**失焦"——一个人把半封信
@@ -628,12 +640,12 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 ## 交接摘要（先读这里）
 
 **当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **225 通过、0 失败**
-（183 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+（183 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 57 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 59 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -678,7 +690,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **草稿镜像只剩"失焦"那条触发**（"每 30 秒"已在 M1a-21 落地；孤儿副本清理已在 M1a-20 落地）。
+1. **草稿镜像已完整**（每 30 秒 + 失焦 + 关窗，孤儿副本清理在 M1a-20）。
 2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
@@ -699,7 +711,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 cargo test --workspace                # 225 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 57 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 59 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
