@@ -953,8 +953,22 @@ impl UserStore {
     }
 
     /// Create the schema. All of it or none of it: the version number must describe a whole schema.
+    ///
+    /// A file written by a **newer** version is refused rather than opened. `create table if not
+    /// exists` would leave its tables alone, so the danger is not the schema — it is the meaning of
+    /// what is already in it: a column that changed shape, a state name that now means something
+    /// else, a draft this version would rewrite in the old form. Refusing costs the user a message
+    /// ("升级程序"); misreading costs them their drafts. `cache.db` has the same guard for the same
+    /// reason, and it is worth having here even though these tables are additive today.
     fn migrate(&self) -> Result<()> {
         self.db.write_blocking(|conn: &Connection| {
+            let version: i64 = conn.query_row("pragma user_version", [], |row| row.get(0))?;
+            if version > USER_SCHEMA_VERSION {
+                return Err(crate::error::MailError::Cache(format!(
+                    "用户数据库版本 {version} 比程序支持的 {USER_SCHEMA_VERSION} 更新，请升级程序后再打开"
+                )));
+            }
+
             conn.execute_batch(
                 "create table if not exists schema_migrations (
                      version    integer primary key,
@@ -1185,6 +1199,35 @@ mod tests {
         drop(again);
         let _ = std::fs::remove_file(&path);
     }
+    #[test]
+    fn a_user_database_from_a_newer_version_is_refused_rather_than_misread() {
+        // The file's *meaning* is what is at stake, not its schema: `create table if not exists`
+        // would leave a future shape alone and this version would then write today's shape into it.
+        let path = temp_path("newer");
+        {
+            let store = UserStore::open(&path).expect("open");
+            assert_eq!(
+                store.schema_version().expect("version"),
+                USER_SCHEMA_VERSION
+            );
+        }
+        {
+            let db = Db::open(&path, DbKind::User, DbOptions::for_kind(DbKind::User)).expect("db");
+            db.write_blocking(|conn: &Connection| {
+                conn.pragma_update(None, "user_version", USER_SCHEMA_VERSION + 1)?;
+                Ok(())
+            })
+            .expect("bump");
+        }
+
+        let error = UserStore::open(&path).expect_err("a newer file must not be opened");
+        assert!(
+            error.to_string().contains("更新"),
+            "the message has to say what to do: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ------------------------------------------------------------------- outbox
 
     fn queued_send(account: &str, at: i64) -> NewOutbox {

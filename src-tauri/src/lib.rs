@@ -1813,7 +1813,15 @@ pub fn run() {
             let user = match UserStore::open(&user_path) {
                 Ok(store) => store,
                 Err(e) => {
-                    log_line(&format!("[easy-email] 用户数据不可用：{e}"));
+                    // Loud on purpose: this is the one fallback where the user's own data is *not*
+                    // read (a corrupt file, or one written by a newer version — `UserStore` refuses
+                    // that rather than misreading it). Drafts and queued sends will not appear, and
+                    // anything saved during this run goes to a database that is thrown away, so the
+                    // reason belongs in the log instead of being inferred from an empty list.
+                    // (Putting it in front of the user in the window is the next step.)
+                    log_line(&format!(
+                        "[easy-email] 用户数据未能打开，本次运行不读写草稿/发件箱：{e}"
+                    ));
                     UserStore::open_in_memory().expect("in-memory user store must be available")
                 }
             };
