@@ -258,6 +258,18 @@ textarea {
   white-space: nowrap;
 }
 
+/* The per-account notification bell: small, clickable, and quiet until hovered — it is a preference,
+   not an action the user came to the sidebar to perform. */
+.row .notify {
+  flex: none;
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0.55;
+}
+
+.row .notify:hover {
+  opacity: 1;
+}
 .row .count {
   font-size: 12px;
   color: var(--text-muted);

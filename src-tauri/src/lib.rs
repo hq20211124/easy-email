@@ -872,6 +872,27 @@ async fn mirror_draft(
     Ok(report)
 }
 
+/// Whether new mail for this account shows a system notification.
+#[tauri::command]
+async fn get_notify_enabled(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<bool, String> {
+    state.user.notify_enabled(&account_id).map_err(describe)
+}
+
+/// Remember the user's choice. Only affects the toast; mail still arrives either way.
+#[tauri::command]
+async fn set_notify_enabled(
+    state: State<'_, AppState>,
+    account_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .user
+        .set_notify_enabled(&account_id, enabled)
+        .map_err(describe)
+}
 /// The largest message this account may send, in bytes.
 ///
 /// `enqueue_send` enforces this before the bytes are frozen; the composer asks for it as well so an
@@ -1550,6 +1571,17 @@ fn announce(
     } else {
         format!("新邮件 {} 封 · 未读 {unread}", outcome.fetched)
     };
+    // The user can silence one account without silencing the rest (the preference is per account and
+    // defaults to on). Checked here rather than at the call site so no future path can bypass it.
+    let notify = app
+        .state::<AppState>()
+        .user
+        .notify_enabled(&cfg.id)
+        .unwrap_or(true);
+    if !notify {
+        return;
+    }
+
     if let Err(error) = app
         .notification()
         .builder()
@@ -2066,6 +2098,8 @@ pub fn run() {
             draft_mirror,
             range_cap_hint,
             max_send_bytes,
+            get_notify_enabled,
+            set_notify_enabled,
             enqueue_send,
             list_outbox,
             cancel_send,

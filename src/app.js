@@ -340,12 +340,35 @@ async function refreshAccounts() {
     button.className = 'row' + (account.id === state.accountId ? ' active' : '');
     button.innerHTML = `
       <span class="label" title="${escapeHtml(account.email)}">${escapeHtml(account.email)}</span>
+      <span class="notify" title="新邮件通知">🔔</span>
       <span class="count" title="移除账号">✕</span>`;
     button.querySelector('.label').addEventListener('click', () => selectAccount(account.id));
     button.querySelector('.count').addEventListener('click', (event) => {
       event.stopPropagation();
       removeAccount(account);
     });
+
+    // Per account, because a noisy work mailbox and a quiet personal one are a normal pair. The bell
+    // is read from the backend (the preference lives in `user.db`), not guessed from a local flag.
+    const bell = button.querySelector('.notify');
+    bell.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      const next = bell.textContent !== '🔔';
+      const saved = await run('保存通知设置', async () => {
+        await invoke('set_notify_enabled', { accountId: account.id, enabled: next });
+        return true;
+      });
+      if (!saved) return;
+      bell.textContent = next ? '🔔' : '🔕';
+      bell.title = next ? '新邮件通知：开' : '新邮件通知：关';
+      toast(`${account.email} 的新邮件通知已${next ? '打开' : '关闭'}`, 'ok');
+    });
+    invoke('get_notify_enabled', { accountId: account.id })
+      .then((enabled) => {
+        bell.textContent = enabled ? '🔔' : '🔕';
+        bell.title = enabled ? '新邮件通知：开' : '新邮件通知：关';
+      })
+      .catch(() => {});
     list.appendChild(button);
   }
 

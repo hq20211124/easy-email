@@ -35,6 +35,14 @@ pub const QUOTA_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// `kv` key holding the chosen sync window.
 pub const SYNC_WINDOW_KEY: &str = "sync_window";
 
+/// `kv` key holding one account's notification preference.
+///
+/// Per account on purpose: somebody with a noisy work mailbox and a quiet personal one wants to
+/// silence exactly one of them.
+pub fn notify_key(account_id: &str) -> String {
+    format!("notify:{account_id}")
+}
+
 /// Tables this database owns, in the order the diagnostics screen lists them.
 pub const USER_TABLES: &[&str] = &[
     "schema_migrations",
@@ -427,6 +435,25 @@ impl UserStore {
         self.db.write_blocking(move |conn| {
             Ok(conn.execute("delete from drafts where id = ?1", [id])? > 0)
         })
+    }
+
+    // ------------------------------------------------------------------ notification preference
+
+    /// Whether this account shows a system notification when new mail arrives.
+    ///
+    /// Stored in `kv` rather than as a new table: it is one bit per account, and `kv` is already the
+    /// home of small user preferences (`design/03`). Default is on — a mail client that stays silent
+    /// about new mail would be the surprise, not the other way round.
+    pub fn notify_enabled(&self, account_id: &str) -> Result<bool> {
+        Ok(self
+            .kv_get(&notify_key(account_id))?
+            .map(|raw| raw != "0")
+            .unwrap_or(true))
+    }
+
+    /// Remember the user's choice for one account.
+    pub fn set_notify_enabled(&self, account_id: &str, enabled: bool) -> Result<()> {
+        self.kv_set(&notify_key(account_id), if enabled { "1" } else { "0" })
     }
 
     // ------------------------------------------------------------------ quota ledger
@@ -1508,6 +1535,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn notifications_default_to_on_and_remember_being_turned_off() {
+        // Default on: a mail client that stays silent about new mail is the surprise. And the choice
+        // is per account — a noisy work mailbox and a quiet personal one are a normal pair.
+        let store = UserStore::open_in_memory().expect("open");
+        assert!(store.notify_enabled("work").expect("read"));
+
+        store.set_notify_enabled("work", false).expect("set");
+        assert!(!store.notify_enabled("work").expect("read"));
+        assert!(
+            store.notify_enabled("personal").expect("read"),
+            "silencing one account must not silence the others"
+        );
+
+        store.set_notify_enabled("work", true).expect("set");
+        assert!(store.notify_enabled("work").expect("read"));
+    }
     #[test]
     fn a_mirror_without_its_draft_is_reported_as_orphaned() {
         // Both ways it happens are normal — the user discarded the draft, or the send path deleted it
