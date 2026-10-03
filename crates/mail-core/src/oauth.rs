@@ -222,6 +222,41 @@ pub async fn sign_in<T: TokenTransport, B: BrowserLauncher>(
     client_secret: Option<&str>,
     timeout: Duration,
 ) -> Result<TokenSet> {
+    sign_in_as(
+        transport,
+        browser,
+        provider,
+        client_id,
+        client_secret,
+        crate::oauthclient::ClientKind::Desktop,
+        timeout,
+    )
+    .await
+}
+
+/// The same, with the kind of client the registration is — because the *type* decides whether a
+/// loopback redirect is allowed at all.
+///
+/// A "Web application" client cannot use one: Google rejects the redirect with `redirect_uri_mismatch`,
+/// which reads like a typo in the redirect URI rather than "you downloaded the wrong kind of client".
+/// One sentence here saves that hunt.
+pub async fn sign_in_as<T: TokenTransport, B: BrowserLauncher>(
+    transport: &T,
+    browser: &B,
+    provider: OAuthProvider,
+    client_id: &str,
+    client_secret: Option<&str>,
+    kind: crate::oauthclient::ClientKind,
+    timeout: Duration,
+) -> Result<TokenSet> {
+    if kind == crate::oauthclient::ClientKind::Web {
+        return Err(MailError::Config(
+            "这个 OAuth 注册是「Web 应用」类型，不能用本机回环地址接收授权。\
+             请在 Google Cloud 里新建一个「桌面应用」类型的客户端，把它的 JSON 放进应用数据目录。"
+                .into(),
+        ));
+    }
+
     let loopback = Loopback::bind().await?;
     let redirect_uri = loopback.redirect_uri.clone();
     let pkce = Pkce::generate()?;
@@ -1028,6 +1063,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_web_type_client_is_refused_before_the_browser_opens() {
+        struct NeverBrowser;
+        impl BrowserLauncher for NeverBrowser {
+            fn open(&self, _url: &str) -> Result<()> {
+                panic!("a web client must not even try to open a browser");
+            }
+        }
+
+        let transport = Fake::replying("{}");
+        let error = sign_in_as(
+            &transport,
+            &NeverBrowser,
+            GOOGLE,
+            "web-client",
+            Some("s"),
+            crate::oauthclient::ClientKind::Web,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("must be refused");
+        assert!(
+            error.to_string().contains("桌面应用"),
+            "the message has to name the type that works: {error}"
+        );
+        assert!(
+            transport.calls.lock().expect("lock").is_empty(),
+            "and nothing may be sent to the provider"
+        );
+    }
+
     // ---------------------------------------------------------------- where the registration comes from
 
     #[test]
@@ -1038,6 +1104,7 @@ mod tests {
                 registration: crate::oauthclient::ClientRegistration {
                     client_id: "mine.apps.googleusercontent.com".into(),
                     client_secret: Some("GOCSPX-mine".into()),
+                    kind: crate::oauthclient::ClientKind::Desktop,
                 },
             },
         );

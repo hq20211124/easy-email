@@ -19,12 +19,33 @@ use crate::error::{MailError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Which kind of client the downloaded file describes.
+///
+/// Google's "Desktop app" clients can use a **loopback** redirect with any port; "Web application"
+/// clients cannot — they require a pre-registered https redirect. Dropping a web client in therefore
+/// fails, and it fails at the provider with `redirect_uri_mismatch`, which says nothing about the real
+/// cause (the wrong client *type*). Naming it here is what turns that into one sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    /// `{"installed": …}` — what the loopback flow needs.
+    Desktop,
+    /// `{"web": …}` — cannot use a loopback redirect at all.
+    Web,
+}
+
 /// One OAuth client registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientRegistration {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: Option<String>,
+    #[serde(default = "desktop")]
+    pub kind: ClientKind,
+}
+
+fn desktop() -> ClientKind {
+    ClientKind::Desktop
 }
 
 /// Google's downloaded file, which nests everything under `installed` (or `web`, for the type that
@@ -95,21 +116,26 @@ fn read(path: &Path) -> Result<ClientRegistration> {
 /// Google's nested shape, or a flat `{client_id, client_secret}` someone wrote by hand.
 fn parse(raw: &str) -> std::result::Result<ClientRegistration, String> {
     if let Ok(file) = serde_json::from_str::<GoogleFile>(raw) {
-        if let Some(registration) = file.installed {
+        if let Some(mut registration) = file.installed {
+            registration.kind = ClientKind::Desktop;
             return Ok(registration);
         }
-        if let Some(registration) = file.web {
-            // Usable, but a `web` client cannot use a loopback redirect — the caller will find out at
-            // the authorization step, and the message there says which type is needed.
+        if let Some(mut registration) = file.web {
+            // Accepted, with the kind recorded: refusing here would leave the user with "the JSON I
+            // downloaded does not work", while the useful sentence is "you downloaded the wrong
+            // *type*" — and that one can only be said at the moment somebody tries to sign in.
+            registration.kind = ClientKind::Web;
             return Ok(registration);
         }
     }
 
-    let flat: ClientRegistration =
+    let mut flat: ClientRegistration =
         serde_json::from_str(raw).map_err(|error| format!("无法解析：{error}"))?;
     if flat.client_id.trim().is_empty() {
         return Err("client_id 为空".into());
     }
+    // A hand-written file has no type to read; the desktop shape is the one this app can use.
+    flat.kind = ClientKind::Desktop;
     Ok(flat)
 }
 
@@ -179,6 +205,23 @@ mod tests {
                 );
             }
             other => panic!("expected the user's registration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_web_client_is_recorded_as_such_rather_than_refused_here() {
+        // Refusing at this point would say "the JSON you downloaded does not work"; the useful sentence
+        // names the wrong *type*, and that can only be said when somebody tries to sign in.
+        let dir = TempDir::new("web-kind");
+        dir.write(
+            PREFERRED,
+            r#"{"web":{"client_id":"web-client","client_secret":"s"}}"#,
+        );
+        match client_registration(&dir.0).expect("read") {
+            Registration::Own { registration } => {
+                assert_eq!(registration.kind, ClientKind::Web);
+            }
+            other => panic!("expected a registration, got {other:?}"),
         }
     }
 
