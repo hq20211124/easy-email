@@ -645,7 +645,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 59 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 60 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -690,8 +690,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **草稿镜像已完整**（每 30 秒 + 失焦 + 关窗，孤儿副本清理在 M1a-20）。
-2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
+1. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
 3. ~~网易系"只让读最近 30 天"的提示~~ → **M1a-19 已做**（`range_cap_hint` + 冷启动提示）。
@@ -701,9 +700,14 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 5. **真机验证**（需要先问你）：一条真实的"发信 → 点查看副本"走查；崩溃恢复时序（预置 spool 缺失的
    `sending` 行 ⇒ 期望 `needs_attention`，全程不碰 SMTP，安全）；"附件被改动"的提醒是否看得懂；
    真机上把写信窗口写点东西关掉 ⇒ 服务器草稿箱出现一份副本（这一步会真的往你邮箱里写东西）。
-6. **第 (5) 件的顺序已查明**（M1a-18 的盘点）：**先做"会话串"**（纯函数 + 列表会话化，无外部依赖，
-   可纯测）→ 通知托盘的点击跳转与开关 → 认证轴的 OAuth（**卡在 M0-8：需要你的 client_id**，
-   在那之前做是白做）→ 安装包（签名是外部条件；自动更新完全没有，可做但大）。
+6. **第 (5) 件的顺序已查明**（M1a-18 的盘点）：**先做"会话串"**，它是三步而不是一步，别低估——
+   ① 读侧还没有会话原料：`MessageSummary` 只有主题/发件人/日期，`Message-ID` 与 `References` 目前
+   只存在于**详情**里 ⇒ 先让列表摘要也带上它们（解析头部 + `cache.db` 的 `messages` 加列 + **一次
+   真迁移**，cache 的 `migrate` 有"版本相等就早退"的守卫，所以这次**必须**升版本号）；
+   ② `mail-core` 一个纯函数算稳定会话键（`References` 根，兜底 `Message-ID`，再兜底规范化主题+
+   发件人），纯测；③ 列表按会话分组 + 展开/折叠 + 未读聚合，探针验证同会话聚成一行。
+   之后：通知托盘的点击跳转与开关 → 认证轴的 OAuth（**卡在 M0-8：需要你的 client_id**，在那之前
+   做是白做）→ 安装包（签名是外部条件；自动更新完全没有，可做但大）。
 
 **运行方式**
 ```
@@ -711,7 +715,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 cargo test --workspace                # 225 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 59 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 60 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
