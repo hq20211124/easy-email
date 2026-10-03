@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **215**（175 lib + 36 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **218**（178 lib + 36 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,8 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-14 配额账本（user.db v2：到额度就停，而不是等服务器拒绝） |
+| 最新 | M1a-15 `sent_index`（cache.db v2）+ 界面「查看已发送副本」 |
+| — | M1a-14 配额账本（user.db v2：到额度就停，而不是等服务器拒绝） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
 | — | M1a-11 已发送副本：先搜索再 APPEND（spool 即"未归档"标记） |
@@ -30,6 +31,45 @@
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-15 `sent_index`：发件箱 → 已发送副本的可追溯链接 ✅（第 21 轮）
+
+`design/07` §5.4/§7。副本此前只是 `ensure_sent_copy` 的**返回值**，落不到任何地方——发出去的信
+在"已发送"里找得到，但界面无从知道它在哪，用户只能自己翻文件夹。
+
+- **`cache.db` v2 新增 `sent_index(account_id, message_id, folder, uid, local_at)`**，主键
+  `(account_id, message_id)`：记录同一个 `Message-ID` 两次只会**替换**（归档步本身就拒绝写第二份副本，
+  所以第二条记录只可能是同一份副本又找到了一次；两行会让链接有歧义）。
+- **`uid` 允许为空**：APPEND 不回 UID 是既定事实（A1-F43），所以"归档了但说不出编号"必须能表示
+  ——否则界面会去查一封明明已经存在的信。空 ≠ 没有副本。
+- **记录写在 `file_sent_copies` 里**（不是命令层）：这一趟已经在 `user.db` 里删标记、删 spool，
+  顺手把链接写进缓存是同一件事的一部分，也因此能被 worker 测试覆盖。**尽力而为**：这是派生数据，
+  写不进去不能连累一封已经发出去的信（下一趟会再记一次）。
+- **放在 cache.db 的理由**：删缓存丢的是"链接"，不是"副本"；而"要归档"的意图由 spool 的存在承载，
+  在 `user.db` 里（M1a-11 的结论）。两者分工不混。
+
+**界面**：发件箱里 `sent` 状态的行多一个**「查看副本」**——按冻结的 `Message-ID` 查索引 → 切到
+那个文件夹 → 按 UID 打开阅读器。三种诚实降级：没有登记（可能清了缓存）⇒ 提示去「已发送」按主题找；
+服务器没给 UID ⇒ 打开文件夹并说明；文件夹已不存在 ⇒ 明确报错。**不会给一个点了没反应的按钮。**
+
+**证据**：
+- cache 三条：记录/读回/按账号隔离/重复记录不产生两行；`uid = None` 仍算"有副本"；
+  **v1 老库打开即获得新表**（与 user.db 同一套模式：`create table if not exists` 就是迁移，
+  测试挡住"改成版本检查从而拒绝打开老库"这种会丢光用户缓存的做法）。
+- worker 一条：归档成功后**索引里确实有那条链接**（folder/uid/local_at 都对）。
+- **真机双库迁移**（这台机器上真实文件）：`tools/inspect-local-db.py` 前后对比 ⇒
+  `cache.db` **v1→v2**、多了 `sent_index`、**`messages` 仍是 158 行**（用户缓存的邮件一封没动）；
+  `user.db` 保持 v2 不变。
+- 真机探针：`sent_copy` 对不存在的 `Message-ID` 返回**诚实的 `null`**（而不是报错），
+  发件箱探针全链仍通过。
+
+**数字**：`check.ps1` 15 步全绿；测试 **218**（178 lib + 36 loopback + 4 reachability）；
+前端命令 **26** 个。
+
+**未做**：一条真实的"发信 → 点查看副本"真机走查（需要真的发一封信，得先问你）；
+副本 UID 在下次同步后的对账（`design/07` §5.4 提到的"找不回 UID 就下次同步对账"）。
 
 ---
 
@@ -432,12 +472,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **215 通过、0 失败**
-（175 lib + 36 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **218 通过、0 失败**
+（178 lib + 36 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
-真机 `user.db` 已随本轮升到 **v2**（`quota_ledger`，原有行数不变）。
-所有改动都在 git 里（基线 `83c1b0c`，共 42 个提交）。
+真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
+迁移前后行数不变（缓存里 158 封邮件一封没动）。
+所有改动都在 git 里（基线 `83c1b0c`，共 44 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -470,6 +511,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 | **M1a-12** | **同步窗口选择器（四种窗口 + 收窄不删信）+ 冷启动自动回填一页（`pages: None` 一页，防"全部"窗口开窗就下载几千封）** | **`tools/probe-sync-window.mjs` 真机：四种窗口逐字往返 / 选择器预选与保存 / 侧栏同步 / 设置已还原；启动日志有真机 `回填到窗口边界 years:2：0 页 / 0 封（HistoryExhausted）`** |
 | **M1a-13** | **附件 sha256：选中时记录、发送前补算与校验、重建 spool 时再校验；契约门禁补上嵌套的 `OutgoingAttachment`** | **`attach.rs` 9 条（含空文件定型值、跨块一致、变了/丢了/没记录三种判定）；worker 测试：改动过的附件 ⇒ `needs_attention`、SMTP 一次没碰；真机探针带嵌套附件负载通过** |
 | **M1a-14** | **配额账本：`user.db` 新增 `quota_ledger`（v2）、滚动 24 小时窗口、按服务商给预算（只有 Gmail 有数）；`BackfillBudget.max_bytes` + `BackfillStop::QuotaSpent`；命令开跑前查、跑完按实际落库字节记账** | **loopback：1 字节预算 ⇒ 停在第一页且此后只有 1 次 `UID FETCH`（不会继续发请求），且那一页仍落库；真机 v1→v2 迁移无损（表增、行数不变）** |
+| **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -479,26 +521,24 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **`sent_index`（cache.db）+ 界面"查看已发送副本"**：副本 UID 现在只在返回值里，没落库；
-   要加就按 §5.4 步骤 0 的顺序，并给 cache.db 加一次真迁移（user.db 的迁移模式刚在 M1a-14 走通过）。
-2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
+1. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
-3. **网易系 `server_floor` 的提示**：表列与写入接口都就位了，但还没有哪条路径在"再也取不到更早"时
+2. **网易系 `server_floor` 的提示**：表列与写入接口都就位了，但还没有哪条路径在"再也取不到更早"时
    写它并按设计给一次可操作提示（"去网页版把收取范围改大"）——**用户会以为是我们的 bug**。
-4. **spool 分块流式写**（`design/07` §8）：现在建 spool 仍是一次性 `formatted()`，25 MB 附件的
+3. **spool 分块流式写**（`design/07` §8）：现在建 spool 仍是一次性 `formatted()`，25 MB 附件的
    峰值内存还没按 §8 的预算收紧。
-5. **真机验证**（需要先问用户）：崩溃恢复时序（预置 spool 缺失的 `sending` 行 ⇒ 期望
-   `needs_attention`，全程不碰 SMTP，安全）；真机上"附件被改动"的提醒是否看得懂。
-6. **服务器草稿镜像**（`draft_mirror`）→ 认证轴（`AuthMethod`）→ 会话串 → 通知托盘 → 安装包。
+4. **真机验证**（需要先问你）：一条真实的"发信 → 点查看副本"走查；崩溃恢复时序（预置 spool 缺失的
+   `sending` 行 ⇒ 期望 `needs_attention`，全程不碰 SMTP，安全）；"附件被改动"的提醒是否看得懂。
+5. **服务器草稿镜像**（`draft_mirror`）→ 认证轴（`AuthMethod`）→ 会话串 → 通知托盘 → 安装包。
 
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 215 个测试
+cargo test --workspace                # 218 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
-python tools\inspect-user-db.py [标签]  # 真机 user.db 的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 42 个提交；git diff 83c1b0c HEAD 是本次全部改动
+python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
+git log --oneline                     # 44 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
