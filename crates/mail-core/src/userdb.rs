@@ -593,6 +593,38 @@ impl UserStore {
         })
     }
 
+    /// Mirror rows whose draft no longer exists.
+    ///
+    /// The two ways that happens are both normal: the user discarded the draft, or the send path
+    /// deleted it once the message went out. Either way the server-side copy we wrote is now the only
+    /// thing left of a draft nobody has, and it is exactly what this list is for — a copy in the
+    /// user's 草稿箱 that nothing in the UI can ever reach.
+    pub fn orphaned_draft_mirrors(&self) -> Result<Vec<DraftMirror>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select m.draft_id, m.account_id, m.folder, m.uid, m.message_id, m.updated_at
+             from draft_mirrors m
+             left join drafts d on d.id = m.draft_id
+             where d.id is null
+             order by m.updated_at asc",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DraftMirror {
+                draft_id: row.get(0)?,
+                account_id: row.get(1)?,
+                folder: row.get(2)?,
+                uid: row.get::<_, Option<i64>>(3)?.map(|uid| uid as u32),
+                message_id: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
     /// Forget the mirror row, and report what it said.
     ///
     /// Returns the row so the caller can delete the server-side copy: dropping the record without
@@ -1474,6 +1506,48 @@ mod tests {
             USER_SCHEMA_VERSION
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_mirror_without_its_draft_is_reported_as_orphaned() {
+        // Both ways it happens are normal — the user discarded the draft, or the send path deleted it
+        // once the message went out — and in both cases the server-side copy we wrote is now litter
+        // that nothing in the UI can reach.
+        let store = UserStore::open_in_memory().expect("open");
+        let mut draft = Draft::new("d1", "acc", 1);
+        draft.subject = "草稿".into();
+        store.save_draft(&draft).expect("save");
+
+        for id in ["d1", "d2"] {
+            store
+                .set_draft_mirror(&DraftMirror {
+                    draft_id: id.into(),
+                    account_id: "acc".into(),
+                    folder: "Drafts".into(),
+                    uid: Some(7),
+                    message_id: format!("<{id}@x>"),
+                    updated_at: 1,
+                })
+                .expect("mirror");
+        }
+
+        let orphans = store.orphaned_draft_mirrors().expect("orphans");
+        assert_eq!(
+            orphans
+                .iter()
+                .map(|mirror| mirror.draft_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d2"],
+            "a draft that still exists is not an orphan"
+        );
+
+        // And the row goes when the sweep has dealt with it.
+        let taken = store
+            .take_draft_mirror("d2")
+            .expect("take")
+            .expect("present");
+        assert_eq!(taken.message_id, "<d2@x>");
+        assert!(store.orphaned_draft_mirrors().expect("orphans").is_empty());
     }
 
     // ------------------------------------------------------------------- drafts

@@ -902,6 +902,54 @@ async fn draft_mirror(
     state.user.draft_mirror(&draft_id).map_err(describe)
 }
 
+/// Delete the server-side draft copies whose local draft is gone.
+///
+/// This is the other half of `mirror_draft`: a mirror row outlives its draft whenever the send path
+/// deletes the draft after a successful delivery, and whenever the user discards a draft while
+/// offline. Without this the user's 草稿箱 keeps a copy nothing in the app can reach.
+///
+/// Best-effort throughout, and it only ever removes copies we wrote ourselves — the folder and UID
+/// come from our own `draft_mirrors` row, never from a search.
+async fn sweep_draft_mirrors(app: &AppHandle) -> usize {
+    let (store, pool) = {
+        let state = app.state::<AppState>();
+        (state.user.clone(), state.pool.clone())
+    };
+
+    let orphans = match store.orphaned_draft_mirrors() {
+        Ok(orphans) => orphans,
+        Err(error) => {
+            log_line(&format!("[easy-email] 读不出待清理的草稿镜像：{error}"));
+            return 0;
+        }
+    };
+
+    let mut removed = 0;
+    for orphan in orphans {
+        let state = app.state::<AppState>();
+        let Ok(cfg) = state.find(&orphan.account_id) else {
+            // The account is gone, so there is nobody to ask and no way to reach the copy. Drop the
+            // row: keeping it would only mean retrying this forever.
+            let _ = store.take_draft_mirror(&orphan.draft_id);
+            continue;
+        };
+        let Ok(password) = password_for(&cfg.id) else {
+            // No credential — the next sweep, after the user fixes the account, can still do it.
+            continue;
+        };
+        if let Some(uid) = orphan.uid {
+            let folder = orphan.folder.clone();
+            let _ = pool_op!(&pool, &cfg, &password, |client| {
+                client.delete_message(&folder, uid).await
+            });
+        }
+        if store.take_draft_mirror(&orphan.draft_id).is_ok() {
+            removed += 1;
+        }
+    }
+
+    removed
+}
 /// Run one pass of the outbox worker for every configured account.
 ///
 /// One account at a time on purpose: the connection budget in `design/04` is per account, and a
@@ -1002,6 +1050,14 @@ fn start_outbox_worker(app: AppHandle) {
         // left mid-flight. It runs here rather than in `setup` so the window never waits on a network
         // round trip — and it runs before the first pass, so a row that turns out to have been
         // delivered already can never be sent a second time.
+        let swept = sweep_draft_mirrors(&app).await;
+        if swept > 0 {
+            log_line(&format!(
+                "[easy-email] 清掉了 {swept} 份没有对应草稿的服务器副本"
+            ));
+            let _ = app.emit("outbox:changed", ());
+        }
+
         match recover_outbox(&app).await {
             Ok(report) if report.already_sent + report.requeued + report.asked_user > 0 => {
                 log_line(&format!(
@@ -1026,6 +1082,12 @@ fn start_outbox_worker(app: AppHandle) {
 
             match outbox_pass(&app).await {
                 Ok((report, filed)) => {
+                    if report.sent > 0 {
+                        // The send path deletes the draft it came from, which orphans its mirror row.
+                        // Sweeping here (rather than only at startup) keeps the server copy from
+                        // sitting in the user's 草稿箱 until the next launch.
+                        sweep_draft_mirrors(&app).await;
+                    }
                     if report.attempted > 0 {
                         log_line(&format!(
                             "[easy-email] 发件箱：本轮尝试 {} 封（成功 {} / 重试 {} / 放弃 {} / 待处理 {}）；\
