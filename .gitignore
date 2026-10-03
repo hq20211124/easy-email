@@ -3,6 +3,11 @@
 /src-tauri/gen
 /src-tauri/icons/*.png.tmp
 
+# A personal OAuth registration: it belongs to whoever downloaded it, not to the repository. The app
+# reads it from the app data directory; see `crates/mail-core/src/oauthclient.rs`.
+client_secret_*.json
+oauth-client.json
+
 # Generated artifacts kept out of history
 /src-tauri/target
 *.log

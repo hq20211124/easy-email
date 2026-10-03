@@ -1110,6 +1110,25 @@ fn token_store(state: &AppState) -> std::result::Result<mail_core::tokenstore::T
 fn http_tokens() -> std::result::Result<mail_core::oauth::HttpTokens, String> {
     mail_core::oauth::HttpTokens::new().map_err(describe)
 }
+/// Which OAuth registration this installation should offer in the wizard.
+///
+/// Read from the app's data directory (the user's own registration, dropped in as the JSON Google
+/// Cloud hands out), falling back to the published Thunderbird one — which is *borrowed*, revocable by
+/// Mozilla, and shows up on the consent screen as "Mozilla Thunderbird", so it comes with a notice the
+/// UI is expected to show (PROGRESS, M1a-63).
+#[tauri::command]
+fn oauth_client_default(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<mail_core::oauth::ClientChoice, String> {
+    let dir = state
+        .accounts_path
+        .parent()
+        .ok_or_else(|| "无法确定数据目录".to_string())?;
+
+    let own = mail_core::oauthclient::client_registration(dir).map_err(describe)?;
+    Ok(mail_core::oauth::client_choice(&provider_id, own))
+}
 /// Sign in with OAuth and stow the refresh token.
 ///
 /// The wizard calls this when the address belongs to a provider that requires OAuth (Google, Microsoft)
@@ -2421,6 +2440,7 @@ pub fn run() {
             refresh_thread_keys,
             quota_status,
             oauth_sign_in,
+            oauth_client_default,
             oauth_relogin,
             take_update_outcome,
             enqueue_send,

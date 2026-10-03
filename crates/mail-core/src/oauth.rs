@@ -40,6 +40,66 @@ pub struct TokenSet {
     pub expires_in: Option<i64>,
 }
 
+/// What the wizard should put in its client-id fields, and what to say about it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClientChoice {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// `own` when the user brought their own registration; `public_test` when it is borrowed.
+    pub source: String,
+    /// Empty for one's own registration; the notice to show for a borrowed one.
+    #[serde(default)]
+    pub notice: String,
+}
+
+/// The published Thunderbird registration, and the notice that has to travel with it.
+///
+/// It is in Mozilla's source because a desktop client cannot keep a secret (A1-F32), and the comment
+/// above it there says "Don't copy these values for your own application--register it yourself." That
+/// is why using it is a **fallback with a notice**, never a default: the consent screen says "Mozilla
+/// Thunderbird", Mozilla can revoke it whenever they like, and a release build must ship its own
+/// registration (A1-F37).
+pub const PUBLIC_TEST_CLIENT: (&str, &str) = (
+    "REMOVED-BORROWED-CLIENT-ID",
+    "REMOVED-BORROWED-CLIENT-SECRET",
+);
+
+/// The notice shown whenever a borrowed registration is used.
+pub const PUBLIC_TEST_NOTICE: &str = "预填的是 Mozilla 公开在源码里的注册（Thunderbird 用的），仅供试用：授权页会显示 \
+     \"Mozilla Thunderbird\"，且 Mozilla 可随时撤销。正式使用请换成你自己注册的客户端 ID\
+     （把 Google Cloud 下载的 JSON 放进应用数据目录即可）。";
+
+/// Decide what to offer for one provider.
+pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -> ClientChoice {
+    if let crate::oauthclient::Registration::Own { registration } = own {
+        return ClientChoice {
+            client_id: registration.client_id,
+            client_secret: registration.client_secret,
+            source: "own".to_string(),
+            notice: String::new(),
+        };
+    }
+
+    // No registration of our own. Gmail gets the borrowed one with its notice; Microsoft has no
+    // published equivalent, and inventing one would be worse than asking.
+    if provider_id == "gmail" {
+        ClientChoice {
+            client_id: PUBLIC_TEST_CLIENT.0.to_string(),
+            client_secret: Some(PUBLIC_TEST_CLIENT.1.to_string()),
+            source: "public_test".to_string(),
+            notice: PUBLIC_TEST_NOTICE.to_string(),
+        }
+    } else {
+        ClientChoice {
+            client_id: String::new(),
+            client_secret: None,
+            source: "missing".to_string(),
+            notice: "这个服务商需要 OAuth 客户端 ID。请把你自己的注册填进来。".to_string(),
+        }
+    }
+}
+
 /// A provider's authorization and token endpoints, and the scope that works for IMAP/SMTP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OAuthProvider {
@@ -966,6 +1026,52 @@ mod tests {
             encoded,
             "scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All%20offline_access&state=a-b_c~d"
         );
+    }
+
+    // ---------------------------------------------------------------- where the registration comes from
+
+    #[test]
+    fn a_users_own_registration_is_used_as_is_and_without_a_notice() {
+        let choice = client_choice(
+            "gmail",
+            crate::oauthclient::Registration::Own {
+                registration: crate::oauthclient::ClientRegistration {
+                    client_id: "mine.apps.googleusercontent.com".into(),
+                    client_secret: Some("GOCSPX-mine".into()),
+                },
+            },
+        );
+        assert_eq!(choice.client_id, "mine.apps.googleusercontent.com");
+        assert_eq!(choice.source, "own");
+        assert!(
+            choice.notice.is_empty(),
+            "nothing to warn about when it is the user's own registration"
+        );
+    }
+
+    #[test]
+    fn without_one_gmail_borrows_thunderbirds_registration_and_says_so() {
+        let choice = client_choice("gmail", crate::oauthclient::Registration::Missing);
+        assert_eq!(choice.client_id, PUBLIC_TEST_CLIENT.0);
+        assert_eq!(choice.source, "public_test");
+        assert!(
+            choice.notice.contains("Mozilla"),
+            "the notice has to name whose registration it is: {}",
+            choice.notice
+        );
+        assert!(
+            choice.notice.contains("撤销"),
+            "and that it can be taken away"
+        );
+    }
+
+    #[test]
+    fn microsoft_gets_no_invented_registration() {
+        // There is no published equivalent for Microsoft, and making one up would be worse than
+        // asking the user for theirs.
+        let choice = client_choice("outlook", crate::oauthclient::Registration::Missing);
+        assert!(choice.client_id.is_empty());
+        assert_eq!(choice.source, "missing");
     }
 
     // ---------------------------------------------------------------- the loopback callback

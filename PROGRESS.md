@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-63 按用户要求预填 Mozilla 公开的 Google 注册（Gmail 也支持 OAuth 了；风险写在界面） |
+| 最新 | M1a-64 用用户自己的 Google 注册（读 Google 原始 JSON；仓库不留个人凭据） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -1706,9 +1706,45 @@ client_id 预填正确、secret 已填、提示文案在位。
 **数字**：`check.ps1` **17 步全绿**；测试 **275**；冒烟通过；调试端口已还原。
 
 ---
+### M1a-64 用你自己的 Google 注册（client_secret JSON 放进去就能用）✅（第 70 轮）
+
+**用户提供了自己的注册**：`%APPDATA%` 之外目录下那份 Google Cloud 下载的
+`client_secret_762379360770-….apps.googleusercontent.com.json`（类型 `installed`，即桌面应用），
+并要我"配置好"。做法不是把值写进代码，而是**让应用去读它**：
+
+- **`crates/mail-core/src/oauthclient.rs`**（5 条测试）：从应用数据目录读注册——
+  ① 先看 `oauth-client.json`；② 否则**直接接受 Google 下载的原始文件名**
+  （`client_secret_*.json`，`{"installed":{…}}` 形状），**不需要改名、不需要编辑**；
+  ③ 也接受手写的扁平 `{client_id, client_secret}`；④ 没有 ⇒ `Missing`（由调用方决定退回什么）；
+  ⑤ **文件坏了要报错**，而不是静默当没有——"我明明放了却没反应"是最没用的回答。
+- **`oauth_client_default(providerId)` 命令**：返回 `{client_id, client_secret, source, notice}`。
+  `source = "own"` 时 **notice 为空**（自己的注册没什么要警告的）；没有自己的注册时，
+  Gmail 退回**借用的 Thunderbird 注册并带上那句提示**，Microsoft **不编造**（返回 missing）。
+  借用值从渲染层搬到了 `mail-core`，成为**唯一出处**。
+- **向导改为向后端要预填值**（而不是渲染层里硬编码一份）——硬编码的副本可能与 `oauth_sign_in`
+  实际用的值不一致，而那正是最难查的一类问题。
+
+**配置结果（真机验证）**：把那份 JSON 原样复制到 `%APPDATA%\com.easyemail.desktop\oauth-client.json`，
+然后：
+```
+oauth_client_default(gmail) ⇒ { source: "own", clientIdHead: "762379360770-t0msrmg6b4rhkla…", hasSecret: true, notice: "" }
+向导里（填 someone@gmail.com + 选 Gmail）⇒ OAuth 区块可见、client_id/secret 已预填为你自己的、notice 为空
+```
+**仓库不留个人注册**：原始 JSON 已从工作目录移除，`.gitignore` 加了
+`client_secret_*.json` 与 `oauth-client.json`（它属于下载它的人，不属于仓库）。
+
+**接下来（轮到你）**：应用里 → 添加邮箱账号 → 填你的 Gmail 地址 → 看到 OAuth 区块已预填 → 点
+**"在浏览器里登录"** → 在浏览器里用你的谷歌账号点"允许"。授权页现在应当显示**你自己的应用名**
+（不再是 Mozilla Thunderbird）。把结果（成功，或失败的原文）告诉我：
+成功我就把这轮的真实端点验证写进 PROGRESS，并顺手把 **M0-8** 定论——令牌端点到底要不要 `client_secret`
+（现在预填了 secret，所以两条路都能试：把 secret 清空再试一次即可分辨）。
+
+**数字**：`check.ps1` **17 步全绿**（前端命令 **37** 个）；测试 **284**（234 lib + 45 loopback + 4 reachability）。
+
+---
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **275 通过、0 失败**
+**当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **284 通过、0 失败**
 （186 lib + 39 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
@@ -1750,11 +1786,11 @@ client_id 预填正确、secret 已填、提示文案在位。
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近四十六轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+**最近四十七轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮）** · **M1a-46 XOAUTH2 的四步计划** · **M1a-47 更新状态（成功/没生效各说一次）** · **M1a-48 XOAUTH2 发送半边** · **M1a-49 XOAUTH2 接收半边** · **M1a-50 连接前刷新令牌（轮换先落盘）** · **M1a-51 OAuth 设置进 user.db + Credential 类型** · **M1a-52 账号自带 auth** · **M1a-53 `secret_for`：OAuth 账号连接前刷新令牌** · **M1a-54 OAuth 账号能被创建** · **M1a-55 OAuth 发信（队列）也走 XOAUTH2 + 测试** · **M1a-56 重新登录入口（`oauth_relogin` + 账号行 ↻）** · **M1a-58 真机验证①崩溃恢复** · **M1a-59 真机验证②附件改动（入队拦住 + 实收 31 字节证明冻结）** · **M1a-60 真机验证③抓到真 bug（草稿镜像缺 account_id 迁移，已修）** · **M1a-61 真机验证④查看副本——四件真机验证全部通过** · **M1a-62 本地库错误文案修正 + 测试信删除** · **M1a-63 预填 Mozilla 公开注册（Gmail 走 OAuth 试跑；风险写在界面上）**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮）** · **M1a-46 XOAUTH2 的四步计划** · **M1a-47 更新状态（成功/没生效各说一次）** · **M1a-48 XOAUTH2 发送半边** · **M1a-49 XOAUTH2 接收半边** · **M1a-50 连接前刷新令牌（轮换先落盘）** · **M1a-51 OAuth 设置进 user.db + Credential 类型** · **M1a-52 账号自带 auth** · **M1a-53 `secret_for`：OAuth 账号连接前刷新令牌** · **M1a-54 OAuth 账号能被创建** · **M1a-55 OAuth 发信（队列）也走 XOAUTH2 + 测试** · **M1a-56 重新登录入口（`oauth_relogin` + 账号行 ↻）** · **M1a-58 真机验证①崩溃恢复** · **M1a-59 真机验证②附件改动（入队拦住 + 实收 31 字节证明冻结）** · **M1a-60 真机验证③抓到真 bug（草稿镜像缺 account_id 迁移，已修）** · **M1a-61 真机验证④查看副本——四件真机验证全部通过** · **M1a-62 本地库错误文案修正 + 测试信删除** · **M1a-63 预填 Mozilla 公开注册** · **M1a-64 读用户自己的 Google 注册（原样放 JSON 即可；个人凭据不入仓库）**。
 
 **若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
 （三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
@@ -1809,7 +1845,7 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
 **运行方式**
 ```
 .\tools\check.ps1                     # 17 步门禁（前端不变量 / 会话键 / 负载契约 / 安装包配置 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 275 个测试
+cargo test --workspace                # 284 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
 git log --oneline                     # 94 个提交；git diff 83c1b0c HEAD 是本次全部改动

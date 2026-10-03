@@ -2335,27 +2335,6 @@ function setComposeCloudStatus(text) {
  */
 let pendingWizardAccountId = null;
 
-/**
- * A client registration you can borrow to try Gmail out — and why it is only that.
- *
- * These are **Mozilla's** published values: the ones Thunderbird itself signs in with, visible in its
- * source because a desktop client cannot keep a secret (A1-F32). The comment right above them in
- * `mailnews/base/util/OAuth2Providers.jsm` says: "Don't copy these values for your own
- * application--register it yourself." That is exactly why the wizard shows them as a *prefill with a
- * notice* rather than as a default: the consent screen says "Mozilla Thunderbird", Mozilla can revoke
- * them whenever they like (every user would break at once), and a release build must ship its own
- * registration (A1-F37). Registering your own takes five minutes in the Google Cloud console.
- */
-const PUBLIC_TEST_CLIENT = {
-  notice:
-    '预填的是 Mozilla 公开在源码里的注册（Thunderbird 用的），仅供试用：授权页会显示 ' +
-    '"Mozilla Thunderbird"，且 Mozilla 可随时撤销。正式使用请换成你自己注册的客户端 ID。',
-  gmail: {
-    id: 'REMOVED-BORROWED-CLIENT-ID',
-    secret: 'REMOVED-BORROWED-CLIENT-SECRET',
-  },
-};
-
 function openAccountWizard() {
   pendingWizardAccountId = null;
 
@@ -2520,16 +2499,22 @@ function openAccountWizard() {
     // yourself." Filling them in here is a deliberate, reversible convenience for a personal test —
     // the consent screen will say "Mozilla Thunderbird", Mozilla can revoke them at any time, and a
     // released build must ship its own registration instead (A1-F37).
-    const clientIdField = modal.querySelector('#wiz-client-id');
-    const clientSecretField = modal.querySelector('#wiz-client-secret');
-    if (oauthEligible && provider.id === 'gmail' && !clientIdField.value) {
-      clientIdField.value = PUBLIC_TEST_CLIENT.gmail.id;
-      clientSecretField.value = PUBLIC_TEST_CLIENT.gmail.secret;
-      clientIdField.title = PUBLIC_TEST_CLIENT.notice;
-    }
     if (oauthEligible) {
-      modal.querySelector('#wiz-oauth-notice').textContent =
-        provider.id === 'gmail' ? PUBLIC_TEST_CLIENT.notice : '';
+      // The registration comes from the backend, which prefers the one the user dropped into the app
+      // data directory and falls back to the borrowed Thunderbird one with its notice. Asking the
+      // backend keeps a single source of truth: a value hard-coded here could silently disagree with
+      // what `oauth_sign_in` is actually configured to use.
+      invoke('oauth_client_default', { providerId: provider.id })
+        .then((choice) => {
+          const clientIdField = modal.querySelector('#wiz-client-id');
+          const clientSecretField = modal.querySelector('#wiz-client-secret');
+          if (choice && choice.client_id && !clientIdField.value) {
+            clientIdField.value = choice.client_id;
+            clientSecretField.value = choice.client_secret ?? '';
+          }
+          modal.querySelector('#wiz-oauth-notice').textContent = choice?.notice ?? '';
+        })
+        .catch(() => {});
     }
     const go = modal.querySelector('#wiz-oauth-go');
     if (oauthEligible && !go.dataset.wired) {
