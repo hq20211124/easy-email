@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **225**（183 lib + 38 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **227**（185 lib + 38 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-22 镜像失焦触发 + 设计审计实测 / M1a-21 镜像每 30 秒 |
+| 最新 | M1a-23 发信上限预检（只写核实的数字 + 本地 25 MB） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -34,6 +34,31 @@
 
 ---
 
+### M1a-23 发信上限预检：编码后超限就地拦住 ✅（第 29 轮）
+
+`design/07` §6 的那一行——"超服务商大小上限 ⇒ 添加附件/点发送时就被拦住，给出具体数字与建议"——
+以前做不到：我们**永远不知道服务器上限**，只能等一个 552，而那是 25 MB 上传五秒之后的事
+（A1-F45 已确认 lettre 既不发 `SIZE=` 也读不到服务器宣告的值）。
+
+- **只写核实的数字**（A1-F3）：Gmail `APPENDLIMIT=35651584`（≈34 MiB）、Office 365 默认 45 MB
+  → `Provider::append_limit_bytes()`（**上传副本**用）。
+- **`smtp_max_message_bytes()` 故意返回 `None`**，并且测试对**全表**断言这一点。理由写进了代码：
+  A1-F3 那些是 **append** 上限，设计第二轮评审明确说过 Gmail 的 34 MiB **不是**它的 SMTP 上限、
+  O365 的 45 MB **不是** `MaxSendSize`。把 append 的数抄进 SMTP 的位置，会**悄悄拒掉服务器本来会收的信**。
+- **本地上限 25 MB**（`LOCAL_MAX_MESSAGE_BYTES`，`design/07` §6 的 `min(服务商上限, 25 MB)`）：
+  `max_outgoing_bytes(provider)` = 已知 SMTP 上限 ∪ 本地 25 MB 取小。这是**本地策略**而不是"发现"，
+  因为协议里读不到。
+- **执行点在冻结字节之前**（`enqueue_send`）：编码后超限就直接返回错误，文案给出**生效的那个数字**
+  （"约 X MB，超过可发送上限 Y MB；请压缩、改用链接，或拆成两封"），草稿保留。
+
+**测试**：Gmail/outlook 的 append 上限逐字断言（A1-F3 的值）、**全表 smtp 上限必须为 `None`**
+（防止有人把 append 的数抄过去）、以及 `max_outgoing_bytes` 在"没有已知上限"时等于本地 25 MB
+（对全表断言）。`check.ps1` 15 步全绿；测试 **227**（185 lib + 38 loopback + 4 reachability）。
+
+**未做**：添加附件**当时**就拦（设计也要求，见 design/15 §4 的验收项）——现在拦在点发送时；
+以及 `append_limit_bytes` 在归档副本那条路上的使用（那里目前不看大小，超了会由服务器的 `NO` 回答）。
+
+---
 ### M1a-22 镜像的"失焦"触发 + 设计审计在本会话内实测 ✅（第 28 轮）
 
 - **失焦也镜像**（`design/07` §5.1 的另一半："每 30 秒**或**失焦"）：窗口失焦时镜像一次——那正是
@@ -639,13 +664,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **225 通过、0 失败**
-（183 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **227 通过、0 失败**
+（185 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 60 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 62 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -712,10 +737,10 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 225 个测试
+cargo test --workspace                # 227 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 60 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 62 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
