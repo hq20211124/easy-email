@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **228**（186 lib + 38 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **229**（186 lib + 39 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-26 按账号开关通知（托盘里能做的那半） |
+| 最新 | M1a-27 副本超过 append 上限就不写（SkippedTooLarge） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -52,6 +52,26 @@ M1a-23 把上限拦在**点发送**时，但设计要的是"添加附件/点发�
 
 **证据**：`check.ps1` 15 步全绿（前端命令 **30** 个）、测试 **227**、启动冒烟 10 秒存活。
 估算函数是纯前端，门禁只能证明语法与接线——**没有自动化测试覆盖它**，如实记在这里。
+
+---
+### M1a-27 副本太大就别写（`design/07` §5.4 的 `SkippedTooLarge`）✅（第 33 轮）
+
+归档副本那条路一直不看大小：一封 40 MB 的信会**先试一次必定失败的 APPEND**，然后（因为没有区分
+"永久失败"）还可能再试。设计里这种事有名字：`SkippedTooLarge`，文案是"服务器不接受这么大的副本，
+已保存在本机"，而且**不再无限重试**。
+
+- `ensure_sent_copy` 现在收一个 `append_limit`（来自服务商表的 `append_limit_bytes()`，**是 append
+  上限不是 SMTP 上限**——A1-F3 明确这是两个数、两个服务）：超过就直接返回 `None`，
+  **APPEND 一次都不发**。理由与 M0-4 同源：拿一条连接去换一次必然失败，不如不做。
+- `None` 的语义收紧并写进文档：**"这封信永远不会被归档"**——没有 Sent 文件夹，或者太大。
+  对调用方两者是同一件事：停下，不要重试。worker 的 `Ok(None)` 分支做的正好是这个
+  （清标记、删字节、计 `skipped`）。
+
+**证据**：loopback 新测试 `a_copy_larger_than_the_append_limit_is_never_appended`——上限给 1 字节，
+断言返回 `None` **且 transcript 里没有 `APPEND`**（"不试"这件事只有这样才看得见）。
+`check.ps1` 15 步全绿；测试 **229**（186 lib + 39 loopback + 4 reachability）；启动冒烟 10 秒存活。
+
+**未做**：把那句"副本太大，已保存在本机"**说给用户看**（现在只计为 `skipped`，界面没有对应文案）。
 
 ---
 ### M1a-26 按账号开关新邮件通知（通知托盘里"能做的"那一半）✅（第 32 轮）
@@ -725,13 +745,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **228 通过、0 失败**
-（186 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **229 通过、0 失败**
+（186 lib + 39 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 67 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 69 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -800,10 +820,10 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 228 个测试
+cargo test --workspace                # 229 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 67 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 69 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
