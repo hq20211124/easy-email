@@ -57,6 +57,8 @@ const state = {
   drafts: [],
   /** Queued and finished sends for the current account, newest first. */
   outbox: [],
+  /** The sync window the user chose; `null` until it has been read. */
+  syncWindow: null,
   /** Decoded mailbox name for display; `mailbox` stays in wire form for commands. */
   mailboxLabel: null,
   messages: [],
@@ -175,6 +177,7 @@ async function run(label, fn) {
 
 async function boot() {
   state.providers = (await run('读取内置邮箱配置', () => invoke('list_providers'))) ?? [];
+  await refreshSyncWindow();
   await refreshAccounts();
   wireGlobalEvents();
   syncThemeButton();
@@ -258,6 +261,7 @@ function wireGlobalEvents() {
   });
   $('btn-drafts').addEventListener('click', showDrafts);
   $('btn-outbox').addEventListener('click', showOutbox);
+  $('btn-sync-window').addEventListener('click', openSyncWindowPicker);
   $('btn-load-more').addEventListener('click', loadOlder);
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
@@ -397,6 +401,9 @@ async function loadMailboxes() {
   state.limit = PAGE_SIZE;
   renderMailboxes();
   await loadMessages({ reset: true });
+  // After the first page is on screen, and never before: the top-up is worth a round trip only when
+  // there is a list to add to.
+  backfillColdStart();
 }
 
 /**
@@ -552,6 +559,145 @@ function syncMailboxRows() {
   for (const row of document.querySelectorAll('#mailbox-list .row')) {
     row.classList.toggle('active', state.view === 'mail' && row.dataset.mailbox === state.mailbox);
   }
+}
+
+/* ---------------------------------------------------------------- sync window */
+
+/** How the stored window reads to a person. */
+function windowLabel(window) {
+  if (!window) return '';
+  switch (window.kind) {
+    case 'all':
+      return '全部';
+    case 'years':
+      return `最近 ${window.value} 年`;
+    case 'count':
+      return `最近 ${window.value} 封`;
+    case 'on_demand':
+      return '按需';
+    default:
+      // A window this version does not know about is still a stored preference; showing the raw
+      // kind beats showing nothing.
+      return String(window.kind);
+  }
+}
+
+async function refreshSyncWindow() {
+  const window = await invoke('get_sync_window').catch(() => null);
+  if (!window) return;
+  state.syncWindow = window;
+  $('sync-window-value').textContent = windowLabel(window);
+}
+
+/**
+ * Let the user choose how far back the client keeps mail.
+ *
+ * The options are the four the backend can store (`design/04`); "全部" is honest about being
+ * unbounded, because that walk only stops when history ends (the quota ledger that paces it is not
+ * built yet). Narrowing never deletes what is already cached — it only stops walking further back,
+ * which is what the hint says, because a setting that silently removed mail would be a trap.
+ */
+function openSyncWindowPicker() {
+  const current = state.syncWindow ?? { kind: 'years', value: 2 };
+  const checked = (kind) => (current.kind === kind ? 'checked' : '');
+  const years = current.kind === 'years' ? current.value : 2;
+  const count = current.kind === 'count' ? current.value : 2000;
+
+  const body = `
+    <div class="field sync-options">
+      <label class="radio-row">
+        <input type="radio" name="sync-window" value="years" ${checked('years')} />
+        <span>最近 <input id="sync-years" type="number" min="1" max="50" value="${years}" class="inline-number" /> 年</span>
+      </label>
+      <label class="radio-row">
+        <input type="radio" name="sync-window" value="count" ${checked('count')} />
+        <span>每个文件夹最近 <input id="sync-count" type="number" min="50" max="100000" value="${count}" class="inline-number" /> 封</span>
+      </label>
+      <label class="radio-row">
+        <input type="radio" name="sync-window" value="all" ${checked('all')} />
+        <span>全部邮件（一直往回取，直到服务器没有更早的）</span>
+      </label>
+      <label class="radio-row">
+        <input type="radio" name="sync-window" value="on_demand" ${checked('on_demand')} />
+        <span>只按需：不主动往回取，打开哪封取哪封</span>
+      </label>
+    </div>
+    <span class="hint">收窄窗口不会删除已经缓存的邮件，只是停止继续往回取。</span>`;
+
+  openModal({
+    title: '同步窗口',
+    bodyHtml: body,
+    confirmLabel: '保存',
+    onConfirm: async () => {
+      const picked = document.querySelector('input[name="sync-window"]:checked')?.value;
+      const window = windowFromForm(picked);
+      if (!window) {
+        toast('请填一个有效的年数或封数。', 'err');
+        return false;
+      }
+
+      const saved = await run('保存同步窗口', async () => {
+        await invoke('set_sync_window', { window });
+        return true;
+      });
+      if (!saved) return false;
+
+      state.syncWindow = window;
+      $('sync-window-value').textContent = windowLabel(window);
+      toast(`同步窗口：${windowLabel(window)}`, 'ok');
+      return true;
+    },
+  });
+}
+
+/** Read the picker's form into the wire shape serde expects (`{kind, value}`). */
+function windowFromForm(kind) {
+  switch (kind) {
+    case 'all':
+      return { kind: 'all' };
+    case 'on_demand':
+      return { kind: 'on_demand' };
+    case 'years': {
+      const years = Number(document.getElementById('sync-years')?.value);
+      if (!Number.isFinite(years) || years < 1 || years > 50) return null;
+      return { kind: 'years', value: Math.round(years) };
+    }
+    case 'count': {
+      const count = Number(document.getElementById('sync-count')?.value);
+      if (!Number.isFinite(count) || count < 50 || count > 100000) return null;
+      return { kind: 'count', value: Math.round(count) };
+    }
+    default:
+      return null;
+  }
+}
+
+/** Accounts whose cold-start backfill has already run in this window session. */
+const backfilledAccounts = new Set();
+
+/**
+ * Walk one page towards the chosen window, once per account per session (`design/04` §5.7's
+ * "冷启动自动回填一页").
+ *
+ * One page, not "until the window is satisfied": the window can be "all mail", and a client that
+ * starts a multi-thousand-message download the moment it opens is the behaviour this bound exists
+ * to prevent. A failure is ignored on purpose — the user asked to read mail, not to see an error
+ * about a background top-up, and the sync status area already reports being offline.
+ */
+async function backfillColdStart() {
+  const accountId = state.accountId;
+  if (!accountId || !state.mailbox || backfilledAccounts.has(accountId)) return;
+  backfilledAccounts.add(accountId);
+
+  const report = await invoke('backfill_to_window', {
+    accountId,
+    mailbox: state.mailbox,
+    pages: 1,
+  }).catch(() => null);
+  if (!report || !report.fetched) return;
+
+  toast(`按同步窗口补齐了 ${report.fetched} 封更早的邮件`, 'info');
+  loadMessages({ reset: true });
 }
 
 /* ---------------------------------------------------------------- drafts */

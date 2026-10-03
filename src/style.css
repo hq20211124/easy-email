@@ -802,8 +802,36 @@ textarea {
   color: var(--danger);
 }
 
-.grid-2 {
-  display: grid;
+/* The sync-window picker: one option per line, with the number field sitting inside its label
+   ("最近 [2] 年") so the sentence reads as one thing. */
+.sync-options {
+  gap: 10px;
+}
+
+.radio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.radio-row input[type='radio'] {
+  flex: none;
+  width: auto;
+}
+
+.inline-number {
+  width: 5.5em;
+  display: inline-block;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.grid-2 {  display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }

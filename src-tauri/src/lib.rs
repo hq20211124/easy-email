@@ -513,20 +513,35 @@ async fn delete_draft(state: State<'_, AppState>, id: String) -> Result<bool, St
 
 /// Walk backwards until the **chosen sync window** is satisfied, and report where it stopped.
 ///
-/// This is what makes the window a setting rather than a stored preference: the button (or a future
-/// scheduled job) calls this, and `Years(2)` stops at the date boundary while `Count(n)` stops once
-/// `n` messages are cached. The walk is bounded, so one click can never become an open-ended download;
-/// the daily byte budget (`design/04` §5.7) will pace the automatic version.
+/// This is what makes the window a setting rather than a stored preference: the walk stops at the
+/// date boundary for `Years(n)` and once `n` messages are cached for `Count(n)`.
+///
+/// `pages` bounds the walk, and the bound is the point:
+/// * `None` — the cold-start case. One page, so opening the app tops the list up by a page without
+///   becoming a multi-thousand-message download when the window is "all mail".
+/// * `Some(n)` — an explicit "keep walking", bounded by `n` pages.
+///
+/// The daily byte budget (`design/04` §5.7) is what should pace a longer automatic walk; it is not
+/// built yet, which is exactly why the cold start asks for one page and not for "the whole window".
 #[tauri::command]
 async fn backfill_to_window(
     state: State<'_, AppState>,
     account_id: String,
     mailbox: String,
+    pages: Option<u32>,
 ) -> Result<BackfillReport, String> {
     let cfg = state.find(&account_id)?;
     let window = state.user.sync_window().map_err(describe)?;
     let cache = state.cache.clone();
     let password = password_for(&account_id)?;
+
+    let budget = match pages {
+        None => BackfillBudget::default(),
+        Some(pages) => BackfillBudget {
+            max_pages: pages.max(1),
+            max_messages: pages.max(1) * mail_core::sync::INITIAL_SYNC as u32,
+        },
+    };
 
     let report = pool_op!(&state.pool, &cfg, &password, |client| {
         backfill_older(
@@ -535,7 +550,7 @@ async fn backfill_to_window(
             &account_id,
             &mailbox,
             window,
-            BackfillBudget::generous(),
+            budget,
             now_seconds(),
         )
         .await
