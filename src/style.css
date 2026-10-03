@@ -89,34 +89,40 @@ textarea {
 /* ---------------------------------------------------------------- layout */
 
 #app {
-  /* Column, not grid: the title strip spans the window, and the three panes below keep the grid they
-     already had (now on `#shell`). */
-  display: flex;
-  flex-direction: column;
+  /* Back to the plain three-column grid: the window controls float inside the reading pane's corner
+     instead of occupying a row of their own (M1a-67). */
+  display: grid;
   height: 100vh;
 }
 
 /*
-  The app's own title bar. `-webkit-app-region` is not used here: Tauri's `data-tauri-drag-region`
-  attribute is what its window manager listens to, and mixing the two makes one of them silently do
-  nothing. The buttons must not be draggable, which is why they are excluded from the strip's region.
+  The drag handle and the window buttons.
+
+  `-webkit-app-region` is not used: Tauri's `data-tauri-drag-region` is what its window manager listens
+  for, and Tauri only starts a drag when the *event target itself* carries the attribute — so buttons
+  placed next to the strip keep their clicks.
 */
-#titlebar {
-  flex: none;
+#reader-drag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 104px;
+  height: 30px;
+  z-index: 4;
+}
+
+#win-controls {
+  position: absolute;
+  top: 4px;
+  right: 6px;
   display: flex;
-  align-items: center;
-  justify-content: flex-end;
   gap: 2px;
-  height: 32px;
-  padding: 0 4px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  user-select: none;
+  z-index: 5;
 }
 
 .winbtn {
-  width: 34px;
-  height: 24px;
+  width: 30px;
+  height: 22px;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -138,7 +144,6 @@ textarea {
 }
 
 #shell {
-  flex: 1;
   display: grid;
   /*
     minmax() rather than fixed widths: on a small or high-DPI display the window can be only
@@ -162,6 +167,10 @@ textarea {
   */
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
+}
+
+#reader {
+  position: relative;
 }
 
 #sidebar {

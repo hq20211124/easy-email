@@ -29,22 +29,9 @@
     <div id="app">
       <!--
         The window's own title bar, drawn here because the native one is off (`decorations: false`).
-        Two reasons, in this order: the OS title bar on Windows 11 is a dark strip that clashes with the
-        app's own light surface, and it carries a duplicated app name next to the one in the sidebar.
-
-        `data-tauri-drag-region` is what makes the empty part of this strip draggable — without it an
-        undecorated window cannot be moved at all. The buttons are deliberately excluded from it.
-      -->
-      <div id="titlebar" data-tauri-drag-region>
-        <button id="win-min" class="winbtn" title="最小化" aria-label="最小化">&#x2013;</button>
-        <button id="win-max" class="winbtn" title="最大化 / 还原" aria-label="最大化或还原">&#x25A2;</button>
-        <button id="win-close" class="winbtn danger" title="关闭" aria-label="关闭">&#x2715;</button>
-      </div>
-
-      <div id="shell">
-      <!-- ---------------------------------------------------------------- accounts + folders -->
+        Two reason      <!-- ---------------------------------------------------------------- accounts + folders -->
       <aside id="sidebar">
-        <div class="brand">
+        <div class="brand" data-tauri-drag-region>
           <span class="brand-mark"></span>
           <span>Easy Email</span>
           <button id="btn-theme" class="btn ghost icon" title="切换到深色模式" aria-label="切换主题">🌙</button>
@@ -87,7 +74,7 @@
 
       <!-- ---------------------------------------------------------------- message list -->
       <main id="list-pane">
-        <header class="pane-header">
+        <header class="pane-header" data-tauri-drag-region>
           <h1 id="mailbox-title">收件箱</h1>
           <div class="pane-actions">
             <button id="btn-refresh" class="btn ghost" title="重新拉取">↻ 刷新</button>
@@ -117,6 +104,20 @@
 
       <!-- ---------------------------------------------------------------- reader -->
       <section id="reader">
+        <!--
+          The window controls, where a Windows user reaches for them: the top-right corner. They float
+          over the reading pane instead of sitting in a strip of their own, because a full-width strip
+          costs a row of height on every screen just to hold three buttons (a real user's suggestion,
+          M1a-67). The area to their left is the drag handle for the window — transparent, so nothing
+          looks like a title bar, but an undecorated window has to be draggable from somewhere.
+        -->
+        <div id="reader-drag" data-tauri-drag-region></div>
+        <div id="win-controls">
+          <button id="win-min" class="winbtn" title="最小化" aria-label="最小化">&#x2013;</button>
+          <button id="win-max" class="winbtn" title="最大化 / 还原" aria-label="最大化或还原">&#x25A2;</button>
+          <button id="win-close" class="winbtn danger" title="关闭" aria-label="关闭">&#x2715;</button>
+        </div>
+
         <div id="reader-placeholder" class="placeholder">
           <p>选择一封邮件开始阅读</p>
         </div>
@@ -162,7 +163,6 @@
           <pre id="body-text" class="body-text" hidden></pre>
         </article>
       </section>
-      </div>
     </div>
 
     <div id="modal-root" class="modal-root" hidden></div>
