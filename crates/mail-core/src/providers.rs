@@ -655,6 +655,48 @@ mod tests {
         }
     }
 
+    /// `design/05` §10.5: the dispatch table gets a snapshot, so adding a provider means *deciding*
+    /// how it authenticates rather than inheriting whatever the last entry happened to use.
+    ///
+    /// A new address pattern that silently arrives as `Password` is how a user ends up typing a
+    /// password into a service that only accepts an authorization code — the failure looks like "the
+    /// password is wrong" and costs an afternoon.
+    #[test]
+    fn every_provider_states_how_it_authenticates() {
+        let expected: &[(&str, AuthKind)] = &[
+            ("qq", AuthKind::AppPassword),
+            ("163", AuthKind::AppPassword),
+            ("126", AuthKind::AppPassword),
+            ("yeah", AuthKind::AppPassword),
+            ("exmail", AuthKind::Password),
+            ("qiye163", AuthKind::Password),
+            ("aliyun", AuthKind::Password),
+            ("aliyun-qiye", AuthKind::Password),
+            ("sina", AuthKind::Password),
+            ("139", AuthKind::Password),
+            ("gmail", AuthKind::AppPassword),
+            ("outlook", AuthKind::OAuth2),
+            ("yahoo", AuthKind::AppPassword),
+            ("icloud", AuthKind::AppPassword),
+            ("zoho", AuthKind::AppPassword),
+            ("yandex", AuthKind::AppPassword),
+            ("aol", AuthKind::AppPassword),
+            ("gmx", AuthKind::Password),
+            ("fastmail", AuthKind::AppPassword),
+            ("proton", AuthKind::Password),
+            ("tutanota", AuthKind::OAuth2),
+        ];
+
+        let actual: Vec<(&str, AuthKind)> = all()
+            .iter()
+            .map(|provider| (provider.id, provider.auth))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "the auth dispatch changed; update this snapshot deliberately"
+        );
+    }
+
     #[test]
     fn only_verified_size_limits_are_written_down() {
         // A1-F3's numbers are *append* limits, so they belong on `append_limit_bytes` and nowhere

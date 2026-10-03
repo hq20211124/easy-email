@@ -257,6 +257,24 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'the auth axis keeps its promises (no token in a log, PKCE, no embedded webview)' {
+        # `design/05` §10 lists these as gate items, and they are the kind of thing that is true today
+        # and quietly stops being true: somebody adds a debug log with the token in it, or reaches for
+        # a webview because it is easier than a browser. A regex over the sources is exactly what the
+        # design asked for, and exactly what catches that.
+        if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            Write-Host "python not found on PATH; skipping. Install Python to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        python tools/auth_axis_check.py 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'the auth axis drifted from design/05 §10' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'the installer configuration points at files that exist' {
         # `installerHooks` is a path inside a JSON file: a typo there does not fail anything until
         # somebody runs `tauri build`, which needs the Tauri CLI and a network — so it would be found
