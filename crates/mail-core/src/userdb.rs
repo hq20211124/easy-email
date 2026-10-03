@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::db::{Db, DbKind, DbOptions};
 use crate::error::Result;
+use crate::outbox::OutboxState;
 use crate::sync::SyncWindow;
 
 /// Schema version of `user.db`. Bump when the statements in [`UserStore::migrate`] change.
@@ -93,6 +94,79 @@ fn row_to_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
         identity: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+    })
+}
+
+/// A queued send, as stored in `user.db`.
+///
+/// `payload_json` is the `OutgoingMail` the message was built from, and the spool file is the
+/// message exactly as it will go on the wire. Both are kept: the spool is what gets sent (so a
+/// retry cannot produce a different message than the one the user approved), and the payload is
+/// what lets us rebuild the spool if that file is ever lost (`design/07` §5.3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutboxItem {
+    pub id: i64,
+    pub account_id: String,
+    pub draft_id: Option<String>,
+    pub payload_json: String,
+    /// Stored form. Read it through [`OutboxItem::parsed_state`] — never compare it as a string.
+    pub state: String,
+    pub attempts: u32,
+    pub next_attempt_at: i64,
+    pub last_error: Option<String>,
+    pub undo_until: i64,
+    pub scheduled_at: i64,
+    pub spool_path: Option<String>,
+    pub spool_bytes: i64,
+    pub created_at: i64,
+    pub sent_at: Option<i64>,
+    pub sent_message_id: Option<String>,
+}
+
+impl OutboxItem {
+    /// The state, with anything unreadable landing on `needs_attention` rather than `queued`.
+    pub fn parsed_state(&self) -> OutboxState {
+        OutboxState::parse_state(&self.state)
+    }
+}
+
+/// A send being committed to the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOutbox {
+    pub account_id: String,
+    /// The draft this send came from, if any. Deleted once the message is on its way out.
+    pub draft_id: Option<String>,
+    pub payload_json: String,
+    pub spool_path: Option<String>,
+    pub spool_bytes: i64,
+    /// Sends are eligible at `max(undo_until, scheduled_at, next_attempt_at)`; all three are NOT
+    /// NULL so the due query can compare them directly (see the schema comment).
+    pub undo_until: i64,
+    pub scheduled_at: i64,
+    pub created_at: i64,
+}
+
+const OUTBOX_COLUMNS: &str = "id, account_id, draft_id, payload_json, state, attempts, \
+     next_attempt_at, last_error, undo_until, scheduled_at, spool_path, spool_bytes, created_at, \
+     sent_at, sent_message_id";
+
+fn row_to_outbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxItem> {
+    Ok(OutboxItem {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        draft_id: row.get(2)?,
+        payload_json: row.get(3)?,
+        state: row.get(4)?,
+        attempts: row.get(5)?,
+        next_attempt_at: row.get(6)?,
+        last_error: row.get(7)?,
+        undo_until: row.get(8)?,
+        scheduled_at: row.get(9)?,
+        spool_path: row.get(10)?,
+        spool_bytes: row.get(11)?,
+        created_at: row.get(12)?,
+        sent_at: row.get(13)?,
+        sent_message_id: row.get(14)?,
     })
 }
 
@@ -271,6 +345,241 @@ impl UserStore {
         })
     }
 
+    // ------------------------------------------------------------------ outbox
+
+    /// Commit a send to the queue, and report the row id it got.
+    ///
+    /// The caller has already built the spool: `design/07` §5.3 freezes the bytes at enqueue time so
+    /// a retry, a crash or a slow network cannot change what goes out.
+    pub fn enqueue_outbox(&self, new: &NewOutbox) -> Result<i64> {
+        let new = new.clone();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "insert into outbox
+                     (account_id, draft_id, payload_json, state, attempts, next_attempt_at,
+                      undo_until, scheduled_at, spool_path, spool_bytes, created_at)
+                 values (?1, ?2, ?3, 'queued', 0, 0, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    new.account_id,
+                    new.draft_id,
+                    new.payload_json,
+                    new.undo_until,
+                    new.scheduled_at,
+                    new.spool_path,
+                    new.spool_bytes,
+                    new.created_at,
+                ],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// One queued send.
+    pub fn outbox_item(&self, id: i64) -> Result<Option<OutboxItem>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn
+            .query_row(
+                &format!("select {OUTBOX_COLUMNS} from outbox where id = ?1"),
+                [id],
+                row_to_outbox_item,
+            )
+            .optional()?)
+    }
+
+    /// Everything in the outbox for one account, or for all of them, newest first.
+    ///
+    /// Every state, not just the open ones: the UI also shows sent and cancelled items, which is how
+    /// a user can tell that a message actually left.
+    pub fn list_outbox(&self, account_id: Option<&str>) -> Result<Vec<OutboxItem>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut items = Vec::new();
+        match account_id {
+            Some(id) => {
+                let mut stmt = conn.prepare(&format!(
+                    "select {OUTBOX_COLUMNS} from outbox where account_id = ?1
+                     order by created_at desc, id desc"
+                ))?;
+                let rows = stmt.query_map([id], row_to_outbox_item)?;
+                for row in rows {
+                    items.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "select {OUTBOX_COLUMNS} from outbox order by created_at desc, id desc"
+                ))?;
+                let rows = stmt.query_map([], row_to_outbox_item)?;
+                for row in rows {
+                    items.push(row?);
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// The sends whose turn has come.
+    ///
+    /// `queued` is the only state the worker may pick up, and it means "waiting for its turn" — the
+    /// undo window, a scheduled time, or a backoff delay, all expressed in the three time columns.
+    /// `failed` and `needs_attention` are terminal and stay out of here on purpose: a permanent
+    /// failure that stayed eligible would be retried forever.
+    ///
+    /// The three time columns are compared directly rather than through `is null or`: they are NOT
+    /// NULL by schema precisely because `null <= now` is NULL in SQL, which would make a row
+    /// unreachable forever (`design/07` §5.3).
+    pub fn due_outbox(&self, now: i64, limit: usize) -> Result<Vec<OutboxItem>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(&format!(
+            "select {OUTBOX_COLUMNS} from outbox
+             where state = 'queued'
+               and undo_until <= ?1 and scheduled_at <= ?1 and next_attempt_at <= ?1
+             order by created_at asc, id asc
+             limit ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![now, limit as i64], row_to_outbox_item)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// Rows a previous run left mid-flight.
+    ///
+    /// A crash between "we are sending" and "we recorded the outcome" leaves these, and they are the
+    /// reason startup checks the Sent folder before requeueing (`design/07` §5.3.1): the message may
+    /// well have been delivered.
+    pub fn outbox_in_flight(&self) -> Result<Vec<OutboxItem>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(&format!(
+            "select {OUTBOX_COLUMNS} from outbox where state = 'sending' order by created_at asc"
+        ))?;
+        let rows = stmt.query_map([], row_to_outbox_item)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// Claim a row for the worker. Only a row that is still due can be claimed, so two ticks — or
+    /// two windows — cannot both send the same message.
+    pub fn claim_outbox(&self, id: i64, now: i64) -> Result<bool> {
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update outbox set state = 'sending' where id = ?1
+                   and state = 'queued'
+                   and undo_until <= ?2 and scheduled_at <= ?2 and next_attempt_at <= ?2",
+                rusqlite::params![id, now],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Remember where the frozen bytes went.
+    ///
+    /// Only used when the worker had to rebuild a spool file that had gone missing: the path is
+    /// otherwise written once, at enqueue time, together with the bytes.
+    pub fn set_outbox_spool(&self, id: i64, path: &str, bytes: i64) -> Result<()> {
+        let path = path.to_string();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update outbox set spool_path = ?2, spool_bytes = ?3 where id = ?1",
+                rusqlite::params![id, path, bytes],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The message is on its way out.
+    pub fn mark_outbox_sent(&self, id: i64, message_id: Option<&str>, now: i64) -> Result<()> {
+        let message_id = message_id.map(str::to_string);
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update outbox set state = 'sent', sent_at = ?2, sent_message_id = ?3,
+                     last_error = null
+                 where id = ?1",
+                rusqlite::params![id, now, message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The attempt failed in a way worth trying again: bump the count and say when.
+    ///
+    /// Back to `queued`, not `failed`: `due_outbox` only picks up rows that are waiting, and a
+    /// retryable failure is exactly that — waiting, with `next_attempt_at` saying until when.
+    pub fn mark_outbox_retry(&self, id: i64, error: &str, next_attempt_at: i64) -> Result<()> {
+        let error = error.to_string();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update outbox set state = 'queued', attempts = attempts + 1,
+                     last_error = ?2, next_attempt_at = ?3
+                 where id = ?1",
+                rusqlite::params![id, error, next_attempt_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Take the row out of the worker's hands for good.
+    ///
+    /// Used for both terminal outcomes: a permanent refusal, and the "a human has to decide" cases
+    /// from [`crate::outbox::needs_user_decision`]. They differ only in what the UI offers next, so
+    /// they differ only in the stored state.
+    pub fn mark_outbox_failed(&self, id: i64, reason: &str, needs_attention: bool) -> Result<()> {
+        let reason = reason.to_string();
+        let state = if needs_attention {
+            "needs_attention"
+        } else {
+            "failed"
+        };
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update outbox set state = ?2, last_error = ?3, attempts = attempts + 1
+                 where id = ?1",
+                rusqlite::params![id, state, reason],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Cancel a send. Only before the worker claims it: once a row is `sending` the message is on the
+    /// wire, and pretending otherwise would be the "撤销" lie `design/07` §5.2 warns about.
+    pub fn cancel_outbox(&self, id: i64) -> Result<bool> {
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update outbox set state = 'cancelled' where id = ?1 and state = 'queued'",
+                [id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Put a cancelled or failed message back in the queue, ready to go out now.
+    pub fn requeue_outbox(&self, id: i64) -> Result<bool> {
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update outbox set state = 'queued', next_attempt_at = 0, scheduled_at = 0,
+                     undo_until = 0, last_error = null
+                 where id = ?1 and state in ('cancelled', 'failed', 'needs_attention')",
+                [id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Remove a row for good.
+    pub fn delete_outbox(&self, id: i64) -> Result<bool> {
+        self.db.write_blocking(move |conn| {
+            Ok(conn.execute("delete from outbox where id = ?1", [id])? > 0)
+        })
+    }
+
     /// The sync window the user chose, or the default when they never chose one.
     ///
     /// Stored in `user.db` rather than the cache on purpose: it is a preference, and re-downloading a
@@ -292,9 +601,19 @@ impl UserStore {
         self.count("drafts")
     }
 
-    /// How many sends are waiting in the outbox.
+    /// How many sends are still waiting. Used by the UI's "发件箱 (2)" badge.
+    ///
+    /// Open states only: the table keeps sent and cancelled rows too (they are the history the user
+    /// looks at), and counting those would leave the badge showing a number forever.
     pub fn outbox_count(&self) -> Result<u32> {
-        self.count("outbox")
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let n: i64 = conn.query_row(
+            "select count(*) from outbox where state in ('queued', 'sending')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n as u32)
     }
 
     /// How many offline operations are queued.

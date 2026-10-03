@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use mail_core::smtp;
 use mail_core::{
-    AccountConfig, Cache, ConnectionPool, Endpoint, ImapClient, MailboxInfo, OutgoingAttachment,
-    OutgoingMail, PushEvent, Security, SyncDriver, SyncOutcome, pool_op, watch_every,
+    AccountConfig, Cache, ConnectionPool, Draft, Endpoint, ImapClient, MailboxInfo, NewOutbox,
+    OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, Security, Spool, SyncDriver,
+    SyncOutcome, UserStore, pool_op, run_due, watch_every,
 };
 use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -866,6 +867,224 @@ async fn serve_smtp_logging(
     }
 }
 
+// ===================================================================== outbox worker
+
+/// The whole queue path against a real SMTP conversation: `user.db` row -> spool file -> worker ->
+/// `send_spool` -> the server's `DATA`.
+///
+/// This is the test that would have caught the class of bug M1a-7 found in the other direction: the
+/// per-piece tests all passed while the pieces did not fit together. Here nothing is stubbed except
+/// the server.
+#[tokio::test]
+async fn a_queued_message_reaches_smtp_through_the_worker() {
+    let (addr, captured, connections) = spawn_smtp_counted().await;
+    let cfg = account(addr, addr);
+    let store = UserStore::open_in_memory().expect("user db");
+    let spool_dir = std::env::temp_dir().join(format!(
+        "easy-email-loopback-spool-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let spool = Spool::open(&spool_dir).expect("spool");
+
+    // A draft the send came from: the worker has to remove it once the message is out.
+    let mut draft = Draft::new("d-outbox", &cfg.id, 100);
+    draft.subject = "来自草稿".to_string();
+    store.save_draft(&draft).expect("draft");
+
+    let mail = OutgoingMail {
+        to: vec!["alice@example.com".to_string()],
+        cc: vec![],
+        bcc: vec!["hidden@example.com".to_string()],
+        subject: "队列里的信".to_string(),
+        body_text: "正文".to_string(),
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+        // Fixed on purpose: this is what the outbox relies on when it rebuilds a lost spool file,
+        // and what the Sent-copy search looks for afterwards.
+        message_id: Some("<frozen@example.com>".to_string()),
+    };
+
+    let id = store
+        .enqueue_outbox(&NewOutbox {
+            account_id: cfg.id.clone(),
+            draft_id: Some("d-outbox".to_string()),
+            payload_json: serde_json::to_string(&mail).expect("payload"),
+            spool_path: None,
+            spool_bytes: 0,
+            // The undo window has passed: this message is due.
+            undo_until: 0,
+            scheduled_at: 0,
+            created_at: 100,
+        })
+        .expect("enqueue");
+
+    // The bytes are frozen at enqueue time, which is what makes the send reproducible.
+    let message = smtp::build_message(&cfg, &mail).expect("build");
+    let (path, size) = spool.write(id, &message.formatted()).expect("spool");
+    store
+        .set_outbox_spool(id, &path.to_string_lossy(), size as i64)
+        .expect("record spool");
+
+    let report = within(run_due(
+        OutboxRun {
+            store: &store,
+            spool: &spool,
+            cfg: &cfg,
+            password: "authorization-code",
+            now: 1_000,
+            limit: 5,
+        },
+        |cfg, password, bytes, recipients| async move {
+            smtp::send_spool(&cfg, &password, bytes, recipients).await
+        },
+    ))
+    .await
+    .expect("worker pass");
+
+    assert_eq!(report.sent, 1, "one message, sent: {report:?}");
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "exactly one SMTP connection"
+    );
+
+    let raw = String::from_utf8_lossy(&captured.lock().unwrap().clone()).to_string();
+    assert!(
+        raw.contains("Subject: "),
+        "no message reached the server:\n{raw}"
+    );
+    assert!(
+        raw.contains("队列里的信") || raw.contains("=?utf-8?"),
+        "raw:\n{raw}"
+    );
+    assert!(
+        raw.contains("Message-ID: <frozen@example.com>"),
+        "the frozen Message-ID must be the one on the wire:\n{raw}"
+    );
+    assert!(
+        !raw.contains("hidden@example.com"),
+        "a Bcc address must never appear in the headers:\n{raw}"
+    );
+
+    let item = store.outbox_item(id).expect("item").expect("present");
+    assert_eq!(
+        item.sent_message_id.as_deref(),
+        Some("<frozen@example.com>"),
+        "the id is recorded for the Sent copy and for crash recovery"
+    );
+    assert!(!path.exists(), "the spool is cleaned up after a send");
+    assert!(
+        store.load_draft("d-outbox").expect("draft").is_none(),
+        "the draft is removed once the message is out"
+    );
+
+    let _ = std::fs::remove_dir_all(&spool_dir);
+}
+
+#[tokio::test]
+async fn a_send_cancelled_inside_its_undo_window_never_opens_a_connection() {
+    // The undo window is the whole point of §5.2: the message must not have been *attempted*. An
+    // empty DATA buffer alone would not prove that, because a connection that failed at AUTH also
+    // leaves nothing behind — hence the connection counter.
+    let (addr, captured, connections) = spawn_smtp_counted().await;
+    let cfg = account(addr, addr);
+    let store = UserStore::open_in_memory().expect("user db");
+    let spool_dir = std::env::temp_dir().join(format!(
+        "easy-email-loopback-undo-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let spool = Spool::open(&spool_dir).expect("spool");
+
+    let mail = OutgoingMail {
+        to: vec!["alice@example.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: "还来得及撤销".to_string(),
+        body_text: "正文".to_string(),
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+        message_id: None,
+    };
+    let id = store
+        .enqueue_outbox(&NewOutbox {
+            account_id: cfg.id.clone(),
+            draft_id: None,
+            payload_json: serde_json::to_string(&mail).expect("payload"),
+            spool_path: None,
+            spool_bytes: 0,
+            // Five seconds of grace, as the design's default.
+            undo_until: 1_005,
+            scheduled_at: 0,
+            created_at: 1_000,
+        })
+        .expect("enqueue");
+    let message = smtp::build_message(&cfg, &mail).expect("build");
+    let (path, size) = spool.write(id, &message.formatted()).expect("spool");
+    store
+        .set_outbox_spool(id, &path.to_string_lossy(), size as i64)
+        .expect("record spool");
+
+    // One pass before the window expires: nothing may happen.
+    let before = within(run_due(
+        OutboxRun {
+            store: &store,
+            spool: &spool,
+            cfg: &cfg,
+            password: "authorization-code",
+            now: 1_003,
+            limit: 5,
+        },
+        |cfg, password, bytes, recipients| async move {
+            smtp::send_spool(&cfg, &password, bytes, recipients).await
+        },
+    ))
+    .await
+    .expect("worker pass");
+    assert_eq!(before.attempted, 0);
+
+    // The user clicks 撤销.
+    assert!(store.cancel_outbox(id).expect("cancel"));
+
+    // And the window expires.
+    let after = within(run_due(
+        OutboxRun {
+            store: &store,
+            spool: &spool,
+            cfg: &cfg,
+            password: "authorization-code",
+            now: 9_999,
+            limit: 5,
+        },
+        |cfg, password, bytes, recipients| async move {
+            smtp::send_spool(&cfg, &password, bytes, recipients).await
+        },
+    ))
+    .await
+    .expect("worker pass");
+
+    assert_eq!(after.attempted, 0, "a cancelled send stays cancelled");
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "no SMTP connection may be opened for a cancelled message"
+    );
+    assert!(captured.lock().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&spool_dir);
+}
+
 // ===================================================================== helpers
 
 fn account(imap: SocketAddr, smtp_addr: SocketAddr) -> AccountConfig {
@@ -1227,6 +1446,7 @@ async fn smtp_send_carries_an_attachment_the_recipient_can_open() {
             path: path.to_string_lossy().to_string(),
             size: contents.len() as u64,
         }],
+        message_id: None,
     };
 
     within(smtp::send(&cfg, "authorization-code", &mail))
@@ -1283,6 +1503,7 @@ async fn smtp_send_delivers_a_well_formed_message() {
             "<parent@example.com>".to_string(),
         ],
         attachments: vec![],
+        message_id: None,
     };
 
     within(smtp::send(&cfg, "authorization-code", &mail))
@@ -2426,6 +2647,7 @@ async fn probe_lettre_never_sends_size() {
         in_reply_to: None,
         references: vec![],
         attachments: vec![],
+        message_id: None,
     };
 
     within(smtp::send(&cfg, "authorization-code", &mail))

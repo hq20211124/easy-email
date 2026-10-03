@@ -30,6 +30,9 @@
       in_reply_to: fields.inReplyTo ?? null,
       references: fields.references ?? [],
       attachments: fields.attachments ?? [],
+      // Left null by the composer: the outbox fixes a Message-ID at enqueue time so the message keeps
+      // one identity across a retry, and a one-shot send gets one generated server-side.
+      message_id: fields.messageId ?? null,
     };
   }
 

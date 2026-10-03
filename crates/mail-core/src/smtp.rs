@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use lettre::address::Envelope;
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
@@ -44,12 +45,47 @@ fn attachment_part(meta: &OutgoingAttachment) -> Result<SinglePart> {
     Ok(Attachment::new(meta.name.clone()).body(bytes, content_type))
 }
 
+/// A `Message-ID` for a message we are building.
+///
+/// lettre writes one only when asked, and "the relay will add it" does not hold for the relays people
+/// actually use here: without it there is nothing to search the Sent folder for (`design/07` §5.4)
+/// and nothing for crash recovery to compare before re-sending (§5.3.1).
+///
+/// The domain is the sender's rather than `localhost`, so the id looks like every other client's.
+fn make_message_id(email: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let domain = email
+        .rsplit('@')
+        .next()
+        .filter(|d| d.contains('.'))
+        .unwrap_or("localhost");
+
+    format!("<{nanos:x}.{sequence:x}.{}@{domain}>", std::process::id())
+}
+
 /// Build the RFC 5322 message, including the threading headers that keep replies grouped
 /// correctly in the recipient's client.
+///
+/// A `message_id` already on the mail is kept **verbatim**: it is what makes the message the same
+/// message across a retry or a rebuilt spool file, which the outbox depends on.
 pub fn build_message(cfg: &AccountConfig, mail: &OutgoingMail) -> Result<Message> {
     let from = Mailbox::new(Some(cfg.from_display()), cfg.email.parse()?);
 
-    let mut builder = Message::builder().from(from).subject(mail.subject.clone());
+    let mut builder = Message::builder()
+        .from(from)
+        .subject(mail.subject.clone())
+        .message_id(Some(
+            mail.message_id
+                .clone()
+                .unwrap_or_else(|| make_message_id(&cfg.email)),
+        ));
 
     for addr in &mail.to {
         builder = builder.to(mailbox(addr)?);
@@ -167,6 +203,60 @@ pub async fn send(cfg: &AccountConfig, password: &str, mail: &OutgoingMail) -> R
     .map_err(|e| MailError::Smtp(format!("发送线程异常终止：{e}")))?
 }
 
+/// Send bytes that were already built — the spool (`design/07` §5.3).
+///
+/// `send_raw` is used rather than `send` because the message must go out **exactly** as it was built
+/// at enqueue time; rebuilding it here would be a second chance to produce something else. lettre
+/// still does the dot-stuffing, which is the one transformation the wire requires.
+///
+/// The envelope is passed in rather than parsed back out of the bytes: it comes from the same
+/// `OutgoingMail` the spool was built from, and Bcc recipients exist only there (they must never
+/// appear in the headers, so they cannot be recovered from them either).
+pub async fn send_spool(
+    cfg: &AccountConfig,
+    password: &str,
+    spool: Vec<u8>,
+    recipients: Vec<String>,
+) -> Result<()> {
+    let from: lettre::address::Address = cfg
+        .email
+        .parse()
+        .map_err(|e| MailError::Config(format!("发件地址「{}」无法解析：{e}", cfg.email)))?;
+    let mut to = Vec::with_capacity(recipients.len());
+    for raw in &recipients {
+        // `Envelope` takes bare addresses: display names belong in the headers, not in `RCPT TO`.
+        to.push(mailbox(raw)?.email);
+    }
+    if to.is_empty() {
+        return Err(MailError::Config("这封信没有收件人。".into()));
+    }
+    let envelope = Envelope::new(Some(from), to)?;
+
+    let transport = build_transport(cfg, password)?;
+    tokio::task::spawn_blocking(move || {
+        transport
+            .send_raw(&envelope, &spool)
+            .map(|_response| ())
+            .map_err(|e| MailError::classify_smtp(e.to_string()))
+    })
+    .await
+    .map_err(|e| MailError::Smtp(format!("发送线程异常终止：{e}")))?
+}
+
+/// The `Message-ID` lettre put into a message it just built.
+///
+/// It is the identity every later step needs: the Sent-folder copy is found by searching for it
+/// (`design/07` §5.4), and crash recovery uses it to decide whether a message already went out
+/// (§5.3.1). lettre generates one at build time when the message does not carry one, which is
+/// another reason the bytes are frozen at enqueue time rather than rebuilt for every attempt.
+pub fn message_id_of(message: &Message) -> Option<String> {
+    message
+        .headers()
+        .get_raw("Message-ID")
+        .map(|raw| String::from_utf8_lossy(raw.as_ref()).trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +287,7 @@ mod tests {
             in_reply_to: None,
             references: vec![],
             attachments: vec![],
+            message_id: None,
         }
     }
 

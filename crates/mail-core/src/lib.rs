@@ -29,8 +29,10 @@ pub mod pool;
 pub mod providers;
 pub mod secret;
 pub mod smtp;
+pub mod spool;
 pub mod sync;
 pub mod userdb;
+pub mod worker;
 
 pub use backfill::{BackfillBudget, BackfillReport, BackfillStop, backfill_older};
 pub use cache::{Cache, FolderState, SearchHit};
@@ -41,10 +43,16 @@ pub use model::{
     AccountConfig, AttachmentMeta, AuthKind, ConnectionReport, Endpoint, InlineImage, MailboxInfo,
     MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMail, Region, Security,
 };
-pub use outbox::{OutboxState, is_permanent_failure, needs_user_decision, next_attempt_delay_secs};
+pub use outbox::{
+    OutboxState, Verdict, is_permanent_failure, needs_user_decision, next_attempt_delay_secs,
+    verdict_for_failure,
+};
 pub use pool::{ConnectionPool, PooledClient};
 pub use providers::Provider;
+pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
+pub use userdb::{Draft, NewOutbox, OutboxItem, UserStore};
+pub use worker::{OutboxRun, RunReport, run_due};
 
 /// Build a ready-to-use account from a provider preset.
 ///

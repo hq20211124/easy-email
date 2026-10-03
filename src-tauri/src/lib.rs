@@ -21,9 +21,9 @@ use mail_core::providers::{self, Provider};
 extern crate mail_core;
 use mail_core::{
     AccountConfig, BackfillBudget, BackfillReport, Cache, ConnectionPool, ConnectionReport,
-    MailError, MailboxInfo, MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMail,
-    PushEvent, SearchHit, SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older,
-    secret,
+    MailError, MailboxInfo, MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun,
+    OutgoingAttachment, OutgoingMail, PushEvent, RunReport, SearchHit, Spool, SyncDriver,
+    SyncOutcome, SyncWindow, account_with_login, backfill_older, run_due, secret, smtp,
     userdb::{Draft, UserStore},
     watch,
 };
@@ -32,6 +32,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
+use tokio::sync::Notify;
 
 /// Shared, mutable application state.
 struct AppState {
@@ -66,6 +67,13 @@ struct AppState {
     /// why "just delete cache.db" is safe advice and "delete user.db" is not — the two must never be
     /// the same file (`design/03` §3.1).
     user: UserStore,
+    /// Frozen message bytes, waiting to be sent (`design/07` §5.3).
+    spool: Spool,
+    /// Wakes the outbox worker immediately.
+    ///
+    /// The tick is 5 s, but three events cannot wait for it: a message just queued (the undo window
+    /// counts down in front of the user), an undo window that just expired, and a manual "retry now".
+    outbox_wake: Arc<Notify>,
 }
 
 /// The two tasks that make up one account's push pipeline.
@@ -94,6 +102,11 @@ impl AppState {
             .lock()
             .expect("accounts mutex poisoned")
             .clone()
+    }
+
+    /// Tell the outbox worker to look at the queue now instead of at its next tick.
+    fn wake_outbox(&self) {
+        self.outbox_wake.notify_one();
     }
 
     /// Clone one account out of the lock.
@@ -543,6 +556,237 @@ fn now_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------- outbox
+
+/// Default undo window: how long a sent message can still be called back.
+///
+/// Five seconds is long enough to catch the wrong recipient and short enough not to feel like the
+/// app is sitting on the message (`design/07` §5.2).
+const DEFAULT_UNDO_SECONDS: u32 = 5;
+
+/// Longest undo window the UI may ask for. The design's range is 0–30 s; a bigger number would be a
+/// scheduling feature, not an undo.
+const MAX_UNDO_SECONDS: u32 = 30;
+
+/// How often the worker looks at the queue when nothing wakes it.
+const OUTBOX_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many messages one account may attempt per pass.
+const OUTBOX_PASS_LIMIT: usize = 5;
+
+/// Queue a message instead of sending it inline.
+///
+/// Everything the send needs is frozen here — the built bytes and the `Message-ID` — because
+/// `design/07` §5.3 puts the build at enqueue time: a retry, a restart or a rebuilt spool file must
+/// not be able to produce a different message than the one the user approved. With `undo_seconds`
+/// at its default the worker will not touch the row for five seconds, which is what makes 撤销 mean
+/// "nothing ever happened" rather than "we sent it and then apologised".
+#[tauri::command]
+async fn enqueue_send(
+    state: State<'_, AppState>,
+    account_id: String,
+    mut mail: OutgoingMail,
+    draft_id: Option<String>,
+    undo_seconds: Option<u32>,
+) -> Result<i64, String> {
+    let cfg = state.find(&account_id)?;
+
+    // Freeze the identity before anything else: lettre generates a fresh Message-ID per build, so
+    // rebuilding later would silently produce a *different* message as far as every client is
+    // concerned — and crash recovery would have nothing to search the Sent folder for.
+    let message = smtp::build_message(&cfg, &mail).map_err(describe)?;
+    if mail.message_id.is_none() {
+        mail.message_id = smtp::message_id_of(&message);
+    }
+    let bytes = message.formatted();
+
+    if mail.to.is_empty() && mail.cc.is_empty() && mail.bcc.is_empty() {
+        return Err("请至少填写一个收件人。".to_string());
+    }
+
+    let now = now_seconds();
+    let undo = i64::from(
+        undo_seconds
+            .unwrap_or(DEFAULT_UNDO_SECONDS)
+            .min(MAX_UNDO_SECONDS),
+    );
+    let id = state
+        .user
+        .enqueue_outbox(&NewOutbox {
+            account_id: account_id.clone(),
+            draft_id,
+            payload_json: serde_json::to_string(&mail)
+                .map_err(|e| format!("发件内容无法序列化：{e}"))?,
+            spool_path: None,
+            spool_bytes: 0,
+            undo_until: now + undo,
+            scheduled_at: 0,
+            created_at: now,
+        })
+        .map_err(describe)?;
+
+    // The row id names the spool file, so this has to come after the insert. A failure here leaves a
+    // queued row with no bytes; the worker rebuilds it from the payload and records the new path.
+    match state.spool.write(id, &bytes) {
+        Ok((path, size)) => {
+            if let Err(error) =
+                state
+                    .user
+                    .set_outbox_spool(id, &path.to_string_lossy(), size as i64)
+            {
+                log_line(&format!("[easy-email] 发件暂存路径未记录：{error}"));
+            }
+        }
+        Err(error) => log_line(&format!("[easy-email] 发件暂存写入失败：{error}")),
+    }
+
+    state.wake_outbox();
+    Ok(id)
+}
+
+/// Everything in the outbox, newest first. `account_id` narrows it to one account.
+#[tauri::command]
+async fn list_outbox(
+    state: State<'_, AppState>,
+    account_id: Option<String>,
+) -> Result<Vec<OutboxItem>, String> {
+    state
+        .user
+        .list_outbox(account_id.as_deref())
+        .map_err(describe)
+}
+
+/// Call a queued send back. False means it was already on its way — the UI says so rather than
+/// pretending the message was stopped (`design/07` §5.2).
+#[tauri::command]
+async fn cancel_send(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
+    let cancelled = state.user.cancel_outbox(id).map_err(describe)?;
+    if cancelled {
+        // The spool is no longer needed, but the draft stays: cancelling must leave the user with
+        // what they wrote (design/07 §5.2).
+        if let Ok(Some(item)) = state.user.outbox_item(id)
+            && let Some(path) = item.spool_path.as_deref()
+        {
+            state.spool.remove(std::path::Path::new(path));
+        }
+    }
+    state.wake_outbox();
+    Ok(cancelled)
+}
+
+/// Put a failed or cancelled message back in the queue and try now.
+#[tauri::command]
+async fn retry_send(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
+    let queued = state.user.requeue_outbox(id).map_err(describe)?;
+    state.wake_outbox();
+    Ok(queued)
+}
+
+/// Drop an outbox row, and its spool file with it. The message is not recoverable afterwards.
+#[tauri::command]
+async fn discard_outbox(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
+    let path = state
+        .user
+        .outbox_item(id)
+        .map_err(describe)?
+        .and_then(|item| item.spool_path);
+    let removed = state.user.delete_outbox(id).map_err(describe)?;
+    if removed && let Some(path) = path {
+        state.spool.remove(std::path::Path::new(&path));
+    }
+    Ok(removed)
+}
+
+/// Run one pass of the outbox worker for every configured account.
+///
+/// One account at a time on purpose: the connection budget in `design/04` is per account, and a
+/// mailbox that is being rate-limited should not be sent two connections' worth of work at once.
+async fn outbox_pass(app: &AppHandle) -> Result<RunReport, String> {
+    let (accounts, store, spool) = {
+        let state = app.state::<AppState>();
+        (state.snapshot(), state.user.clone(), state.spool.clone())
+    };
+
+    let mut total = RunReport::default();
+    for account in accounts {
+        // No credential means no send, and the row must stay queued rather than be marked failed:
+        // the user may simply not have typed the authorization code yet.
+        let password = match secret::load_password(&account.id) {
+            Ok(Some(password)) => password,
+            _ => continue,
+        };
+
+        let report = run_due(
+            OutboxRun {
+                store: &store,
+                spool: &spool,
+                cfg: &account,
+                password: &password,
+                now: now_seconds(),
+                limit: OUTBOX_PASS_LIMIT,
+            },
+            |cfg, password, bytes, recipients| async move {
+                smtp::send_spool(&cfg, &password, bytes, recipients).await
+            },
+        )
+        .await
+        .map_err(describe)?;
+
+        total.attempted += report.attempted;
+        total.sent += report.sent;
+        total.retried += report.retried;
+        total.gave_up += report.gave_up;
+        total.needs_attention += report.needs_attention;
+    }
+
+    Ok(total)
+}
+
+/// Keep the queue moving for as long as the app runs.
+///
+/// A tick plus a wake-up, because the interesting moments are not periodic: a message just queued,
+/// an undo window that just expired, a user pressing "重试". Without the wake-ups those would each
+/// wait up to five seconds, which is exactly the delay `design/07` §5.3 calls out.
+fn start_outbox_worker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let wake = {
+                let state = app.state::<AppState>();
+                state.outbox_wake.clone()
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(OUTBOX_TICK) => {}
+                _ = wake.notified() => {}
+            }
+
+            match outbox_pass(&app).await {
+                Ok(report) => {
+                    if report.attempted > 0 {
+                        log_line(&format!(
+                            "[easy-email] 发件箱：本轮尝试 {} 封（成功 {} / 重试 {} / 放弃 {} / 待处理 {}）",
+                            report.attempted,
+                            report.sent,
+                            report.retried,
+                            report.gave_up,
+                            report.needs_attention
+                        ));
+                    }
+                    if report.sent > 0
+                        || report.retried > 0
+                        || report.gave_up > 0
+                        || report.needs_attention > 0
+                    {
+                        // Tell the window, which owns what is on screen. Quiet when the pass only
+                        // looked at rows it could not use.
+                        let _ = app.emit("outbox:changed", ());
+                    }
+                }
+                Err(error) => log_line(&format!("[easy-email] 发件箱：{error}")),
+            }
+        }
+    });
 }
 
 /// The sync window the user chose (how far back the client keeps mail).
@@ -1262,6 +1506,17 @@ pub fn run() {
                 }
             };
 
+            // The send spool. Same rule once more: if it cannot be created, the app still starts —
+            // the worker rebuilds a missing spool file from the stored payload before sending.
+            let spool = match Spool::open(dir.join("spool")) {
+                Ok(spool) => spool,
+                Err(e) => {
+                    log_line(&format!("[easy-email] 发件暂存目录不可用：{e}"));
+                    Spool::open(std::env::temp_dir().join("easy-email-spool"))
+                        .expect("the temp directory must be usable")
+                }
+            };
+
             app.manage(AppState {
                 accounts_path,
                 accounts: Mutex::new(accounts),
@@ -1271,7 +1526,15 @@ pub fn run() {
                 watchers: Mutex::new(HashMap::new()),
                 download_dir,
                 user,
+                // Its own directory under the app's config dir, next to the two databases: a spool
+                // file is disposable, but it must survive a restart to keep a queued send's bytes.
+                spool,
+                outbox_wake: Arc::new(Notify::new()),
             });
+
+            // Start the outbox worker. Queued messages outlive the window, so this is what actually
+            // sends them: the composer only commits them to `user.db`.
+            start_outbox_worker(app.handle().clone());
 
             // The tray icon. Built here rather than in config so the menu can drive the app.
             let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
@@ -1341,6 +1604,11 @@ pub fn run() {
             save_draft,
             list_drafts,
             delete_draft,
+            enqueue_send,
+            list_outbox,
+            cancel_send,
+            retry_send,
+            discard_outbox,
             load_more_messages,
             fetch_message,
             mark_seen,

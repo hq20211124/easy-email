@@ -223,6 +223,14 @@ pub struct OutgoingMail {
     /// Files to attach. `default` so a message serialised before this existed still loads.
     #[serde(default)]
     pub attachments: Vec<OutgoingAttachment>,
+    /// This message's own `Message-ID`, when the sender already fixed one.
+    ///
+    /// The outbox sets it at enqueue time so the message keeps the same identity across a retry, a
+    /// rebuilt spool file and a crash: everything downstream — the Sent-folder copy (`design/07`
+    /// §5.4) and the "did it already go out?" check (§5.3.1) — searches by this value. Left unset
+    /// for a one-shot send, where [`crate::smtp::build_message`] generates one.
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 /// Result of probing an account's endpoints before saving it.
