@@ -431,6 +431,26 @@ textarea {
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+/* The fold control and the messages it reveals. The caret is inline with the sender so the row keeps
+   one line of height; the children are indented and slightly dimmed so the conversation's main row
+   still reads as the row. */
+.msg-caret {
+  display: inline-block;
+  width: 14px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.msg-caret:hover {
+  color: var(--accent);
+}
+
+.thread-child {
+  padding-left: 22px;
+  border-bottom-style: dashed;
+  opacity: 0.85;
+}
 .msg.unread {
   box-shadow: inset 3px 0 0 var(--unread);
 }

@@ -12,6 +12,7 @@
  * check is self-consistent: the rows rendered must equal the groups computed from the same array.
  */
 (async () => {
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const rows = () => {
     const list = document.getElementById('message-list');
     return [...list.querySelectorAll('.msg')].map((row) => ({
@@ -25,7 +26,45 @@
   }
 
   const expected = threads.groupConversations(state.messages).length;
+
+  // Normalise before measuring: a fold is view state that outlives one probe run (the page stays
+  // open between runs), so a probe that does not reset it measures whatever the last run left behind.
+  state.expandedThreads.clear();
+  renderMessages();
+  await wait(50);
+
   const rendered = rows();
+
+  // ---------------------------------------------------------------- folding
+  // A fold that hides messages with no way to reach them is just a shorter list, so the claim to
+  // check is: expanding a conversation reveals exactly the rest of it, and collapsing puts the list
+  // back the way it was.
+  const conversations = threads.groupConversations(state.messages);
+  const foldable = conversations.find((conversation) => conversation.messages.length > 1);
+  const caret = document.querySelector('#message-list .msg .msg-caret');
+  let folding = { available: Boolean(caret) };
+
+  if (caret && foldable) {
+    const before = rows().length;
+    caret.click();
+    await wait(150);
+    const expandedRows = rows().length;
+    const children = document.querySelectorAll('#message-list .thread-child').length;
+
+    const caretAgain = document.querySelector('#message-list .msg .msg-caret');
+    caretAgain.click();
+    await wait(150);
+
+    folding = {
+      available: true,
+      groupSize: foldable.messages.length,
+      before,
+      expandedRows,
+      children,
+      after: rows().length,
+      collapsedAgain: document.querySelectorAll('#message-list .thread-child').length === 0,
+    };
+  }
 
   // Every row's badge has to match the size of a group, not just "some number".
   const groups = threads.groupConversations(state.messages).map((group) => group.messages.length);
@@ -38,6 +77,7 @@
       .length,
     fallbackOnly: state.messages.filter((m) => !m.thread_key).length,
     expectedRows: expected,
+    folding,
     renderedRows: rendered.length,
     hasCounts: badges.length > 0,
     badges: sorted(badges),
@@ -45,6 +85,11 @@
     sample: rendered.slice(0, 4),
     passed:
       rendered.length === expected &&
+      (!folding.available ||
+        (folding.children === folding.groupSize - 1 &&
+          folding.expandedRows === folding.before + folding.groupSize - 1 &&
+          folding.after === folding.before &&
+          folding.collapsedAgain)) &&
       JSON.stringify(sorted(badges)) === JSON.stringify(sorted(groups.filter((size) => size > 1))),
   };
 })()

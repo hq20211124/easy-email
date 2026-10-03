@@ -94,7 +94,13 @@ const state = {
   bodyMode: 'html',
   /** Per-message opt-in; reset every time a different message is opened. */
   allowRemoteImages: false,
-  /** Non-empty means the list is showing cache hits rather than the current folder. */
+  /**
+   * Conversations the user has opened in the list, by thread key.
+   *
+   * A fold is a view state, not a preference: it is cleared when the list is rebuilt for a different
+   * folder or a search, because the same key in another folder is a different set of messages.
+   */
+  expandedThreads: new Set(),  /** Non-empty means the list is showing cache hits rather than the current folder. */
   searchQuery: '',
   searchHits: [],
 };
@@ -1226,6 +1232,8 @@ async function loadMessages({ reset = false } = {}) {
     state.limit = PAGE_SIZE;
     state.selectedUid = null;
     state.detail = null;
+    // Folds belong to the rows on screen; a different folder or a search is a different list.
+    state.expandedThreads.clear();
     // A new folder (or a refresh) starts over: whatever we learned about the bottom of the previous
     // one does not apply here.
     state.historyDone = false;
@@ -1284,14 +1292,16 @@ function renderMessages() {
     return;
   }
 
-  // One row per conversation rather than one per message (`design/07` §2). The key is an
-  // approximation of the `References` chain — see `src/threads.js` for what it does and does not
-  // group — and the count on the row says how many messages were folded, so nothing is hidden.
+  // One row per conversation rather than one per message (`design/07` §2). The key is the
+  // `References` root the backend computed, falling back to subject+sender for rows that predate it
+  // (`src/threads.js`) — and the count on the row says how many messages were folded, so nothing is
+  // hidden behind a single subject.
   const conversations = threads.groupConversations(state.messages);
 
   for (const conversation of conversations) {
     const message = conversation.messages[0];
     const extra = conversation.messages.length - 1;
+    const folded = state.expandedThreads.has(conversation.key);
     const button = document.createElement('button');
     const selected =
       message.uid === state.selectedUid && state.mailbox === state.selectedFolder;
@@ -1301,17 +1311,60 @@ function renderMessages() {
     button.className = 'msg' + (unread ? ' unread' : '') + (selected ? ' selected' : '');
     button.innerHTML = `
       <div class="msg-top">
-        <span class="msg-from">${escapeHtml(senderLabel(message))}</span>
+        <span class="msg-from">${
+          extra > 0
+            ? `<span class="msg-caret" role="button" title="${
+                folded ? '收起这个会话' : '展开这个会话'
+              }">${folded ? '▾' : '▸'}</span>`
+            : ''
+        }${escapeHtml(senderLabel(message))}</span>
         <span class="msg-date">${escapeHtml(formatDate(message.date))}</span>
       </div>
       <div class="msg-subject">${escapeHtml(message.subject)}${
         extra > 0 ? `<span class="msg-count" title="这个会话里的邮件数">${conversation.messages.length}</span>` : ''
       }</div>`;
-    button.addEventListener('click', () => openMessage(message));
+
+    // The caret toggles the fold; the rest of the row opens the newest message. Keeping those two
+    // apart matters: "read the newest" is what a click on a row means everywhere else in the app.
+    button.addEventListener('click', (event) => {
+      if (extra > 0 && event.target?.classList?.contains('msg-caret')) {
+        event.stopPropagation();
+        toggleThread(conversation.key);
+        return;
+      }
+      openMessage(message);
+    });
     list.appendChild(button);
+
+    if (folded) {
+      // The rest of the conversation, oldest last, indented. Each is a real row the user can open:
+      // a fold that hides messages without a way to reach them is just a shorter list.
+      for (const entry of conversation.messages.slice(1)) {
+        const child = document.createElement('button');
+        child.className = 'msg thread-child' + (entry.seen ? '' : ' unread');
+        child.innerHTML = `
+          <div class="msg-top">
+            <span class="msg-from">${escapeHtml(senderLabel(entry))}</span>
+            <span class="msg-date">${escapeHtml(formatDate(entry.date))}</span>
+          </div>
+          <div class="msg-subject">${escapeHtml(entry.subject)}</div>`;
+        child.addEventListener('click', () => openMessage(entry));
+        list.appendChild(child);
+      }
+    }
   }
 
   $('list-footer').hidden = state.messages.length < state.limit;
+}
+
+/** Open or close one conversation in the list. */
+function toggleThread(key) {
+  if (state.expandedThreads.has(key)) {
+    state.expandedThreads.delete(key);
+  } else {
+    state.expandedThreads.add(key);
+  }
+  renderMessages();
 }
 
 /** Search results, each tagged with the folder it came from. */
