@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **227**（185 lib + 38 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **228**（186 lib + 38 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-25 更正：通知点击跳转属 M0-6（外部阻塞） / M1a-24 附件超限拦截 |
+| 最新 | M1a-26 按账号开关通知（托盘里能做的那半） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -52,6 +52,26 @@ M1a-23 把上限拦在**点发送**时，但设计要的是"添加附件/点发�
 
 **证据**：`check.ps1` 15 步全绿（前端命令 **30** 个）、测试 **227**、启动冒烟 10 秒存活。
 估算函数是纯前端，门禁只能证明语法与接线——**没有自动化测试覆盖它**，如实记在这里。
+
+---
+### M1a-26 按账号开关新邮件通知（通知托盘里"能做的"那一半）✅（第 32 轮）
+
+M1a-25 更正后的结论是：通知**能做**的只有"发不发"，**点击跳转做不了**（要 M0-6）。这一轮就把能做的那半做完。
+
+- **偏好存在 `user.db` 的 `kv`**（键 `notify:<账号>`，值 `1`/`0`）：一位账号一个键——**默认开**，
+  因为一个对新邮件完全沉默的邮件客户端才是意外；而"工作邮箱吵、私人邮箱安静"是很正常的一对。
+  `UserStore::notify_enabled()` / `set_notify_enabled()`，测试覆盖默认值、关闭、以及**关一个不影响另一个**。
+- **判断在发通知处**（`src-tauri` 的推送路径）：`notify_enabled` 为假就直接返回，不发 `.show()`。
+  放在这里而不是调用点，是为了将来任何新路径都绕不过它。
+- **界面**：侧栏每个账号行多一个铃铛（🔔/🔕），点一下切换并提示；挂载时从后端读**真实**偏好，
+  而不是本地猜。这个铃铛是偏好不是动作，所以默认半透明、悬停才变亮。
+
+**证据**：`check.ps1` 15 步全绿（前端命令 **32** 个）、测试 **228**（186 lib + 38 loopback + 4 reachability）、
+启动冒烟 10 秒存活。**门禁在过程中真的抓到了我的一次失误**：两个新命令加进了函数却没加进
+`generate_handler!`，被"每个前端调用的命令都已注册"那一步拦下（还连带 clippy/build 的 dead_code 警告），
+修好后全绿——这正是那条门禁存在的理由。
+
+**未做**：真机验证（需要等一封真的新邮件，或你自己点一下铃铛试试）；点击跳转与富通知仍是 M0-6（外部阻塞）。
 
 ---
 ### M1a-25 更正 M1a-18 的一处乐观判断：通知的"点击跳转"是被外部条件卡住的 ✅（第 31 轮）
@@ -705,13 +725,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **227 通过、0 失败**
-（185 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **228 通过、0 失败**
+（186 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 65 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 67 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -772,17 +792,18 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    真迁移**，cache 的 `migrate` 有"版本相等就早退"的守卫，所以这次**必须**升版本号）；
    ② `mail-core` 一个纯函数算稳定会话键（`References` 根，兜底 `Message-ID`，再兜底规范化主题+
    发件人），纯测；③ 列表按会话分组 + 展开/折叠 + 未读聚合，探针验证同会话聚成一行。
-   之后：通知托盘的**开关**（可做；**点击跳转与富通知做不了**——插件桌面端没有动作回调，要 M0-6 的
-   Windows App SDK，见 M1a-25 的更正）→ 认证轴的 OAuth（**卡在 M0-8：需要你的 client_id**，
+   之后：~~通知托盘的开关~~ → **M1a-26 已做**（按账号、默认开、存在 kv）。
+   **点击跳转与富通知做不了**——插件桌面端没有动作回调，要 M0-6 的 Windows App SDK（见 M1a-25 的更正）
+   → 认证轴的 OAuth（**卡在 M0-8：需要你的 client_id**，
    在那之前做是白做）→ 安装包（签名是外部条件；自动更新完全没有，可做但大）。
 
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 227 个测试
+cargo test --workspace                # 228 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 65 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 67 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
