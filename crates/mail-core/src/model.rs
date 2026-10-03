@@ -197,6 +197,13 @@ pub struct OutgoingAttachment {
     /// Size in bytes, for the composer to show. Not used when sending.
     #[serde(default)]
     pub size: u64,
+    /// SHA-256 of the file when the user chose it.
+    ///
+    /// The path is not identity: the file can be edited or deleted between adding it and sending,
+    /// and delivering the new contents would be sending something the user never approved. Filled
+    /// in at pick time, and at send time for a draft that predates this (`design/07` §5.5/§7).
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// A message to be sent.

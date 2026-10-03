@@ -21,7 +21,7 @@
  */
 (async () => {
   const invoke = window.__TAURI__.core.invoke;
-  const { draft, serializeAttachments, outgoingMail } = window.__easyEmailPayload;
+  const { draft, serializeAttachments, outgoingMail, attachment } = window.__easyEmailPayload;
   const steps = [];
   const note = (step, detail) => steps.push({ step, ...detail });
 
@@ -134,6 +134,10 @@
   // `missing field \`body_text\`` while the 发送 button looked perfectly wired. M1a-9 moved the
   // composer onto `enqueue_send`, which takes the same `OutgoingMail`, so the contract is the same
   // one — and this probe is what keeps a future edit from quietly changing it.
+  //
+  // The attachment is here on purpose: `OutgoingAttachment` is a nested struct with
+  // `deny_unknown_fields`, so its keys fail at runtime too, and a nested payload is exactly the
+  // shape a top-level check would miss.
   const sendError = await invoke('enqueue_send', {
     accountId: 'dsh-no-such-account',
     mail: outgoingMail({
@@ -141,7 +145,15 @@
       subject: 'shape probe',
       bodyText: 'hello',
       references: [],
-      attachments: [],
+      attachments: [
+        attachment({
+          name: 'a.txt',
+          mime: 'text/plain',
+          path: 'C:\\nonexistent\\a.txt',
+          size: 3,
+          sha256: 'ab',
+        }),
+      ],
     }),
     draftId: null,
     undoSeconds: 5,

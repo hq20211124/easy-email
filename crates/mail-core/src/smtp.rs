@@ -308,6 +308,7 @@ mod tests {
             mime: "application/pdf".into(),
             path: path.to_string_lossy().to_string(),
             size: 13,
+            sha256: None,
         });
 
         let message = build_message(&account(), &mail).expect("build");
@@ -366,6 +367,7 @@ mod tests {
             mime: "application/octet-stream".into(),
             path: path.to_string_lossy().to_string(),
             size: 4,
+            sha256: None,
         });
 
         let raw =
@@ -394,6 +396,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string(),
             size: 1,
+            sha256: None,
         });
 
         let error = build_message(&account(), &mail).expect_err("must not build");
@@ -415,6 +418,7 @@ mod tests {
             mime: "not a mime type".into(),
             path: path.to_string_lossy().to_string(),
             size: 5,
+            sha256: None,
         });
 
         let message = build_message(&account(), &mail).expect("must still build");

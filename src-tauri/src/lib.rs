@@ -24,8 +24,8 @@ use mail_core::{
     FilingReport, FilingRun, MailError, MailboxInfo, MessageDetail, MessageSummary, NewOutbox,
     OutboxItem, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryReport,
     RecoveryRun, RunReport, SearchHit, SentCopy, Spool, SyncDriver, SyncOutcome, SyncWindow,
-    account_with_login, backfill_older, ensure_sent_copy, file_sent_copies, recover_in_flight,
-    run_due, secret, smtp,
+    account_with_login, backfill_older, ensure_sent_copy, file_sent_copies, file_sha256,
+    prepare_attachments, recover_in_flight, run_due, secret, smtp,
     userdb::{Draft, UserStore},
     watch,
 };
@@ -610,6 +610,15 @@ async fn enqueue_send(
 ) -> Result<i64, String> {
     let cfg = state.find(&account_id)?;
 
+    if mail.to.is_empty() && mail.cc.is_empty() && mail.bcc.is_empty() {
+        return Err("请至少填写一个收件人。".to_string());
+    }
+
+    // Attachments are paths, so the file can have been edited or deleted since it was chosen, and
+    // this is the last moment at which that can still be a question: once the bytes are frozen they
+    // are what goes out. A draft that predates hashing is completed here rather than refused.
+    prepare_attachments(&mut mail).map_err(describe)?;
+
     // Freeze the identity before anything else: lettre generates a fresh Message-ID per build, so
     // rebuilding later would silently produce a *different* message as far as every client is
     // concerned — and crash recovery would have nothing to search the Sent folder for.
@@ -618,10 +627,6 @@ async fn enqueue_send(
         mail.message_id = smtp::message_id_of(&message);
     }
     let bytes = message.formatted();
-
-    if mail.to.is_empty() && mail.cc.is_empty() && mail.bcc.is_empty() {
-        return Err("请至少填写一个收件人。".to_string());
-    }
 
     let now = now_seconds();
     let undo = i64::from(
@@ -1316,6 +1321,11 @@ async fn pick_attachments(app: AppHandle) -> Result<Vec<OutgoingAttachment>, Str
             continue;
         }
 
+        // Hash now, while the user is looking at the file they just chose: that is the version they
+        // approved, and it is the only chance to record it. A file too large or too odd to hash is
+        // added without one — the send path then hashes it instead of refusing the attachment.
+        let sha256 = file_sha256(&path).ok();
+
         chosen.push(OutgoingAttachment {
             name: path
                 .file_name()
@@ -1325,6 +1335,7 @@ async fn pick_attachments(app: AppHandle) -> Result<Vec<OutgoingAttachment>, Str
             mime: guess_mime(&path),
             size: metadata.len(),
             path: path.to_string_lossy().to_string(),
+            sha256,
         });
     }
 

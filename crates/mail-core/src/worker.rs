@@ -100,8 +100,13 @@ fn frozen_bytes(run: &OutboxRun<'_>, item: &OutboxItem) -> Result<(Vec<u8>, Opti
         }
     }
 
-    let mail: OutgoingMail = serde_json::from_str(&item.payload_json)
+    let mut mail: OutgoingMail = serde_json::from_str(&item.payload_json)
         .map_err(|e| MailError::Parse(format!("发件内容无法解析：{e}")))?;
+    // Rebuilding is the only path where the file on disk can still be compared against what the user
+    // approved — the frozen bytes are gone, so this is the last chance to tell them the file changed.
+    // A file that was edited or deleted stops the send and asks; it is never quietly rebuilt from
+    // whatever happens to be at that path now (`design/07` §5.3/§5.5).
+    crate::attach::prepare_attachments(&mut mail)?;
     let message = smtp::build_message(run.cfg, &mail)?;
     let message_id = smtp::message_id_of(&message);
     let bytes = message.formatted();
@@ -1083,6 +1088,70 @@ mod tests {
             ),
             Recovery::Resend
         );
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_refuses_an_attachment_that_changed() {
+        // The frozen bytes are gone, so the file on disk is the only source left — and it is no longer
+        // what the user approved. This is the one moment the check can still be made, and sending the
+        // new contents instead would deliver something they never agreed to.
+        let dir = temp_dir("rebuild-changed");
+        let spool = Spool::open(&dir).expect("spool");
+        let store = UserStore::open_in_memory().expect("open");
+        let cfg = account();
+
+        let file = dir.join("report.pdf");
+        std::fs::write(&file, b"first version").expect("fixture");
+        let recorded = crate::attach::file_sha256(&file).expect("hash");
+        std::fs::write(&file, b"second version").expect("edit fixture");
+
+        let mut mail = outgoing();
+        mail.attachments.push(crate::model::OutgoingAttachment {
+            name: "report.pdf".into(),
+            mime: "application/pdf".into(),
+            path: file.to_string_lossy().to_string(),
+            size: 14,
+            sha256: Some(recorded),
+        });
+
+        let id = store
+            .enqueue_outbox(&NewOutbox {
+                account_id: "t".into(),
+                draft_id: None,
+                payload_json: serde_json::to_string(&mail).expect("payload"),
+                // No spool file: this row can only be sent by rebuilding from the payload.
+                spool_path: None,
+                spool_bytes: 0,
+                undo_until: 0,
+                scheduled_at: 0,
+                created_at: 1_000,
+            })
+            .expect("enqueue");
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let counter = calls.clone();
+        let report = run_due(run(&store, &spool, &cfg, 1_000), move |_, _, _, _| {
+            *counter.lock().expect("lock") += 1;
+            async { Ok(()) }
+        })
+        .await
+        .expect("run");
+
+        assert_eq!(report.sent, 0, "it must not go out with the new contents");
+        assert_eq!(report.needs_attention, 1, "{report:?}");
+        assert_eq!(*calls.lock().expect("lock"), 0, "SMTP was never reached");
+
+        let item = store.outbox_item(id).expect("item").expect("present");
+        assert_eq!(
+            item.parsed_state(),
+            crate::outbox::OutboxState::NeedsAttention
+        );
+        let reason = item.last_error.expect("reason");
+        assert!(
+            reason.contains("report.pdf") && reason.contains("改动"),
+            "the user has to be told which file and how to proceed: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

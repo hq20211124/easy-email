@@ -25,6 +25,10 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
 # Inline (`cid:`) images are handed to the webview as `data:` URIs, which requires base64.
 base64 = { version = "0.23", default-features = false, features = ["std"] }
+# Attachment identity: a draft records each file's hash when it is added, and the send path compares
+# it against the file on disk, so "the file changed under us" is caught instead of sent (design/07
+# §5.5). Hashed in chunks — a 100 MB attachment must not be read into memory to hash it.
+sha2 = { version = "0.10", default-features = false }
 
 serde.workspace = true
 serde_json.workspace = true

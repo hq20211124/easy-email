@@ -1796,14 +1796,18 @@ function openComposer({ mode = 'new', draft = null } = {}) {
         bodyHtml: null,
         inReplyTo,
         references,
-        // Rebuilt field by field: the stored form also carries `sha256`, which `OutgoingAttachment`
-        // does not have.
-        attachments: attachments.map((file) => ({
-          name: file.name,
-          mime: file.mime,
-          path: file.path,
-          size: file.size,
-        })),
+        // Built through the shared builder, including `sha256`: the hash is what lets the backend
+        // notice a file that was edited or deleted after it was chosen, instead of sending bytes the
+        // user never approved.
+        attachments: attachments.map((file) =>
+          payload.attachment({
+            name: file.name,
+            mime: file.mime,
+            path: file.path,
+            size: file.size,
+            sha256: file.sha256,
+          })
+        ),
       });
 
       const ok = await run('加入发件箱', async () => {

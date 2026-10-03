@@ -36,6 +36,24 @@
     };
   }
 
+  /**
+   * `OutgoingAttachment` — crates/mail-core/src/model.rs.
+   *
+   * `sha256` is the identity of the file as the user chose it: it is what lets the send path notice
+   * that the file was edited or deleted in between, instead of delivering something they never
+   * approved (design/07 §5.5). The picker fills it in; a draft saved before it existed has `null`
+   * and the backend completes it at send time.
+   */
+  function attachment(fields) {
+    return {
+      name: fields.name ?? '',
+      mime: fields.mime ?? 'application/octet-stream',
+      path: fields.path ?? '',
+      size: fields.size ?? 0,
+      sha256: fields.sha256 ?? null,
+    };
+  }
+
   /** `Draft` — crates/mail-core/src/userdb.rs. */
   function draft(fields) {
     return {
@@ -107,6 +125,7 @@
   }
 
   global.__easyEmailPayload = {
+    attachment,
     outgoingMail,
     draft,
     serializeAttachments,

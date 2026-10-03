@@ -28,6 +28,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const CONTRACTS = [
   { builder: 'outgoingMail', struct: 'OutgoingMail', file: 'crates/mail-core/src/model.rs' },
+  { builder: 'attachment', struct: 'OutgoingAttachment', file: 'crates/mail-core/src/model.rs' },
   { builder: 'draft', struct: 'Draft', file: 'crates/mail-core/src/userdb.rs' },
 ];
 

@@ -15,6 +15,7 @@
 //! - [`smtp`] — compose and send, including threading headers.
 //! - [`secret`] — Windows Credential Manager access.
 
+pub mod attach;
 pub mod backfill;
 pub mod cache;
 pub mod db;
@@ -35,6 +36,7 @@ pub mod sync;
 pub mod userdb;
 pub mod worker;
 
+pub use attach::{AttachmentIssue, check_attachment, file_sha256, prepare_attachments};
 pub use backfill::{BackfillBudget, BackfillReport, BackfillStop, backfill_older};
 pub use cache::{Cache, FolderState, SearchHit};
 pub use error::{AuthHint, MailError, Result};

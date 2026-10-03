@@ -1617,6 +1617,7 @@ async fn smtp_send_carries_an_attachment_the_recipient_can_open() {
             mime: "application/pdf".to_string(),
             path: path.to_string_lossy().to_string(),
             size: contents.len() as u64,
+            sha256: None,
         }],
         message_id: None,
     };
