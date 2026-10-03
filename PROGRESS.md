@@ -7,8 +7,8 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **156**（122 lib + 30 loopback + 4 reachability）。
-  `tools/check.ps1` **全绿**：**14 步**（7 项前端不变量 + "命令共享一个数据库句柄" +
+- **测试数量**：基线 116 → 现在 **166**（132 lib + 30 loopback + 4 reachability）。
+  `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
 ## 提交记录
@@ -16,13 +16,66 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-5 草稿命令 + 交接摘要 |
-| — | M1a-4 草稿落库 / M1a-3b 窗口生效 / M1a-3 窗口模型 / M1a-2 `user.db` / M1a-1b 回填接线 / M1a-1a 回填原语 |
+| 最新 | M1a-7 修发信负载大小写 bug + 写信接草稿 + 草稿箱 + 交接摘要 |
+| — | M1a-6 发件箱决策逻辑 / M1a-5 草稿命令 / M1a-4 草稿落库 / M1a-3b 窗口生效 / M1a-3 窗口模型 / M1a-2 `user.db` / M1a-1b 回填接线 / M1a-1a 回填原语 |
 | `62d806c` | M0-2b `Cache`/`src-tauri` 切到共享 `Db`（去掉每条命令开连接）+ 新门禁 |
 | `1cc4aef` | M0-2a `db.rs`：单写线程 + 读池 + `DbSet` |
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-7 发信负载大小写 bug + 写信真正接草稿 + 草稿箱 ✅（第 13 轮）
+
+这一轮先撞上一个**上线级 bug**，再完成交接摘要里的第一优先级。
+
+**1. `send_mail` 从 v0.1 起就不可能成功**（真机 CDP 探针实测，不是推理）：
+渲染层发的是 `bodyText`/`inReplyTo`，而 Tauri 只把**命令参数名**做 camelCase↔snake_case
+转换，参数**值**里的结构体是 serde 按 Rust 字段名逐字反序列化的 ⇒ 每次点"发送"都得到
+`invalid args \`mail\` for command \`send_mail\`: missing field \`body_text\``。编译器、`cargo test`、
+`node --check` 全都看不见它——这就是它活了这么久的原因。
+- **单一来源**：新增 `src/payload.js`，`send_mail`/`save_draft` 的负载只在这里构造（键就是
+  Rust 字段名），`app.js` 只能通过它构造。
+- **新门禁**（`check.ps1` 第 8 步）：`tools/payload_keys.mjs` 把 `payload.js` 里每个构造器的**键集合**
+  与 Rust 里对应的 `pub struct` 字段集合**双向**比对（多一个键、少一个字段都红）。
+  **证伪验证**：把 `body_text` 改成 `bodyText` ⇒ 门禁同时报"struct 里没有这个字段"和
+  "payload 少了这个字段"（两侧都报）；改回即绿。
+- **运行时也变响**：`OutgoingMail` / `OutgoingAttachment` / `Draft` 加 `#[serde(deny_unknown_fields)]`
+  —— 否则一个拼错的**可选**字段（如 `bodyHtml`）会被静默忽略，富文本邮件悄悄变成纯文本。
+  3 条新 Rust 测试钉住"正确负载能反序列化 / 拼错的键必须报错"。
+- **真机探针** `tools/probe-drafts.mjs`（`node tools/inspect-dom.mjs @tools/probe-drafts.mjs`）：
+  正确负载 ⇒ 报 `找不到账号「…」`（**已经进了命令体**，证明负载被接受）；v0.1 的
+  camelCase 负载 ⇒ 报 `unknown field \`bodyHtml\`, expected one of … \`body_text\` …`（证明探针真能抓到这个 bug）。
+
+**2. 写信接草稿**（`design/07` §3/§5.1 的本地草稿部分）：
+- 2 秒去抖自动保存（`DRAFT_AUTOSAVE_MS`）+ **失焦/关闭时保存**（`openModal` 新增 `onClose` 钩子，
+  在拆 DOM **之前**读字段）；发送成功后才 `delete_draft`，且**先等排队中的保存落地**再删，
+  否则一次跑在删除之后的自动保存会在草稿箱里留下幽灵行。
+- **空草稿不入库**：没写任何字的写信窗口关闭后不该留下一行；已经落过库的草稿即使被清空也
+  保留（`design/07` §9：宁可多留一份）。
+- 草稿 id 用 `newDraftId()`（时间戳+随机）而不是 `crypto.randomUUID()`——webview 算不算
+  secure context 是运行期细节，为它赌上"第一次击键就抛异常"不划算。
+- 附件只存路径+元数据，`sha256` 记 `null`（**未做**：`pick_attachments` 还没算哈希，
+  `design/07` §9 的"发送前补算"仍待做）。
+- 状态行：`草稿 · 已保存 14:32` / 失败时红字提示（关窗后改用 toast，因为状态行已经不在 DOM 里）。
+
+**3. 草稿箱界面**：侧栏"本地 / 草稿箱 (N)"一行；列表按 `updated_at` 倒序、显示收件人与主题、
+点行续写、行内"丢弃"（`confirm` 后永久删除）；切账号会重新读该账号的草稿，搜索/选文件夹则
+回到邮件视图（`state.view`）。
+
+**真机端到端证据**（CDP 驱动真实窗口，探针自己清理，不留测试数据）：
+`save_draft` 接受 ⇒ 计数 +1、附件与 References JSON 原样存回；草稿箱渲染 1 行 + 徽标 1 + 标题
+"草稿箱"；点开续写把 收件人/主题/正文/1 个附件 全部填回，状态行 `草稿 · 上次保存 09:28`；
+改正文后 2.6 秒 ⇒ 状态行 `已保存` 且库里是新正文；点 ✕ 关闭 ⇒ 库里是**关闭前最后一版**；
+点"丢弃" ⇒ 行消失、计数回到开跑前。
+（探针还抓到一个真实小 bug：初始状态行写在 `openModal` 之前，落到了上一个对话的 DOM 上，
+所以续写时状态行是空的——已修成在 `onReady` 里写。）
+
+**数字**：`check.ps1` **15 步全绿**；测试 **166**（132 lib + 30 loopback + 4 reachability）；
+前端命令 **18** 个（新增 `save_draft`/`list_drafts`/`delete_draft` 的调用）；启动冒烟 9 秒存活。
+
+**未做**：附件 sha256；服务器草稿镜像（`draft_mirror`）；发件箱 worker（下一优先级）。
 
 ---
 
@@ -42,15 +95,18 @@
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **14 步全绿**；`cargo test --workspace` **163 通过、0 失败**
-（129 lib + 30 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
-应用启动冒烟通过（7–10 秒存活）。所有改动都在 git 里（基线 `83c1b0c`，共 22 个提交）。
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **166 通过、0 失败**
+（132 lib + 30 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+应用启动冒烟通过（9 秒存活）。所有改动都在 git 里（基线 `83c1b0c`，共 24 个提交）。
 
-**磁盘上已验证的两件事**（不是文档结论，是真机查过的）：
+**磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
   表与 `user_version` 完好 —— "清理缓存真的能腾出磁盘"这条对老用户也成立。
 - `%APPDATA%\com.easyemail.desktop\user.db`：`synchronous = 2 (FULL)`、五个表齐全
   —— 与 `cache.db`（NORMAL）各自独立，草稿/待发送不会因为"删缓存"而丢。
+- **草稿真的走通了**（CDP 探针驱动真实窗口，`tools/probe-drafts.mjs`）：写 → 2 秒自动保存 →
+  关闭时保存 → 草稿箱列出 → 点开续写填回 → 丢弃删除，全链路通过；同一探针还证明
+  `send_mail` 的负载契约是真的——v0.1 的"发送"按钮**从来没能成功过**（见 M1a-7）。
 
 **已完成的块**
 | 块 | 内容 | 关键证据 |
@@ -65,6 +121,8 @@
 | M1a-2 | `user.db` 落地（`UserStore`） | 真机 synchronous=2 |
 | M1a-3/3b | 可配同步窗口：模型 + 持久化 + `backfill_older` 窗口语义 + 命令 | `Count(20)` 停在正好 20 封；`Years(2)` 一页跨边界即停 |
 | M1a-4 | 草稿落库（upsert / 列表 / 删除 / 重启存活）+ 三个命令 | 5 条测试，含"重启后草稿还在" |
+| M1a-5/6 | 草稿命令；发件箱决策纯函数（状态解析 / 退避 / 永久失败判定 / needs_attention） | 7 条测试（含 `u32::MAX` 尝试次数与超范围 SMTP 码） |
+| **M1a-7** | **修 `send_mail` 负载大小写 bug（v0.1 起发送从未成功）+ 写信接草稿（2 s 自动保存 / 关闭保存 / 发送后删草稿）+ 草稿箱界面 + 契约门禁** | **`tools/probe-drafts.mjs` CDP 全链路通过；门禁可证伪（改回 camelCase 即红）** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -74,19 +132,26 @@
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **写信接草稿**：`src/app.js` 的 composer 目前把状态放在闭包里、不落库；
-   接 `save_draft` / `list_drafts` / `delete_draft` 三个命令（自动保存 + 关闭时保存 + 草稿箱列表）。
-2. **发件箱**：`outbox` 表已就位；`design/07` §5.3 的 worker（撤销窗口、退避重试、`needs_attention`）
-   与"发送后归档到已发送"（`append` + `find_uid_by_message_id` 已实现）。
-3. **窗口选择器界面** + 冷启动自动回填一页（并接配额账本，`design/04` §5.7）。
-4. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
+1. **发件箱 worker**：`outbox` 表与 M1a-6 的纯函数决策都已就位；按 `design/07` §5.3/§5.3.1 接
+   5 s tick（enqueue / 撤销到期 / 网络恢复都要立刻唤醒）、撤销窗口、退避重试、`needs_attention`、
+   以及"发送后归档到已发送"（`append` + `find_uid_by_message_id` 已实现）。
+   **崩溃恢复必须先查再重发**（冻结 Message-ID 去已发送里搜，找到就判 sent，不重发）。
+2. **附件 sha256**：`pick_attachments` 现在不返回哈希，草稿里 `sha256` 记 `null`
+   （`design/07` §9 允许，但要求**发送前补算**）；补上后 `AttachmentChanged` 这条提醒才成立。
+3. **服务器草稿镜像**：`draft_mirror`（APPEND + `find_uid_by_message_id` 找回 UID，best-effort，
+   失败不阻塞写信）。
+4. **窗口选择器界面** + 冷启动自动回填一页（并接配额账本，`design/04` §5.7）。
+5. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
 
 **运行方式**
 ```
-.	ools\check.ps1                     # 14 步门禁（前端不变量 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 156 个测试
-python design	oolsudit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
-git log --oneline                     # 22 个提交；git diff 83c1b0c HEAD 是本次全部改动
+.\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
+cargo test --workspace                # 166 个测试
+python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
+git log --oneline                     # 24 个提交；git diff 83c1b0c HEAD 是本次全部改动
+
+# 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
+node tools/inspect-dom.mjs @tools/probe-drafts.mjs
 ```
 
 ---
