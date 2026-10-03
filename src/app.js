@@ -59,6 +59,13 @@ const state = {
   outbox: [],
   /** The sync window the user chose; `null` until it has been read. */
   syncWindow: null,
+  /**
+   * Bytes this account may send, or `null` before it has been read.
+   *
+   * Read from the backend rather than kept here as a constant: the cap is a policy about providers
+   * (`design/07` §6), and a second copy in the renderer is a second thing to get wrong.
+   */
+  sendCap: null,
   /** Decoded mailbox name for display; `mailbox` stays in wire form for commands. */
   mailboxLabel: null,
   messages: [],
@@ -351,6 +358,8 @@ async function refreshAccounts() {
 
 async function selectAccount(accountId) {
   if (!accountId) return;
+  // The cap belongs to the account's provider; a second account may have a different one.
+  state.sendCap = null;
   const changed = state.accountId !== accountId;
   state.accountId = accountId;
 
@@ -1839,6 +1848,24 @@ function openComposer({ mode = 'new', draft = null } = {}) {
       modal.querySelector('#btn-add-attachment').addEventListener('click', async () => {
         const picked = await run('选择附件', () => invoke('pick_attachments'));
         if (!picked || picked.length === 0) return;
+
+        // `design/15` §4 / `design/07` §6: refuse at the moment the file is chosen rather than after
+        // the mail has been written. The estimate is deliberately rough (base64 inflates by about a
+        // third, plus headers) and the authoritative check is still the one `enqueue_send` makes
+        // before freezing the bytes — this one exists so nobody types for ten minutes first.
+        const total = [...attachments, ...picked].reduce((sum, file) => sum + (file.size ?? 0), 0);
+        const cap = await sendCapBytes();
+        if (cap && estimatedEncodedBytes(total) > cap) {
+          toast(
+            `这些附件加起来约 ${formatBytes(total)}，编码后约 ${formatBytes(
+              estimatedEncodedBytes(total)
+            )}，超过可发送上限 ${formatBytes(cap)}。请压缩、改用云盘链接，或分两封发。`,
+            'err',
+            12000
+          );
+          return;
+        }
+
         attachments = attachments.concat(picked);
         renderAttachments(modal);
         scheduleSave(modal);
@@ -2047,6 +2074,24 @@ function stripTags(html) {
   return div.textContent || '';
 }
 
+/**
+ * Base64 is 4/3, and headers/boundaries add a little on top.
+ *
+ * An *estimate*, on purpose: the number that decides is the one `enqueue_send` computes from the
+ * bytes it actually built. Being a little pessimistic here is the cheap direction — the user is told
+ * about a problem while they can still choose a smaller file.
+ */
+function estimatedEncodedBytes(bytes) {
+  return Math.ceil(bytes * (4 / 3)) + 4096;
+}
+
+/** The cap for the current account, read from the backend once and then remembered. */
+async function sendCapBytes() {
+  if (state.sendCap) return state.sendCap;
+  const cap = await invoke('max_send_bytes', { accountId: state.accountId }).catch(() => null);
+  if (cap) state.sendCap = cap;
+  return cap;
+}
 /** The sentence the drafts area shows when the server copy is behind. */
 const CLOUD_DRAFT_PENDING = '本地已保存（云端草稿待同步）';
 

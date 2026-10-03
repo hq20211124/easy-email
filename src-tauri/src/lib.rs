@@ -872,6 +872,18 @@ async fn mirror_draft(
     Ok(report)
 }
 
+/// The largest message this account may send, in bytes.
+///
+/// `enqueue_send` enforces this before the bytes are frozen; the composer asks for it as well so an
+/// oversized attachment is refused when it is chosen rather than after the mail has been written
+/// (`design/07` §6, `design/15` §4). One number, one place: the renderer must not keep its own copy.
+#[tauri::command]
+async fn max_send_bytes(state: State<'_, AppState>, account_id: String) -> Result<u64, String> {
+    let cfg = state.find(&account_id)?;
+    Ok(mail_core::providers::max_outgoing_bytes(
+        mail_core::providers::by_id(&cfg.provider_id),
+    ))
+}
 /// The sentence to show when a sync stopped because the server will not go further back.
 ///
 /// Only for services known to cap how far back a third-party client may read (A1-F2, the NetEase
@@ -2053,6 +2065,7 @@ pub fn run() {
             mirror_draft,
             draft_mirror,
             range_cap_hint,
+            max_send_bytes,
             enqueue_send,
             list_outbox,
             cancel_send,
