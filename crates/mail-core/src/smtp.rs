@@ -334,6 +334,33 @@ mod tests {
     }
 
     #[test]
+    fn the_composer_payload_deserialises_and_a_mistyped_key_does_not() {
+        // The renderer builds this object in src/payload.js; tools/check.ps1 compares its keys with
+        // `OutgoingMail`. This is the runtime half: before M1a-7 the composer sent `bodyText` and
+        // every send failed with "missing field `body_text`" — a bug no compiler and no Rust test
+        // could have seen, because nothing deserialised the payload the UI actually built.
+        let good = serde_json::json!({
+            "to": ["a@example.com"], "cc": [], "bcc": [], "subject": "s",
+            "body_text": "hi", "body_html": null, "in_reply_to": null,
+            "references": [], "attachments": []
+        });
+        let parsed: OutgoingMail = serde_json::from_value(good).expect("the composer's payload");
+        assert_eq!(parsed.body_text, "hi");
+
+        // `body_html` is optional, so a camelCase spelling would be ignored rather than refused —
+        // a rich message would go out as plain text with nothing to show for it.
+        let typo = serde_json::json!({
+            "to": ["a@example.com"], "cc": [], "bcc": [], "subject": "s",
+            "body_text": "hi", "bodyHtml": "<p>hi</p>", "in_reply_to": null,
+            "references": [], "attachments": []
+        });
+        assert!(
+            serde_json::from_value::<OutgoingMail>(typo).is_err(),
+            "a key the struct does not have must be an error, not a silently ignored field"
+        );
+    }
+
+    #[test]
     fn plain_message_has_the_expected_headers() {
         let msg = build_message(&account(), &outgoing()).expect("build");
         assert_eq!(

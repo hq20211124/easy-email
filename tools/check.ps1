@@ -239,6 +239,27 @@ try {
 
     # ------------------------------------------------------------ rust
 
+    Step 'payloads sent to struct commands match the Rust structs' {
+        # `send_mail` takes `mail: OutgoingMail` and `save_draft` takes `draft: Draft`. Tauri only
+        # renames the command *argument*; the struct is deserialised by serde under its exact Rust
+        # field names, so a camelCase key is a runtime failure that no compiler and no Rust test can
+        # see. It already happened: `send_mail` was called with `bodyText`/`inReplyTo` from v0.1 and
+        # the 发送 button could never succeed (M1a-7). The comparison lives in a script because it
+        # has to read both languages.
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/payload_keys.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'the frontend and serde disagree about a payload shape' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'Tauri commands share one database handle (no connection per command)' {
         # v0.2 opened a `Cache` (one SQLite connection) inside almost every command. That shape cannot
         # batch — every row became its own transaction — and it is the thing M0-2 removed: the app

@@ -186,6 +186,7 @@ pub struct MessageDetail {
 /// built. Serialising a 20 MB attachment through the IPC boundary as a JSON string would be both
 /// slow and pointless when the file is already sitting on the same machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutgoingAttachment {
     /// Filename to present to the recipient. Sent `Content-Disposition`-encoded.
     pub name: String,
@@ -199,7 +200,14 @@ pub struct OutgoingAttachment {
 }
 
 /// A message to be sent.
+///
+/// `deny_unknown_fields` is deliberate: this struct arrives as JSON from the renderer, and an
+/// optional field whose key is spelled differently would be *ignored* rather than rejected — a
+/// message with `bodyHtml` would quietly go out as plain text only. The keys are compared against
+/// the frontend's builders by `tools/check.ps1`; this is what makes the mismatch loud at runtime
+/// as well, for any caller the gate cannot see.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutgoingMail {
     pub to: Vec<String>,
     pub cc: Vec<String>,

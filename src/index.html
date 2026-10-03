@@ -46,6 +46,19 @@
           <div id="mailbox-list" class="mailbox-list"></div>
         </div>
 
+        <!--
+          Drafts are local (`user.db`), not a server folder, so they are listed separately from the
+          mailbox tree rather than mixed into it: a "草稿箱" that appears only after the server
+          answers would be missing exactly when the network is, which is when drafts matter most.
+        -->
+        <div class="section">
+          <div class="section-title">本地</div>
+          <button id="btn-drafts" class="row" type="button">
+            <span class="label">草稿箱</span>
+            <span id="drafts-count" class="count"></span>
+          </button>
+        </div>
+
         <button id="btn-compose" class="btn primary block">写邮件</button>
       </aside>
 
@@ -131,6 +144,8 @@
     <div id="modal-root" class="modal-root" hidden></div>
     <div id="toast-root" class="toast-root"></div>
 
+    <!-- Before app.js: it owns the payload shapes app.js sends (see the header of payload.js). -->
+    <script src="payload.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

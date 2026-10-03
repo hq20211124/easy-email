@@ -412,6 +412,22 @@ textarea {
   box-shadow: inset 3px 0 0 var(--unread);
 }
 
+/* The draft rows reuse the message layout (`.msg`), so a drafts list reads like the mail lists
+   beside it. This is the one part that has no message equivalent: the per-row action. */
+.draft-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.draft-actions .btn {
+  padding: 1px 7px;
+  font-size: 11px;
+}
+
 .list-footer {
   padding: 10px;
   border-top: 1px solid var(--border);  flex: none;
@@ -741,6 +757,19 @@ textarea {
 .field .hint {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* The composer's autosave line ("草稿 · 已保存 14:32"). It is the only place the app tells the
+   user that what they are typing is already on disk, so it is always visible rather than only
+   appearing on a failure. */
+.compose-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  min-height: 16px;
+}
+
+.compose-status.err {
+  color: var(--danger);
 }
 
 .grid-2 {

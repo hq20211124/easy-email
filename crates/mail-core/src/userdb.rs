@@ -31,7 +31,11 @@ pub const USER_TABLES: &[&str] = &["schema_migrations", "kv", "drafts", "outbox"
 /// Attachments are **paths plus metadata**, never bytes: a draft with a 100 MB attachment must not
 /// turn the user database into a second copy of the mail. `sha256` is what lets the send path notice
 /// that a file changed under it (design/07 §5.3).
+///
+/// `deny_unknown_fields` matches `OutgoingMail`: the draft arrives as JSON from the renderer, and a
+/// mistyped optional key would otherwise be dropped in silence (see `tools/payload_keys.mjs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Draft {
     pub id: String,
     pub account_id: String,
@@ -523,6 +527,42 @@ mod tests {
 
     fn draft(id: &str, account: &str, now: i64) -> Draft {
         Draft::new(id, account, now)
+    }
+
+    #[test]
+    fn a_mistyped_optional_key_is_refused_rather_than_dropped() {
+        // `body_html` is optional, so a payload that sends `bodyHtml` would deserialise into a
+        // draft with no HTML at all — a silent downgrade of what the user wrote. The key set is
+        // compared against the frontend's builders by tools/check.ps1; this keeps the runtime
+        // honest for callers the gate does not see.
+        let payload = serde_json::json!({
+            "id": "d1", "account_id": "acc",
+            "to_addrs": "", "cc_addrs": "", "bcc_addrs": "",
+            "subject": "s", "body_text": "b", "bodyHtml": "<p>b</p>",
+            "attachments_json": "[]", "in_reply_to": null, "references": "[]",
+            "identity": null, "created_at": 1, "updated_at": 1
+        });
+        let parsed: std::result::Result<Draft, serde_json::Error> = serde_json::from_value(payload);
+        assert!(
+            parsed.is_err(),
+            "an unknown key must be an error, not a silently ignored field"
+        );
+    }
+
+    #[test]
+    fn the_payload_the_composer_sends_deserialises() {
+        // Mirrors src/payload.js -> draft(). Kept next to the struct so the shape the renderer
+        // really sends is pinned on this side too, not only in the frontend's own gate.
+        let payload = serde_json::json!({
+            "id": "d1", "account_id": "acc",
+            "to_addrs": "a@example.com", "cc_addrs": "", "bcc_addrs": "",
+            "subject": "十月报销", "body_text": "见附件", "body_html": null,
+            "attachments_json": "[]", "in_reply_to": null, "references": "[]",
+            "identity": null, "created_at": 1, "updated_at": 2
+        });
+        let draft: Draft = serde_json::from_value(payload).expect("the composer's payload");
+        assert_eq!(draft.subject, "十月报销");
+        assert_eq!(draft.body_html, None);
     }
 
     #[test]
