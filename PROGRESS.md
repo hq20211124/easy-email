@@ -49,9 +49,10 @@ M1a-16 收尾时顺带发现的安全缺口，这一轮补上。`cache.db` 一�
 测试 `a_user_database_from_a_newer_version_is_refused_rather_than_misread`：正常开一个文件 →
 把 `user_version` 改成 `SCHEMA_VERSION + 1` → 断言 `open` **失败**且消息里有"更新"。
 
-**回退路径也说清楚了**：打开失败时程序仍要能起窗（既有决定，没改成硬失败），但那条 `log_line`
-现在明说"**本次运行不读写草稿/发件箱**"——因为此时用户看到的是空列表，而这里存的东西会被丢掉。
-**还差的一半**：把这个原因显示在窗口里，而不是只留在 `startup-error.log`（已进下一步）。
+**回退路径现在也说得出口**：打开失败时程序仍要能起窗（既有决定，没改成硬失败），但那条 `log_line`
+明说"**本次运行不读写草稿/发件箱**"，并且**窗口自己会说**——`SyncStatus` 新增 `user_store_error`，
+前端启动时读一次并红字提示。这一步非做不可：回退是唯一一处"不读用户自己的数据"的地方，
+窗口显示空草稿箱会被读成"我的草稿没了"，而那正是相反的事实（草稿在磁盘上、只是这个版本拒绝误读）。
 
 **数字**：`check.ps1` 15 步全绿；测试 **223**（181 lib + 38 loopback + 4 reachability）。
 
@@ -95,7 +96,7 @@ M1a-16 收尾时顺带发现的安全缺口，这一轮补上。`cache.db` 一�
 - **真机**：应用起来后 `user.db` 里出现了 `draft_mirrors`（版本仍是 2，未升号），其余行数不变。
 
 **数字**：`check.ps1` 15 步全绿；测试 **222**（180 lib + 38 loopback + 4 reachability）；
-前端命令 **27** 个。
+前端命令 **28** 个。
 
 **已知缺口（下一轮先做这三件）**：
 1. **发出后就没人清那份服务器草稿了**：worker 在发送成功后删的是本地草稿行（mail-core 层，没有 IMAP
@@ -551,7 +552,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 48 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 50 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -599,8 +600,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 1. **镜像的收尾**（M1a-16）：发出后 worker 删的是本地草稿行，`draft_mirrors` 那行与服务器副本会留下
    ——镜像命令在"草稿已经不存在"时删旧副本并清行即可（`account_id` 已在表里正为此）；
    再有 §5.1 的"每 30 秒或失焦"镜像。
-   （"更新版本拒绝打开"的守卫已在 M1a-17 补上；**还差把"用户数据没能打开"显示给用户**——
-   现在只有启动日志。）
+   （守卫与"显示给用户"都已在 M1a-17 落地。）
 2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
@@ -619,7 +619,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 cargo test --workspace                # 223 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 48 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 50 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
