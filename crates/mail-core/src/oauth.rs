@@ -16,11 +16,14 @@
 //!   question that decides the wizard's shape is whether the token endpoint *requires* it — that is
 //!   M0-8, and it is why every call here takes it as an `Option`.
 //!
-//! What is deliberately **not** here: opening the browser and catching the redirect. That half needs
-//! a human to press "allow" and a real client id, so it stays next to the UI where it can be seen
-//! (`design/05` §3.1); this half is pure and testable, and its tests use a fake transport.
+//! What is deliberately **not** here: opening the browser. That needs a human to press "allow", so it
+//! stays next to the UI; the *listener* the redirect comes back to is here, because it is where the
+//! `state` check has to happen and a check that is not tested is not a check.
 
 use crate::error::{MailError, Result};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// The pieces of an OAuth token response this client needs.
 ///
@@ -204,6 +207,185 @@ pub async fn refresh<T: TokenTransport>(
 
     let body = transport.post_form(provider.token_endpoint, form).await?;
     parse_tokens(&body)
+}
+
+/// The loopback listener the provider redirects the browser to.
+///
+/// RFC 8252 (A1-F32/F36) and nothing invented here:
+///
+/// * **`127.0.0.1`, never `0.0.0.0`.** A wildcard bind would accept the authorization code from the
+///   local network, and the code is a bearer credential for the account.
+/// * **An ephemeral port**, announced to the provider as part of the redirect URI. There is nothing
+///   to register per installation, and no fixed port for another local process to sit on first.
+/// * **The `state` is checked before the code is accepted.** A request with the wrong state is
+///   *ignored* rather than fatal: it is not necessarily an attack (a stray probe, a second tab), and
+///   killing the sign-in for it would hand anyone who can reach the port a way to cancel it.
+///
+/// Everything here is synchronous with the browser: the caller opens the browser, then awaits
+/// [`Loopback::wait_for_code`].
+pub struct Loopback {
+    listener: TcpListener,
+    /// Exactly the string to hand the provider, including the trailing slash.
+    pub redirect_uri: String,
+}
+
+impl Loopback {
+    /// Bind an ephemeral port on loopback and work out the redirect URI.
+    pub async fn bind() -> Result<Loopback> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|error| MailError::Config(format!("无法监听本机端口：{error}")))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| MailError::Config(format!("无法读取监听端口：{error}")))?
+            .port();
+        Ok(Loopback {
+            listener,
+            // Google and Microsoft both require the path to be part of the registered URI; `/` is the
+            // one form that works without a custom scheme.
+            redirect_uri: format!("http://127.0.0.1:{port}/"),
+        })
+    }
+
+    /// Wait for the browser to come back with a code, up to `timeout`.
+    ///
+    /// Returns the authorization code. `access_denied` (the user pressed "cancel") is reported as
+    /// such — it is a normal outcome, not an error to apologize for.
+    pub async fn wait_for_code(self, expected_state: &str, timeout: Duration) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(MailError::Timeout(timeout.as_secs()));
+            }
+
+            let accepted = tokio::time::timeout(remaining, self.listener.accept()).await;
+            let Ok(Ok((mut stream, _peer))) = accepted else {
+                // The timeout above is the only way this ends without a browser.
+                return Err(MailError::Timeout(timeout.as_secs()));
+            };
+
+            // A browser sends a small request; anything larger is not one, and reading it would just
+            // be a way to make us allocate on demand.
+            let mut buffer = [0u8; 4096];
+            let read = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                .await
+            {
+                Ok(Ok(read)) => read,
+                _ => continue,
+            };
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let Some(query) = query_of(&request) else {
+                let _ = respond(&mut stream, 400, "这不是一个回环回调请求。").await;
+                continue;
+            };
+
+            let params = parse_query(&query);
+
+            match params.iter().find(|(key, _)| key == "state") {
+                // The check A1-F36 exists for. Ignored, not answered: see the type's note.
+                Some((_, got)) if got != expected_state => {
+                    let _ = respond(&mut stream, 400, "state 不匹配，已忽略这个请求。").await;
+                    continue;
+                }
+                None => {
+                    let _ = respond(&mut stream, 400, "缺少 state。").await;
+                    continue;
+                }
+                Some(_) => {}
+            }
+
+            if let Some((_, error)) = params.iter().find(|(key, _)| key == "error") {
+                let _ = respond(&mut stream, 200, "授权被取消，可以关闭这个页面了。").await;
+                return Err(MailError::Credential(format!("授权被取消（{error}）")));
+            }
+
+            if let Some((_, code)) = params.iter().find(|(key, _)| key == "code") {
+                let _ = respond(&mut stream, 200, "登录完成，可以回到 Easy Email 了。").await;
+                return Ok(code.clone());
+            }
+
+            let _ = respond(&mut stream, 400, "回调里既没有 code 也没有 error。").await;
+        }
+    }
+}
+
+/// The query string of a request line like `GET /?code=x HTTP/1.1`.
+fn query_of(request: &str) -> Option<String> {
+    let line = request.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    if method != "GET" {
+        return None;
+    }
+    target.split_once('?').map(|(_, query)| query.to_string())
+}
+
+/// `a=1&b=2` into pairs, percent-decoded. `+` is a space in a query string.
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(key), percent_decode(value))
+        })
+        .collect()
+}
+
+/// Percent-decoding, so an authorization code containing `%2F` (they do) survives intact.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// The page the user sees in the browser tab they are about to close.
+async fn respond(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    message: &str,
+) -> std::io::Result<()> {
+    let body = format!(
+        "<!doctype html><meta charset=utf-8><title>Easy Email</title>\
+         <p style=\"font-family:system-ui;padding:2rem\">{message}</p>"
+    );
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        if status == 200 { "OK" } else { "Bad Request" },
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
 }
 
 /// Read a token response, or explain what went wrong in terms a person can act on.
@@ -541,5 +723,119 @@ mod tests {
             encoded,
             "scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All%20offline_access&state=a-b_c~d"
         );
+    }
+
+    // ---------------------------------------------------------------- the loopback callback
+
+    /// Long enough for a test on a busy machine, short enough that a real deadlock fails rather than
+    /// hangs the suite.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Pretend to be the browser: one `GET`, then read whatever came back.
+    async fn browser_gets(redirect_uri: &str, path: &str) -> String {
+        let addr = redirect_uri
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .expect("write");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.expect("read");
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    #[test]
+    fn the_redirect_uri_is_loopback_and_ephemeral() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let loopback = runtime.block_on(Loopback::bind()).expect("bind");
+        assert!(
+            loopback.redirect_uri.starts_with("http://127.0.0.1:"),
+            "never a wildcard bind: the code is a bearer credential ({})",
+            loopback.redirect_uri
+        );
+        assert!(loopback.redirect_uri.ends_with('/'));
+    }
+
+    #[test]
+    fn a_matching_state_yields_the_code_and_a_stray_request_does_not_cancel_it() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let loopback = Loopback::bind().await.expect("bind");
+            let redirect = loopback.redirect_uri.clone();
+            let waiting =
+                tokio::spawn(
+                    async move { loopback.wait_for_code("good-state", TEST_TIMEOUT).await },
+                );
+
+            // Somebody else's request: wrong state. It must not be answered with a code, and — the
+            // point of ignoring rather than failing — it must not cancel the sign-in either.
+            let stray = browser_gets(&redirect, "/?code=stolen&state=wrong-state").await;
+            assert!(stray.starts_with("HTTP/1.1 400"), "{stray}");
+            assert!(
+                !waiting.is_finished(),
+                "a stray request must not end the wait"
+            );
+
+            // ...and the real one still works.
+            let good = browser_gets(&redirect, "/?code=the-code&state=good-state").await;
+            assert!(good.starts_with("HTTP/1.1 200"), "{good}");
+            assert!(
+                good.contains("回到 Easy Email"),
+                "the browser tab should say what to do: {good}"
+            );
+            assert_eq!(waiting.await.expect("join").expect("code"), "the-code");
+        });
+    }
+
+    #[test]
+    fn a_code_with_escaped_characters_survives_the_callback() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let loopback = Loopback::bind().await.expect("bind");
+            let redirect = loopback.redirect_uri.clone();
+            let waiting =
+                tokio::spawn(async move { loopback.wait_for_code("s", TEST_TIMEOUT).await });
+
+            // Real authorization codes contain `/`, `+` and `=`; a decoder that eats them produces a
+            // token exchange that fails for a reason nobody can see.
+            browser_gets(&redirect, "/?state=s&code=4%2F0A%2Bx%3D").await;
+            assert_eq!(waiting.await.expect("join").expect("code"), "4/0A+x=");
+        });
+    }
+
+    #[test]
+    fn the_user_pressing_cancel_is_reported_as_a_cancel_not_a_failure() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let loopback = Loopback::bind().await.expect("bind");
+            let redirect = loopback.redirect_uri.clone();
+            let waiting =
+                tokio::spawn(async move { loopback.wait_for_code("s", TEST_TIMEOUT).await });
+
+            browser_gets(&redirect, "/?state=s&error=access_denied").await;
+            let error = waiting
+                .await
+                .expect("join")
+                .expect_err("must not be a code");
+            assert!(
+                error.to_string().contains("取消"),
+                "cancelling is a normal outcome and should read like one: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn no_browser_at_all_times_out_instead_of_hanging_forever() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let loopback = Loopback::bind().await.expect("bind");
+            let error = loopback
+                .wait_for_code("s", Duration::from_millis(120))
+                .await
+                .expect_err("nobody connected");
+            assert!(matches!(error, MailError::Timeout(_)), "{error:?}");
+        });
     }
 }
