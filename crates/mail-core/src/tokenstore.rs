@@ -341,6 +341,42 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_token_file_asks_for_a_sign_in_instead_of_returning_garbage() {
+        // `design/05`'s acceptance list: rotation, power loss, corruption and a different user must all
+        // be covered. A power cut during the write leaves a file that cannot be decrypted, and the only
+        // useful answer is "sign in again" — not a panic, not half a token handed to the server.
+        if !available() {
+            return;
+        }
+        let dir = TempDir::new("truncated");
+        let store = TokenStore::new(dir.path());
+        store
+            .save("me@example.com", "a-real-refresh-token")
+            .expect("save");
+
+        let path = store.path_for("me@example.com");
+        let sealed = std::fs::read(&path).expect("read");
+        std::fs::write(&path, &sealed[..sealed.len() / 2]).expect("truncate");
+
+        let error = store
+            .load("me@example.com")
+            .expect_err("a half-written file must not load");
+        assert!(
+            error.to_string().contains("重新登录"),
+            "the message has to be actionable: {error}"
+        );
+
+        // And the account can be recovered by signing in again, which overwrites the damaged file.
+        store
+            .save("me@example.com", "a-new-token")
+            .expect("re-save");
+        assert_eq!(
+            store.load("me@example.com").expect("load").as_deref(),
+            Some("a-new-token")
+        );
+    }
+
+    #[test]
     fn an_address_never_becomes_a_file_name() {
         let store = TokenStore::new("C:/nowhere");
         let path = store.path_for("../../etc/passwd\\..");
