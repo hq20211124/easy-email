@@ -2335,6 +2335,27 @@ function setComposeCloudStatus(text) {
  */
 let pendingWizardAccountId = null;
 
+/**
+ * A client registration you can borrow to try Gmail out — and why it is only that.
+ *
+ * These are **Mozilla's** published values: the ones Thunderbird itself signs in with, visible in its
+ * source because a desktop client cannot keep a secret (A1-F32). The comment right above them in
+ * `mailnews/base/util/OAuth2Providers.jsm` says: "Don't copy these values for your own
+ * application--register it yourself." That is exactly why the wizard shows them as a *prefill with a
+ * notice* rather than as a default: the consent screen says "Mozilla Thunderbird", Mozilla can revoke
+ * them whenever they like (every user would break at once), and a release build must ship its own
+ * registration (A1-F37). Registering your own takes five minutes in the Google Cloud console.
+ */
+const PUBLIC_TEST_CLIENT = {
+  notice:
+    '预填的是 Mozilla 公开在源码里的注册（Thunderbird 用的），仅供试用：授权页会显示 ' +
+    '"Mozilla Thunderbird"，且 Mozilla 可随时撤销。正式使用请换成你自己注册的客户端 ID。',
+  gmail: {
+    id: 'REMOVED-BORROWED-CLIENT-ID',
+    secret: 'REMOVED-BORROWED-CLIENT-SECRET',
+  },
+};
+
 function openAccountWizard() {
   pendingWizardAccountId = null;
 
@@ -2373,6 +2394,7 @@ function openAccountWizard() {
       <label>OAuth 登录（可选，推荐）</label>
       <input id="wiz-client-id" placeholder="你的 OAuth 客户端 ID（client_id）" autocomplete="off" spellcheck="false" />
       <input id="wiz-client-secret" placeholder="客户端密钥（只有在服务商要求时填）" autocomplete="off" spellcheck="false" />
+      <span id="wiz-oauth-notice" class="hint"></span>
       <span class="hint">这类邮箱不能只用密码登录。点下面的按钮会在**系统浏览器**里完成授权，
         我们只拿到一个可撤销的授权码，密码不经过我们。</span>
       <button id="wiz-oauth-go" class="btn" type="button">在浏览器里登录</button>
@@ -2483,8 +2505,32 @@ function openAccountWizard() {
     // for a QQ account would offer a flow that does not exist for it, and hiding it for Gmail would
     // leave the user typing a password that can never work (`design/05` §3.1).
     const oauth = modal.querySelector('#wiz-oauth');
-    const oauthEligible = provider.auth === 'oauth2';
+    // Two providers *require* OAuth2 (Microsoft), and Gmail offers it as an alternative to an app
+    // password: Google still issues those for accounts with two-step verification, and the provider
+    // note walks the user through it, so hiding OAuth there would take away a working path. The
+    // reverse mistake — offering OAuth for QQ or 163 — is what the old condition avoided.
+    const oauthEligible = provider.auth === 'oauth2' || provider.id === 'gmail';
     oauth.hidden = !oauthEligible;
+
+    // A prefilled registration for trying Gmail out, and the honest reason it is only that.
+    //
+    // These are **Mozilla's** published values, the ones Thunderbird itself signs in with. They are
+    // public because a desktop client cannot keep a secret anyway (A1-F32), and the comment above them
+    // in Mozilla's source says plainly: "Don't copy these values for your own application--register it
+    // yourself." Filling them in here is a deliberate, reversible convenience for a personal test —
+    // the consent screen will say "Mozilla Thunderbird", Mozilla can revoke them at any time, and a
+    // released build must ship its own registration instead (A1-F37).
+    const clientIdField = modal.querySelector('#wiz-client-id');
+    const clientSecretField = modal.querySelector('#wiz-client-secret');
+    if (oauthEligible && provider.id === 'gmail' && !clientIdField.value) {
+      clientIdField.value = PUBLIC_TEST_CLIENT.gmail.id;
+      clientSecretField.value = PUBLIC_TEST_CLIENT.gmail.secret;
+      clientIdField.title = PUBLIC_TEST_CLIENT.notice;
+    }
+    if (oauthEligible) {
+      modal.querySelector('#wiz-oauth-notice').textContent =
+        provider.id === 'gmail' ? PUBLIC_TEST_CLIENT.notice : '';
+    }
     const go = modal.querySelector('#wiz-oauth-go');
     if (oauthEligible && !go.dataset.wired) {
       go.dataset.wired = '1';
