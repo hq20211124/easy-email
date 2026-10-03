@@ -187,6 +187,23 @@ async function boot() {
   setInterval(updateUndoCountdowns, 1000);
   if (state.accounts.length === 0) {
     openAccountWizard();
+  } else {
+    await warnIfUserDataUnavailable();
+  }
+}
+
+/**
+ * Say so when `user.db` could not be opened (`design/03` §11 反驳 5).
+ *
+ * That fallback is the only one where the user's own data is not being read — the drafts are on disk,
+ * this version simply refuses to misread them. Without this the window shows an empty 草稿箱, which
+ * reads as "my drafts are gone": the opposite of what happened, and the one thing that would make
+ * somebody stop trusting the app.
+ */
+async function warnIfUserDataUnavailable() {
+  const status = await invoke('sync_status', { accountId: state.accountId }).catch(() => null);
+  if (status?.user_store_error) {
+    toast(`草稿与发件箱这次没有打开：${status.user_store_error}`, 'err', 20000);
   }
 }
 

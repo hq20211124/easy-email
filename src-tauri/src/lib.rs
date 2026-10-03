@@ -71,6 +71,8 @@ struct AppState {
     user: UserStore,
     /// Frozen message bytes, waiting to be sent (`design/07` §5.3).
     spool: Spool,
+    /// Why `user.db` could not be opened, when that happened. See [`SyncStatus::user_store_error`].
+    user_store_error: Mutex<Option<String>>,
     /// Wakes the outbox worker immediately.
     ///
     /// The tick is 5 s, but three events cannot wait for it: a message just queued (the undo window
@@ -1156,6 +1158,11 @@ async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<S
         cached_total,
         drafts,
         pending_ops: pending,
+        user_store_error: state
+            .user_store_error
+            .lock()
+            .expect("user store error mutex")
+            .clone(),
     })
 }
 
@@ -1189,6 +1196,12 @@ struct SyncStatus {
     drafts: u32,
     /// Offline actions still waiting to reach the server.
     pending_ops: u32,
+    /// Set when `user.db` could not be opened this run, with the reason.
+    ///
+    /// That fallback is the one place where the user's own data is not being read, so the window has
+    /// to say so: an empty 草稿箱 otherwise reads as "my drafts are gone", which is the opposite of
+    /// what happened — they are on disk, unread, because this version refuses to misread them.
+    user_store_error: Option<String>,
 }
 
 #[tauri::command]
@@ -1810,6 +1823,9 @@ pub fn run() {
             // offline actions cannot be re-fetched, so they must survive "delete the cache". Same
             // rule as above: a failure must not stop the window from opening.
             let user_path = dir.join("user.db");
+            // Kept so the window can say "your drafts are on disk but this version will not read
+            // them" instead of showing an empty list (see `SyncStatus::user_store_error`).
+            let mut user_store_error: Option<String> = None;
             let user = match UserStore::open(&user_path) {
                 Ok(store) => store,
                 Err(e) => {
@@ -1822,6 +1838,7 @@ pub fn run() {
                     log_line(&format!(
                         "[easy-email] 用户数据未能打开，本次运行不读写草稿/发件箱：{e}"
                     ));
+                    user_store_error = Some(e.to_string());
                     UserStore::open_in_memory().expect("in-memory user store must be available")
                 }
             };
@@ -1849,6 +1866,7 @@ pub fn run() {
                 // Its own directory under the app's config dir, next to the two databases: a spool
                 // file is disposable, but it must survive a restart to keep a queued send's bytes.
                 spool,
+                user_store_error: Mutex::new(user_store_error),
                 outbox_wake: Arc::new(Notify::new()),
             });
 
