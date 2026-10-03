@@ -2391,7 +2391,11 @@ function openAccountWizard() {
         toast('请填写完整的邮箱地址。', 'err');
         return false;
       }
-      if (!password) {
+      // A password is required for the accounts that use one. For an OAuth2 provider the credential
+      // is the token the browser flow already stored, so demanding a password here would block the
+      // one path that cannot have one (design/05 §3.2).
+      const oauthAccount = modal.querySelector('#wiz-oauth').hidden === false;
+      if (!password && !oauthAccount) {
         toast('请填写密码或授权码。', 'err');
         return false;
       }

@@ -235,12 +235,30 @@ async fn save_account(
     password: String,
     username: Option<String>,
 ) -> Result<AccountConfig, String> {
-    let cfg = account_with_login(&provider_id, &email, &display_name, username.as_deref())
+    let mut cfg = account_with_login(&provider_id, &email, &display_name, username.as_deref())
         .map_err(describe)?;
 
-    // Persist the credential first: an account that exists but cannot authenticate is worse than
-    // a credential with no account entry.
-    secret::save_password(&cfg.id, &password).map_err(describe)?;
+    // An account whose registration is already stored was signed in with OAuth a moment ago (the
+    // wizard does that before saving). Marking it here — rather than asking the frontend to say so —
+    // keeps the two facts from being able to disagree: the registration is what makes it OAuth.
+    if state
+        .user
+        .oauth_settings(&cfg.id)
+        .map_err(describe)?
+        .is_some()
+    {
+        cfg.auth = mail_core::AuthMethod::OAuth2;
+    }
+
+    if cfg.auth == mail_core::AuthMethod::OAuth2 {
+        // Nothing to store: the token already is the credential, and writing an empty password into
+        // the vault would only create a second, wrong answer to "how does this account sign in".
+        let _ = secret::delete_password(&cfg.id);
+    } else {
+        // Persist the credential first: an account that exists but cannot authenticate is worse than
+        // a credential with no account entry.
+        secret::save_password(&cfg.id, &password).map_err(describe)?;
+    }
 
     {
         let mut accounts = state.accounts.lock().expect("accounts mutex poisoned");
@@ -1072,6 +1090,19 @@ async fn oauth_sign_in(
     )
     .await
     .map_err(describe)?;
+
+    // The registration is stored with the token: a refresh needs both, and asking the user for the
+    // client id a second time would be asking them to remember something we already know.
+    state
+        .user
+        .set_oauth_settings(
+            &email.to_ascii_lowercase(),
+            &mail_core::userdb::OAuthSettings {
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+            },
+        )
+        .map_err(describe)?;
 
     // A1-F34: a refresh token that is not persisted signs the user out at the next launch — and with
     // Microsoft's rotation, it also invalidates the one we would otherwise have kept.
