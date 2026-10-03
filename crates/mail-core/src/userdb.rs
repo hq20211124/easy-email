@@ -22,7 +22,7 @@ use crate::sync::SyncWindow;
 ///
 /// 2 added `quota_ledger` (`design/04` §5.7). Additive: `migrate` runs `create table if not
 /// exists` for every table it owns, so an existing file picks the new one up on the next open.
-pub const USER_SCHEMA_VERSION: i64 = 2;
+pub const USER_SCHEMA_VERSION: i64 = 3;
 
 /// How long a quota window lasts.
 ///
@@ -53,6 +53,27 @@ pub fn oauth_client_secret_key(account_id: &str) -> String {
     format!("oauth_client_secret:{account_id}")
 }
 
+/// Add a column to an existing table, once.
+///
+/// SQLite has no `alter table ... add column if not exists`, so the check is made against the schema
+/// rather than the recorded version: the two can disagree (an interrupted migration, a file copied
+/// between versions), and the schema is what a query actually runs against.
+fn add_column_if_missing(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    kind: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if !existing.iter().any(|name| name == column) {
+        conn.execute_batch(&format!("alter table {table} add column {column} {kind};"))?;
+    }
+    Ok(())
+}
 /// `kv` key holding one account's notification preference.
 ///
 /// Per account on purpose: somebody with a noisy work mailbox and a quiet personal one wants to
@@ -1183,6 +1204,14 @@ impl UserStore {
                  );",
             )?;
 
+            // `draft_mirrors` gained `account_id` after the table had already shipped in a release.
+            // `create table if not exists` cannot add a column: an existing file keeps the shape it
+            // was created with, and every query that names `account_id` fails with
+            // "no such column: account_id" — which is what a **real profile** did, found by the
+            // mirror probe (M1a-59). The tests had never seen it because they all start from a fresh
+            // schema, which is exactly the blind spot this kind of migration exists to cover.
+            add_column_if_missing(conn, "draft_mirrors", "account_id", "text not null default ''")?;
+
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -1705,6 +1734,60 @@ mod tests {
 
     fn draft(id: &str, account: &str, now: i64) -> Draft {
         Draft::new(id, account, now)
+    }
+
+    /// A file created before `draft_mirrors` had `account_id` must gain it on open.
+    ///
+    /// This is the one that was **missing in a real release**: the tests all start from a fresh
+    /// schema, so nothing noticed that an existing profile kept the old table and every mirror query
+    /// failed with "no such column: account_id". The mirror had therefore never worked on any profile
+    /// older than the column — reported on a real machine by `tools/probe-draft-mirror.mjs`.
+    #[test]
+    fn an_older_profile_gains_the_mirror_account_column_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-mirror-migration-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        // A v2 file: `draft_mirrors` without `account_id`, plus a row already in it.
+        {
+            let conn = rusqlite::Connection::open(&path).expect("legacy open");
+            conn.execute_batch(
+                "pragma user_version = 2;
+                 create table draft_mirrors (
+                     draft_id   text primary key,
+                     folder     text not null,
+                     uid        integer,
+                     message_id text not null,
+                     updated_at integer not null
+                 );
+                 insert into draft_mirrors (draft_id, folder, uid, message_id, updated_at)
+                 values ('d1', 'Drafts', 7, '<m@x>', 1);",
+            )
+            .expect("legacy schema");
+        }
+
+        let store = UserStore::open(&path).expect("opening must migrate, not refuse");
+        assert_eq!(
+            store.schema_version().expect("version"),
+            USER_SCHEMA_VERSION,
+            "the version has to move, or the next open repeats this"
+        );
+        let mirror = store
+            .draft_mirror("d1")
+            .expect("the column must be readable now")
+            .expect("and the pre-existing row must still be there");
+        assert_eq!(
+            mirror.account_id, "",
+            "a row from before the column has no account, which is the honest value"
+        );
+        assert_eq!(mirror.folder, "Drafts");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
