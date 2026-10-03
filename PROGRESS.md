@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **223**（181 lib + 38 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **224**（182 lib + 38 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-18 第 (5) 件现状盘点（无代码改动） / M1a-17 `user.db` 拒绝打开更新版本 |
+| 最新 | M1a-19 "只让读最近 30 天"的可操作提示 / M1a-18 第 (5) 件现状盘点 |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -34,6 +34,27 @@
 
 ---
 
+### M1a-19 "服务器只让读最近 30 天"的提示 ✅（第 25 轮）
+
+`design/04` §5.7 第 4 条 / §6：网易系（A1-F2）的"第三方客户端收取范围"由网页端设置决定，企业版默认
+**最近 30 天**。协议里没有任何东西说明这一点——IMAP 就是"再往回没有了"——所以症状与**我们自己的 bug
+完全一样**：用户要了两年，拿到三十天，没有任何解释。设计里这句判断很准：**"这条比同步不到重要得多：
+用户会以为是我们的 bug。"**
+
+- **服务商表加两个判定**（`providers.rs`）：`caps_third_party_range()`（163/126/yeah/qiye163）与
+  `range_cap_is_enterprise_policy()`（只有 qiye163）。分成两个是因为**措辞不同**：对网易企业邮说
+  "企业策略"是对的，对个人 163 说就是错的（同一症状来自账号自己的收取范围设置）。
+- **测试**：网易四家都被标记；**其余每一家都必须不被标记**——这条提示会叫用户去改一个设置，
+  叫他们改一个不存在的设置比什么都不说更糟；两个措辞判定也各断言一次。
+- **命令 `range_cap_hint`**：后端给句子（把"哪些服务这样"留在一处，不在渲染层复制名单），`None` = 不说。
+- **前端**：冷启动回填以 `history_exhausted` 结束**且**窗口不是"只按需"时问一次并提示 15 秒——
+  只在"本来就想要更早"的前提下问；只按需取件时"没有更早"不是问题。
+
+**证据**：Rust 单元测试钉住"谁被标记、谁不被标记"；`check.ps1` 15 步全绿；前端命令 29 个；
+启动冒烟 10 秒存活。**未做真机验证**：您的账号是 QQ（不在名单里），所以这条提示在您机器上本就
+不该出现——这也正是它不该被误触发的原因；网易账号上的实际观感需要有号才能看。
+
+---
 ### M1a-18 第 (5) 件（认证轴/会话串/通知托盘/安装包）现状盘点 ✅（第 24 轮）
 
 **这一轮没有写功能代码**，先把"第 (5) 件到底还剩什么"逐条对着源码查清楚——它是四件不同的事，
@@ -569,13 +590,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **223 通过、0 失败**
-（181 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **224 通过、0 失败**
+（182 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 51 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 52 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -627,8 +648,8 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
-3. **网易系 `server_floor` 的提示**：表列与写入接口都就位了，但还没有哪条路径在"再也取不到更早"时
-   写它并按设计给一次可操作提示（"去网页版把收取范围改大"）——**用户会以为是我们的 bug**。
+3. ~~网易系"只让读最近 30 天"的提示~~ → **M1a-19 已做**（`range_cap_hint` + 冷启动提示）。
+   仍差：把学到的下界写进 `quota_ledger.server_floor`（表列与写入接口都就位）并在设置里显示。
 4. **spool 分块流式写**（`design/07` §8）：现在建 spool 仍是一次性 `formatted()`，25 MB 附件的
    峰值内存还没按 §8 的预算收紧。
 5. **真机验证**（需要先问你）：一条真实的"发信 → 点查看副本"走查；崩溃恢复时序（预置 spool 缺失的
@@ -641,10 +662,10 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 223 个测试
+cargo test --workspace                # 224 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 51 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 52 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
