@@ -255,6 +255,20 @@ pub struct ImapClient {
 impl ImapClient {
     /// Connect and authenticate.
     pub async fn connect(cfg: &AccountConfig, password: &str) -> Result<Self> {
+        Self::connect_with(cfg, Login::Password(password.to_string())).await
+    }
+
+    /// Connect with an OAuth2 access token instead of a password (`design/05` §3.2).
+    ///
+    /// The token comes from `oauth::refresh`, and it is short-lived by design: this function does not
+    /// cache or renew it, so the caller renews before each connection rather than discovering halfway
+    /// through a sync that the token expired.
+    pub async fn connect_oauth(cfg: &AccountConfig, access_token: &str) -> Result<Self> {
+        Self::connect_with(cfg, Login::OAuth2(access_token.to_string())).await
+    }
+
+    /// Everything the two entry points share, up to and including authentication.
+    async fn connect_with(cfg: &AccountConfig, login: Login) -> Result<Self> {
         let ep = cfg.imap.clone();
         let tls = TlsConnector::new();
 
@@ -301,20 +315,35 @@ impl ImapClient {
             let _ = client.run_command_and_check_ok(&command, None).await;
         }
 
-        // `login` takes the client by value, so the future must own everything it touches.
-        let mut session = {
-            let host = ep.host.clone();
-            let username = cfg.username.clone();
-            let password = password.to_string();
-            let needs_id = cfg.needs_id_command;
+        // `login` and `authenticate` both take the client by value, so the future must own everything
+        // it touches.
+        let mut session = match login {
+            Login::Password(password) => {
+                let host = ep.host.clone();
+                let username = cfg.username.clone();
+                let needs_id = cfg.needs_id_command;
 
-            timed(async move {
-                client
-                    .login(&username, &password)
-                    .await
-                    .map_err(|(e, _)| MailError::classify_login(&host, e.to_string(), needs_id))
-            })
-            .await?
+                timed(async move {
+                    client
+                        .login(&username, &password)
+                        .await
+                        .map_err(|(e, _)| MailError::classify_login(&host, e.to_string(), needs_id))
+                })
+                .await?
+            }
+            Login::OAuth2(token) => {
+                let host = ep.host.clone();
+                let username = cfg.username.clone();
+                let auth = Xoauth2::new(&username, &token);
+
+                timed(async move {
+                    client
+                        .authenticate("XOAUTH2", auth)
+                        .await
+                        .map_err(|(e, _)| MailError::classify_login(&host, e.to_string(), false))
+                })
+                .await?
+            }
         };
 
         // Ask once, up front. Treating a missing CAPABILITY as "no UIDPLUS" is safe: the fallback
@@ -968,6 +997,54 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         thread_key,
         seen,
         flagged,
+    }
+}
+
+/// How the client proves who it is, for the two shapes the providers ship.
+enum Login {
+    Password(String),
+    OAuth2(String),
+}
+
+/// The XOAUTH2 client response, exactly as Google and Microsoft specify it.
+///
+/// `user=<address>\x01auth=Bearer <token>\x01\x01` — the **two trailing `\x01`** are not decoration;
+/// the SASL profile requires the double separator, and servers reject the response without it (which
+/// then looks like an invalid token rather than a malformed request).
+pub fn xoauth2_response(user: &str, access_token: &str) -> String {
+    format!("user={user}\x01auth=Bearer {access_token}\x01\x01")
+}
+
+/// The `Authenticator` async-imap asks for: base64 of [`xoauth2_response`] on the first challenge,
+/// and an empty response afterwards.
+///
+/// The second part matters: when XOAUTH2 fails, the server sends a challenge containing a JSON error
+/// and expects an empty line before it reports the failure. Answering with the response again would
+/// loop; answering with nothing lets the server's own message come through, which is what
+/// `classify_login` turns into something a person can act on.
+struct Xoauth2 {
+    response: String,
+    sent: bool,
+}
+
+impl Xoauth2 {
+    fn new(user: &str, access_token: &str) -> Xoauth2 {
+        Xoauth2 {
+            response: xoauth2_response(user, access_token),
+            sent: false,
+        }
+    }
+}
+
+impl async_imap::Authenticator for Xoauth2 {
+    type Response = Vec<u8>;
+
+    fn process(&mut self, _challenge: &[u8]) -> Vec<u8> {
+        if self.sent {
+            return Vec::new();
+        }
+        self.sent = true;
+        self.response.clone().into_bytes()
     }
 }
 

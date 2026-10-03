@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use mail_core::smtp;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, Draft, DraftMirror, Endpoint, ImapClient, MailboxInfo,
@@ -408,6 +409,19 @@ async fn serve_imap(
                 ok(&mut write, &tag, "ID completed").await?;
             }
             "LOGIN" => ok(&mut write, &tag, "LOGIN completed").await?,
+            // async-imap sends `AUTHENTICATE XOAUTH2` **without** SASL-IR, so the server has to open
+            // the challenge with `+` and read the base64 response from the next line before accepting.
+            // (A fixture that answered OK immediately would accept a client that sent nothing at all.)
+            "AUTHENTICATE" => {
+                write.write_all(b"+ \r\n").await?;
+                line.clear();
+                reader.read_line(&mut line).await?;
+                // The loop logs the command it read; this response is read *inside* the branch, so it
+                // has to be logged here too — otherwise the test cannot see what the client sent, and
+                // a client that sent nothing would look identical to one that sent the right bytes.
+                log.lock().unwrap().push(line.trim().to_string());
+                ok(&mut write, &tag, "AUTHENTICATE completed").await?;
+            }
             "LIST" => {
                 // A \Noselect container must be reported but flagged unselectable. The Chinese
                 // folder is in IMAP modified UTF-7: it must decode for display while staying
@@ -1523,6 +1537,64 @@ async fn an_account_without_a_drafts_folder_simply_has_no_mirror() {
         .await
         .expect("must not be an error");
     assert_eq!(report, None);
+}
+
+/// `design/05` §3.2: an OAuth2 account authenticates with `AUTHENTICATE XOAUTH2`, and the string it
+/// sends has to be exactly the one the providers specify.
+///
+/// The two trailing `\x01` are the part that is easy to drop and impossible to debug from the error
+/// ("invalid token" is what a malformed request looks like), so this test decodes what the server
+/// received and compares it verbatim.
+#[tokio::test]
+async fn an_oauth_account_authenticates_with_the_exact_xoauth2_string() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+
+    let client = within(ImapClient::connect_oauth(&cfg, "an-access-token")).await;
+
+    assert!(
+        client.is_ok(),
+        "the fake server accepts XOAUTH2: {:?}",
+        client.err().map(|error| error.to_string())
+    );
+
+    let lines = transcript(&log);
+    let line = lines
+        .iter()
+        .find(|line| line.to_ascii_uppercase().contains("AUTHENTICATE"))
+        .unwrap_or_else(|| panic!("no AUTHENTICATE line in {lines:?}"));
+
+    // The response is the line *after* the command: async-imap waits for the `+` challenge first.
+    let index = lines
+        .iter()
+        .position(|candidate| candidate.to_ascii_uppercase().contains("AUTHENTICATE"))
+        .expect("the AUTHENTICATE line");
+    let encoded = lines
+        .get(index + 1)
+        .expect("the base64 response follows the command")
+        .trim();
+    let decoded = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap_or_else(|error| panic!("the response is base64 ({error}): line={line:?}")),
+    )
+    .expect("and it is text");
+
+    assert_eq!(
+        decoded,
+        mail_core::imap::xoauth2_response(&cfg.username, "an-access-token"),
+        "the wire string is the one the providers document"
+    );
+    assert!(
+        decoded.ends_with("\u{1}\u{1}"),
+        "the double separator: {decoded:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("LOGIN")),
+        "an OAuth account must not fall back to a password login: {lines:?}"
+    );
 }
 
 /// The key refresh (`design/07` §2, PROGRESS "会话链"): mail cached before the `thread_key` column
