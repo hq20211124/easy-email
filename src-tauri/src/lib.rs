@@ -706,6 +706,20 @@ async fn enqueue_send(
     }
     let bytes = message.formatted();
 
+    // `design/07` §6: refuse before the bytes go anywhere. The alternative is a 25 MB upload that ends
+    // in a 552 five seconds later, which costs the user exactly the time it was meant to save — and
+    // the number in the sentence is the one that actually applied, not a generic "too big".
+    let limit =
+        mail_core::providers::max_outgoing_bytes(mail_core::providers::by_id(&cfg.provider_id));
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "这封信编码后约 {:.1} MB，超过可发送上限 {:.0} MB。\
+             请压缩附件、改用云盘链接，或者拆成两封再发。",
+            bytes.len() as f64 / 1_048_576.0,
+            limit as f64 / 1_048_576.0
+        ));
+    }
+
     let now = now_seconds();
     let undo = i64::from(
         undo_seconds

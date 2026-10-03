@@ -43,6 +43,22 @@ impl Quirks {
     };
 }
 
+/// The largest message this client will *send*, before the provider gets a say.
+///
+/// `design/07` §6: a single message is capped at the provider's limit **or** 25 MB, whichever is
+/// smaller. The number is a refusal the user can understand ("太大了，请压缩或改用链接") instead of a
+/// 552 five seconds into a 25 MB upload — and `A1-F45` established that the provider's own limit
+/// cannot be read from the protocol (lettre neither sends `SIZE=` nor exposes what the server
+/// announced), so this is a local policy, not a discovery.
+pub const LOCAL_MAX_MESSAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+/// What one account may actually send, given its provider.
+pub fn max_outgoing_bytes(provider: Option<&Provider>) -> u64 {
+    match provider.and_then(|p| p.smtp_max_message_bytes()) {
+        Some(limit) => limit.min(LOCAL_MAX_MESSAGE_BYTES),
+        None => LOCAL_MAX_MESSAGE_BYTES,
+    }
+}
 /// One entry in the built-in database.
 ///
 /// Hosts are stored as `&'static str` so the whole table can be a `const`, which keeps it in
@@ -106,6 +122,30 @@ impl Provider {
         }
     }
 
+    /// The largest message this service will accept for **upload** (our Sent/Drafts copies).
+    ///
+    /// A1-F3, verified: Gmail advertises `APPENDLIMIT=35651584` (≈34 MiB), Office 365 defaults to
+    /// 45 MB, Exchange to 10 MB, and a self-hosted Dovecot is whatever its admin decided. Only the
+    /// numbers that were actually verified are here — an invented limit would refuse somebody's mail
+    /// for a rule that does not exist.
+    pub fn append_limit_bytes(&self) -> Option<u64> {
+        match self.id {
+            "gmail" => Some(35_651_584),
+            "outlook" => Some(45_000_000),
+            _ => None,
+        }
+    }
+
+    /// The largest message this service will accept **over SMTP**.
+    ///
+    /// Deliberately empty for now, and the emptiness is the point: A1-F3's numbers are *append*
+    /// limits, and the design's second review is explicit that Gmail's 34 MiB is **not** its SMTP
+    /// limit and Office 365's 45 MB is **not** `MaxSendSize`. Writing Gmail's append limit into this
+    /// function would silently refuse mail that Gmail would have accepted. Until a number is verified
+    /// per service, the local cap below is what protects us.
+    pub fn smtp_max_message_bytes(&self) -> Option<u64> {
+        None
+    }
     /// Whether this service is one that caps how far back a third-party client may read.
     ///
     /// A1-F2: NetEase's web setting decides the range a third-party client may fetch, and for the
@@ -615,6 +655,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_verified_size_limits_are_written_down() {
+        // A1-F3's numbers are *append* limits, so they belong on `append_limit_bytes` and nowhere
+        // else. The design's second review is explicit that Gmail's 34 MiB is not its SMTP limit and
+        // Office 365's 45 MB is not MaxSendSize — copying one into the other would refuse mail the
+        // provider would have taken.
+        assert_eq!(
+            by_id("gmail").expect("gmail").append_limit_bytes(),
+            Some(35_651_584),
+            "the value A1-F3 recorded is the one Gmail advertises"
+        );
+        assert_eq!(
+            by_id("outlook").expect("outlook").append_limit_bytes(),
+            Some(45_000_000)
+        );
+
+        for provider in all() {
+            assert_eq!(
+                provider.smtp_max_message_bytes(),
+                None,
+                "{} must not be given an unverified SMTP limit",
+                provider.id
+            );
+        }
+
+        // The design's own acceptance item: Gmail / O365 / Exchange must not silently fall back to a
+        // default. Exchange is not a separate entry (the Microsoft row is `outlook`), which this
+        // asserts rather than leaves to memory.
+        for id in ["gmail", "outlook"] {
+            let provider = by_id(id).unwrap_or_else(|| panic!("{id} is in the table"));
+            assert!(
+                provider.append_limit_bytes().is_some(),
+                "{id} must carry its append limit"
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_cap_is_what_applies_when_no_limit_is_known() {
+        // 25 MB, per design/07 §6: big enough for ordinary mail, small enough that the refusal is a
+        // sentence rather than a five-second upload that ends in a 552.
+        assert_eq!(max_outgoing_bytes(None), LOCAL_MAX_MESSAGE_BYTES);
+        assert_eq!(max_outgoing_bytes(by_id("qq")), LOCAL_MAX_MESSAGE_BYTES);
+        // Every shipped provider currently has no known SMTP limit, so the local cap is what protects
+        // them all — asserted over the whole table rather than for one example.
+        for provider in all() {
+            assert_eq!(
+                max_outgoing_bytes(Some(provider)),
+                LOCAL_MAX_MESSAGE_BYTES,
+                "{} currently relies on the local cap",
+                provider.id
+            );
+        }
+    }
     #[test]
     fn only_the_services_that_cap_the_fetch_range_are_flagged() {
         // A1-F2: the NetEase family. Anyone else must stay unflagged — the hint tells the user to go
