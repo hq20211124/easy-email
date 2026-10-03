@@ -338,6 +338,38 @@ impl ImapClient {
 
     /// List every mailbox the account exposes, `INBOX` first.
     pub async fn list_mailboxes(&mut self) -> Result<Vec<MailboxInfo>> {
+        Ok(self
+            .list_mailboxes_with_roles()
+            .await?
+            .into_iter()
+            .map(|(mailbox, _)| mailbox)
+            .collect())
+    }
+
+    /// The wire name of the folder that holds sent copies, if the server has one.
+    ///
+    /// Resolved through the same role logic the sidebar uses — the RFC 6154 special-use attribute
+    /// first, then the conventional English names — rather than by searching for a literal `Sent`:
+    /// QQ calls it `Sent Messages`, and a server may name it entirely in another language and only
+    /// say so in the attribute.
+    ///
+    /// `None` means the mailbox has no Sent folder at all, which is not an error: the archive step
+    /// then simply has nowhere to put a copy (`design/07` §5.4).
+    pub async fn sent_mailbox(&mut self) -> Result<Option<String>> {
+        Ok(self
+            .list_mailboxes_with_roles()
+            .await?
+            .into_iter()
+            .find(|(mailbox, role)| *role == Some(Role::Sent) && mailbox.selectable)
+            .map(|(mailbox, _)| mailbox.name))
+    }
+
+    /// Every mailbox with the role it was derived from.
+    ///
+    /// The roles are kept here rather than on [`MailboxInfo`] because the UI has no use for the
+    /// enum — but the flows that need "the Sent folder" or "the Drafts folder" do, and re-deriving
+    /// a role from a display name is not possible once it has been localised.
+    pub async fn list_mailboxes_with_roles(&mut self) -> Result<Vec<(MailboxInfo, Option<Role>)>> {
         let names = timed(async {
             let stream = self.session.list(None, Some("*")).await.map_err(imap_err)?;
             stream.try_collect::<Vec<_>>().await.map_err(imap_err)
@@ -374,7 +406,7 @@ impl ImapClient {
             .collect();
 
         out.sort_by_key(|(mailbox, role)| folders::sort_key(&mailbox.display_name, *role));
-        Ok(out.into_iter().map(|(mailbox, _)| mailbox).collect())
+        Ok(out)
     }
 
     /// Select a mailbox, returning its metadata (message count, UIDVALIDITY, ...).

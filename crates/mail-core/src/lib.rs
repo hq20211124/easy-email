@@ -52,7 +52,10 @@ pub use providers::Provider;
 pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
 pub use userdb::{Draft, NewOutbox, OutboxItem, UserStore};
-pub use worker::{OutboxRun, RunReport, run_due};
+pub use worker::{
+    DEFAULT_CRASH_RESEND_LIMIT, OutboxRun, Recovery, RecoveryQuestion, RecoveryReport, RecoveryRun,
+    RunReport, recover_in_flight, run_due,
+};
 
 /// Build a ready-to-use account from a provider preset.
 ///

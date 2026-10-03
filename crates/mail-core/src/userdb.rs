@@ -573,6 +573,23 @@ impl UserStore {
         })
     }
 
+    /// Put a row a crash left in `sending` back in the queue.
+    ///
+    /// Deliberately separate from [`UserStore::requeue_outbox`]: that one is the user pressing 重试
+    /// on a row the worker has finished with, and it refuses to touch a row that might be mid-send.
+    /// This one is only ever called by crash recovery, which knows no send is running.
+    pub fn requeue_in_flight(&self, id: i64) -> Result<bool> {
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update outbox set state = 'queued', next_attempt_at = 0, scheduled_at = 0,
+                     undo_until = 0
+                 where id = ?1 and state = 'sending'",
+                [id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     /// Remove a row for good.
     pub fn delete_outbox(&self, id: i64) -> Result<bool> {
         self.db.write_blocking(move |conn| {

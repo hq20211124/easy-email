@@ -22,8 +22,9 @@ extern crate mail_core;
 use mail_core::{
     AccountConfig, BackfillBudget, BackfillReport, Cache, ConnectionPool, ConnectionReport,
     MailError, MailboxInfo, MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun,
-    OutgoingAttachment, OutgoingMail, PushEvent, RunReport, SearchHit, Spool, SyncDriver,
-    SyncOutcome, SyncWindow, account_with_login, backfill_older, run_due, secret, smtp,
+    OutgoingAttachment, OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit,
+    Spool, SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older,
+    recover_in_flight, run_due, secret, smtp,
     userdb::{Draft, UserStore},
     watch,
 };
@@ -751,6 +752,22 @@ async fn outbox_pass(app: &AppHandle) -> Result<RunReport, String> {
 /// wait up to five seconds, which is exactly the delay `design/07` §5.3 calls out.
 fn start_outbox_worker(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        // `design/07` §5.3.1, before anything is sent in this run: settle whatever the previous run
+        // left mid-flight. It runs here rather than in `setup` so the window never waits on a network
+        // round trip — and it runs before the first pass, so a row that turns out to have been
+        // delivered already can never be sent a second time.
+        match recover_outbox(&app).await {
+            Ok(report) if report.already_sent + report.requeued + report.asked_user > 0 => {
+                log_line(&format!(
+                    "[easy-email] 崩溃恢复：已发出 {} / 重新排队 {} / 待用户确认 {} / 未决 {}",
+                    report.already_sent, report.requeued, report.asked_user, report.unresolved
+                ));
+                let _ = app.emit("outbox:changed", ());
+            }
+            Ok(_) => {}
+            Err(error) => log_line(&format!("[easy-email] 崩溃恢复失败：{error}")),
+        }
+
         loop {
             let wake = {
                 let state = app.state::<AppState>();
@@ -787,6 +804,91 @@ fn start_outbox_worker(app: AppHandle) {
             }
         }
     });
+}
+
+/// Messages larger than this wait for the user after a crash instead of being re-sent unattended
+/// (`design/07` §5.3.1).
+const CRASH_RESEND_LIMIT: i64 = mail_core::DEFAULT_CRASH_RESEND_LIMIT;
+
+/// Answer "did this already go out?" for the rows a crash left in flight.
+///
+/// The question goes to the **Sent folder**, by the `Message-ID` frozen into the spool at enqueue
+/// time — the same identity the archive step looks for. An account with nothing in flight is skipped
+/// entirely: this must not cost one connection per account on every startup.
+async fn recover_outbox(app: &AppHandle) -> Result<RecoveryReport, String> {
+    let (accounts, store, spool, pool) = {
+        let state = app.state::<AppState>();
+        (
+            state.snapshot(),
+            state.user.clone(),
+            state.spool.clone(),
+            state.pool.clone(),
+        )
+    };
+
+    let mut total = RecoveryReport::default();
+    for account in accounts {
+        let in_flight = store
+            .outbox_in_flight()
+            .map_err(describe)?
+            .into_iter()
+            .any(|item| item.account_id == account.id);
+        if !in_flight {
+            continue;
+        }
+
+        // Without the credential we cannot ask, and the rows stay exactly as they are for the next
+        // attempt — including one that runs after the user re-enters their authorization code.
+        let password = match secret::load_password(&account.id) {
+            Ok(Some(password)) => password,
+            _ => continue,
+        };
+
+        let report = recover_in_flight(
+            RecoveryRun {
+                store: &store,
+                spool: &spool,
+                now: now_seconds(),
+                max_auto_bytes: CRASH_RESEND_LIMIT,
+            },
+            |message_id| {
+                let pool = pool.clone();
+                let cfg = account.clone();
+                let password = password.clone();
+                async move { sent_folder_has(&pool, &cfg, &password, &message_id).await }
+            },
+        )
+        .await
+        .map_err(describe)?;
+
+        total.already_sent += report.already_sent;
+        total.requeued += report.requeued;
+        total.asked_user += report.asked_user;
+        total.unresolved += report.unresolved;
+    }
+
+    Ok(total)
+}
+
+/// Whether the account's Sent folder already holds this `Message-ID`.
+///
+/// A server with no Sent folder answers "no": there is nowhere a copy could have landed, so there is
+/// nothing that could be duplicated.
+async fn sent_folder_has(
+    pool: &ConnectionPool,
+    cfg: &AccountConfig,
+    password: &str,
+    message_id: &str,
+) -> mail_core::Result<bool> {
+    pool_op!(pool, cfg, password, |client| {
+        match client.sent_mailbox().await? {
+            Some(folder) => Ok(client
+                .find_uid_by_message_id(&folder, message_id)
+                .await?
+                .is_some()),
+            None => Ok(false),
+        }
+    })
 }
 
 /// The sync window the user chose (how far back the client keeps mail).

@@ -22,8 +22,8 @@ use std::time::Duration;
 use mail_core::smtp;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, Draft, Endpoint, ImapClient, MailboxInfo, NewOutbox,
-    OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, Security, Spool, SyncDriver,
-    SyncOutcome, UserStore, pool_op, run_due, watch_every,
+    OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryRun, Security, Spool,
+    SyncDriver, SyncOutcome, UserStore, pool_op, recover_in_flight, run_due, watch_every,
 };
 use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1081,6 +1081,127 @@ async fn a_send_cancelled_inside_its_undo_window_never_opens_a_connection() {
         "no SMTP connection may be opened for a cancelled message"
     );
     assert!(captured.lock().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&spool_dir);
+}
+
+// ===================================================================== crash recovery
+
+/// The §5.3.1 check, against a real IMAP folder: a row a crash left in `sending` whose message the
+/// Sent folder already has must be settled as **sent**, never queued again.
+#[tokio::test]
+async fn crash_recovery_finds_the_message_in_the_sent_folder_and_does_not_resend_it() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+
+    // The folder lookup is part of the contract: a server may localise the name entirely and only
+    // say \Sent in the attribute, so the folder is found by role, not by the literal "Sent".
+    let folder = {
+        let mut client = within(ImapClient::connect(&cfg, "app-password"))
+            .await
+            .expect("connect");
+        within(client.sent_mailbox())
+            .await
+            .expect("LIST must succeed")
+            .expect("the fixture has a \\Sent folder")
+    };
+    assert_eq!(folder, "Sent");
+
+    let store = UserStore::open_in_memory().expect("user db");
+    let spool_dir = std::env::temp_dir().join(format!(
+        "easy-email-loopback-recover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let spool = Spool::open(&spool_dir).expect("spool");
+
+    let mail = OutgoingMail {
+        to: vec!["alice@example.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: "崩溃前发出去了吗".to_string(),
+        body_text: "正文".to_string(),
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+        message_id: Some("<recovered@example.com>".to_string()),
+    };
+
+    let id = store
+        .enqueue_outbox(&NewOutbox {
+            account_id: cfg.id.clone(),
+            draft_id: None,
+            payload_json: serde_json::to_string(&mail).expect("payload"),
+            spool_path: None,
+            spool_bytes: 0,
+            undo_until: 0,
+            scheduled_at: 0,
+            created_at: 1_000,
+        })
+        .expect("enqueue");
+    let message = smtp::build_message(&cfg, &mail).expect("build");
+    let (path, size) = spool.write(id, &message.formatted()).expect("spool");
+    store
+        .set_outbox_spool(id, &path.to_string_lossy(), size as i64)
+        .expect("record spool");
+    // The crash: the row was claimed and never resolved.
+    assert!(store.claim_outbox(id, 1_000).expect("claim"));
+    assert_eq!(store.outbox_in_flight().expect("in flight").len(), 1);
+
+    let report = within(recover_in_flight(
+        RecoveryRun {
+            store: &store,
+            spool: &spool,
+            now: 2_000,
+            max_auto_bytes: mail_core::DEFAULT_CRASH_RESEND_LIMIT,
+        },
+        |message_id| {
+            let cfg = cfg.clone();
+            async move {
+                let mut client = ImapClient::connect(&cfg, "app-password").await?;
+                match client.sent_mailbox().await? {
+                    Some(folder) => Ok(client
+                        .find_uid_by_message_id(&folder, &message_id)
+                        .await?
+                        .is_some()),
+                    None => Ok(false),
+                }
+            }
+        },
+    ))
+    .await
+    .expect("recovery");
+
+    assert_eq!(report.already_sent, 1, "{report:?}");
+    assert_eq!(
+        report.requeued, 0,
+        "a delivered message must not queue again"
+    );
+    assert!(
+        store.due_outbox(i64::MAX / 2, 10).expect("due").is_empty(),
+        "the row must not be eligible for another send"
+    );
+    let item = store.outbox_item(id).expect("item").expect("present");
+    assert_eq!(item.parsed_state(), mail_core::OutboxState::Sent);
+    assert_eq!(
+        item.sent_message_id.as_deref(),
+        Some("<recovered@example.com>")
+    );
+
+    // And the search really went over IMAP: an implementation that guessed would leave no trace.
+    // (`saw_command` is for single-verb commands like LOGIN, so this looks at the whole line.)
+    let lines = transcript(&log);
+    assert!(
+        lines.iter().any(|line| {
+            let upper = line.to_ascii_uppercase();
+            upper.contains("SEARCH") && upper.contains("MESSAGE-ID")
+        }),
+        "expected a Message-ID search: {lines:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&spool_dir);
 }
