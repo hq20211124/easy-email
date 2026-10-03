@@ -940,6 +940,85 @@ textarea {
   gap: 12px;
 }
 
+/* The two ways in, as a choice. Rendered as full-width rows rather than a cramped radio line: the
+   labels carry a sentence each, and that sentence is what makes the choice decidable. */
+.auth-choice {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px 12px 10px;
+  margin: 0 0 12px;
+}
+
+.auth-choice legend {
+  padding: 0 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.auth-choice .choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.auth-choice .choice:hover {
+  background: var(--surface-2);
+}
+
+.auth-choice .choice input {
+  margin-top: 3px;
+}
+
+.auth-choice .choice span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.auth-choice .choice em {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* The result of the browser half of an OAuth sign-in, where the user is looking for it. */
+.oauth-status {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 12px;
+}
+
+.oauth-status.ok {
+  background: color-mix(in srgb, #16a34a 14%, transparent);
+}
+
+.oauth-status.bad {
+  background: color-mix(in srgb, #dc2626 14%, transparent);
+}
+
+/* Advanced settings start closed: the client id has a working default, and showing two cryptic
+   prefilled boxes next to the sign-in button made a real user ask what they were for. */
+.advanced {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.advanced input {
+  margin-top: 8px;
+}
+
 .detected {
   border: 1px solid var(--border);
   border-radius: 10px;

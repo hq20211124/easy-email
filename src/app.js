@@ -318,9 +318,10 @@ function wireGlobalEvents() {
     state.allowRemoteImages = true;
     applyBodyMode();
   });
-  $('modal-root').addEventListener('mousedown', (event) => {
-    if (event.target === $('modal-root')) closeModal();
-  });
+  // Deliberately **not** closing on a click outside the dialog. It used to, and it destroyed work: a
+  // user typing an address, a password or an authorization code who clicked a few pixels wide lost
+  // everything — and in the wizard `closeModal` also deletes the half-created account (M1a-66, a real
+  // user's report: "我点一下旁边填写的界面就消失了"). Esc and the two explicit buttons remain.
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') closeModal();
   });
@@ -2335,6 +2336,9 @@ function setComposeCloudStatus(text) {
  */
 let pendingWizardAccountId = null;
 
+/** Set once the browser half of an OAuth sign-in has succeeded for the wizard currently open. */
+let oauthAuthorized = false;
+
 function openAccountWizard() {
   pendingWizardAccountId = null;
 
@@ -2369,31 +2373,70 @@ function openAccountWizard() {
       client without a secret has to be answered against the real endpoint, and until then the honest
       shape is "bring your own registration" — which is also what the design's BYO wizard anticipates.
     -->
-    <div id="wiz-oauth" class="field" hidden>
-      <label>OAuth 登录（可选，推荐）</label>
-      <input id="wiz-client-id" placeholder="你的 OAuth 客户端 ID（client_id）" autocomplete="off" spellcheck="false" />
-      <input id="wiz-client-secret" placeholder="客户端密钥（只有在服务商要求时填）" autocomplete="off" spellcheck="false" />
-      <span id="wiz-oauth-notice" class="hint"></span>
-      <span class="hint">这类邮箱不能只用密码登录。点下面的按钮会在**系统浏览器**里完成授权，
-        我们只拿到一个可撤销的授权码，密码不经过我们。</span>
-      <button id="wiz-oauth-go" class="btn" type="button">在浏览器里登录</button>
-    </div>
     <div id="wiz-detected" class="detected" hidden></div>
     <div id="wiz-note" class="callout" hidden></div>
-    <div class="field">
-      <label>登录用户名（可选）</label>
-      <input id="wiz-username" placeholder="默认与邮箱地址相同" autocomplete="off" spellcheck="false" />
-      <span class="hint">只有登录名和邮箱地址不一样时才需要填。典型情况：@foxmail.com 别名
-        需要改用 QQ 号邮箱登录，或者企业/VIP 账号下发了单独的登录名。</span>
+
+    <!--
+      Two ways in, and they are a *choice* rather than two stacks of fields in one form: OAuth sends
+      the user to a browser and never sees a password, while a password account never sees a browser.
+      Showing both at once made it unclear what had to be filled in — and the client-id boxes that
+      belong to the first path looked like something the user had to understand (reported by a real
+      user, M1a-66).
+    -->
+    <fieldset id="wiz-auth-choice" class="auth-choice" hidden>
+      <legend>登录方式</legend>
+      <label class="choice">
+        <input type="radio" name="wiz-auth" value="oauth" />
+        <span>
+          <strong>用浏览器登录</strong>
+          <em>不用输入密码；授权可以随时在服务商那边撤销。</em>
+        </span>
+      </label>
+      <label class="choice">
+        <input type="radio" name="wiz-auth" value="password" />
+        <span>
+          <strong>用密码 / 授权码</strong>
+          <em>国内邮箱和自建服务器通常走这条。</em>
+        </span>
+      </label>
+    </fieldset>
+
+    <div id="wiz-oauth-path" hidden>
+      <p class="hint">
+        点下面的按钮会<b>自动打开你的默认浏览器</b>；在浏览器里点「允许」之后回到这里就会自动完成，
+        不需要你自己去开浏览器。
+      </p>
+      <button id="wiz-oauth-go" class="btn primary" type="button">打开浏览器登录</button>
+      <div id="wiz-oauth-status" class="oauth-status" hidden></div>
+
+      <details id="wiz-oauth-advanced" class="advanced">
+        <summary>高级：使用你自己的 OAuth 客户端 ID</summary>
+        <p class="hint">
+          已经为你填好了默认值，通常不用改。如果你有自己的 Google Cloud 注册，把下载的 JSON
+          放进应用数据目录即可（会优先使用它），或直接在这里替换。
+        </p>
+        <input id="wiz-client-id" placeholder="client_id" autocomplete="off" spellcheck="false" />
+        <input id="wiz-client-secret" placeholder="client_secret（服务商要求时才有）" autocomplete="off" spellcheck="false" />
+        <span id="wiz-oauth-notice" class="hint"></span>
+      </details>
     </div>
-    <div class="field">
-      <label>密码 / 授权码 / 应用专用密码</label>
-      <!--
-        new-password rather than off: browsers ignore "off" for password fields and would
-        otherwise offer to fill a saved website password into an email account field.
-      -->
-      <input id="wiz-password" type="password" autocomplete="new-password" spellcheck="false" />
-      <span class="hint">国内邮箱几乎都需要「授权码」，不是登录密码 —— 见上方说明。</span>
+
+    <div id="wiz-password-path">
+      <div class="field">
+        <label>登录用户名（可选）</label>
+        <input id="wiz-username" placeholder="默认与邮箱地址相同" autocomplete="off" spellcheck="false" />
+        <span class="hint">只有登录名和邮箱地址不一样时才需要填。典型情况：@foxmail.com 别名
+          需要改用 QQ 号邮箱登录，或者企业/VIP 账号下发了单独的登录名。</span>
+      </div>
+      <div class="field">
+        <label>密码 / 授权码 / 应用专用密码</label>
+        <!--
+          new-password rather than off: browsers ignore "off" for password fields and would
+          otherwise offer to fill a saved website password into an email account field.
+        -->
+        <input id="wiz-password" type="password" autocomplete="new-password" spellcheck="false" />
+        <span class="hint">国内邮箱几乎都需要「授权码」，不是登录密码 —— 见上方说明。</span>
+      </div>
     </div>
     <div id="wiz-report"></div>`;
 
@@ -2415,7 +2458,13 @@ function openAccountWizard() {
       // A password is required for the accounts that use one. For an OAuth2 provider the credential
       // is the token the browser flow already stored, so demanding a password here would block the
       // one path that cannot have one (design/05 §3.2).
-      const oauthAccount = modal.querySelector('#wiz-oauth').hidden === false;
+      const oauthAccount =
+        modal.querySelector('input[name="wiz-auth"]:checked')?.value === 'oauth' ||
+        modal.querySelector('#wiz-auth-choice').hidden;
+      if (oauthAccount && !oauthAuthorized) {
+        toast('请先点上面的「打开浏览器登录」完成授权。', 'err', 9000);
+        return false;
+      }
       if (!password && !oauthAccount) {
         toast('请填写密码或授权码。', 'err');
         return false;
@@ -2480,39 +2529,60 @@ function openAccountWizard() {
     const detected = modal.querySelector('#wiz-detected');
     const note = modal.querySelector('#wiz-note');
 
-    // The OAuth block appears exactly for the accounts that cannot sign in with a password: showing it
-    // for a QQ account would offer a flow that does not exist for it, and hiding it for Gmail would
-    // leave the user typing a password that can never work (`design/05` §3.1).
-    const oauth = modal.querySelector('#wiz-oauth');
-    // Two providers *require* OAuth2 (Microsoft), and Gmail offers it as an alternative to an app
-    // password: Google still issues those for accounts with two-step verification, and the provider
-    // note walks the user through it, so hiding OAuth there would take away a working path. The
-    // reverse mistake — offering OAuth for QQ or 163 — is what the old condition avoided.
+    // Two paths, chosen explicitly. Shown only where there is a real choice: a QQ account has one way
+    // in, and offering a radio pair with a single usable option is noise. Gmail has both (app password
+    // or OAuth), Microsoft only OAuth.
+    const choice = modal.querySelector('#wiz-auth-choice');
+    const oauthPath = modal.querySelector('#wiz-oauth-path');
+    const passwordPath = modal.querySelector('#wiz-password-path');
     const oauthEligible = provider.auth === 'oauth2' || provider.id === 'gmail';
-    oauth.hidden = !oauthEligible;
+    const passwordEligible = provider.auth !== 'oauth2';
+    choice.hidden = !(oauthEligible && passwordEligible);
 
-    // A prefilled registration for trying Gmail out, and the honest reason it is only that.
-    //
-    // These are **Mozilla's** published values, the ones Thunderbird itself signs in with. They are
-    // public because a desktop client cannot keep a secret anyway (A1-F32), and the comment above them
-    // in Mozilla's source says plainly: "Don't copy these values for your own application--register it
-    // yourself." Filling them in here is a deliberate, reversible convenience for a personal test —
-    // the consent screen will say "Mozilla Thunderbird", Mozilla can revoke them at any time, and a
-    // released build must ship its own registration instead (A1-F37).
+    const selected = () =>
+      modal.querySelector('input[name="wiz-auth"]:checked')?.value ??
+      (oauthEligible && !passwordEligible ? 'oauth' : 'password');
+
+    const applyPath = () => {
+      const path = selected();
+      oauthPath.hidden = path !== 'oauth';
+      passwordPath.hidden = path === 'oauth';
+      const confirm = modal.querySelector('[data-role="confirm"]');
+      if (confirm && !confirm.disabled) {
+        // The button at the bottom means different things on the two paths, and saying which is the
+        // difference between "what do I do now?" and a finished setup.
+        confirm.textContent = path === 'oauth' && !oauthAuthorized ? '先完成上面的浏览器登录' : '验证并保存';
+      }
+    };
+
+    if (oauthEligible && !choice.dataset.wired) {
+      choice.dataset.wired = '1';
+      choice.querySelectorAll('input[name="wiz-auth"]').forEach((radio) =>
+        radio.addEventListener('change', applyPath)
+      );
+      if (oauthEligible && !passwordEligible) {
+        choice.querySelector('input[value="oauth"]').checked = true;
+      } else if (!choice.querySelector('input[name="wiz-auth"]:checked')) {
+        // OAuth is the recommended path where it exists: no password typed, revocable authorization.
+        choice.querySelector('input[value="oauth"]').checked = true;
+      }
+      applyPath();
+    }
+
     if (oauthEligible) {
       // The registration comes from the backend, which prefers the one the user dropped into the app
       // data directory and falls back to the borrowed Thunderbird one with its notice. Asking the
       // backend keeps a single source of truth: a value hard-coded here could silently disagree with
       // what `oauth_sign_in` is actually configured to use.
       invoke('oauth_client_default', { providerId: provider.id })
-        .then((choice) => {
+        .then((client) => {
           const clientIdField = modal.querySelector('#wiz-client-id');
           const clientSecretField = modal.querySelector('#wiz-client-secret');
-          if (choice && choice.client_id && !clientIdField.value) {
-            clientIdField.value = choice.client_id;
-            clientSecretField.value = choice.client_secret ?? '';
+          if (client && client.client_id && !clientIdField.value) {
+            clientIdField.value = client.client_id;
+            clientSecretField.value = client.client_secret ?? '';
           }
-          modal.querySelector('#wiz-oauth-notice').textContent = choice?.notice ?? '';
+          modal.querySelector('#wiz-oauth-notice').textContent = client?.notice ?? '';
         })
         .catch(() => {});
     }
@@ -2527,12 +2597,15 @@ function openAccountWizard() {
         }
         const clientId = modal.querySelector('#wiz-client-id').value.trim();
         if (!clientId) {
-          toast('这类邮箱需要你自己的 OAuth 客户端 ID（见上方说明）', 'err', 9000);
+          toast('这类邮箱需要一个 OAuth 客户端 ID（见「高级」里的说明）', 'err', 9000);
           return;
         }
         const secret = modal.querySelector('#wiz-client-secret').value.trim();
+        const status = modal.querySelector('#wiz-oauth-status');
+        status.hidden = false;
+        status.className = 'oauth-status';
+        status.innerHTML = '<span class="spinner"></span>已打开浏览器，请在那里点「允许」（两分钟内）…';
 
-        toast('已打开系统浏览器，请在其中完成登录（两分钟内）', 'info', 9000);
         const tokens = await run('OAuth 登录', () =>
           invoke('oauth_sign_in', {
             email: address,
@@ -2541,16 +2614,18 @@ function openAccountWizard() {
             clientSecret: secret || null,
           })
         );
-        if (!tokens) return;
+        if (!tokens) {
+          status.className = 'oauth-status bad';
+          status.textContent = '没有完成授权。可以再点一次「打开浏览器登录」。';
+          return;
+        }
 
-        // The refresh token is already stored by the backend (A1-F34); the wizard only has to say so.
-        toast(
-          tokens.refresh_token
-            ? '登录成功，授权已保存。现在填邮箱密码的位置可以留空，直接点「验证并保存」。'
-            : '登录成功了，但服务商没有返回刷新令牌 —— 下次启动可能需要重新登录。',
-          'ok',
-          12000
-        );
+        oauthAuthorized = true;
+        status.className = 'oauth-status ok';
+        status.textContent = tokens.refresh_token
+          ? '✓ 已授权，授权已保存在本机。现在点下面的「验证并保存」即可。'
+          : '✓ 已登录，但服务商没有返回刷新令牌 —— 下次启动可能需要重新登录。';
+        applyPath();
       });
     }
 
