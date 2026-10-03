@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-29 会话串（近似键版）列表按会话聚成一行 |
+| 最新 | M1a-30 会话串精确键（References 根，cache.db v3） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -791,15 +791,48 @@ sample: "Re:Re:赖先生6" 徽标 6  ← 一封真的六封会话
 （现在显示最新那封的原样主题，所以会看到 `Re:Re:`）。
 
 ---
+### M1a-30 会话串的精确键：`References` 根进列表摘要（cache.db v3）✅（第 36 轮）
+
+M1a-29 用的是近似键（主题 + 发件人），并明确留了一条边界："已发送里自己的回复不会与收到的原信合并"。
+这一轮把**精确键**做进数据里：`References` 链的**根**。
+
+- **`crates/mail-core/src/threads.rs`**：`root_of(message_id, references)` = `References` 里最老的那个 id，
+  没有链就用这封自己的 `Message-ID`；两者都没有 ⇒ **返回空**（不是编一个键——把没有身份的邮件全并到
+  一个会话里才是藏邮件）。id 一律规范化成 `<...>`：客户端与服务商对尖括号不一致，同一条消息不能因此
+  落进两个会话。4 条测试（回复与原信同键、深链取根、尖括号无关、无身份不编键）。
+- **解析头部时就算**（`imap::summarise`）：`References` 只在这个时刻手上有，缓存里只存摘要字段。
+  `MessageSummary` 增加 `thread_key: Option<String>`（`#[serde(default)]`，老行是 `None`）。
+- **存储**：`cache.db` 的 `messages` 加 `thread_key` 列。**这是本项目第一次给已有表加列**——
+  与"加表"完全不同：`create table if not exists` 对已存在的表会保留旧定义并**静默忽略**新列，
+  所以必须用 `pragma table_info` 判断再 `alter table`（`add_column_if_missing`），版本 2 → **3**。
+  有一条专门的测试：手工造一个 v2 形状的文件（`messages` 无该列 + 一行旧数据）⇒ 打开后版本 3、
+  **旧行还在**、它 `thread_key` 为 `None`、并且新列从此可写可读。
+- **前端**：`conversationKey` **优先用后端给的 `thread_key`**，没有才退回主题+发件人。
+  测试新增三条：精确键覆盖退回、同会话主题被改也不拆（人真的会改主题）、**已发送的回复通过精确键
+  与原信合并**（这正是 M1a-29 那条边界要被移除的原因）。
+
+**真机证据**（真 QQ 账号）：
+- **迁移**：`cache.db` **user_version 2 → 3**，`messages` **仍是 160 行**（缓存一封没丢）。
+- **探针**：50 封 ⇒ 41 行，徽标 [2,2,3,6] 与组大小一致（自洽），**`exactKeys: 0 / fallbackOnly: 50`**
+  ——因为那 160 行是**加列之前**写的，它们没有键，于是**退回近似键**并仍然正确分组（`passed: true`）。
+  这正是设计想要的行为：老数据优雅降级，而不是报错或错分。
+
+**由此得到一个具体的后续（已进下一步）**：已缓存的邮件**不会**自己拿到精确键——增量同步只问游标之上的
+UID，而这些行的 `References` 在缓存里**根本没存**。要让它们也有精确键，需要一次性的"重取最近 N 封头部"
+（头部很便宜）或者接受"新邮件开始精确、老邮件继续近似"。
+
+**数字**：`check.ps1` **16 步全绿**；测试 **234**（191 lib + 39 loopback + 4 reachability）。
+
+---
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **16 步全绿**；`cargo test --workspace` **229 通过、0 失败**
+**当前状态**：`tools/check.ps1` **16 步全绿**；`cargo test --workspace` **234 通过、0 失败**
 （186 lib + 39 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
-真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
+真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v3**（`sent_index` + `thread_key`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 74 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 76 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -835,11 +868,11 @@ sample: "Re:Re:赖先生6" 徽标 6  ← 一封真的六封会话
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近十二轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+**最近十四轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）列表按会话聚成一行 + 新门禁第 8 步**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）**。
 
 **若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
 （三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
@@ -855,10 +888,12 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-0. **会话串的精确键**：M1a-29 上了近似键（主题+发件人）；真做法是把 `Message-ID`/`References`
+0. **让已缓存的邮件也拿到精确键**：增量同步只问游标之上的 UID，而这些行的 `References` 没存，
+   所以它们永远停在近似键上。需要一次"重取最近 N 封头部"（很便宜）或接受新旧两制（见 M1a-30）。
+1. ~~会话串的精确键~~：M1a-29 上了近似键（主题+发件人）；真做法是把 `Message-ID`/`References`
    带进列表摘要 ⇒ `cache.db` 加列 + 真迁移（cache 的 migrate 有"版本相等就早退"的守卫，必须升版本号），
-   再换掉 `threads.js` 的键（那条"已知边界"的断言就该翻过来）。
-1. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
+   再换掉 `threads.js` 的键（那条"已知边界"的断言就该翻过来）。**← 已在 M1a-30 完成**。
+2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
 3. ~~网易系"只让读最近 30 天"的提示~~ → **M1a-19 已做**（`range_cap_hint` + 冷启动提示）。
@@ -882,10 +917,10 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 229 个测试
+cargo test --workspace                # 234 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 74 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 76 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
