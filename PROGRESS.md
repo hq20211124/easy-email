@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-35 服务端下界（记录 + 说出） |
+| 最新 | M1a-36 安装包配置补齐 + hooks.nsh + 体积实测（安装包未测） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -957,15 +957,54 @@ not defined`。② 顺手确认了 `invoke` 对**任何**命令名都会给出 `
 能验证的只有"它不影响 QQ"与单元测试；网易账号上的实际观感需要有号才能看。
 
 ---
+### M1a-36 安装包：配置按 design/17 补齐 + hooks.nsh（含体积实测）✅（第 42 轮）
+
+`design/17` 的安装包计划一直只有"NSIS + 图标"三行配置。这一轮把**不需要外部条件**的部分补齐，
+并且**量了体积**。
+
+- **`bundle.windows` 补齐**：`webviewInstallMode: embedBootstrapper(silent)`、
+  `digestAlgorithm: sha256`、`timestampUrl`，以及 `nsis { installMode: currentUser,
+  displayLanguageSelector: false, languages: [SimpChinese, English], installerIcon, installerHooks }`。
+  `installMode: currentUser` 不是偏好而是**硬要求**：提权安装的应用**发不出通知**（§9），
+  而通知是这个客户端的功能。
+- **`src-tauri/installer/hooks.nsh`**（设计里写明"必须自己写，Tauri 不做这部分"）：Tauri 的 NSIS 只写
+  `Software\Classes\mailto`，**不写 `RegisteredApplications`/`Capabilities`** ⇒ Windows 的"默认应用"
+  页里根本看不到我们，用户想设默认也没处设。两个宏补上注册，并在卸载时用 **`DeleteRegValue`** 清掉
+  `RegisteredApplications` 下的那个**值**——用 `DeleteRegKey` 是空操作，应用会永远留在那个列表里
+  （设计第二轮评审抓到的正是这一点，注释里写明了原因）。
+- **新门禁第 9 步**（16→**17 步**）：检查 `tauri.conf.json` 能解析、`installMode` 仍是 `currentUser`、
+  `installerHooks` **指向的文件真的存在**、`webviewInstallMode` 是 embedBootstrapper、图标都在。
+  理由：`installerHooks` 是一个**写在 JSON 里的路径**，打错字不会让任何东西失败，直到**某个要发版的人**
+  去跑 `tauri build`（需要 CLI 与网络）——那时才发现，而做错的人早就不在场了。
+
+**体积实测（本轮真的编了 release）**：
+| 项 | 实测 | 设计预算（`design/17` §5） |
+|---|---|---|
+| `easy-email.exe`（release，已 lto/strip/panic=abort） | **8.32 MB** | — |
+| 安装包（NSIS + embedBootstrapper） | **未测**：`cargo tauri` CLI 本机没装，装它需要网络 | ≤ 20 MB |
+| release 冒烟 | 启动 12 秒存活、日志无新错误 | — |
+
+8.32 MB 的可执行文件 + NSIS 的 LZMA 压缩，20 MB 的预算**看起来**很宽裕，但**安装包本身没有测**——
+这句话就写在 PROGRESS 里，不给一个没有测量过的"通过"。
+
+**证据**：`check.ps1` **17 步全绿**；测试 235；release 与 debug 两种构建都做过存活冒烟；
+`installer/hooks.nsh` 2082 字节在树里。
+
+**未做（都需要外部条件，写清了谁来补）**：代码签名（`certificateThumbprint` 或 `signCommand`——
+要证书，设计默认不买 OV/EV）；`createUpdaterArtifacts: true`（会产出 `*.sig`，但**需要签名私钥**，
+我没有密钥，加了无法在本机验证 ⇒ 按"不写测不了的东西"原则不加）；自动更新本身（**需要先决定更新源**
+——GitHub Releases 还是自己的服务器——在那之前写它只会是连不到任何地方的死代码）。
+
+---
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **16 步全绿**；`cargo test --workspace` **235 通过、0 失败**
+**当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **235 通过、0 失败**
 （186 lib + 39 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v3**（`sent_index` + `thread_key`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 86 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 88 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -1001,11 +1040,11 @@ not defined`。② 顺手确认了 `invoke` 对**任何**命令名都会给出 `
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近十九轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+**最近二十轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测，CLI 不在本机）**。
 
 **若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
 （三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
@@ -1049,11 +1088,11 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
 
 **运行方式**
 ```
-.\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
+.\tools\check.ps1                     # 17 步门禁（前端不变量 / 会话键 / 负载契约 / 安装包配置 / fmt / clippy / build / test / PE=2）
 cargo test --workspace                # 235 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 86 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 88 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
