@@ -858,6 +858,38 @@ async fn mirror_draft(
     Ok(report)
 }
 
+/// The sentence to show when a sync stopped because the server will not go further back.
+///
+/// Only for services known to cap how far back a third-party client may read (A1-F2, the NetEase
+/// family). For everyone else "no older mail" means the mailbox has no older mail, and a hint about a
+/// setting would be noise. `None` means say nothing.
+///
+/// This exists because the symptom is indistinguishable from our own bug: the user asked for two
+/// years, got thirty days, and nothing in the protocol explains why. The wording lives next to the
+/// data rather than in the renderer, so the list of services that behave this way stays in one place.
+#[tauri::command]
+async fn range_cap_hint(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<String>, String> {
+    let cfg = state.find(&account_id)?;
+    let Some(provider) = providers::by_id(&cfg.provider_id) else {
+        return Ok(None);
+    };
+    if !provider.caps_third_party_range() {
+        return Ok(None);
+    }
+
+    Ok(Some(if provider.range_cap_is_enterprise_policy() {
+        "该邮箱的企业策略只允许第三方客户端读取最近约 30 天的邮件。\
+         如需更早，请在网易网页版设置里把「收取范围」改大，然后回到这里重试。"
+            .to_string()
+    } else {
+        "这个邮箱只让第三方客户端读取最近约 30 天的邮件。\
+         如需更早，请到网页版把「收取范围 / IMAP 收取」改大，然后回到这里重试。"
+            .to_string()
+    }))
+}
 /// Where the server-side copy of a draft is, if we ever wrote one.
 ///
 /// Exposed so the composer can be honest later ("云端草稿待同步" vs "已同步") without guessing, and
@@ -1944,6 +1976,7 @@ pub fn run() {
             delete_draft,
             mirror_draft,
             draft_mirror,
+            range_cap_hint,
             enqueue_send,
             list_outbox,
             cancel_send,

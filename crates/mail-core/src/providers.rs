@@ -105,6 +105,25 @@ impl Provider {
             _ => None,
         }
     }
+
+    /// Whether this service is one that caps how far back a third-party client may read.
+    ///
+    /// A1-F2: NetEase's web setting decides the range a third-party client may fetch, and for the
+    /// enterprise product it defaults to the last 30 days. Nothing in the protocol says so — IMAP
+    /// simply stops having older mail — which is why the client has to *know* which services behave
+    /// this way before it says anything. Getting this wrong in the "yes" direction would tell people
+    /// to change a setting that does not exist.
+    pub fn caps_third_party_range(&self) -> bool {
+        matches!(self.id, "163" | "126" | "yeah" | "qiye163")
+    }
+
+    /// Whether the cap is documented as an *enterprise* policy rather than a per-account setting.
+    ///
+    /// The distinction is only for the wording: "企业策略" is right for 网易企业邮 and wrong for a
+    /// personal 163 mailbox, where the same symptom comes from the account's own 收取范围 setting.
+    pub fn range_cap_is_enterprise_policy(&self) -> bool {
+        matches!(self.id, "qiye163")
+    }
 }
 
 use AuthKind::{AppPassword, OAuth2, Password};
@@ -594,6 +613,37 @@ mod tests {
                 provider.id
             );
         }
+    }
+
+    #[test]
+    fn only_the_services_that_cap_the_fetch_range_are_flagged() {
+        // A1-F2: the NetEase family. Anyone else must stay unflagged — the hint tells the user to go
+        // and change a setting, and telling them to change one that does not exist is worse than
+        // saying nothing.
+        for id in ["163", "126", "yeah", "qiye163"] {
+            let provider = by_id(id).unwrap_or_else(|| panic!("{id} is in the table"));
+            assert!(
+                provider.caps_third_party_range(),
+                "{id} caps how far back a third-party client can read"
+            );
+        }
+        for provider in all() {
+            if matches!(provider.id, "163" | "126" | "yeah" | "qiye163") {
+                continue;
+            }
+            assert!(
+                !provider.caps_third_party_range(),
+                "{} must not be given a range-cap hint",
+                provider.id
+            );
+        }
+        // The wording differs between the enterprise product and a personal mailbox.
+        assert!(
+            by_id("qiye163")
+                .expect("qiye163")
+                .range_cap_is_enterprise_policy()
+        );
+        assert!(!by_id("163").expect("163").range_cap_is_enterprise_policy());
     }
 
     #[test]

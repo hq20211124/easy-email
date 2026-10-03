@@ -719,6 +719,15 @@ async function backfillColdStart() {
     toast(quotaMessage(), 'info', 12000);
     return;
   }
+
+  // "No older mail" is normal (the mailbox is small) — except on the services that cap how far back
+  // a third-party client may read, where it looks exactly like our own bug. The backend knows which
+  // ones those are and words the hint; an empty answer means say nothing.
+  if (report.stop === 'history_exhausted' && state.syncWindow?.kind !== 'on_demand') {
+    const hint = await invoke('range_cap_hint', { accountId }).catch(() => null);
+    if (hint) toast(hint, 'info', 15000);
+  }
+
   if (!report.fetched) return;
 
   toast(`按同步窗口补齐了 ${report.fetched} 封更早的邮件`, 'info');

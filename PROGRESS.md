@@ -596,7 +596,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 52 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 53 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -665,7 +665,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 cargo test --workspace                # 224 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 52 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 53 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
