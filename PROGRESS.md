@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **198**（160 lib + 34 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **208**（170 lib + 34 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,8 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
+| 最新 | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
+| — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
 | — | M1a-11 已发送副本：先搜索再 APPEND（spool 即"未归档"标记） |
 | — | M1a-10 崩溃恢复：先查已发送再决定重发（含按角色找 Sent 文件夹） |
 | — | M1a-9 发件箱界面 + 写信改走队列（撤销窗口真正对用户可见） |
@@ -28,6 +29,48 @@
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-13 附件 sha256：路径不是身份 ✅（第 19 轮）
+
+`design/07` §5.5/§7。草稿存的是**路径**（100 MB 附件不能把 `user.db` 变成第二份邮件），
+而路径**不是身份**：文件可以在"选中"与"发送"之间被改、被改名、被删。发出去的是改过的新内容，
+用户在写信界面看不出来（名字和大小还是旧的）。所以每个附件记一份选中时的 SHA-256，发送前比对。
+
+**新增 `attach.rs`**（9 条测试）：
+- `file_sha256()`：**分块**（256 KB，`design/07` §5.5 的数字）流式读，100 MB 附件不会为了算哈希
+  被读进内存。测试用空文件的公开定型值钉住算法与十六进制编码，另有一条"跨块文件与整读结果一致"
+  ——哈希循环漏读/重读一块仍然会算出**一个**哈希，只是不是对的那个。
+- `check_attachment()`：内容变了 ⇒ `Changed`；文件读不到 ⇒ `Missing`；**没有记录哈希 ⇒ 什么都不说**
+  （老草稿不该因为"我们没记过"被拒绝）。
+- `prepare_attachments()`：**发送前补算**——没哈希的补上（并写回 payload，下次才能比对），
+  比不上的返回可行动的中文错误（**点名是哪个文件**）。两个 reason key（`attachment_changed`/
+  `attachment_missing`）有测试断言它们确实落在 `needs_user_decision` 里。
+
+**接线**：
+- 选附件时（`pick_attachments`）立刻算哈希——那是用户**刚刚看着**选择的那一版，也是唯一能记录它的时刻；
+  算不出来就留空，发送时补算，而不是拒绝这个附件。
+- 入队时（`enqueue_send`）先 `prepare_attachments`：这是"文件不是你选的那个"还能作为**问题**存在的
+  最后一刻，之后字节就被冻结了。
+- **重建 spool 时**（`worker::frozen_bytes`）再校验一次：冻结字节丢了，磁盘上的文件是唯一来源，
+  这是最后一次能发现改动的地方 ⇒ 停下来问用户，绝不"照现在的样子重建"
+  （新增 worker 测试：改动过的附件 ⇒ `needs_attention`、`sent=0`、**SMTP 一次都没碰**）。
+
+**契约门禁补上了嵌套结构**：`tools/payload_keys.mjs` 之前只比对顶层 `OutgoingMail`/`Draft`，
+`OutgoingAttachment` 是**嵌套**结构、同样带 `deny_unknown_fields`，错了也是运行期才炸
+（正是 M1a-7 那类 bug 的藏身处）。现在 `payload.js` 有 `attachment()` 构造器，门禁数到
+**5 个字段**；`probe-drafts.mjs` 的负载检查也带上了嵌套附件，真机走一遍确认能反序列化。
+
+**依赖**：新增 `sha2 = "0.10"`（`default-features = false`）。它本来就在 `Cargo.lock` 里
+（传递依赖），源码与 `.crate` 都已在本地 registry 缓存，构建全程 `--offline` 通过。
+
+**数字**：`check.ps1` 15 步全绿；测试 **208**（170 lib + 34 loopback + 4 reachability）；
+真机两个探针（草稿 / 发件箱）重跑均通过。
+
+**未做**：附件大小预检（`design/07` §6 的 `ValidationIssue::TooLarge`，需要服务商表里的上限字段）、
+spool 的 256 KB 分块流式写（现在仍是一次性 `formatted()`，峰值内存问题见 §8）、
+以及 PROGRESS 里列的其余项。
 
 ---
 
@@ -340,11 +383,11 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **198 通过、0 失败**
-（160 lib + 34 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
-应用启动冒烟通过（10 秒存活）。交接摘要里三件优先级现在都落地了：写信接草稿（M1a-7/9）、
-发件箱 worker 全链（M1a-8/9/10/11：撤销窗口 / 退避重试 / needs_attention / 发送后归档）、
-同步窗口选择器 + 冷启动回填（M1a-12）。所有改动都在 git 里（基线 `83c1b0c`，共 38 个提交）。
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **208 通过、0 失败**
+（170 lib + 34 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
+这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
+所有改动都在 git 里（基线 `83c1b0c`，共 40 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -375,6 +418,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 | **M1a-10** | **崩溃恢复 `sending` 行：按冻结 Message-ID 查已发送 ⇒ 已发出判 sent（绝不重发）/ 查不到回队列 / 大附件问用户 / 问不到原样不动；`sent_mailbox()` 按 RFC 6154 角色找文件夹** | **loopback 真 IMAP：解析出 `Sent` → 恢复判 `sent` 且不可再发 → transcript 里确有 `SEARCH ... MESSAGE-ID`** |
 | **M1a-11** | **已发送副本：先搜索再 APPEND（幂等）、spool 即"未归档"标记、`file_sent_copies` 一趟 + 离线延后；刻意不加 `auto_files_sent` 标志与 `sent_index`（理由见 M1a-11）** | **loopback：服务器已归档 ⇒ `appended:false`，transcript 里有 `MESSAGE-ID` 搜索、**没有 `APPEND`**（重复副本这个失败模式只有这样才看得见）** |
 | **M1a-12** | **同步窗口选择器（四种窗口 + 收窄不删信）+ 冷启动自动回填一页（`pages: None` 一页，防"全部"窗口开窗就下载几千封）** | **`tools/probe-sync-window.mjs` 真机：四种窗口逐字往返 / 选择器预选与保存 / 侧栏同步 / 设置已还原；启动日志有真机 `回填到窗口边界 years:2：0 页 / 0 封（HistoryExhausted）`** |
+| **M1a-13** | **附件 sha256：选中时记录、发送前补算与校验、重建 spool 时再校验；契约门禁补上嵌套的 `OutgoingAttachment`** | **`attach.rs` 9 条（含空文件定型值、跨块一致、变了/丢了/没记录三种判定）；worker 测试：改动过的附件 ⇒ `needs_attention`、SMTP 一次没碰；真机探针带嵌套附件负载通过** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -387,21 +431,23 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 交接摘要原本的三件已全部完成，下面是收口与"日常可用"要补的）
 1. **配额账本**（`design/04` §5.7）：现在"全部邮件"窗口的回填没有任何节流——M1a-12 用"冷启动只走
    一页"挡住了最坏情况，但一个长走一回仍然没有每日字节预算。
-2. **附件 sha256**（`design/07` §9"发送前补算"）：草稿里 `sha256` 记 `null`，
-   `attachment_changed`/`attachment_missing` 两个 `needs_attention` 分支还没有触发源。
+2. **发信上限预检**（`design/07` §6）：服务商表目前没有 `smtp_max_message_bytes` / `append_limit_bytes`，
+   所以"这封信太大了"只能在服务器拒绝之后才知道（552 已经会落到 `needs_attention`，
+   但那时已经晚了一步）。附件哈希（M1a-13）让"算准大小"这件事变得可做。
 3. **`sent_index`（cache.db）+ 界面"查看已发送副本"**：副本 UID 现在只在返回值里，没落库；
    要加就按 §5.4 步骤 0 的顺序，并给 cache.db 加一次真迁移。
-4. **真机验证**（都需要先问用户，都会真的动他的邮箱）：真实账号上发一封信 ⇒ 已发送副本落位；
-   崩溃恢复时序（预置 spool 缺失的 `sending` 行 ⇒ 期望 `needs_attention`，全程不碰 SMTP）。
-5. **服务器草稿镜像**（`draft_mirror`，APPEND + `find_uid_by_message_id`，best-effort 不阻塞写信）。
-6. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
+4. **spool 分块流式写**（`design/07` §8）：现在建 spool 是 `formatted()` 一次性成字节，
+   25 MB 附件的峰值内存还没按 §8 的预算收紧。
+5. **真机验证**（需要先问用户）：崩溃恢复时序（预置 spool 缺失的 `sending` 行 ⇒ 期望
+   `needs_attention`，全程不碰 SMTP——这条安全）；真实账号上"附件被改动"的提醒是否看得懂。
+6. **服务器草稿镜像**（`draft_mirror`）→ 认证轴（`AuthMethod`）→ 会话串 → 通知托盘 → 安装包。
 
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 198 个测试
+cargo test --workspace                # 208 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
-git log --oneline                     # 38 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 40 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
