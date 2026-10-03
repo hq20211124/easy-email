@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **222**（180 lib + 38 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **223**（181 lib + 38 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,8 +16,8 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-16 服务器草稿镜像 `draft_mirror`（user.db 新增 `draft_mirrors`） |
-| — | M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
+| 最新 | M1a-17 `user.db` 拒绝打开更新版本（数据安全守卫） |
+| — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
 | — | M1a-11 已发送副本：先搜索再 APPEND（spool 即"未归档"标记） |
@@ -31,6 +31,29 @@
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-17 `user.db` 的"更新版本拒绝打开"守卫 ✅（第 23 轮）
+
+M1a-16 收尾时顺带发现的安全缺口，这一轮补上。`cache.db` 一直有这道守卫
+（`a_cache_from_a_newer_schema_is_refused_rather_than_misread`），`user.db` **没有**：它的
+`migrate` 无条件跑 `create table if not exists`，于是一个更老的程序会把将来版本写的 user.db
+当成自己的格式打开。
+
+风险不在 schema——`if not exists` 不会动已有的表——而在**已有内容的含义**：某个列换了形状、
+某个状态名现在指别的东西、某份草稿被这个版本按旧格式重写。**拒绝的代价是一条"请升级程序"，
+误读的代价是用户的草稿。** 现在 `migrate` 先读 `user_version`，比自己新就返回
+`用户数据库版本 X 比程序支持的 Y 更新，请升级程序后再打开`。
+
+测试 `a_user_database_from_a_newer_version_is_refused_rather_than_misread`：正常开一个文件 →
+把 `user_version` 改成 `SCHEMA_VERSION + 1` → 断言 `open` **失败**且消息里有"更新"。
+
+**回退路径也说清楚了**：打开失败时程序仍要能起窗（既有决定，没改成硬失败），但那条 `log_line`
+现在明说"**本次运行不读写草稿/发件箱**"——因为此时用户看到的是空列表，而这里存的东西会被丢掉。
+**还差的一半**：把这个原因显示在窗口里，而不是只留在 `startup-error.log`（已进下一步）。
+
+**数字**：`check.ps1` 15 步全绿；测试 **223**（181 lib + 38 loopback + 4 reachability）。
 
 ---
 
@@ -522,13 +545,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **222 通过、0 失败**
-（180 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **223 通过、0 失败**
+（181 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 46 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 48 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -562,7 +585,8 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 | **M1a-13** | **附件 sha256：选中时记录、发送前补算与校验、重建 spool 时再校验；契约门禁补上嵌套的 `OutgoingAttachment`** | **`attach.rs` 9 条（含空文件定型值、跨块一致、变了/丢了/没记录三种判定）；worker 测试：改动过的附件 ⇒ `needs_attention`、SMTP 一次没碰；真机探针带嵌套附件负载通过** |
 | **M1a-14** | **配额账本：`user.db` 新增 `quota_ledger`（v2）、滚动 24 小时窗口、按服务商给预算（只有 Gmail 有数）；`BackfillBudget.max_bytes` + `BackfillStop::QuotaSpent`；命令开跑前查、跑完按实际落库字节记账** | **loopback：1 字节预算 ⇒ 停在第一页且此后只有 1 次 `UID FETCH`（不会继续发请求），且那一页仍落库；真机 v1→v2 迁移无损（表增、行数不变）** |
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
-| **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且**没有 `\SEEN`**、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
+| **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
+| **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -572,9 +596,11 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **镜像的收尾**（M1a-16 的三个缺口）：发出后 worker 删的是本地草稿行，`draft_mirrors` 那行与服务器
-   副本会留下——镜像命令在"草稿已经不存在"时删旧副本并清行即可（`account_id` 已在表里正为此）；
-   再有 §5.1 的"每 30 秒或失焦"镜像；以及给 `user.db` 补上 cache.db 那样的"更新版本拒绝打开"守卫。
+1. **镜像的收尾**（M1a-16）：发出后 worker 删的是本地草稿行，`draft_mirrors` 那行与服务器副本会留下
+   ——镜像命令在"草稿已经不存在"时删旧副本并清行即可（`account_id` 已在表里正为此）；
+   再有 §5.1 的"每 30 秒或失焦"镜像。
+   （"更新版本拒绝打开"的守卫已在 M1a-17 补上；**还差把"用户数据没能打开"显示给用户**——
+   现在只有启动日志。）
 2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
@@ -590,10 +616,10 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 222 个测试
+cargo test --workspace                # 223 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 46 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 48 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
