@@ -260,6 +260,17 @@ textarea {
 
 /* The per-account notification bell: small, clickable, and quiet until hovered — it is a preference,
    not an action the user came to the sidebar to perform. */
+.row .reauth {
+  flex: none;
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.row .reauth:hover {
+  opacity: 1;
+}
+
 .row .notify {
   flex: none;
   cursor: pointer;

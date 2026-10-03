@@ -347,8 +347,15 @@ async function refreshAccounts() {
   for (const account of state.accounts) {
     const button = document.createElement('button');
     button.className = 'row' + (account.id === state.accountId ? ' active' : '');
+    // OAuth accounts have no password on this machine, so the one thing the row owes the user is a way
+    // back in when the refresh token dies — the error they will see is "请重新登录一次" (A1-F34).
+    const reauth =
+      account.auth === 'oauth2'
+        ? '<span class="reauth" title="用浏览器重新登录（授权可能已过期）">↻</span>'
+        : '';
     button.innerHTML = `
       <span class="label" title="${escapeHtml(account.email)}">${escapeHtml(account.email)}</span>
+      ${reauth}
       <span class="notify" title="新邮件通知">🔔</span>
       <span class="count" title="移除账号">✕</span>`;
     button.querySelector('.label').addEventListener('click', () => selectAccount(account.id));
@@ -356,6 +363,19 @@ async function refreshAccounts() {
       event.stopPropagation();
       removeAccount(account);
     });
+
+    const reauthButton = button.querySelector('.reauth');
+    if (reauthButton) {
+      reauthButton.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        toast('已打开系统浏览器，请在其中完成登录（两分钟内）', 'info', 9000);
+        const tokens = await run('重新登录', () =>
+          invoke('oauth_relogin', { accountId: account.id })
+        );
+        if (!tokens) return;
+        toast(`${account.email} 已重新授权`, 'ok');
+      });
+    }
 
     // Per account, because a noisy work mailbox and a quiet personal one are a normal pair. The bell
     // is read from the backend (the preference lives in `user.db`), not guessed from a local flag.

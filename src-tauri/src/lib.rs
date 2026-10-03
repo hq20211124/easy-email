@@ -1020,6 +1020,62 @@ async fn set_notify_enabled(
         .set_notify_enabled(&account_id, enabled)
         .map_err(describe)
 }
+/// Sign an existing OAuth account in again, reusing the registration it was created with.
+///
+/// Needed because of what this app tells the user: when a refresh token is revoked or expired, every
+/// message says "请重新登录一次" (`oauth::fresh_access_token`, A1-F34) — and until this existed there was
+/// nothing to click. The client id is not asked for again: it is stored with the account (M1a-54), and
+/// making somebody re-enter something we already know is how a recovery path stops being used.
+#[tauri::command]
+async fn oauth_relogin(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<mail_core::oauth::TokenSet, String> {
+    let cfg = state.find(&account_id)?;
+    let settings = state
+        .user
+        .oauth_settings(&cfg.id)
+        .map_err(describe)?
+        .ok_or_else(|| {
+            format!(
+                "{} 没有保存 OAuth 客户端 ID，请删除后重新添加账号。",
+                cfg.email
+            )
+        })?;
+
+    let provider = match cfg.provider_id.as_str() {
+        "gmail" => mail_core::oauth::GOOGLE,
+        "outlook" => mail_core::oauth::MICROSOFT,
+        other => return Err(format!("{other} 不支持 OAuth2 登录。")),
+    };
+
+    let tokens = mail_core::oauth::sign_in(
+        &http_tokens()?,
+        &mail_core::oauth::SystemBrowser,
+        provider,
+        &settings.client_id,
+        settings.client_secret.as_deref(),
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .map_err(describe)?;
+
+    match tokens.refresh_token.as_deref() {
+        Some(refresh) => {
+            token_store(&state)?
+                .save(&cfg.id, refresh)
+                .map_err(describe)?;
+            log_line(&format!("[easy-email] {} 已重新授权", cfg.id));
+        }
+        None => {
+            return Err(
+                "服务商这次没有返回刷新令牌，账号仍然是未授权状态。请稍后再试。".to_string(),
+            );
+        }
+    }
+
+    Ok(tokens)
+}
 /// What happened to the last update attempt, if anything.
 ///
 /// Called once at startup by the renderer. `None` is the ordinary case; `Updated` and `StillOld` are
@@ -2365,6 +2421,7 @@ pub fn run() {
             refresh_thread_keys,
             quota_status,
             oauth_sign_in,
+            oauth_relogin,
             take_update_outcome,
             enqueue_send,
             list_outbox,
