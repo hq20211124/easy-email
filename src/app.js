@@ -1650,6 +1650,8 @@ function openComposer({ mode = 'new', draft = null } = {}) {
   let persisted = Boolean(draft);
   let sent = false;
   let saveTimer = null;
+  /** The 30 s server-mirror timer (`design/07` §5.1); cleared when the composer closes. */
+  let mirrorTimer = null;
   /** The save in flight, so a send can wait for it before deleting the draft. */
   let inFlight = Promise.resolve();
 
@@ -1858,10 +1860,20 @@ function openComposer({ mode = 'new', draft = null } = {}) {
       // the same thing — "the draft changed".
       modal.querySelector('.modal-body').addEventListener('input', () => scheduleSave(modal));
       modal.querySelector('.modal-body').addEventListener('change', () => scheduleSave(modal));
+
+      // `design/07` §5.1 asks for the mirror every 30 s *or* on losing focus, not only on close:
+      // somebody who leaves a half-written mail open for an hour should still find it on their phone.
+      // It mirrors the stored draft rather than reading the fields, so it can never send the server
+      // something the local save has not already agreed to.
+      mirrorTimer = setInterval(() => {
+        if (!sent) mirrorDraft(draftId, accountId, persisted);
+      }, MIRROR_INTERVAL_MS);
     },
     onClose: (modal) => {
       clearTimeout(saveTimer);
       saveTimer = null;
+      clearInterval(mirrorTimer);
+      mirrorTimer = null;
       // A queued send kept the draft on purpose — the worker deletes it once the message is really
       // out — so there is nothing to save again here.
       if (sent) return;
@@ -2022,6 +2034,15 @@ function stripTags(html) {
 
 /** The sentence the drafts area shows when the server copy is behind. */
 const CLOUD_DRAFT_PENDING = '本地已保存（云端草稿待同步）';
+
+/**
+ * How often an open composer mirrors itself to the server (`design/07` §5.1).
+ *
+ * The local save is every 2 s; this one costs a network round trip and an APPEND, so it is ordered
+ * of magnitude rarer — and the design's other trigger (losing focus) covers "the user walked away
+ * and is now reading mail on their phone".
+ */
+const MIRROR_INTERVAL_MS = 30000;
 
 /**
  * Copy a saved draft to the server's Drafts folder, best-effort (`design/07` §3).
