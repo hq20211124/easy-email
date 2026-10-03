@@ -1189,7 +1189,25 @@ async fn oauth_sign_in(
         std::time::Duration::from_secs(120),
     )
     .await
-    .map_err(describe)?;
+    .map_err(|error| {
+        let message = describe(error);
+        // Logged as well as returned. The message the user sees is one sentence by design; the
+        // provider's own words (`access_denied`, `invalid_client`, `redirect_uri_mismatch`) are what
+        // diagnose it, and a toast is not something a person can hand back to whoever is debugging.
+        // No secret goes in here: the text is the provider's, and the client id is not secret.
+        let tail: String = client_id
+            .chars()
+            .rev()
+            .take(14)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        log_line(&format!(
+            "[easy-email] OAuth 登录失败（{provider_id}，client_id …{tail}）：{message}"
+        ));
+        message
+    })?;
 
     // The registration is stored with the token: a refresh needs both, and asking the user for the
     // client id a second time would be asking them to remember something we already know.
