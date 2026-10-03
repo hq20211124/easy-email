@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **186**（150 lib + 32 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **193**（156 lib + 33 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,8 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-9 发件箱界面 + 写信改走队列（撤销窗口真正对用户可见） |
+| 最新 | M1a-10 崩溃恢复：先查已发送再决定重发（含按角色找 Sent 文件夹） |
+| — | M1a-9 发件箱界面 + 写信改走队列（撤销窗口真正对用户可见） |
 | — | M1a-8 发件箱后端（存储层 + spool + worker + 命令 + 5 秒 tick） |
 | — | M1a-7 修发信负载大小写 bug + 写信接草稿 + 草稿箱 |
 | — | M1a-6 发件箱决策逻辑 / M1a-5 草稿命令 / M1a-4 草稿落库 / M1a-3b 窗口生效 / M1a-3 窗口模型 / M1a-2 `user.db` / M1a-1b 回填接线 / M1a-1a 回填原语 |
@@ -25,6 +26,50 @@
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-10 崩溃恢复：先查已发送，再决定重发 ✅（第 16 轮）
+
+`design/07` §5.3.1。崩在"正在发送"和"记录结果"之间的行，`state` 会永远是 `sending`；不处理它们
+就是**再也发不出去**，处理错了就是**收件人收到两封**——第二次 SMTP 提交对收件人来说就是又一封信
+（"靠 Message-ID 去重"只在 Gmail 上成立）。
+
+**判定（纯函数 `recovery_verdict`，6 条测试）**——顺序本身就是结论：
+1. 没有冻结的 `Message-ID` ⇒ **问用户**（没有可核对的身份，猜"没发出"就是赌）。
+2. 服务器说"已发送文件夹里有它" ⇒ **判 sent，绝不重发**（这一条压过下面所有情况，包括大附件暂停：
+   暂停只是为了避免猜测，而这里不需要猜）。
+3. 不在已发送里 **且** 大小超过 5 MB ⇒ **问用户**（§5.3.1 的默认暂停：大附件的暴露窗口是
+   TLS + 慢速上传的几分钟，正好是 Windows 更新重启的时候）。
+4. 不在已发送里且不大 ⇒ **回到 `queued`**（这封信还欠用户）。
+5. **服务器问不到**（断网/文件夹打不开）⇒ **原样不动**，报告 `unresolved`；下次再问。
+   这里"不知道"绝不能滑向"没发出"。
+
+**已发送文件夹按角色找，不按名字**：新增 `ImapClient::sent_mailbox()`（复用 `list_mailboxes_with_roles`
+的 RFC 6154 属性优先 + 英文名回退）——QQ 叫它 `Sent Messages`，服务器也可能只给属性、名字全本地化。
+原来 `list_mailboxes` 把 role 丢掉了（因为界面不需要），现在保留在内部的 `*_with_roles` 里。
+
+**接线**（`src-tauri`）：worker 启动后**先跑一次恢复，再进循环**（§5.3.1 的"启动时"）。放在
+`start_outbox_worker` 里而不是 `setup` 里，是为了不让开窗等一次网络往返。**没有 in-flight 行的账号
+直接跳过**（不能让启动对每个账号都开一条连接）。`sent_folder_has()` 用连接池
+（`pool_op!`）+ `find_uid_by_message_id`。
+
+**证据**：
+- `loopback.rs::crash_recovery_finds_the_message_in_the_sent_folder_and_does_not_resend_it`：
+  真 IMAP 会话。先断言 `sent_mailbox()` 从 `\Sent` 属性解析出 `Sent`；再把一行置为 `sending`，
+  跑恢复 ⇒ `already_sent=1`、`requeued=0`、行变 `sent`、`sent_message_id` 记录正确、
+  **在 `i64::MAX/2` 时刻也不可再发**；最后断言服务器 transcript 里**真的有一条
+  `SEARCH ... MESSAGE-ID`**（靠猜的实现不会留下这条痕迹）。
+- 单元测试 3 条 runner 行为（找到 ⇒ 已发出；查不到 ⇒ 重新排队且立即可发；问不到 ⇒ 保持 `sending`）
+  + 1 条"冻结字节丢了 ⇒ needs_attention"。
+
+**仍未验证的一处**：worker 里"恢复先于第一轮发送"的**时序**只有代码保证，没有真机探针
+（要造一条 >5 MB 的 in-flight 行才安全，否则恢复后会真的去发）。下次真机验证时可以这样做：
+预置 spool 缺失的行 ⇒ 期望启动后变 `needs_attention`，全程不碰 SMTP。
+
+**数字**：`check.ps1` 15 步全绿；测试 **193**（156 lib + 33 loopback + 4 reachability）。
+
+**未做**：发送后归档到已发送（§5.4）、附件 sha256、服务器草稿镜像、窗口选择器界面。
 
 ---
 
@@ -204,10 +249,10 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **186 通过、0 失败**
-（150 lib + 32 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
-应用启动冒烟通过（10 秒存活，发件箱 worker 随启动运行，写信窗口的"发送"现在真的经过队列）。
-所有改动都在 git 里（基线 `83c1b0c`，共 32 个提交）。
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **193 通过、0 失败**
+（156 lib + 33 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+应用启动冒烟通过（10 秒存活；发件箱 worker 随启动运行，**先做崩溃恢复再发信**，写信窗口的"发送"
+真的经过队列并显示撤销窗口）。所有改动都在 git 里（基线 `83c1b0c`，共 34 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -235,6 +280,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 | **M1a-7** | **修 `send_mail` 负载大小写 bug（v0.1 起发送从未成功）+ 写信接草稿（2 s 自动保存 / 关闭保存 / 发送后删草稿）+ 草稿箱界面 + 契约门禁** | **`tools/probe-drafts.mjs` CDP 全链路通过；门禁可证伪（改回 camelCase 即红）** |
 | **M1a-8** | **发件箱后端：`userdb` 队列操作 + 入队冻结 spool + worker（认领/退避/needs_attention/成功后删草稿）+ 5 条命令 + 5 秒 tick 与唤醒；补上一直缺失的 `Message-ID`** | **loopback 两条端到端打真 SMTP：冻结 Message-ID 上线、Bcc 不在头部、spool/草稿被清理、撤销后 SMTP 连接数为 0** |
 | **M1a-9** | **发件箱界面（状态/倒计时/撤销/重试/删除）+ 写信改走 `enqueue_send`（撤销窗口对用户可见）+ 删掉会绕过队列的 `send_mail`** | **`tools/probe-outbox.mjs` 真机全链路：入队→界面→点撤销→删除→**写信窗口点发送真的入队**（全程不发信）** |
+| **M1a-10** | **崩溃恢复 `sending` 行：按冻结 Message-ID 查已发送 ⇒ 已发出判 sent（绝不重发）/ 查不到回队列 / 大附件问用户 / 问不到原样不动；`sent_mailbox()` 按 RFC 6154 角色找文件夹** | **loopback 真 IMAP：解析出 `Sent` → 恢复判 `sent` 且不可再发 → transcript 里确有 `SEARCH ... MESSAGE-ID`** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -246,13 +292,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
 1. **发送后归档到已发送**（`design/07` §5.4）：`sent_index`（放 `cache.db`）→ 按**冻结的
    Message-ID** 有界轮询（≤3 次 / ≤30 s）→ 若服务商不自带归档则 `append` +
-   `find_uid_by_message_id` 找回 UID。先写 `sent_index` 再做归档判断，否则崩在中间会重复 APPEND。
-2. **崩溃恢复 `sending` 行**（§5.3.1）：启动/worker 首次运行时，对每条 `state='sending'` 的行
-   按**冻结 Message-ID** 去已发送里 `UID SEARCH HEADER Message-ID`：找到 ⇒ 直接判 `sent`
-   （**绝不重发**），找不到 ⇒ 回 `queued`；>5 MB 的行默认先暂停等用户确认。
-   Spool 文件就是冻结的字节，Message-ID 可从头部直接读出（`worker::frozen_message_id` 已就绪）。
-3. **附件 sha256**（`design/07` §9"发送前补算"）：现在草稿里 `sha256` 记 `null`，
+   `find_uid_by_message_id` 找回 UID。**先写 `sent_index` 再做归档判断**，否则崩在中间会重复 APPEND。
+   现成的零件：`sent_mailbox()`（按角色找文件夹）、`append`、`find_uid_by_message_id`、
+   `worker::frozen_message_id`。
+2. **附件 sha256**（`design/07` §9"发送前补算"）：现在草稿里 `sha256` 记 `null`，
    所以 `attachment_changed`/`attachment_missing` 这两条 `needs_attention` 分支还没有触发源。
+3. **真机验证崩溃恢复时序**（M1a-10 的遗留）：预置一条 spool 缺失的 `sending` 行 ⇒ 期望启动后
+   变 `needs_attention`，全程不碰 SMTP（这条不会真的发信，可以放心跑）。
 4. **服务器草稿镜像**（`draft_mirror`，APPEND + `find_uid_by_message_id`，best-effort 不阻塞写信）。
 5. **窗口选择器界面** + 冷启动自动回填一页（并接配额账本，`design/04` §5.7）。
 6. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
@@ -260,9 +306,9 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 186 个测试
+cargo test --workspace                # 193 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
-git log --oneline                     # 32 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 34 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs    # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
