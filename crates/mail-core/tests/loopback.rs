@@ -823,13 +823,23 @@ async fn serve_smtp_logging(
 
         if upper.starts_with("EHLO") {
             // The final line uses a space, not a hyphen, or the client keeps reading.
+            // `XOAUTH2` is advertised as well, because a server that does not offer it is a different
+            // scenario; the client is the one under test here.
             write
                 .write_all(
-                    b"250-loopback.test\r\n250-AUTH PLAIN LOGIN\r\n250-8BITMIME\r\n250-SIZE 10485760\r\n250 HELP\r\n",
+                    b"250-loopback.test\r\n250-AUTH PLAIN LOGIN XOAUTH2\r\n250-8BITMIME\r\n250-SIZE 10485760\r\n250 HELP\r\n",
                 )
                 .await?;
         } else if upper.starts_with("HELO") {
             write.write_all(b"250 loopback.test\r\n").await?;
+        } else if upper.starts_with("AUTH XOAUTH2") {
+            // An OAuth2 access token is sent as `AUTH XOAUTH2 <base64>`; the base64 is recorded by the
+            // caller, which is how the test asserts the *shape* of the line rather than just "auth
+            // happened". A server that wants an empty challenge is not needed: lettre sends the initial
+            // response on the same line.
+            write
+                .write_all(b"235 2.7.0 Authentication successful\r\n")
+                .await?;
         } else if upper.starts_with("AUTH PLAIN") {
             // Credentials may arrive on the same line or on a continuation line.
             if trimmed.split_whitespace().count() < 3 {
@@ -1576,6 +1586,54 @@ async fn the_key_refresh_walks_back_and_fills_what_the_sync_will_never_touch() {
         rows.iter().all(|row| row.thread_key.is_some()),
         "every cached row the walk reached now has its key: {:?}",
         rows.iter().map(|row| &row.thread_key).collect::<Vec<_>>()
+    );
+}
+
+/// `design/05` §3.2: an OAuth2 account sends with `AUTH XOAUTH2`, not with the token as a password.
+///
+/// The difference is not cosmetic. Passing a bearer token through the password path produces
+/// `AUTH PLAIN` with a secret in it — a line the server rejects, which then looks like "the token is
+/// wrong" — so the assertion here is about the mechanism, not about "authentication happened".
+#[tokio::test]
+async fn an_oauth_account_authenticates_with_xoauth2_and_not_plain() {
+    let (addr, _raw, _count, commands) = spawn_smtp_with_commands().await;
+    let cfg = account(addr, addr);
+
+    let mail = OutgoingMail {
+        to: vec!["alice@example.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: "OAuth 发送".to_string(),
+        body_text: "用访问令牌发送。".to_string(),
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+        message_id: None,
+    };
+
+    within(smtp::send_oauth(&cfg, "an-access-token", &mail))
+        .await
+        .expect("the fake server accepts XOAUTH2");
+
+    let lines = commands.lock().expect("commands").clone();
+    let auth = lines
+        .iter()
+        .find(|line| line.to_ascii_uppercase().starts_with("AUTH"))
+        .unwrap_or_else(|| panic!("no AUTH line in {lines:?}"));
+    assert!(
+        auth.to_ascii_uppercase().starts_with("AUTH XOAUTH2"),
+        "the mechanism has to be XOAUTH2, not PLAIN: {auth}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("AUTH PLAIN")),
+        "a bearer token must never be sent as a password: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("DATA")),
+        "the message body is sent after authenticating: {lines:?}"
     );
 }
 

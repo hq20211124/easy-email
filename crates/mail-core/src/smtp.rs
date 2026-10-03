@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use lettre::address::Envelope;
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{SmtpTransport, Transport};
 
@@ -139,10 +139,40 @@ pub fn build_message(cfg: &AccountConfig, mail: &OutgoingMail) -> Result<Message
     Ok(message)
 }
 
+/// How an account proves who it is.
+///
+/// Two shapes because the providers ship two: a password (including the "authorization code" the
+/// Chinese services issue) and an OAuth2 access token for the accounts whose password path is closed
+/// (`design/05` §3.2). `Mechanism::Xoauth2` is what makes lettre build `AUTH XOAUTH2 <base64>`; the
+/// alternative — passing the token as a password — produces `AUTH PLAIN` with a bearer token in it,
+/// which the server rejects and which puts a secret on the wire in a shape nobody expects.
+#[derive(Debug, Clone, Copy)]
+pub enum SmtpCredential<'a> {
+    Password(&'a str),
+    OAuth2(&'a str),
+}
+
+impl<'a> SmtpCredential<'a> {
+    /// The one line this whole enum exists for.
+    fn mechanism(self) -> Option<Mechanism> {
+        match self {
+            SmtpCredential::Password(_) => None,
+            SmtpCredential::OAuth2(_) => Some(Mechanism::Xoauth2),
+        }
+    }
+
+    fn secret(self) -> &'a str {
+        match self {
+            SmtpCredential::Password(password) => password,
+            SmtpCredential::OAuth2(access_token) => access_token,
+        }
+    }
+}
+
 /// Build the transport for an endpoint.
-fn build_transport(cfg: &AccountConfig, password: &str) -> Result<SmtpTransport> {
+fn build_transport(cfg: &AccountConfig, credential: SmtpCredential<'_>) -> Result<SmtpTransport> {
     let ep = &cfg.smtp;
-    let credentials = Credentials::new(cfg.username.clone(), password.to_string());
+    let credentials = Credentials::new(cfg.username.clone(), credential.secret().to_string());
 
     let tls = match ep.security {
         Security::Plain => Tls::None,
@@ -159,12 +189,20 @@ fn build_transport(cfg: &AccountConfig, password: &str) -> Result<SmtpTransport>
         }
     };
 
-    Ok(SmtpTransport::builder_dangerous(ep.host.as_str())
+    let mut builder = SmtpTransport::builder_dangerous(ep.host.as_str())
         .port(ep.port)
         .tls(tls)
         .credentials(credentials)
-        .timeout(Some(SMTP_TIMEOUT))
-        .build())
+        .timeout(Some(SMTP_TIMEOUT));
+
+    // Restricting the mechanism list is not decoration: left open, lettre tries the strongest
+    // mechanism the server advertises, and a server that advertises `PLAIN` would be sent the bearer
+    // token in a form it will reject — a failure that looks like a wrong token.
+    if let Some(mechanism) = credential.mechanism() {
+        builder = builder.authentication(vec![mechanism]);
+    }
+
+    Ok(builder.build())
 }
 
 /// Open a connection, authenticate, and disconnect — without sending anything.
@@ -172,7 +210,7 @@ fn build_transport(cfg: &AccountConfig, password: &str) -> Result<SmtpTransport>
 /// This is the path the account wizard uses, so a rejected credential must be classified here
 /// just as carefully as in [`send`] — it is the single most common failure a new user hits.
 pub async fn test_connection(cfg: &AccountConfig, password: &str) -> Result<()> {
-    let transport = build_transport(cfg, password)?;
+    let transport = build_transport(cfg, SmtpCredential::Password(password))?;
     let ok = tokio::task::spawn_blocking(move || {
         transport
             .test_connection()
@@ -189,9 +227,32 @@ pub async fn test_connection(cfg: &AccountConfig, password: &str) -> Result<()> 
 }
 
 /// Send one message.
+/// Send with an OAuth2 access token instead of a password.
+///
+/// A separate entry point rather than a `bool` on [`send`]: the two credentials behave differently in
+/// ways that matter (a token expires, a password does not; a token is bearer, a password is not), and
+/// a flag would put that distinction at every call site instead of at the one that knows.
+pub async fn send_oauth(
+    cfg: &AccountConfig,
+    access_token: &str,
+    mail: &OutgoingMail,
+) -> Result<()> {
+    let message = build_message(cfg, mail)?;
+    let transport = build_transport(cfg, SmtpCredential::OAuth2(access_token))?;
+
+    tokio::task::spawn_blocking(move || {
+        transport
+            .send(&message)
+            .map(|_| ())
+            .map_err(|error| MailError::Smtp(format!("发送失败：{error}")))
+    })
+    .await
+    .map_err(|error| MailError::Smtp(format!("发送任务异常：{error}")))?
+}
+
 pub async fn send(cfg: &AccountConfig, password: &str, mail: &OutgoingMail) -> Result<()> {
     let message = build_message(cfg, mail)?;
-    let transport = build_transport(cfg, password)?;
+    let transport = build_transport(cfg, SmtpCredential::Password(password))?;
 
     tokio::task::spawn_blocking(move || {
         transport
@@ -232,7 +293,7 @@ pub async fn send_spool(
     }
     let envelope = Envelope::new(Some(from), to)?;
 
-    let transport = build_transport(cfg, password)?;
+    let transport = build_transport(cfg, SmtpCredential::Password(password))?;
     tokio::task::spawn_blocking(move || {
         transport
             .send_raw(&envelope, &spool)
