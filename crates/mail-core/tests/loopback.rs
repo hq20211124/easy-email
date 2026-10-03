@@ -27,7 +27,9 @@ use mail_core::{
     RecoveryRun, Security, Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy,
     mirror_draft, pool_op, recover_in_flight, run_due, watch_every,
 };
-use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older, fill_thread_keys};
+use mail_core::{
+    AuthMethod, BackfillBudget, BackfillStop, SyncWindow, backfill_older, fill_thread_keys,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -1539,6 +1541,61 @@ async fn an_account_without_a_drafts_folder_simply_has_no_mirror() {
     assert_eq!(report, None);
 }
 
+/// The account's own `auth` decides the mechanism — no call site has to know.
+///
+/// This is the point of putting `auth` on the account: `connect(cfg, secret)` and `send(cfg, secret, …)`
+/// look the same for both kinds, so an account that switches to OAuth does not require finding every
+/// place that opens a connection or sends mail.
+#[tokio::test]
+async fn the_account_auth_field_decides_the_mechanism() {
+    let (imap_addr, imap_log) = spawn_imap(true).await;
+    let mut cfg = account(imap_addr, imap_addr);
+    cfg.auth = AuthMethod::OAuth2;
+
+    within(ImapClient::connect(&cfg, "a-token"))
+        .await
+        .expect("connect with an OAuth account");
+    let lines = transcript(&imap_log);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("AUTHENTICATE XOAUTH2")),
+        "an OAuth account must authenticate: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("LOGIN")),
+        "and must not try a password login: {lines:?}"
+    );
+
+    let (smtp_addr, _raw, _count, commands) = spawn_smtp_with_commands().await;
+    let mut cfg = account(smtp_addr, smtp_addr);
+    cfg.auth = AuthMethod::OAuth2;
+    let mail = OutgoingMail {
+        to: vec!["alice@example.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: "OAuth".to_string(),
+        body_text: "hi".to_string(),
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+        message_id: None,
+    };
+    within(smtp::send(&cfg, "a-token", &mail))
+        .await
+        .expect("send with an OAuth account");
+    let commands = commands.lock().expect("commands").clone();
+    assert!(
+        commands
+            .iter()
+            .any(|line| line.to_ascii_uppercase().starts_with("AUTH XOAUTH2")),
+        "sending must use the same mechanism: {commands:?}"
+    );
+}
+
 /// The pool hands back a working connection whichever credential it was given, and reuses it.
 ///
 /// This is the seam the app will use for an OAuth account: `acquire_with` has to reach the same
@@ -1752,6 +1809,7 @@ fn account(imap: SocketAddr, smtp_addr: SocketAddr) -> AccountConfig {
             Security::Plain,
         ),
         needs_id_command: false,
+        auth: AuthMethod::Password,
         max_connections: 1,
     }
 }

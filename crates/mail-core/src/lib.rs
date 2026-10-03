@@ -50,8 +50,8 @@ pub use idle::{PushEvent, watch, watch_every};
 pub use imap::Credential;
 pub use imap::{HeaderPage, ImapClient};
 pub use model::{
-    AccountConfig, AttachmentMeta, AuthKind, ConnectionReport, Endpoint, InlineImage, MailboxInfo,
-    MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMail, Region, Security,
+    AccountConfig, AttachmentMeta, AuthKind, AuthMethod, ConnectionReport, Endpoint, InlineImage,
+    MailboxInfo, MessageDetail, MessageSummary, OutgoingAttachment, OutgoingMail, Region, Security,
 };
 pub use outbox::{
     OutboxState, Verdict, is_permanent_failure, needs_user_decision, next_attempt_delay_secs,
@@ -130,6 +130,9 @@ pub fn account_with_login(
         smtp: provider.smtp_endpoint(),
         needs_id_command: provider.quirks.needs_id,
         max_connections: provider.quirks.max_connections,
+        // The password path; the wizard switches this to `OAuth2` when the user signs in with a
+        // provider that requires it.
+        auth: AuthMethod::Password,
     })
 }
 

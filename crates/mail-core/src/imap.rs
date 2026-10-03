@@ -31,7 +31,7 @@ use tokio::net::TcpStream;
 use crate::error::{MailError, Result};
 use crate::folders::{self, Role};
 use crate::model::{
-    AccountConfig, AttachmentMeta, Endpoint, InlineImage, MailboxInfo, MessageDetail,
+    AccountConfig, AttachmentMeta, AuthMethod, Endpoint, InlineImage, MailboxInfo, MessageDetail,
     MessageSummary, Security,
 };
 use crate::mutf7;
@@ -254,8 +254,18 @@ pub struct ImapClient {
 
 impl ImapClient {
     /// Connect and authenticate.
-    pub async fn connect(cfg: &AccountConfig, password: &str) -> Result<Self> {
-        Self::connect_with(cfg, Login::Password(password.to_string())).await
+    /// Connect with whatever this account authenticates with.
+    ///
+    /// The second argument is "the secret": a password for a password account, an access token for an
+    /// OAuth2 one. Which of the two it is comes from `cfg.auth` — a fact the account carries — rather
+    /// than from a flag at every call site, so switching an account to OAuth does not mean finding
+    /// every place that opens a connection.
+    pub async fn connect(cfg: &AccountConfig, secret: &str) -> Result<Self> {
+        let login = match cfg.auth {
+            AuthMethod::Password => Login::Password(secret.to_string()),
+            AuthMethod::OAuth2 => Login::OAuth2(secret.to_string()),
+        };
+        Self::connect_with(cfg, login).await
     }
 
     /// Connect with an OAuth2 access token instead of a password (`design/05` §3.2).

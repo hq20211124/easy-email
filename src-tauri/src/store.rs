@@ -81,6 +81,7 @@ mod tests {
             smtp: Endpoint::new("smtp.example.com", 465, Security::Ssl),
             needs_id_command: false,
             max_connections: 2,
+            auth: mail_core::AuthMethod::Password,
         }
     }
 
@@ -119,11 +120,17 @@ mod tests {
         save(&path, &[account("a@example.com")]).expect("save");
 
         let raw = std::fs::read_to_string(&path).expect("read");
+        // The property is about the *secret*, not about a word: the file now legitimately carries
+        // `"auth":"password"`, which says how the account signs in and is not a credential. What must
+        // never appear is anything that is one.
         assert!(
-            !raw.contains("password"),
-            "config file must not mention passwords"
+            !raw.contains("client_secret"),
+            "config file must not carry OAuth secrets"
         );
-        assert!(!raw.contains("secret"));
+        assert!(
+            !raw.contains("secret"),
+            "config file must not mention secrets: {raw}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

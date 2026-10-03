@@ -13,7 +13,7 @@ use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{SmtpTransport, Transport};
 
 use crate::error::{MailError, Result};
-use crate::model::{AccountConfig, OutgoingAttachment, OutgoingMail, Security};
+use crate::model::{AccountConfig, AuthMethod, OutgoingAttachment, OutgoingMail, Security};
 
 const SMTP_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -153,6 +153,14 @@ pub enum SmtpCredential<'a> {
 }
 
 impl<'a> SmtpCredential<'a> {
+    /// Read the credential out of the account, so no call site has to know which kind it holds.
+    fn for_account(cfg: &AccountConfig, secret: &'a str) -> SmtpCredential<'a> {
+        match cfg.auth {
+            AuthMethod::Password => SmtpCredential::Password(secret),
+            AuthMethod::OAuth2 => SmtpCredential::OAuth2(secret),
+        }
+    }
+
     /// The one line this whole enum exists for.
     fn mechanism(self) -> Option<Mechanism> {
         match self {
@@ -210,7 +218,7 @@ fn build_transport(cfg: &AccountConfig, credential: SmtpCredential<'_>) -> Resul
 /// This is the path the account wizard uses, so a rejected credential must be classified here
 /// just as carefully as in [`send`] — it is the single most common failure a new user hits.
 pub async fn test_connection(cfg: &AccountConfig, password: &str) -> Result<()> {
-    let transport = build_transport(cfg, SmtpCredential::Password(password))?;
+    let transport = build_transport(cfg, SmtpCredential::for_account(cfg, password))?;
     let ok = tokio::task::spawn_blocking(move || {
         transport
             .test_connection()
@@ -252,7 +260,7 @@ pub async fn send_oauth(
 
 pub async fn send(cfg: &AccountConfig, password: &str, mail: &OutgoingMail) -> Result<()> {
     let message = build_message(cfg, mail)?;
-    let transport = build_transport(cfg, SmtpCredential::Password(password))?;
+    let transport = build_transport(cfg, SmtpCredential::for_account(cfg, password))?;
 
     tokio::task::spawn_blocking(move || {
         transport
@@ -293,7 +301,7 @@ pub async fn send_spool(
     }
     let envelope = Envelope::new(Some(from), to)?;
 
-    let transport = build_transport(cfg, SmtpCredential::Password(password))?;
+    let transport = build_transport(cfg, SmtpCredential::for_account(cfg, password))?;
     tokio::task::spawn_blocking(move || {
         transport
             .send_raw(&envelope, &spool)
@@ -334,6 +342,7 @@ mod tests {
             smtp: Endpoint::new("smtp.example.com", 465, Security::Ssl),
             needs_id_command: false,
             max_connections: 2,
+            auth: AuthMethod::Password,
         }
     }
 

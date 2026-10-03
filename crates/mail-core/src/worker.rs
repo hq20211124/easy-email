@@ -490,6 +490,7 @@ mod tests {
             smtp: Endpoint::new("127.0.0.1", 1025, Security::Plain),
             needs_id_command: false,
             max_connections: 4,
+            auth: crate::model::AuthMethod::Password,
         }
     }
 

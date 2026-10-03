@@ -87,6 +87,27 @@ pub struct AccountConfig {
     pub needs_id_command: bool,
     /// Keep this many simultaneous connections to the server at most. QQ/NetEase throttle hard.
     pub max_connections: u8,
+    /// How this account proves who it is.
+    ///
+    /// `#[serde(default)]` so every account written before OAuth existed — which is every account in
+    /// every existing installation — keeps loading as what it is: a password account.
+    #[serde(default)]
+    pub auth: AuthMethod,
+}
+
+/// The two ways an account can authenticate (`design/05` §3.2).
+///
+/// It lives on the account rather than being inferred at each connection because "does this account
+/// use OAuth" is a fact the user chose during setup, and inferring it from, say, the presence of a
+/// refresh token would make an account flip behaviour when that file is deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    /// A password, or the "authorization code" the Chinese services issue in its place.
+    #[default]
+    Password,
+    /// An OAuth2 access token, renewed from a stored refresh token before each connection.
+    OAuth2,
 }
 
 impl AccountConfig {
