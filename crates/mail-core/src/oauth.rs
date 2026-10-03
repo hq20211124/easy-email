@@ -46,6 +46,12 @@ pub struct ClientChoice {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// The endpoints the registration names, when it names any. The command layer passes these to
+    /// [`OAuthProvider::with_registration_endpoints`].
+    #[serde(default)]
+    pub auth_endpoint: Option<String>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
     /// `own` when the user brought their own registration; `public_test` when it is borrowed.
     pub source: String,
     /// Empty for one's own registration; the notice to show for a borrowed one.
@@ -70,12 +76,45 @@ pub const PUBLIC_TEST_NOTICE: &str = "预填的是 Mozilla 公开在源码里的
      \"Mozilla Thunderbird\"，且 Mozilla 可随时撤销。正式使用请换成你自己注册的客户端 ID\
      （把 Google Cloud 下载的 JSON 放进应用数据目录即可）。";
 
+impl OAuthProvider {
+    /// This provider's endpoints, overridden by the ones the client registration names.
+    ///
+    /// Only the two URLs change: the scope is what *this app* asks for, not something a downloaded
+    /// file may redefine. A registration that names different endpoints is taken at its word because
+    /// it belongs to whoever will be signing in — and because it makes the flow testable against a
+    /// local server without a feature flag or a code change (see `tests/oauth_flow.rs`).
+    pub fn with_registration_endpoints(
+        self,
+        registration: &crate::oauthclient::ClientRegistration,
+    ) -> OAuthProvider {
+        // `&'static str` in the type, so an owned override has to be leaked. It happens once per
+        // sign-in, on a value that lives for the process anyway.
+        fn leak(value: &str) -> &'static str {
+            Box::leak(value.to_string().into_boxed_str())
+        }
+
+        OAuthProvider {
+            auth_endpoint: match registration.auth_uri.as_deref() {
+                Some(uri) if !uri.is_empty() => leak(uri),
+                _ => self.auth_endpoint,
+            },
+            token_endpoint: match registration.token_uri.as_deref() {
+                Some(uri) if !uri.is_empty() => leak(uri),
+                _ => self.token_endpoint,
+            },
+            ..self
+        }
+    }
+}
+
 /// Decide what to offer for one provider.
 pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -> ClientChoice {
     if let crate::oauthclient::Registration::Own { registration } = own {
         return ClientChoice {
             client_id: registration.client_id,
             client_secret: registration.client_secret,
+            auth_endpoint: registration.auth_uri,
+            token_endpoint: registration.token_uri,
             source: "own".to_string(),
             notice: String::new(),
         };
@@ -87,6 +126,8 @@ pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -
         ClientChoice {
             client_id: PUBLIC_TEST_CLIENT.0.to_string(),
             client_secret: Some(PUBLIC_TEST_CLIENT.1.to_string()),
+            auth_endpoint: None,
+            token_endpoint: None,
             source: "public_test".to_string(),
             notice: PUBLIC_TEST_NOTICE.to_string(),
         }
@@ -94,6 +135,8 @@ pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -
         ClientChoice {
             client_id: String::new(),
             client_secret: None,
+            auth_endpoint: None,
+            token_endpoint: None,
             source: "missing".to_string(),
             notice: "这个服务商需要 OAuth 客户端 ID。请把你自己的注册填进来。".to_string(),
         }
@@ -1063,6 +1106,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_registration_with_endpoints_of_its_own_is_taken_at_its_word() {
+        // The scope is not overridable: it is what *this app* asks for, and a downloaded file has no
+        // business redefining it. The two URLs are the client's own statement of where its endpoints
+        // live, which is also what makes the whole flow testable against a local server.
+        let registration = crate::oauthclient::ClientRegistration {
+            client_id: "c".into(),
+            client_secret: None,
+            kind: crate::oauthclient::ClientKind::Desktop,
+            auth_uri: Some("http://127.0.0.1:9/auth".into()),
+            token_uri: Some("http://127.0.0.1:9/token".into()),
+        };
+        let provider = GOOGLE.with_registration_endpoints(&registration);
+        assert_eq!(provider.auth_endpoint, "http://127.0.0.1:9/auth");
+        assert_eq!(provider.token_endpoint, "http://127.0.0.1:9/token");
+        assert_eq!(
+            provider.scope, GOOGLE.scope,
+            "the scope stays ours: {provider:?}"
+        );
+
+        // A file without endpoints keeps the provider's built-in ones.
+        let bare = crate::oauthclient::ClientRegistration {
+            client_id: "c".into(),
+            client_secret: None,
+            kind: crate::oauthclient::ClientKind::Desktop,
+            auth_uri: None,
+            token_uri: Some(String::new()),
+        };
+        let provider = GOOGLE.with_registration_endpoints(&bare);
+        assert_eq!(provider.auth_endpoint, GOOGLE.auth_endpoint);
+        assert_eq!(
+            provider.token_endpoint, GOOGLE.token_endpoint,
+            "an empty string is not an endpoint"
+        );
+    }
+
     #[tokio::test]
     async fn a_web_type_client_is_refused_before_the_browser_opens() {
         struct NeverBrowser;
@@ -1105,6 +1184,8 @@ mod tests {
                     client_id: "mine.apps.googleusercontent.com".into(),
                     client_secret: Some("GOCSPX-mine".into()),
                     kind: crate::oauthclient::ClientKind::Desktop,
+                    auth_uri: None,
+                    token_uri: None,
                 },
             },
         );

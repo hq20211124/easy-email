@@ -1110,20 +1110,6 @@ fn token_store(state: &AppState) -> std::result::Result<mail_core::tokenstore::T
 fn http_tokens() -> std::result::Result<mail_core::oauth::HttpTokens, String> {
     mail_core::oauth::HttpTokens::new().map_err(describe)
 }
-/// What kind of client this installation's registration file describes.
-///
-/// Read here rather than passed in from the renderer: the type is a property of the *file* the user
-/// dropped in, and a value that came from the UI could disagree with what will actually be used.
-fn registration_kind(state: &AppState, provider_id: &str) -> mail_core::oauthclient::ClientKind {
-    let _ = provider_id;
-    let Some(dir) = state.accounts_path.parent() else {
-        return mail_core::oauthclient::ClientKind::Desktop;
-    };
-    match mail_core::oauthclient::client_registration(dir) {
-        Ok(mail_core::oauthclient::Registration::Own { registration }) => registration.kind,
-        _ => mail_core::oauthclient::ClientKind::Desktop,
-    }
-}
 /// Which OAuth registration this installation should offer in the wizard.
 ///
 /// Read from the app's data directory (the user's own registration, dropped in as the JSON Google
@@ -1169,15 +1155,21 @@ async fn oauth_sign_in(
 
     // 120 seconds: the user has to find the browser, pick an account, and consent. Long enough to be
     // usable, short enough that a window left open does not hold a listening socket for ever.
-    // The kind comes from the file the registration was read from, so a "Web application" client is
-    // refused with that word in the message instead of failing later as a redirect_uri_mismatch.
-    let kind = state
-        .user
-        .oauth_settings(&email.to_ascii_lowercase())
+    // The registration file also says *where* its endpoints are, and the kind of client it describes:
+    // a "Web application" client is refused with that word instead of failing later as a
+    // redirect_uri_mismatch, and a registration pointing somewhere else (a test environment) is used
+    // as written. Absent a file, the provider's built-in endpoints are what the flow runs against.
+    let (kind, provider) = match token_store(&state)
         .ok()
-        .flatten()
-        .map(|_| registration_kind(&state, &provider_id))
-        .unwrap_or(mail_core::oauthclient::ClientKind::Desktop);
+        .and_then(|_| state.accounts_path.parent())
+        .map(mail_core::oauthclient::client_registration)
+    {
+        Some(Ok(mail_core::oauthclient::Registration::Own { registration })) => (
+            registration.kind,
+            provider.with_registration_endpoints(&registration),
+        ),
+        _ => (mail_core::oauthclient::ClientKind::Desktop, provider),
+    };
 
     let tokens = mail_core::oauth::sign_in_as(
         &http_tokens()?,

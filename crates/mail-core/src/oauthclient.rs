@@ -35,6 +35,12 @@ pub enum ClientKind {
 }
 
 /// One OAuth client registration.
+///
+/// The endpoints come from Google's file too, and they are honoured rather than ignored: the file is
+/// the client's own statement of where its authorization and token endpoints live, so a registration
+/// for a different environment (a test tenant, a self-hosted IdP that speaks the same flow) works
+/// without a code change. When they are absent — a hand-written file — the provider's built-in
+/// endpoints are used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientRegistration {
     pub client_id: String,
@@ -42,6 +48,10 @@ pub struct ClientRegistration {
     pub client_secret: Option<String>,
     #[serde(default = "desktop")]
     pub kind: ClientKind,
+    #[serde(default)]
+    pub auth_uri: Option<String>,
+    #[serde(default)]
+    pub token_uri: Option<String>,
 }
 
 fn desktop() -> ClientKind {
