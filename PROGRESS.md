@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **208**（170 lib + 34 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **215**（175 lib + 36 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,8 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
+| 最新 | M1a-14 配额账本（user.db v2：到额度就停，而不是等服务器拒绝） |
+| — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
 | — | M1a-11 已发送副本：先搜索再 APPEND（spool 即"未归档"标记） |
 | — | M1a-10 崩溃恢复：先查已发送再决定重发（含按角色找 Sent 文件夹） |
@@ -29,6 +30,54 @@
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-14 配额账本：到额度就停，而不是等服务器拒绝 ✅（第 20 轮）
+
+`design/04` §5.7。硬事实：Gmail 的 IMAP 下载上限约 **2.5 GB/天**，超了会被限到近乎不可用、24 小时后
+才重置。**这不是能优化的工程问题，是配额**——所以必须自己停，而不是等被拒绝（被拒绝时账号已经被罚了）。
+
+**账本放在 `user.db`**（新增 `quota_ledger` 表，`USER_SCHEMA_VERSION` 1→2）：设计特意强调过，
+放可删的 `cache.db` 里意味着"删缓存 = 忘掉今天已经下载了多少"，下一次立刻又超。
+- `QuotaLedger { bytes_today, daily_budget, window_start, throttled_until, server_floor }`；
+  `allows_download(now)` 把"今天用完了"和"服务器让我们退避到某时刻"两件事合起来回答。
+- **窗口边界用滚动 24 小时**（从窗口内第一次请求算起）而不是日历日：严格更保守（任何窗口都不会
+  放出超过预算的量），而且不需要时区数据库。代价是重置时刻会随当天首次使用时间漂移，
+  界面文案"明天自动继续"如实覆盖。这条偏离写在这里，不藏在代码里。
+- `daily_budget` 与 `throttled_until`/`server_floor` 的寿命不同：换窗口只清字节数，
+  **服务器教给我们的事实（被退避到什么时候、能取到多早）继续保留**。
+
+**预算从服务商表来**：新增 `Provider::daily_download_budget()`——**只有 Gmail 有数字**
+（2.3 GB，留 8% 余量），其余全是 `None`。有意如此：**编一个上限会无缘无故停掉别人的邮件**，
+而"未知"就该原样表示未知。测试断言 Gmail 的数落在文档上限内、且**其他每一家都必须是 `None`**。
+
+**执行点**：`BackfillBudget` 增加 `max_bytes`，`BackfillStop` 增加 `QuotaSpent`，
+`BackfillReport` 增加 `bytes`（本次落库邮件大小之和）。
+- 走完一页（**先落库**）后先看字节数：到额度就返回 `QuotaSpent`——排在窗口判定之前，
+  因为"窗口已满足"不是继续下载的理由。
+- 命令 `backfill_to_window` 开跑前问账本：不允许下载就直接返回 `QuotaSpent`（**一个字节不取**），
+  否则把剩余额度当作 `max_bytes`；跑完按**实际落库的字节**记账（取回但没落库的不收费）。
+- 前端：`stop === 'quota_spent'` 时按设计的口径提示（带上服务商名），而不是当成失败静默。
+
+**证据**：
+- loopback 两条：给 1 字节预算、`max_pages: 40` ⇒ 停在**第 1 页**且 `QuotaSpent`，
+  并断言 transcript 里**那一页之后只有 1 次 `UID FETCH`**（"不会在预算耗尽后继续发请求"——
+  这正是设计要求的门禁）；另一条断言**花掉预算的那一页仍然落库**（否则下次会把同一页再取一遍）。
+- userdb 四条：累加与 24 小时滚动（读不重置）、无上限的服务商永远不被我们拦、
+  **重启与删缓存都不重置账本**、**v1 的老库在打开时自动获得新表**。
+- **真机迁移验证**（这台机器上真实的 `user.db`，v1、有 2 条历史行）：
+  `tools/inspect-user-db.py` 前后对比 ⇒ `user_version` 1→2、表里多了 `quota_ledger`、
+  **原有行数不变**（outbox 2，迁移是无损的增量）。
+- 顺手清掉了我自己留下的两个探针行（发件箱里曾是两条"已撤销"的假邮件），
+  新工具 `tools/probe-cleanup.mjs` 只删"非排队中且主题带探针标记"的行；
+  `probe-outbox.mjs` 现在也会清掉它自己那条撤销行，跑完 cleanup 复查 = 0 条。
+
+**数字**：`check.ps1` 15 步全绿；测试 **215**（175 lib + 36 loopback + 4 reachability）；
+真机 user.db 现在 `user_version = 2`、`outbox = 0`（探测残留已清）。
+
+**未做**：网易系 `server_floor` 的提示文案（表列已就位、写入接口已就位，但还没有哪条路径在
+"再也取不到更早"时写它并提示用户）、加账号向导里的体量预检、配额进诊断包。
 
 ---
 
@@ -383,11 +432,12 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **208 通过、0 失败**
-（170 lib + 34 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **215 通过、0 失败**
+（175 lib + 36 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
-所有改动都在 git 里（基线 `83c1b0c`，共 40 个提交）。
+真机 `user.db` 已随本轮升到 **v2**（`quota_ledger`，原有行数不变）。
+所有改动都在 git 里（基线 `83c1b0c`，共 42 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -419,6 +469,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 | **M1a-11** | **已发送副本：先搜索再 APPEND（幂等）、spool 即"未归档"标记、`file_sent_copies` 一趟 + 离线延后；刻意不加 `auto_files_sent` 标志与 `sent_index`（理由见 M1a-11）** | **loopback：服务器已归档 ⇒ `appended:false`，transcript 里有 `MESSAGE-ID` 搜索、**没有 `APPEND`**（重复副本这个失败模式只有这样才看得见）** |
 | **M1a-12** | **同步窗口选择器（四种窗口 + 收窄不删信）+ 冷启动自动回填一页（`pages: None` 一页，防"全部"窗口开窗就下载几千封）** | **`tools/probe-sync-window.mjs` 真机：四种窗口逐字往返 / 选择器预选与保存 / 侧栏同步 / 设置已还原；启动日志有真机 `回填到窗口边界 years:2：0 页 / 0 封（HistoryExhausted）`** |
 | **M1a-13** | **附件 sha256：选中时记录、发送前补算与校验、重建 spool 时再校验；契约门禁补上嵌套的 `OutgoingAttachment`** | **`attach.rs` 9 条（含空文件定型值、跨块一致、变了/丢了/没记录三种判定）；worker 测试：改动过的附件 ⇒ `needs_attention`、SMTP 一次没碰；真机探针带嵌套附件负载通过** |
+| **M1a-14** | **配额账本：`user.db` 新增 `quota_ledger`（v2）、滚动 24 小时窗口、按服务商给预算（只有 Gmail 有数）；`BackfillBudget.max_bytes` + `BackfillStop::QuotaSpent`；命令开跑前查、跑完按实际落库字节记账** | **loopback：1 字节预算 ⇒ 停在第一页且此后只有 1 次 `UID FETCH`（不会继续发请求），且那一页仍落库；真机 v1→v2 迁移无损（表增、行数不变）** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -427,32 +478,33 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 2. **M0-8 OAuth 端点探测**：需要你的 client_id 与网络。命令已写在本文档 M0-8 一节，
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
-**下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿；
-交接摘要原本的三件已全部完成，下面是收口与"日常可用"要补的）
-1. **配额账本**（`design/04` §5.7）：现在"全部邮件"窗口的回填没有任何节流——M1a-12 用"冷启动只走
-   一页"挡住了最坏情况，但一个长走一回仍然没有每日字节预算。
-2. **发信上限预检**（`design/07` §6）：服务商表目前没有 `smtp_max_message_bytes` / `append_limit_bytes`，
-   所以"这封信太大了"只能在服务器拒绝之后才知道（552 已经会落到 `needs_attention`，
-   但那时已经晚了一步）。附件哈希（M1a-13）让"算准大小"这件事变得可做。
-3. **`sent_index`（cache.db）+ 界面"查看已发送副本"**：副本 UID 现在只在返回值里，没落库；
-   要加就按 §5.4 步骤 0 的顺序，并给 cache.db 加一次真迁移。
-4. **spool 分块流式写**（`design/07` §8）：现在建 spool 是 `formatted()` 一次性成字节，
-   25 MB 附件的峰值内存还没按 §8 的预算收紧。
+**下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
+1. **`sent_index`（cache.db）+ 界面"查看已发送副本"**：副本 UID 现在只在返回值里，没落库；
+   要加就按 §5.4 步骤 0 的顺序，并给 cache.db 加一次真迁移（user.db 的迁移模式刚在 M1a-14 走通过）。
+2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
+   所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
+   附件哈希（M1a-13）让"算准要发多大"变得可做。
+3. **网易系 `server_floor` 的提示**：表列与写入接口都就位了，但还没有哪条路径在"再也取不到更早"时
+   写它并按设计给一次可操作提示（"去网页版把收取范围改大"）——**用户会以为是我们的 bug**。
+4. **spool 分块流式写**（`design/07` §8）：现在建 spool 仍是一次性 `formatted()`，25 MB 附件的
+   峰值内存还没按 §8 的预算收紧。
 5. **真机验证**（需要先问用户）：崩溃恢复时序（预置 spool 缺失的 `sending` 行 ⇒ 期望
-   `needs_attention`，全程不碰 SMTP——这条安全）；真实账号上"附件被改动"的提醒是否看得懂。
+   `needs_attention`，全程不碰 SMTP，安全）；真机上"附件被改动"的提醒是否看得懂。
 6. **服务器草稿镜像**（`draft_mirror`）→ 认证轴（`AuthMethod`）→ 会话串 → 通知托盘 → 安装包。
 
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 208 个测试
+cargo test --workspace                # 215 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
-git log --oneline                     # 40 个提交；git diff 83c1b0c HEAD 是本次全部改动
+python tools\inspect-user-db.py [标签]  # 真机 user.db 的版本/表/行数（迁移前后对比用）
+git log --oneline                     # 42 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
 node tools/inspect-dom.mjs @tools/probe-outbox.mjs       # 发件箱：入队→撤销→删除→写信点发送真的入队
 node tools/inspect-dom.mjs @tools/probe-sync-window.mjs  # 同步窗口：四种窗口往返 + 冷启动回填（会还原设置）
+node tools/inspect-dom.mjs @tools/probe-cleanup.mjs      # 清掉探针在真机上留下的历史行
 ```
 
 ---
