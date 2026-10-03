@@ -920,6 +920,85 @@ async fn serve_smtp_logging(
 /// per-piece tests all passed while the pieces did not fit together. Here nothing is stubbed except
 /// the server.
 #[tokio::test]
+async fn a_queued_message_from_an_oauth_account_is_sent_with_xoauth2() {
+    // The queue is the path mail actually takes (`design/07` §5.3), and it is a *different* function
+    // from `send` — so "the SMTP side branches on cfg.auth" has to be true here too, not just there.
+    let (addr, _captured, _connections, commands) = spawn_smtp_with_commands().await;
+    let mut cfg = account(addr, addr);
+    cfg.auth = AuthMethod::OAuth2;
+
+    let store = UserStore::open_in_memory().expect("user db");
+    let spool_dir = std::env::temp_dir().join(format!(
+        "easy-email-oauth-spool-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let spool = Spool::open(&spool_dir).expect("spool");
+
+    let mail = OutgoingMail {
+        to: vec!["alice@example.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: "OAuth 队列".to_string(),
+        body_text: "正文".to_string(),
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![],
+        message_id: Some("<oauth-queued@example.com>".to_string()),
+    };
+
+    let id = store
+        .enqueue_outbox(&NewOutbox {
+            account_id: cfg.id.clone(),
+            draft_id: None,
+            payload_json: serde_json::to_string(&mail).expect("payload"),
+            spool_path: None,
+            spool_bytes: 0,
+            undo_until: 0,
+            scheduled_at: 0,
+            created_at: 100,
+        })
+        .expect("enqueue");
+    let message = smtp::build_message(&cfg, &mail).expect("build");
+    let (path, size) = spool.write(id, &message.formatted()).expect("spool");
+    store
+        .set_outbox_spool(id, &path.to_string_lossy(), size as i64)
+        .expect("record spool");
+
+    let report = within(run_due(
+        OutboxRun {
+            store: &store,
+            spool: &spool,
+            cfg: &cfg,
+            // What `secret_for` hands over for an OAuth account: an access token, not a password.
+            password: "an-access-token",
+            now: 1_000,
+            limit: 5,
+        },
+        |cfg, password, bytes, recipients| async move {
+            smtp::send_spool(&cfg, &password, bytes, recipients).await
+        },
+    ))
+    .await
+    .expect("worker");
+    assert_eq!(report.sent, 1, "{report:?}");
+
+    let lines = commands.lock().expect("commands").clone();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().starts_with("AUTH XOAUTH2")),
+        "the queued path must use the account's mechanism: {lines:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&spool_dir);
+}
+
+#[tokio::test]
 async fn a_queued_message_reaches_smtp_through_the_worker() {
     let (addr, captured, connections) = spawn_smtp_counted().await;
     let cfg = account(addr, addr);
