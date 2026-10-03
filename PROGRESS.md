@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-27 副本超过 append 上限就不写（SkippedTooLarge） |
+| 最新 | M1a-28 副本缺失文案如实说两种可能 |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -52,6 +52,19 @@ M1a-23 把上限拦在**点发送**时，但设计要的是"添加附件/点发�
 
 **证据**：`check.ps1` 15 步全绿（前端命令 **30** 个）、测试 **227**、启动冒烟 10 秒存活。
 估算函数是纯前端，门禁只能证明语法与接线——**没有自动化测试覆盖它**，如实记在这里。
+
+---
+### M1a-28 副本缺失的文案不再假装知道原因 ✅（第 34 轮）
+
+M1a-27 之后，"副本没归档"有两种可能：**太大被跳过**，或者**缓存被清理**（链接丢了）。点「查看副本」
+没查到时的文案原来只说"可能缓存被清理过"——那是在不知道的时候给了一个确定的答案。
+
+现在如实说两种可能（"可能是副本太大没能归档，也可能是本地缓存被清理过"），并保留"去已发送按主题找"
+这条可行动的出路。**要把它说准**需要 M1a-27 里我省掉的那个区分：让 `ensure_sent_copy` 返回三态
+（归档 / 无文件夹 / 太大）而不是 `None`，再把"太大"记到 outbox 行上、界面读那个标记。这一轮没做，
+因为那是一次跨 mail-core + src-tauri 的类型改造，我已经没有余量做完整并验证它——**半成品不如不做**。
+
+**证据**：`check.ps1` 15 步全绿（文案改动只过前端语法与门禁）；测试仍是 **229**（未动 Rust）。
 
 ---
 ### M1a-27 副本太大就别写（`design/07` §5.4 的 `SkippedTooLarge`）✅（第 33 轮）
@@ -751,7 +764,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 69 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 71 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -823,7 +836,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 cargo test --workspace                # 229 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 69 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 71 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
