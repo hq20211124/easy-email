@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-32 会话展开/折叠（含探针归一化的教训） |
+| 最新 | M1a-33 配额账本露到界面（同步窗口里显示今日用量） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -880,6 +880,38 @@ messages: 50   expectedRows: 43   renderedRows: 43   exactKeys: 50   fallbackOnl
 **数字**：`check.ps1` **16 步全绿**；测试 234（未动 Rust）。
 
 ---
+### M1a-33 配额账本露到界面：同步窗口对话里显示今日用量 ✅（第 39 轮）
+
+M1a-14 让账本**决定**同步什么时候停，但用户看不到那个数字——于是"今天不再往回取"与**"网络坏了"**
+长得一模一样。设计要的正是这份诚实（`design/04` §5.7 的文案）。
+
+- **新命令 `quota_status`**：返回账本本身（今日字节、预算、退避到何时、服务器下界），预算仍按
+  "只有 Gmail 有公开数字"的规矩取自服务商表。
+- **同步窗口对话顶部多一行状态**（就是那个"往回取多少"的设置框，配额属于同一个话题）：
+  - 有预算：`今日已下载 0 B，额度 2.1 GB（剩余 2.1 GB）；用完后会自动停到明天。`
+  - 无预算：`今日已下载 0 B（这个服务商没有公开的每日下载上限）。`
+  - 被服务器限流：**优先显示**`服务器暂时限制了同步频率，会在 14:32 后自动重试。`
+    （限流比用量更紧急，所以它先说话。）
+- 对话改为 `async`（要先把账本取回来再渲染），失败时整块不显示而不是显示 0。
+
+**真机证据**（`tools/probe-sync-window.mjs` 扩展，真 QQ 账号）：
+```
+step quota: { bytes_today: 0, daily_budget: null }
+line: "今日已下载 0 B（这个服务商没有公开的每日下载上限）。"   mentionsBytes: true
+passed: true（initial / cold_start / round_trip / quota / picker / restored 全过）
+```
+`daily_budget: null` 正是 M1a-14 刻意的选择（QQ 没有公开上限，就不编一个）。
+
+**探针自身又修了两处（都写进注释）**：① 我在新代码里用了 `ACCOUNT`，而这个探针用的是
+`state.accountId` —— CDP 只报 `{}`，看不出原因；现在探针**把自己的异常也报出来**
+（`catch (error) { return { failed: … } }`），这次的报错就是它自己说的 `ReferenceError: ACCOUNT is
+not defined`。② 顺手确认了 `invoke` 对**任何**命令名都会给出 `ReferenceError: <name> is not defined`
+——所以"命令没定义"这种报错**不能**用来判断后端有没有这个命令（我一度被它误导，拿 `list_outbox`
+对照才发现两者报的一模一样）。
+
+**数字**：`check.ps1` **16 步全绿**；测试 234；前端命令 **34** 个。
+
+---
 ## 交接摘要（先读这里）
 
 **当前状态**：`tools/check.ps1` **16 步全绿**；`cargo test --workspace` **234 通过、0 失败**
@@ -888,7 +920,7 @@ messages: 50   expectedRows: 43   renderedRows: 43   exactKeys: 50   fallbackOnl
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v3**（`sent_index` + `thread_key`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 80 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 82 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -924,11 +956,11 @@ messages: 50   expectedRows: 43   renderedRows: 43   exactKeys: 50   fallbackOnl
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近十六轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+**最近十七轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面（真机读到今日用量与无上限说明）**。
 
 **若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
 （三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
@@ -953,7 +985,8 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
 3. ~~网易系"只让读最近 30 天"的提示~~ → **M1a-19 已做**（`range_cap_hint` + 冷启动提示）。
-   仍差：把学到的下界写进 `quota_ledger.server_floor`（表列与写入接口都就位）并在设置里显示。
+   仍差：把**学到的下界**写进 `quota_ledger.server_floor`（表列、写入接口、以及 M1a-33 的显示位都已就位，
+   只差"在哪一刻判断这是服务端下界"——它和"这个邮箱本来就小"在协议上难以区分，见 M1a-19 的注释）。
 4. **spool 分块流式写**（`design/07` §8）：现在建 spool 仍是一次性 `formatted()`，25 MB 附件的
    峰值内存还没按 §8 的预算收紧。
 5. **真机验证**（需要先问你）：一条真实的"发信 → 点查看副本"走查；崩溃恢复时序（预置 spool 缺失的
@@ -976,7 +1009,7 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
 cargo test --workspace                # 234 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 80 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 82 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
