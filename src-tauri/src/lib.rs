@@ -146,6 +146,49 @@ fn password_for(account_id: &str) -> Result<String, String> {
     }
 }
 
+/// The secret a connection authenticates with: a password, or a freshly refreshed access token.
+///
+/// The account says which (`cfg.auth`), so call sites keep passing one string and the protocols keep
+/// deciding the mechanism (M1a-52). OAuth accounts therefore have no password to fetch — the stored
+/// refresh token is turned into an access token here, which is also where A1-F34's rotation gets
+/// persisted (inside `oauth::fresh_access_token`).
+///
+/// A missing registration or a dead refresh token is reported as "sign in again", not as a network
+/// problem, because that is what the user has to do about it.
+async fn secret_for(state: &AppState, cfg: &AccountConfig) -> Result<String, String> {
+    if cfg.auth != mail_core::AuthMethod::OAuth2 {
+        return password_for(&cfg.id);
+    }
+
+    let Some(settings) = state.user.oauth_settings(&cfg.id).map_err(describe)? else {
+        return Err(format!(
+            "{} 是 OAuth2 账号，但还没有保存客户端 ID。请重新登录一次。",
+            cfg.email
+        ));
+    };
+
+    let provider = match cfg.provider_id.as_str() {
+        "gmail" => mail_core::oauth::GOOGLE,
+        "outlook" => mail_core::oauth::MICROSOFT,
+        other => {
+            return Err(format!("{other} 不支持 OAuth2 登录。"));
+        }
+    };
+
+    let store = token_store(state)?;
+    let transport = http_tokens()?;
+    mail_core::oauth::fresh_access_token(
+        &transport,
+        &store,
+        &cfg.id,
+        provider,
+        &settings.client_id,
+        settings.client_secret.as_deref(),
+    )
+    .await
+    .map_err(describe)
+}
+
 // ---------------------------------------------------------------- provider database
 
 /// The full built-in provider database, for the setup wizard.
@@ -183,7 +226,7 @@ fn list_accounts(state: State<'_, AppState>) -> Vec<AccountConfig> {
 
 /// Add or update an account and stash the credential in the Windows Credential Manager.
 #[tauri::command]
-fn save_account(
+async fn save_account(
     state: State<'_, AppState>,
     app: AppHandle,
     provider_id: String,
@@ -210,7 +253,7 @@ fn save_account(
 
     // Start push for the new account straight away, rather than waiting for the next launch. A
     // failure here is logged, not returned: the account is saved and usable either way.
-    if let Err(error) = start_watcher(&app, state.inner(), cfg.clone(), "INBOX".to_string()) {
+    if let Err(error) = start_watcher(&app, state.inner(), cfg.clone(), "INBOX".to_string()).await {
         log_line(&format!("[easy-email] 未能启动 {} 的推送：{error}", cfg.id));
     }
 
@@ -244,7 +287,7 @@ async fn verify_account(
     account_id: String,
 ) -> Result<ConnectionReport, String> {
     let cfg = state.find(&account_id)?;
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
     Ok(mail_core::verify_account(&cfg, &password).await)
 }
 
@@ -275,7 +318,7 @@ async fn load_more_messages(
         .map_err(describe)?
         .ok_or_else(|| "这个文件夹还没有缓存内容，请先刷新一次。".to_string())?;
 
-    let password = password_for(&account_id)?;
+    let password = secret_for(&state, &cfg).await?;
     let page = pool_op!(&state.pool, &cfg, &password, |client| {
         client
             .fetch_older_headers(&mailbox, before_uid, limit)
@@ -315,6 +358,7 @@ struct HistoryPage {
 /// one showing slightly stale mail, which is the whole reason the cache exists. Callers fall back to
 /// whatever is on disk and surface [`AppState::last_sync_error`] when it fails.
 async fn refresh_folder(
+    state: &AppState,
     pool: &ConnectionPool,
     cache: &Cache,
     cfg: &AccountConfig,
@@ -327,7 +371,7 @@ async fn refresh_folder(
     let info = match known {
         Some(info) => info,
         None => {
-            let password = password_for(&cfg.id)?;
+            let password = secret_for(state, cfg).await?;
             let all = pool_op!(pool, cfg, &password, |client| {
                 client.list_mailboxes().await
             })
@@ -343,7 +387,7 @@ async fn refresh_folder(
         }
     };
 
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(state, cfg).await?;
 
     // The driver is built *inside* the block, which matters twice over: the block runs more than
     // once for the pool's retry, and rebuilding the driver is what makes a retry safe —
@@ -381,7 +425,7 @@ async fn list_mailboxes(
     account_id: String,
 ) -> Result<Vec<MailboxInfo>, String> {
     let cfg = state.find(&account_id)?;
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
 
     let listed = pool_op!(state.pool, &cfg, &password, |client| {
         client.list_mailboxes().await
@@ -434,7 +478,7 @@ async fn list_messages(
     // Guard against a caller asking for the whole mailbox; the UI pages at 50.
     let limit = limit.clamp(1, 500);
 
-    let sync_failure = refresh_folder(&state.pool, &state.cache, &cfg, &mailbox)
+    let sync_failure = refresh_folder(&state, &state.pool, &state.cache, &cfg, &mailbox)
         .await
         .err();
     *state.last_sync_error.lock().expect("sync error mutex") = sync_failure.clone();
@@ -476,7 +520,7 @@ async fn fetch_message(
         return Ok(detail);
     }
 
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
     // One pooled connection does both commands, so the select and the fetch cannot land on
     // different sessions.
     let detail = pool_op!(state.pool, &cfg, &password, |client| {
@@ -538,7 +582,7 @@ async fn drop_server_copy(state: &AppState, copy: &DraftMirror) {
     let Ok(cfg) = state.find(&copy.account_id) else {
         return;
     };
-    let Ok(password) = password_for(&cfg.id) else {
+    let Ok(password) = secret_for(state, &cfg).await else {
         return;
     };
     let folder = copy.folder.clone();
@@ -569,7 +613,7 @@ async fn backfill_to_window(
     let cfg = state.find(&account_id)?;
     let window = state.user.sync_window().map_err(describe)?;
     let cache = state.cache.clone();
-    let password = password_for(&account_id)?;
+    let password = secret_for(&state, &cfg).await?;
     let budget_for_account = mail_core::providers::by_id(&cfg.provider_id)
         .and_then(|provider| provider.daily_download_budget())
         .map(|bytes| bytes as i64);
@@ -867,7 +911,7 @@ async fn mirror_draft(
         return Ok(None);
     };
     let cfg = state.find(&draft.account_id)?;
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
     let previous = state.user.draft_mirror(&draft_id).map_err(describe)?;
 
     let report = pool_op!(&state.pool, &cfg, &password, |client| {
@@ -913,7 +957,7 @@ async fn refresh_thread_keys(
     mailbox: String,
 ) -> Result<u32, String> {
     let cfg = state.find(&account_id)?;
-    let password = password_for(&account_id)?;
+    let password = secret_for(&state, &cfg).await?;
     let cache = state.cache.clone();
 
     // A few pages rather than one: the newest page covers what is on screen, and the pages below it
@@ -1151,7 +1195,7 @@ async fn sweep_draft_mirrors(app: &AppHandle) -> usize {
             let _ = store.take_draft_mirror(&orphan.draft_id);
             continue;
         };
-        let Ok(password) = password_for(&cfg.id) else {
+        let Ok(password) = secret_for(&state, &cfg).await else {
             // No credential — the next sweep, after the user fixes the account, can still do it.
             continue;
         };
@@ -1532,7 +1576,7 @@ async fn mark_seen(
     seen: bool,
 ) -> Result<(), String> {
     let cfg = state.find(&account_id)?;
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
 
     pool_op!(state.pool, &cfg, &password, |client| {
         client.select(&mailbox).await?;
@@ -1558,7 +1602,7 @@ async fn delete_message(
     uid: u32,
 ) -> Result<(), String> {
     let cfg = state.find(&account_id)?;
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
 
     pool_op!(state.pool, &cfg, &password, |client| {
         client.delete_message(&mailbox, uid).await
@@ -1583,7 +1627,7 @@ async fn move_message(
     destination: String,
 ) -> Result<(), String> {
     let cfg = state.find(&account_id)?;
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
 
     pool_op!(state.pool, &cfg, &password, |client| {
         client.move_message(&mailbox, uid, &destination).await
@@ -1605,13 +1649,13 @@ async fn move_message(
 /// A plain function rather than only a command, because the same thing has to happen at startup for
 /// accounts that are already configured — otherwise push would only begin after the user clicked
 /// something.
-fn start_watcher(
+async fn start_watcher(
     app: &AppHandle,
     state: &AppState,
     cfg: AccountConfig,
     mailbox: String,
 ) -> Result<(), String> {
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(state, &cfg).await?;
     let pool = Arc::clone(&state.pool);
     let cache = state.cache.clone();
     let account_id = cfg.id.clone();
@@ -1632,11 +1676,14 @@ fn start_watcher(
 
     let app = app.clone();
     let handler = tauri::async_runtime::spawn(async move {
+        // This task outlives the call, so it must not borrow `state`; the handle can produce one, and
+        // that is also what keeps the reference valid for as long as the task runs.
+        let state = app.state::<AppState>();
         while let Some(event) = rx.recv().await {
             match event {
                 PushEvent::Changed { mailbox } => {
                     // Sync on a *different* pooled connection; the IDLE connection stays idle.
-                    match refresh_folder(&pool, &cache, &cfg, &mailbox).await {
+                    match refresh_folder(state.inner(), &pool, &cache, &cfg, &mailbox).await {
                         Ok(outcome) if outcome.fetched > 0 => {
                             announce(&app, &cfg, &mailbox, &cache, &outcome);
                         }
@@ -1678,7 +1725,7 @@ async fn watch_inbox(
     mailbox: String,
 ) -> Result<(), String> {
     let cfg = state.find(&account_id)?;
-    start_watcher(&app, state.inner(), cfg, mailbox)
+    start_watcher(&app, state.inner(), cfg, mailbox).await
 }
 
 /// Bring the main window back from the tray.
@@ -1893,7 +1940,7 @@ async fn save_attachment(
     name: String,
 ) -> Result<String, String> {
     let cfg = state.find(&account_id)?;
-    let password = password_for(&cfg.id)?;
+    let password = secret_for(&state, &cfg).await?;
 
     let directory = state
         .download_dir
@@ -2247,11 +2294,17 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 for account in state.snapshot() {
                     let id = account.id.clone();
-                    if let Err(error) =
-                        start_watcher(app.handle(), state.inner(), account, "INBOX".into())
-                    {
-                        log_line(&format!("[easy-email] 未能启动 {id} 的推送：{error}"));
-                    }
+                    // `setup` runs outside any Tokio runtime, so the watchers are started on the
+                    // runtime instead of being awaited here (spawning from there panics).
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = handle.state::<AppState>();
+                        if let Err(error) =
+                            start_watcher(&handle, state.inner(), account, "INBOX".into()).await
+                        {
+                            log_line(&format!("[easy-email] 未能启动 {id} 的推送：{error}"));
+                        }
+                    });
                 }
             }
             Ok(())
