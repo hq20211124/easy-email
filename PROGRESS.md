@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **183**（147 lib + 32 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **186**（150 lib + 32 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,8 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-8 发件箱后端（存储层 + spool + worker + 命令 + 5 秒 tick） |
+| 最新 | M1a-9 发件箱界面 + 写信改走队列（撤销窗口真正对用户可见） |
+| — | M1a-8 发件箱后端（存储层 + spool + worker + 命令 + 5 秒 tick） |
 | — | M1a-7 修发信负载大小写 bug + 写信接草稿 + 草稿箱 |
 | — | M1a-6 发件箱决策逻辑 / M1a-5 草稿命令 / M1a-4 草稿落库 / M1a-3b 窗口生效 / M1a-3 窗口模型 / M1a-2 `user.db` / M1a-1b 回填接线 / M1a-1a 回填原语 |
 | `62d806c` | M0-2b `Cache`/`src-tauri` 切到共享 `Db`（去掉每条命令开连接）+ 新门禁 |
@@ -24,6 +25,50 @@
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-9 发件箱界面 + 写信改走队列 ✅（第 15 轮）
+
+M1a-8 把后端做完了但**用户还走不上那条路**（composer 仍在直接 `send_mail`）。这一轮把界面接上，
+并让发送真的经过队列。
+
+**1. 发件箱视图**：侧栏"本地"下新增「发件箱 (N)」，列表显示收件人 / 主题 / 状态 / 已试次数 /
+失败原因（红边 + 服务器原话），行内按钮按状态给：`queued` ⇒ **撤销**，
+`failed`/`needs_attention`/`cancelled` ⇒ **重试**，另有**删除**。
+- **倒计时只改文本节点**：撤销窗口每秒变一次，但整行重建会在指针底下换掉正要点的"撤销"按钮
+  ⇒ 只更新 `[data-undo]` 的 textContent。
+- 状态文案集中在 `OUTBOX_LABELS`；行预览从 `payload_json` 读（那份负载就是将要发出的信，
+  所以**不**再复制一份 subject/收件人到别的列）；负载读不出来也必须能渲染。
+- `outbox:changed` 事件 ⇒ 重读 `user.db` 并同时刷新草稿徽标（发送成功会删掉那封草稿）。
+
+**2. 写信改走 `enqueue_send`**（`design/07` §5.1 的唯一发送路径）：
+- 点"发送"后弹带**「撤销」按钮**的 toast（"已加入发件箱（5 秒内可撤销）"），撤销按最新一条
+  仍在排队的行处理；如果 worker 已经抢先，接口如实返回 false，界面说"已经交给服务器了"。
+- **草稿生命周期变了**：不再在点发送时删除（现在删它的是 worker，且只在**真正发出**之后）。
+  但入队前会**再存一次草稿**——否则"打完最后几个字就点发送"会让草稿箱里留下两秒前的版本，
+  而发送失败时用户重新打开的正是它。
+- **删掉 `send_mail` 命令**：两个入口里有一个会绕过撤销窗口、退避策略和崩溃恢复。
+  `smtp::send` 保留给对比测试。
+
+**真机证据**（新工具 `tools/probe-outbox.mjs`，CDP 驱动真实窗口；用 `@example.invalid`
+收件人 + 30 秒窗口内立即撤销，**不发任何东西**）：
+```
+enqueue      : state=queued, spool 已记录(336 B), payload 里的主题可读回
+outbox_view  : 标题=发件箱, 行已渲染, 徽标=1, 状态=等待发送, 倒计时="30 秒内可撤销", 按钮=[撤销, 删除]
+undo         : 点行内"撤销" ⇒ state=cancelled, DOM 显示"已撤销", 徽标清空
+discard      : 点"删除" ⇒ 行消失, 列表归零
+composer     : 打开写信窗口填好点"发送" ⇒ 真的入队(queued), 弹窗关闭, 随后撤销成功
+```
+（探针自己清理：删掉了写信留下的那条草稿。`tools/probe-drafts.mjs` 的负载契约检查已改指
+`enqueue_send`——同一个 `OutgoingMail`，两边仍然一个字段都不差。）
+
+**数字**：`check.ps1` **15 步全绿**；测试 **186**（150 lib + 32 loopback + 4 reachability，
+新增 3 条 `userdb` 队列语义测试：徽标只数未完成、重试回 `queued` 而永久失败不回、
+撤销窗口内不可被认领）；前端命令 **22** 个。
+
+**未做**：发送后归档到已发送（§5.4）、崩溃恢复 `sending` 行（§5.3.1）、附件 sha256、
+服务器草稿镜像、窗口选择器界面。
 
 ---
 
@@ -159,10 +204,10 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **183 通过、0 失败**
-（147 lib + 32 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
-应用启动冒烟通过（10 秒存活，发件箱 worker 已随启动运行）。所有改动都在 git 里
-（基线 `83c1b0c`，共 26 个提交）。
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **186 通过、0 失败**
+（150 lib + 32 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+应用启动冒烟通过（10 秒存活，发件箱 worker 随启动运行，写信窗口的"发送"现在真的经过队列）。
+所有改动都在 git 里（基线 `83c1b0c`，共 32 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -189,6 +234,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 | M1a-5/6 | 草稿命令；发件箱决策纯函数（状态解析 / 退避 / 永久失败判定 / needs_attention） | 7 条测试（含 `u32::MAX` 尝试次数与超范围 SMTP 码） |
 | **M1a-7** | **修 `send_mail` 负载大小写 bug（v0.1 起发送从未成功）+ 写信接草稿（2 s 自动保存 / 关闭保存 / 发送后删草稿）+ 草稿箱界面 + 契约门禁** | **`tools/probe-drafts.mjs` CDP 全链路通过；门禁可证伪（改回 camelCase 即红）** |
 | **M1a-8** | **发件箱后端：`userdb` 队列操作 + 入队冻结 spool + worker（认领/退避/needs_attention/成功后删草稿）+ 5 条命令 + 5 秒 tick 与唤醒；补上一直缺失的 `Message-ID`** | **loopback 两条端到端打真 SMTP：冻结 Message-ID 上线、Bcc 不在头部、spool/草稿被清理、撤销后 SMTP 连接数为 0** |
+| **M1a-9** | **发件箱界面（状态/倒计时/撤销/重试/删除）+ 写信改走 `enqueue_send`（撤销窗口对用户可见）+ 删掉会绕过队列的 `send_mail`** | **`tools/probe-outbox.mjs` 真机全链路：入队→界面→点撤销→删除→**写信窗口点发送真的入队**（全程不发信）** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -198,29 +244,29 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **发件箱前端（与 composer 切队列一起做）**：现在后端全通、worker 已在跑，但 **composer 仍直接
-   调 `send_mail`**，所以用户还没用上撤销窗口。三件事必须同时落地：发件箱视图
-   （`list_outbox` + 撤销/重试/删除）、发送后的"正在发送…（N 秒内可撤销）"、composer 改调
-   `enqueue_send`。只切发送而没有界面，失败的信会无处可看。
-2. **发送后归档到已发送**（`design/07` §5.4）：`sent_index`（`cache.db`）→ 按冻结 Message-ID
-   有界轮询 → `append` + `find_uid_by_message_id` 找回 UID。
-3. **崩溃恢复 `sending` 行**（§5.3.1）：先按冻结 Message-ID 去已发送里查，查到就判 sent（**不重发**），
-   查不到才回 `queued`；带大附件的默认先暂停等用户确认。
-4. **附件 sha256**（`design/07` §9"发送前补算"）与 `attachment_changed` 判定——现在草稿里 `sha256`
-   记 `null`，所以"附件被改过"这条提醒还不成立。
-5. **服务器草稿镜像**（`draft_mirror`，APPEND + `find_uid_by_message_id`，best-effort 不阻塞写信）。
-6. **窗口选择器界面** + 冷启动自动回填一页（并接配额账本，`design/04` §5.7）。
-7. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
+1. **发送后归档到已发送**（`design/07` §5.4）：`sent_index`（放 `cache.db`）→ 按**冻结的
+   Message-ID** 有界轮询（≤3 次 / ≤30 s）→ 若服务商不自带归档则 `append` +
+   `find_uid_by_message_id` 找回 UID。先写 `sent_index` 再做归档判断，否则崩在中间会重复 APPEND。
+2. **崩溃恢复 `sending` 行**（§5.3.1）：启动/worker 首次运行时，对每条 `state='sending'` 的行
+   按**冻结 Message-ID** 去已发送里 `UID SEARCH HEADER Message-ID`：找到 ⇒ 直接判 `sent`
+   （**绝不重发**），找不到 ⇒ 回 `queued`；>5 MB 的行默认先暂停等用户确认。
+   Spool 文件就是冻结的字节，Message-ID 可从头部直接读出（`worker::frozen_message_id` 已就绪）。
+3. **附件 sha256**（`design/07` §9"发送前补算"）：现在草稿里 `sha256` 记 `null`，
+   所以 `attachment_changed`/`attachment_missing` 这两条 `needs_attention` 分支还没有触发源。
+4. **服务器草稿镜像**（`draft_mirror`，APPEND + `find_uid_by_message_id`，best-effort 不阻塞写信）。
+5. **窗口选择器界面** + 冷启动自动回填一页（并接配额账本，`design/04` §5.7）。
+6. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
 
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 183 个测试
+cargo test --workspace                # 186 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
-git log --oneline                     # 26 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 32 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
-node tools/inspect-dom.mjs @tools/probe-drafts.mjs
+node tools/inspect-dom.mjs @tools/probe-drafts.mjs    # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
+node tools/inspect-dom.mjs @tools/probe-outbox.mjs    # 发件箱：入队→撤销→删除→写信点发送真的入队
 ```
 
 ---
