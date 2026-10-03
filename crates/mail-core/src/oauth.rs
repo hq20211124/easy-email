@@ -209,7 +209,76 @@ pub async fn refresh<T: TokenTransport>(
     parse_tokens(&body)
 }
 
-/// The loopback listener the provider redirects the browser to.
+/// The real transport: one HTTPS form POST, with a client that is reused.
+///
+/// The one decision worth spelling out is what happens on a **4xx**. OAuth providers report failures
+/// as JSON *in the body* of a 400 (`invalid_grant`, `invalid_client`, …), so turning a 400 into a
+/// transport error would throw away the only thing that says whether the user must sign in again or
+/// the client registration is wrong. The body is returned and [`parse_tokens`] classifies it; only a
+/// 5xx (or a request that never got there) is a transport failure.
+pub struct HttpTokens {
+    client: reqwest::Client,
+}
+
+impl HttpTokens {
+    /// A client with the timeout this flow can live with.
+    ///
+    /// 30 seconds: the user is sitting in front of a browser waiting for the sign-in to finish, and a
+    /// sign-in that hangs for minutes is worse than one that fails and can be retried.
+    pub fn new() -> Result<HttpTokens> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| MailError::Config(format!("无法创建 HTTP 客户端：{error}")))?;
+        Ok(HttpTokens { client })
+    }
+}
+
+impl TokenTransport for HttpTokens {
+    fn post_form(
+        &self,
+        url: &str,
+        form: Vec<(String, String)>,
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
+        // Owned so the returned future does not borrow the caller's strings (it has to be `Send`).
+        let url = url.to_string();
+        async move {
+            let response = self
+                .client
+                .post(&url)
+                .form(&form)
+                .send()
+                .await
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        MailError::Timeout(30)
+                    } else {
+                        MailError::Config(format!("连接令牌端点失败：{error}"))
+                    }
+                })?;
+
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|error| MailError::Config(format!("无法读取令牌端点响应：{error}")))?;
+
+            if status.is_server_error() {
+                // A 5xx body is an HTML error page, not an OAuth error document: classifying it as a
+                // credential problem would sign the user out over a provider outage.
+                return Err(MailError::Config(format!(
+                    "令牌端点暂时出错（{}）：{}",
+                    status.as_u16(),
+                    body.chars().take(200).collect::<String>()
+                )));
+            }
+
+            Ok(body)
+        }
+    }
+}
+
+/// The loopback listener the provider redirects the browser to./// The loopback listener the provider redirects the browser to.
 ///
 /// RFC 8252 (A1-F32/F36) and nothing invented here:
 ///
@@ -837,5 +906,110 @@ mod tests {
                 .expect_err("nobody connected");
             assert!(matches!(error, MailError::Timeout(_)), "{error:?}");
         });
+    }
+
+    // ---------------------------------------------------------------- the real transport
+
+    /// A one-answer HTTP server, so the *real* `reqwest` transport is exercised without a network.
+    async fn serve_once(status: &str, body: &str) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let url = format!("http://{}/token", listener.local_addr().expect("addr"));
+        let status = status.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_real_transport_posts_a_form_and_returns_the_body() {
+        let url = serve_once("200 OK", r#"{"access_token":"at","expires_in":10}"#).await;
+        let tokens = HttpTokens::new().expect("client");
+        let answer = tokens
+            .post_form(
+                &url,
+                vec![("grant_type".to_string(), "refresh_token".to_string())],
+            )
+            .await
+            .expect("post");
+        assert!(answer.contains("access_token"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_400_body_reaches_the_classifier_instead_of_being_swallowed() {
+        // This is why the transport returns 4xx bodies at all: the useful part of an OAuth failure is
+        // in the body, and the caller has to tell "sign in again" from "the registration is wrong".
+        let url = serve_once(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"revoked"}"#,
+        )
+        .await;
+
+        // Called at the transport/classifier seam rather than through `refresh`: `refresh` posts to
+        // the *provider's* endpoint, and a test suite must never reach accounts.google.com. The seam
+        // is what matters anyway — a 400 body in, an actionable error out.
+        let tokens = HttpTokens::new().expect("client");
+        let body = tokens
+            .post_form(
+                &url,
+                vec![("grant_type".to_string(), "refresh_token".to_string())],
+            )
+            .await
+            .expect("a 400 is delivered as a body, not raised as a transport error");
+        let error = parse_tokens(&body).expect_err("must fail");
+        assert!(
+            error.to_string().contains("重新登录"),
+            "a revoked token has to be reported as one: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_a_provider_problem_not_a_credential_problem() {
+        let url = serve_once("503 Service Unavailable", "<html>down</html>").await;
+        let tokens = HttpTokens::new().expect("client");
+        let error = tokens
+            .post_form(
+                &url,
+                vec![("grant_type".to_string(), "refresh_token".to_string())],
+            )
+            .await
+            .expect_err("a 5xx is raised by the transport");
+        assert!(
+            !matches!(error, MailError::Credential(_)),
+            "an outage must not sign the user out: {error:?}"
+        );
+        assert!(error.to_string().contains("503"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_port_with_nothing_on_it_fails_rather_than_hanging() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let url = format!("http://{}/token", listener.local_addr().expect("addr"));
+        drop(listener);
+
+        let tokens = HttpTokens::new().expect("client");
+        let error = tokens
+            .post_form(&url, vec![("a".to_string(), "b".to_string())])
+            .await
+            .expect_err("nothing is listening");
+        assert!(
+            error.to_string().contains("连接令牌端点失败"),
+            "a refused connection is a transport failure: {error}"
+        );
     }
 }

@@ -34,6 +34,10 @@ sha2 = { version = "0.10", default-features = false }
 getrandom = "0.3"
 # DPAPI (`CryptProtectData`) for refresh tokens: the credential manager caps blobs at 2560 bytes and
 # Entra refresh tokens are 1-4 KB (A1-F35). User scope only, never LOCAL_MACHINE.
+# The OAuth token endpoints are HTTPS POSTs of a form. rustls (not native-tls) because only its
+# crate set is available in this environment's offline registry (M1a-38 measured that).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 
