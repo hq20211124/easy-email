@@ -75,6 +75,18 @@ for needle, why in [
     if needle not in oauth:
         problems.append(f"oauth.rs no longer contains `{needle}`: {why}")
 
+# ---------------------------------------------------------------- 1. the UI asks the table
+# `design/05` §10.1: the "sign in with X" condition must come from the provider table, not from a list of
+# ids in the renderer. A hardcoded id is how a service silently gets the wrong treatment the day it
+# changes its mind — and how 163 would end up with an OAuth button.
+app_js = read(os.path.join(ROOT, "src", "app.js"))
+for index, line in enumerate(app_js.splitlines(), start=1):
+    if "oauthAvailable" in line or "oauthEligible" in line:
+        if re.search(r"provider\.id\s*===", line):
+            problems.append(
+                f"src/app.js:{index} decides OAuth eligibility from a provider id: {line.strip()}"
+            )
+
 # ---------------------------------------------------------------- 4. no embedded WebView
 for path in list(sources(["src"], (".js",))) + list(sources(["src-tauri"], (".rs",))):
     text = read(path)

@@ -109,6 +109,18 @@ impl Provider {
         self.auth == AuthKind::OAuth2
     }
 
+    /// Whether an OAuth2 path exists for this service at all.
+    ///
+    /// `design/05` §10.1 asks the gate to enforce "a provider that is not OAuth2 must not offer an
+    /// OAuth button", and the flip side of that rule is why this is a method rather than a condition
+    /// in the UI: Gmail is `AppPassword` (Google still issues app passwords for accounts with
+    /// two-step verification) **and** supports OAuth. Naming that exception here, next to the table it
+    /// is an exception to, is what keeps the renderer from accumulating provider ids — a list that
+    /// silently rots the day a service changes its mind.
+    pub fn oauth_available(&self) -> bool {
+        self.auth == AuthKind::OAuth2 || self.id == "gmail"
+    }
+
     /// Roughly how many bytes a day this service lets an IMAP client download, when that is known.
     ///
     /// Only Gmail documents a number: about 2.5 GB a day, after which the account is throttled for
@@ -661,6 +673,24 @@ mod tests {
     /// A new address pattern that silently arrives as `Password` is how a user ends up typing a
     /// password into a service that only accepts an authorization code — the failure looks like "the
     /// password is wrong" and costs an afternoon.
+    /// Which services offer an OAuth path, pinned.
+    ///
+    /// `design/05` §10.1: the UI's OAuth condition must come from the table, not from a hardcoded id
+    /// list. This is that table, so a change here is a change to what the wizard offers.
+    #[test]
+    fn the_services_with_an_oauth_path_are_pinned() {
+        let oauth: Vec<&str> = all()
+            .iter()
+            .filter(|provider| provider.oauth_available())
+            .map(|provider| provider.id)
+            .collect();
+        assert_eq!(
+            oauth,
+            vec!["gmail", "outlook", "tutanota"],
+            "the OAuth-capable set changed; the wizard's condition is derived from this"
+        );
+    }
+
     #[test]
     fn every_provider_states_how_it_authenticates() {
         let expected: &[(&str, AuthKind)] = &[

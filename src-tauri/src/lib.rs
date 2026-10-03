@@ -1127,7 +1127,13 @@ fn oauth_client_default(
         .ok_or_else(|| "无法确定数据目录".to_string())?;
 
     let own = mail_core::oauthclient::client_registration(dir).map_err(describe)?;
-    Ok(mail_core::oauth::client_choice(&provider_id, own))
+    let mut choice = mail_core::oauth::client_choice(&provider_id, own);
+    // The renderer decides whether to show the OAuth path from this, not from a provider id of its
+    // own: one table decides, and `providers::oauth_available` is where the exception for Gmail lives.
+    choice.oauth_available = mail_core::providers::by_id(&provider_id)
+        .map(|provider| provider.oauth_available())
+        .unwrap_or(false);
+    Ok(choice)
 }
 /// Sign in with OAuth and stow the refresh token.
 ///

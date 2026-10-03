@@ -43,6 +43,10 @@ pub struct TokenSet {
 /// What the wizard should put in its client-id fields, and what to say about it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClientChoice {
+    /// Whether this provider offers an OAuth path at all, straight from the provider table
+    /// (`design/05` §10.1: the wizard's condition must come from the table, not from an id list).
+    #[serde(default)]
+    pub oauth_available: bool,
     pub client_id: String,
     #[serde(default)]
     pub client_secret: Option<String>,
@@ -111,6 +115,8 @@ impl OAuthProvider {
 pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -> ClientChoice {
     if let crate::oauthclient::Registration::Own { registration } = own {
         return ClientChoice {
+            // Filled in by the command layer, which has the provider table at hand.
+            oauth_available: false,
             client_id: registration.client_id,
             client_secret: registration.client_secret,
             auth_endpoint: registration.auth_uri,
@@ -124,6 +130,7 @@ pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -
     // published equivalent, and inventing one would be worse than asking.
     if provider_id == "gmail" {
         ClientChoice {
+            oauth_available: false,
             client_id: PUBLIC_TEST_CLIENT.0.to_string(),
             client_secret: Some(PUBLIC_TEST_CLIENT.1.to_string()),
             auth_endpoint: None,
@@ -133,6 +140,7 @@ pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -
         }
     } else {
         ClientChoice {
+            oauth_available: false,
             client_id: String::new(),
             client_secret: None,
             auth_endpoint: None,

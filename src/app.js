@@ -2458,9 +2458,11 @@ function openAccountWizard() {
       // A password is required for the accounts that use one. For an OAuth2 provider the credential
       // is the token the browser flow already stored, so demanding a password here would block the
       // one path that cannot have one (design/05 §3.2).
+      // The OAuth path is the one that was *chosen* and is actually available: `oauth_available` comes
+      // from the provider table, so a service that has no OAuth path can never end up requiring one.
       const oauthAccount =
-        modal.querySelector('input[name="wiz-auth"]:checked')?.value === 'oauth' ||
-        modal.querySelector('#wiz-auth-choice').hidden;
+        modal.querySelector('#wiz-auth-choice').dataset.oauthAvailable === '1' &&
+        modal.querySelector('input[name="wiz-auth"]:checked')?.value === 'oauth';
       if (oauthAccount && !oauthAuthorized) {
         toast('请先点上面的「打开浏览器登录」完成授权。', 'err', 9000);
         return false;
@@ -2551,47 +2553,66 @@ function openAccountWizard() {
     const choice = modal.querySelector('#wiz-auth-choice');
     const oauthPath = modal.querySelector('#wiz-oauth-path');
     const passwordPath = modal.querySelector('#wiz-password-path');
-    const oauthEligible = provider.auth === 'oauth2' || provider.id === 'gmail';
+    // From the provider table (`oauth_available`), never from a provider id listed here: an id list in
+    // the renderer is what `design/05` §10.1 exists to prevent, and Gmail's "app password *or* OAuth"
+    // is exactly the kind of exception that belongs next to the table. The answer arrives from the
+    // backend with the registration, so for a moment nothing is known and the path stays hidden.
+    const oauthEligible = () => choice.dataset.oauthAvailable === '1';
     const passwordEligible = provider.auth !== 'oauth2';
-    choice.hidden = !(oauthEligible && passwordEligible);
 
     const selected = () =>
       modal.querySelector('input[name="wiz-auth"]:checked')?.value ??
-      (oauthEligible && !passwordEligible ? 'oauth' : 'password');
+      (oauthEligible() && !passwordEligible ? 'oauth' : 'password');
 
     const applyPath = () => {
       const path = selected();
-      oauthPath.hidden = path !== 'oauth';
-      passwordPath.hidden = path === 'oauth';
+      choice.hidden = !(oauthEligible() && passwordEligible);
+      oauthPath.hidden = path !== 'oauth' || !oauthEligible();
+      passwordPath.hidden = path === 'oauth' && oauthEligible();
       const confirm = modal.querySelector('[data-role="confirm"]');
       if (confirm && !confirm.disabled) {
         // The button at the bottom means different things on the two paths, and saying which is the
-        // difference between "what do I do now?" and a finished setup.
-        confirm.textContent = path === 'oauth' && !oauthAuthorized ? '先完成上面的浏览器登录' : '验证并保存';
+        // difference between "what do I know now?" and a finished setup.
+        confirm.textContent =
+          path === 'oauth' && oauthEligible() && !oauthAuthorized
+            ? '先完成上面的浏览器登录'
+            : '验证并保存';
       }
     };
 
-    if (oauthEligible && !choice.dataset.wired) {
+    if (oauthEligible() && !choice.dataset.wired) {
       choice.dataset.wired = '1';
       choice.querySelectorAll('input[name="wiz-auth"]').forEach((radio) =>
         radio.addEventListener('change', applyPath)
       );
-      if (oauthEligible && !passwordEligible) {
-        choice.querySelector('input[value="oauth"]').checked = true;
-      } else if (!choice.querySelector('input[name="wiz-auth"]:checked')) {
-        // OAuth is the recommended path where it exists: no password typed, revocable authorization.
-        choice.querySelector('input[value="oauth"]').checked = true;
-      }
-      applyPath();
+      // OAuth is the recommended path where it exists: no password typed, revocable authorization.
+      choice.querySelector('input[value="oauth"]').checked = true;
     }
+    applyPath();
 
-    if (oauthEligible) {
-      // The registration comes from the backend, which prefers the one the user dropped into the app
-      // data directory and falls back to the borrowed Thunderbird one with its notice. Asking the
-      // backend keeps a single source of truth: a value hard-coded here could silently disagree with
-      // what `oauth_sign_in` is actually configured to use.
+    {
+      // Asked for **every** provider, not only the ones already known to offer OAuth: the answer is
+      // what tells us that (the provider table is speaking), so gating the question on the answer
+      // would be a deadlock — which is exactly the state this file was in for one commit.
+      //
+      // The backend prefers the registration the user dropped into the app data directory and falls
+      // back to the borrowed Thunderbird one with its notice. Asking it keeps one source of truth: a
+      // value hard-coded here could silently disagree with what `oauth_sign_in` is configured to use.
       invoke('oauth_client_default', { providerId: provider.id })
         .then((client) => {
+          if (client?.oauth_available) {
+            choice.dataset.oauthAvailable = '1';
+            // The answer can arrive after the provider was chosen, so the layout is re-applied here
+            // rather than only where it was first computed.
+            if (!choice.dataset.wired) {
+              choice.dataset.wired = '1';
+              choice.querySelectorAll('input[name="wiz-auth"]').forEach((radio) =>
+                radio.addEventListener('change', applyPath)
+              );
+              choice.querySelector('input[value="oauth"]').checked = true;
+            }
+            applyPath();
+          }
           const clientIdField = modal.querySelector('#wiz-client-id');
           const clientSecretField = modal.querySelector('#wiz-client-secret');
           if (client && client.client_id && !clientIdField.value) {
@@ -2603,7 +2624,7 @@ function openAccountWizard() {
         .catch(() => {});
     }
     const go = modal.querySelector('#wiz-oauth-go');
-    if (oauthEligible && !go.dataset.wired) {
+    if (oauthEligible() && !go.dataset.wired) {
       go.dataset.wired = '1';
       go.addEventListener('click', async () => {
         const address = emailInput.value.trim();
