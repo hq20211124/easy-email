@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-42 真实 reqwest transport（认证轴离线部分齐全） |
+| 最新 | M1a-43 认证轴整条流程 + 系统浏览器（端到端测试；差命令与向导） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -1159,9 +1159,34 @@ refresh token，要 DPAPI 加密文件）、向导按钮、以及真实 `reqwest
 **数字**：`check.ps1` **17 步全绿**；测试 **259**（215 lib + 40 loopback + 4 reachability）；clippy 干净。
 
 ---
+### M1a-43 认证轴：整条流程串起来 + 用系统浏览器（含一条端到端测试）✅（第 49 轮）
+
+M1a-39…42 把零件做齐了（PKCE、URL、回环、交换/刷新、DPAPI、transport），这一轮把它们**按正确顺序串成
+一件事**，并把最后一块平台相关的代码写掉。
+
+- **`sign_in(transport, browser, provider, client_id, client_secret, timeout)`**：绑回环（**先绑**——重定向
+  URI 必须先知道，否则等于把一个没人监听的地址交给服务商）→ 新 PKCE 与新 `state` → 打开系统浏览器 →
+  等回调（**回调里校验 state**）→ 拿 code 去交换（**verifier 用那个从未离开进程的值**）。返回 token；
+  **落盘交给调用方**（它知道账号 id 与数据目录），访问令牌一律不落盘。
+- **`SystemBrowser`**：Windows 上 `cmd /C start "" <url>`。那个**空标题参数**是关键：`start` 会把第一个
+  带引号的参数当成窗口标题，而我们的 URL **必然含 `&`**，少了 `""` 就会被拆成"标题 + 命令"。
+  另外按 A1-F32，**只能**用系统浏览器（内嵌 webview 会被 Google 拒成 `disallowed_useragent`），
+  所以这不是省事而是唯一正确的实现。
+- **端到端测试（`the_whole_flow_opens_the_browser_with_the_state_it_checks`）**：用一个**假浏览器**同时
+  扮演用户与服务商的重定向——它从被交给它的 URL 里**读出 state 与 redirect_uri**，然后回到回环地址上
+  带着**同一个 state** 递 code。于是：URL 用一套值、回调校验用另一套值这种错误，会在这里失败而不是在
+  线上；测试还断言 URL 带 `S256` 与 `access_type=offline`、重定向是 `127.0.0.1`、交换请求里带的是
+  **verifier**，且它的 challenge 就是 URL 里那个。
+
+**仍未做**：Tauri 命令与向导按钮（把 `sign_in` 接到界面上、把 refresh token 交给 `TokenStore` 落盘）。
+那一步需要真人点"允许"，而**真实端点验证仍卡 M0-8（你的 client_id）**。
+
+**数字**：`check.ps1` **17 步全绿**；测试 **260**（216 lib + 40 loopback + 4 reachability）；clippy 干净。
+
+---
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **259 通过、0 失败**
+**当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **260 通过、0 失败**
 （186 lib + 39 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
@@ -1203,11 +1228,11 @@ refresh token，要 DPAPI 加密文件）、向导按钮、以及真实 `reqwest
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近二十六轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+**最近二十七轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport（4xx 正文必须交出去；测试不得上网）**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器（端到端测试用假浏览器）**。
 
 **若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
 （三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
@@ -1252,7 +1277,7 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
 **运行方式**
 ```
 .\tools\check.ps1                     # 17 步门禁（前端不变量 / 会话键 / 负载契约 / 安装包配置 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 259 个测试
+cargo test --workspace                # 260 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
 git log --oneline                     # 94 个提交；git diff 83c1b0c HEAD 是本次全部改动
