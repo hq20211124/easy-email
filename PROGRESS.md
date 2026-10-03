@@ -7,7 +7,7 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **224**（182 lib + 38 loopback + 4 reachability）。
+- **测试数量**：基线 116 → 现在 **225**（183 lib + 38 loopback + 4 reachability）。
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-19 "只让读最近 30 天"的可操作提示 / M1a-18 第 (5) 件现状盘点 |
+| 最新 | M1a-20 镜像收尾（清掉没有对应草稿的服务器副本） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -34,6 +34,27 @@
 
 ---
 
+### M1a-20 镜像收尾：清掉没有对应草稿的服务器副本 ✅（第 26 轮）
+
+M1a-16 留下的那个洞：`mirror_draft` 在服务器 Drafts 里写一份副本，但**本地草稿被删掉时没人管那份副本**
+——发送成功后 worker 删草稿走的是 mail-core 层（没有 IMAP 连接），用户离线丢弃草稿时也一样。于是
+服务器草稿箱里会留下一份**界面里谁也够不着**的副本。
+
+- `UserStore::orphaned_draft_mirrors()`：`draft_mirrors left join drafts where d.id is null`。
+  两种成因都是正常的（用户丢弃 / 发送成功后删），所以这不是异常清理而是常规收尾。
+- `sweep_draft_mirrors()`（src-tauri）：对每条孤儿行，用**我们自己记下的 folder+UID**删副本
+  （绝不靠搜索猜哪份是我们的），然后清行。账号已删或没有凭据 ⇒ 留着下次再来；**绝不动别人的草稿**。
+- 调用点两处：worker 启动时一次（覆盖"上次运行里发出的信"），以及**本轮有信发出之后**一次
+  （否则那份副本会在用户草稿箱里躺到下次启动）。
+
+**测试**：`a_mirror_without_its_draft_is_reported_as_orphaned` —— 同一账号两条镜像、只删掉其中一份草稿，
+断言**只有那条**被判为孤儿，并断言 `take_draft_mirror` 之后列表清空。
+
+**证据边界（如实说）**：判定与清行有单元测试；"服务器上那份副本真的被删掉"这一步**没有真机验证**——
+它需要真的往你的邮箱写一份草稿再删掉它，等你点头。`check.ps1` 15 步全绿、测试 **225**、
+启动冒烟 10 秒存活。
+
+---
 ### M1a-19 "服务器只让读最近 30 天"的提示 ✅（第 25 轮）
 
 `design/04` §5.7 第 4 条 / §6：网易系（A1-F2）的"第三方客户端收取范围"由网页端设置决定，企业版默认
@@ -590,13 +611,13 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **224 通过、0 失败**
-（182 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
+**当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **225 通过、0 失败**
+（183 lib + 38 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 53 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 55 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -641,10 +662,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **镜像的收尾**（M1a-16）：发出后 worker 删的是本地草稿行，`draft_mirrors` 那行与服务器副本会留下
-   ——镜像命令在"草稿已经不存在"时删旧副本并清行即可（`account_id` 已在表里正为此）；
-   再有 §5.1 的"每 30 秒或失焦"镜像。
-   （守卫与"显示给用户"都已在 M1a-17 落地。）
+1. **草稿镜像还差 §5.1 的"每 30 秒或失焦"**（现在只有关闭时镜像一次）；孤儿副本的清理已在 M1a-20 落地。
 2. **发信上限预检**（`design/07` §6）：服务商表还没有 `smtp_max_message_bytes` / `append_limit_bytes`，
    所以"这封信太大了"只能等服务器拒绝（552 现在会落到 `needs_attention`，但那时已经晚一步）。
    附件哈希（M1a-13）让"算准要发多大"变得可做。
@@ -662,10 +680,10 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 **运行方式**
 ```
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 224 个测试
+cargo test --workspace                # 225 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 53 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 55 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
