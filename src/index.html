@@ -27,6 +27,21 @@
   </head>
   <body>
     <div id="app">
+      <!--
+        The window's own title bar, drawn here because the native one is off (`decorations: false`).
+        Two reasons, in this order: the OS title bar on Windows 11 is a dark strip that clashes with the
+        app's own light surface, and it carries a duplicated app name next to the one in the sidebar.
+
+        `data-tauri-drag-region` is what makes the empty part of this strip draggable — without it an
+        undecorated window cannot be moved at all. The buttons are deliberately excluded from it.
+      -->
+      <div id="titlebar" data-tauri-drag-region>
+        <button id="win-min" class="winbtn" title="最小化" aria-label="最小化">&#x2013;</button>
+        <button id="win-max" class="winbtn" title="最大化 / 还原" aria-label="最大化或还原">&#x25A2;</button>
+        <button id="win-close" class="winbtn danger" title="关闭" aria-label="关闭">&#x2715;</button>
+      </div>
+
+      <div id="shell">
       <!-- ---------------------------------------------------------------- accounts + folders -->
       <aside id="sidebar">
         <div class="brand">
@@ -147,12 +162,14 @@
           <pre id="body-text" class="body-text" hidden></pre>
         </article>
       </section>
+      </div>
     </div>
 
     <div id="modal-root" class="modal-root" hidden></div>
     <div id="toast-root" class="toast-root"></div>
 
     <!-- Before app.js: it owns the payload shapes app.js sends (see the header of payload.js). -->
+    <script src="window.js"></script>
     <script src="payload.js"></script>
     <script src="threads.js"></script>
     <script src="app.js"></script>

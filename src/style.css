@@ -89,6 +89,56 @@ textarea {
 /* ---------------------------------------------------------------- layout */
 
 #app {
+  /* Column, not grid: the title strip spans the window, and the three panes below keep the grid they
+     already had (now on `#shell`). */
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/*
+  The app's own title bar. `-webkit-app-region` is not used here: Tauri's `data-tauri-drag-region`
+  attribute is what its window manager listens to, and mixing the two makes one of them silently do
+  nothing. The buttons must not be draggable, which is why they are excluded from the strip's region.
+*/
+#titlebar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  height: 32px;
+  padding: 0 4px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.winbtn {
+  width: 34px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.winbtn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* Closing is the one destructive control up here, and it should look like it. */
+.winbtn.danger:hover {
+  background: #dc2626;
+  color: #fff;
+}
+
+#shell {
+  flex: 1;
   display: grid;
   /*
     minmax() rather than fixed widths: on a small or high-DPI display the window can be only

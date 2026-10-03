@@ -17,6 +17,7 @@
         "minWidth": 640,
         "minHeight": 460,
         "resizable": true,
+        "decorations": false,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication"
       }
     ],
