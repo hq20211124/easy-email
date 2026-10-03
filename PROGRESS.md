@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-38 认证轴环境排查（可做）+ 修掉一个 flaky 测试 |
+| 最新 | M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新，10 条测试；尚未接界面） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -1049,15 +1049,49 @@ WAL 能让读者不进写锁，但没法让一台正在编译的机器变快。*
 **数字**：`check.ps1` **17 步全绿**；测试 **236**（192 lib + 40 loopback + 4 reachability）。
 
 ---
+### M1a-39 认证轴：OAuth 协议那一半（含 10 条测试）✅（第 45 轮）
+
+按 M1a-38 的结论开工。这一轮做的是**不需要人去点"允许"**的那一半：`crates/mail-core/src/oauth.rs`。
+
+- **PKCE**：`Pkce::generate()`（verifier 64 字符 URL-safe）+ `code_challenge_s256()`。**用 RFC 7636 的
+  官方示例值钉住**（`dBjftJeZ4CVP-…` ⇒ `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`），这样"base64 标准表
+  还是 URL-safe 表""带不带 padding"这类改动会立刻变红。verifier/state 来自 **OS 随机源**（`getrandom`），
+  且**可失败**：拿不到熵时宁可不开始登录，也不能用弱随机——注释里写了为什么（state 可猜就是真攻击）。
+- **授权 URL**（`authorization_url`）：Google 与 Microsoft 的端点/scope 都按 A1-F32/F33 写死成常量；测试
+  逐字断言参数，包括**两个最容易漏掉的**：`access_type=offline` 与 `prompt=consent`（缺了它们 Google
+  只给访问令牌、没有刷新令牌 ⇒ 账号能用一小时然后"自己坏了"），以及**verifier 绝不出现在 URL 里**。
+  Microsoft 那份必须是完整资源 URL 形式，且**不**带 Google 专有参数。
+- **令牌交换与刷新**：`exchange_code` / `refresh`，`client_secret` 是 `Option`——因为"端点到底要不要求它"
+  正是 **M0-8 的未决问题**，传 `None` 是合法调用而不是未完成。**刷新会把（可能轮换的）新 refresh token
+  交回调用方**：微软每次刷新都换新并作废旧的（A1-F34），刷新成功却不落盘＝下次启动被锁在外面。
+- **错误分类**（`parse_tokens`）：`invalid_grant` ⇒ 明确告诉用户**要重新登录**（重试无用且会打端点）；
+  `invalid_client` ⇒ 指向"向导需要多一个输入框"（这正是 M0-8 的表现形式）；传输层错误**保持可重试**、
+  且与凭据错误**可区分**（有测试钉住）。
+- **测试 10 条**，全部走一个**假 transport**（记录被问了什么、按脚本回答）：S256 定型值、verifier 长度/
+  随机/URL-safe、Google 参数齐全、Microsoft 资源 scope、交换把 verifier 发出去且不凭空造 secret、
+  **轮换后的新 token 被交回**、`invalid_grant` 的文案、`invalid_client` 的文案、超时不被当成凭据错误、
+  form 编码。
+
+**⚠️ 诚实说明：这个模块目前还没有被界面调用。** 差的是另一半——**回环监听 + 打开系统浏览器 + 令牌落盘
+（A1-F35：凭据管理器只有 2560 字节，装不下 1-4 KB 的 refresh token，要 DPAPI 加密文件）+ 向导按钮**。
+把它们硬塞进本轮只会留下半条流程；这是**下一步**。不过协议这一半是纯的、可测的，先把它钉死是有价值的：
+它包含了整个流程里最容易悄悄错掉的部分（参数、轮换、错误分类）。
+
+**数字**：`check.ps1` **17 步全绿**；测试 **246**（202 lib + 40 loopback + 4 reachability）；clippy 干净
+（过程中它抓了 3 处：可合并的 if、测试里的复杂类型、以及"这个 impl 可以写成 async fn"——最后一处
+**故意不遵从**，因为 trait 声明成 `impl Future + Send` 是为了让真实 transport 能用在 `Send` 的 Tauri
+命令里，故加了带说明的 `allow`）。
+
+---
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **236 通过、0 失败**
+**当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **246 通过、0 失败**
 （186 lib + 39 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
 应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v3**（`sent_index` + `thread_key`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 92 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 94 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -1093,11 +1127,11 @@ WAL 能让读者不进写锁，但没法让一台正在编译的机器变快。*
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近二十二轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+**最近二十三轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新；10 条测试；尚未接界面）**。
 
 **若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
 （三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
@@ -1142,10 +1176,10 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
 **运行方式**
 ```
 .\tools\check.ps1                     # 17 步门禁（前端不变量 / 会话键 / 负载契约 / 安装包配置 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 236 个测试
+cargo test --workspace                # 246 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 92 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 94 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
