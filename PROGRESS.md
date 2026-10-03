@@ -16,7 +16,8 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-11 已发送副本：先搜索再 APPEND（spool 即"未归档"标记） |
+| 最新 | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
+| — | M1a-11 已发送副本：先搜索再 APPEND（spool 即"未归档"标记） |
 | — | M1a-10 崩溃恢复：先查已发送再决定重发（含按角色找 Sent 文件夹） |
 | — | M1a-9 发件箱界面 + 写信改走队列（撤销窗口真正对用户可见） |
 | — | M1a-8 发件箱后端（存储层 + spool + worker + 命令 + 5 秒 tick） |
@@ -27,6 +28,48 @@
 | `66957ad` | M0-7 pragma 定稿 + M0-3 更正推送结论 |
 | `c726f98` | M0-5 修增量截断丢信 + M0-1 库能力探针 |
 | `83c1b0c` | baseline（开工前的可回滚点） |
+
+---
+
+### M1a-12 同步窗口选择器 + 冷启动自动回填一页 ✅（第 18 轮）
+
+交接摘要的第 3 优先级。窗口此前是"存得住、读得出、也真的改变同步行为"（M1a-3/3b），但**界面上没有
+入口**，冷启动也不会自动往回取——这一轮把这两件事补上，目标点 3 到此完整。
+
+**1. 选择器**（侧栏「本地 / 同步窗口」一行显示当前值，点开对话）：
+- 四个选项与后端能存的四种窗口一一对应：最近 N 年 / 每个文件夹最近 N 封 / 全部 / 只按需。
+- 文案对"全部"是诚实的：它写到"一直往回取，直到服务器没有更早的"，因为**配额账本还没做**
+  （`design/04` §5.7），现在没有任何东西给它节流。
+- 提示写明"收窄窗口不会删除已经缓存的邮件"——一个会悄悄删信的设置是个陷阱（这是 M1a-3 就定下的语义）。
+
+**2. 冷启动回填一页**（`design/04` §5.7 的"冷启动自动回填一页"）：
+- 首个文件夹的第一页上屏**之后**才触发，每个账号每个会话一次（`backfilledAccounts`）；
+  只有在真的取回邮件时才提示，失败**不弹错**——用户是来读信的，不是来看一个后台补信失败的红条
+  （离线状态另有既有的提示）。
+- 命令加了 `pages: Option<u32>`：`None` ⇒ **一页**（`BackfillBudget::default()`），
+  `Some(n)` ⇒ 显式多走 n 页。**这个上界才是重点**：窗口可能是"全部邮件"，
+  一个开窗就开始下载几千封信的客户端正是这个上界要防的东西（原来这里写死 `generous()`＝40 页）。
+
+**真机证据**（新工具 `tools/probe-sync-window.mjs`，CDP 驱动真实窗口，**跑完把用户设置原样放回**）：
+```
+initial    : {"kind":"years","value":2} ⇒ 侧栏显示"最近 2 年"
+cold_start : backfilledAccounts 里已有 me@example.com（冷启动确实跑了）
+round_trip : years:3 / count:1234 / all / on_demand 四种**逐字往返成功**
+             （serde 的 tag+content 对 unit 变体是运行期陷阱，这里四种都过了一遍）
+picker     : 打开时预选当前类型；选"最近 5 年"保存后 get 回 {"kind":"years","value":5}，
+             侧栏同步变成"最近 5 年"，弹窗关闭
+restored   : 用户原来的 years:2 已恢复
+```
+启动日志另有一条真机网络证据：
+`[easy-email] 回填到窗口边界 years:2：0 页 / 0 封（HistoryExhausted）` —— 命令真的走通了
+IMAP → 缓存 → 报告这条链，停在"历史到底"这个正常出口（这个 profile 的缓存已到邮箱底部）。
+
+**数字**：`check.ps1` 15 步全绿；测试 **198**（160 lib + 34 loopback + 4 reachability，
+这一轮没有新增 Rust 测试——后端本来就齐了，新增的是界面与上界）；
+前端命令 **25** 个（终于用上了 `get_sync_window`/`set_sync_window`/`backfill_to_window`）。
+
+**未做**：配额账本（`design/04` §5.7，长走一回的节流）、`Some(n)` 多页走的界面入口（目前只有
+`None` 一页在用）、以及 M1a-11/PROGRESS 里列的其余项。
 
 ---
 
@@ -299,9 +342,9 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 
 **当前状态**：`tools/check.ps1` **15 步全绿**；`cargo test --workspace` **198 通过、0 失败**
 （160 lib + 34 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**；
-应用启动冒烟通过（10 秒存活）。发件箱这条链现在是完整的：写信 → 入队（撤销窗口）→ worker 发送 →
-**崩溃恢复先查已发送再决定重发** → **已发送副本先搜索再 APPEND**。所有改动都在 git 里
-（基线 `83c1b0c`，共 36 个提交）。
+应用启动冒烟通过（10 秒存活）。交接摘要里三件优先级现在都落地了：写信接草稿（M1a-7/9）、
+发件箱 worker 全链（M1a-8/9/10/11：撤销窗口 / 退避重试 / needs_attention / 发送后归档）、
+同步窗口选择器 + 冷启动回填（M1a-12）。所有改动都在 git 里（基线 `83c1b0c`，共 38 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -331,6 +374,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 | **M1a-9** | **发件箱界面（状态/倒计时/撤销/重试/删除）+ 写信改走 `enqueue_send`（撤销窗口对用户可见）+ 删掉会绕过队列的 `send_mail`** | **`tools/probe-outbox.mjs` 真机全链路：入队→界面→点撤销→删除→**写信窗口点发送真的入队**（全程不发信）** |
 | **M1a-10** | **崩溃恢复 `sending` 行：按冻结 Message-ID 查已发送 ⇒ 已发出判 sent（绝不重发）/ 查不到回队列 / 大附件问用户 / 问不到原样不动；`sent_mailbox()` 按 RFC 6154 角色找文件夹** | **loopback 真 IMAP：解析出 `Sent` → 恢复判 `sent` 且不可再发 → transcript 里确有 `SEARCH ... MESSAGE-ID`** |
 | **M1a-11** | **已发送副本：先搜索再 APPEND（幂等）、spool 即"未归档"标记、`file_sent_copies` 一趟 + 离线延后；刻意不加 `auto_files_sent` 标志与 `sent_index`（理由见 M1a-11）** | **loopback：服务器已归档 ⇒ `appended:false`，transcript 里有 `MESSAGE-ID` 搜索、**没有 `APPEND`**（重复副本这个失败模式只有这样才看得见）** |
+| **M1a-12** | **同步窗口选择器（四种窗口 + 收窄不删信）+ 冷启动自动回填一页（`pages: None` 一页，防"全部"窗口开窗就下载几千封）** | **`tools/probe-sync-window.mjs` 真机：四种窗口逐字往返 / 选择器预选与保存 / 侧栏同步 / 设置已还原；启动日志有真机 `回填到窗口边界 years:2：0 页 / 0 封（HistoryExhausted）`** |
 
 **被外部条件卡住的两项（不是没做，是做不了；步骤已写清）**
 1. **M0-6 WinAppSDK 通知**：本机没装 Windows App SDK 运行时，`src-tauri` 也没有 `windows` crate 依赖。
@@ -339,17 +383,17 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 2. **M0-8 OAuth 端点探测**：需要你的 client_id 与网络。命令已写在本文档 M0-8 一节，
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
-**下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-1. **附件 sha256**（`design/07` §9"发送前补算"）：现在草稿里 `sha256` 记 `null`，
-   所以 `attachment_changed`/`attachment_missing` 这两条 `needs_attention` 分支还没有触发源。
-   同时是"发送失败后重试前校验附件没被改过"的前提。
-2. **`sent_index`（cache.db）+ 界面的"查看已发送副本"**：现在副本的 UID 只存在于返回值里，
-   没有落库。要加就按 §5.4 步骤 0 的顺序（先写 `pending_file` 再归档），并给 cache.db 加一次真迁移。
-3. **真机验证**：崩溃恢复时序（预置 spool 缺失的 `sending` 行 ⇒ 期望 `needs_attention`，全程不碰 SMTP）
-   + 已发送副本在这台机器的 QQ 账号上真的能落进"已发送"（这一条会真的开一次 IMAP + 可能 APPEND
-   到用户自己的邮箱，跑之前要先问）。
-4. **服务器草稿镜像**（`draft_mirror`，APPEND + `find_uid_by_message_id`，best-effort 不阻塞写信）。
-5. **窗口选择器界面** + 冷启动自动回填一页（并接配额账本，`design/04` §5.7）。
+**下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿；
+交接摘要原本的三件已全部完成，下面是收口与"日常可用"要补的）
+1. **配额账本**（`design/04` §5.7）：现在"全部邮件"窗口的回填没有任何节流——M1a-12 用"冷启动只走
+   一页"挡住了最坏情况，但一个长走一回仍然没有每日字节预算。
+2. **附件 sha256**（`design/07` §9"发送前补算"）：草稿里 `sha256` 记 `null`，
+   `attachment_changed`/`attachment_missing` 两个 `needs_attention` 分支还没有触发源。
+3. **`sent_index`（cache.db）+ 界面"查看已发送副本"**：副本 UID 现在只在返回值里，没落库；
+   要加就按 §5.4 步骤 0 的顺序，并给 cache.db 加一次真迁移。
+4. **真机验证**（都需要先问用户，都会真的动他的邮箱）：真实账号上发一封信 ⇒ 已发送副本落位；
+   崩溃恢复时序（预置 spool 缺失的 `sending` 行 ⇒ 期望 `needs_attention`，全程不碰 SMTP）。
+5. **服务器草稿镜像**（`draft_mirror`，APPEND + `find_uid_by_message_id`，best-effort 不阻塞写信）。
 6. 认证轴（`AuthMethod`：应用专用密码为主 + BYO，P2 已拍板）→ 会话串 → 通知托盘 → 安装包与自动更新。
 
 **运行方式**
@@ -357,11 +401,12 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 .\tools\check.ps1                     # 15 步门禁（前端不变量 / 负载契约 / fmt / clippy / build / test / PE=2）
 cargo test --workspace                # 198 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
-git log --oneline                     # 36 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 38 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
-node tools/inspect-dom.mjs @tools/probe-drafts.mjs    # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
-node tools/inspect-dom.mjs @tools/probe-outbox.mjs    # 发件箱：入队→撤销→删除→写信点发送真的入队
+node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
+node tools/inspect-dom.mjs @tools/probe-outbox.mjs       # 发件箱：入队→撤销→删除→写信点发送真的入队
+node tools/inspect-dom.mjs @tools/probe-sync-window.mjs  # 同步窗口：四种窗口往返 + 冷启动回填（会还原设置）
 ```
 
 ---
