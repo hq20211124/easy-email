@@ -19,13 +19,31 @@ use crate::outbox::OutboxState;
 use crate::sync::SyncWindow;
 
 /// Schema version of `user.db`. Bump when the statements in [`UserStore::migrate`] change.
-pub const USER_SCHEMA_VERSION: i64 = 1;
+///
+/// 2 added `quota_ledger` (`design/04` §5.7). Additive: `migrate` runs `create table if not
+/// exists` for every table it owns, so an existing file picks the new one up on the next open.
+pub const USER_SCHEMA_VERSION: i64 = 2;
+
+/// How long a quota window lasts.
+///
+/// `design/04` §5.7 asks for a "local day" boundary. A rolling 24 hours from the first request of
+/// the window is what is implemented: it is strictly conservative (no window can ever allow more
+/// than the budget) and it needs no timezone database. The cost is that the reset time drifts with
+/// when the app was first used that day, which the UI phrase "明天自动继续" covers honestly enough.
+pub const QUOTA_WINDOW_SECS: i64 = 24 * 60 * 60;
 
 /// `kv` key holding the chosen sync window.
 pub const SYNC_WINDOW_KEY: &str = "sync_window";
 
 /// Tables this database owns, in the order the diagnostics screen lists them.
-pub const USER_TABLES: &[&str] = &["schema_migrations", "kv", "drafts", "outbox", "pending_ops"];
+pub const USER_TABLES: &[&str] = &[
+    "schema_migrations",
+    "kv",
+    "drafts",
+    "outbox",
+    "pending_ops",
+    "quota_ledger",
+];
 
 /// A draft, as stored in `user.db`.
 ///
@@ -128,6 +146,52 @@ impl OutboxItem {
     pub fn parsed_state(&self) -> OutboxState {
         OutboxState::parse_state(&self.state)
     }
+}
+
+/// One account's quota state for the current window (`design/04` §5.7).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaLedger {
+    pub account_id: String,
+    /// Bytes downloaded in the current window.
+    pub bytes_today: i64,
+    /// The window's budget, or `None` when the provider has no documented limit.
+    pub daily_budget: Option<i64>,
+    /// When the current window started.
+    pub window_start: i64,
+    /// When the provider last told us to back off, if it did.
+    pub throttled_until: Option<i64>,
+    /// The oldest date this account can reach, once the server has made that clear.
+    ///
+    /// NetEase's "third-party clients may only read the last 30 days" shows up exactly here, and
+    /// saying so is the difference between a policy and a bug the user blames on us.
+    pub server_floor: Option<i64>,
+}
+
+impl QuotaLedger {
+    /// Bytes left in this window, or `None` when there is no limit.
+    pub fn remaining(&self) -> Option<i64> {
+        self.daily_budget
+            .map(|budget| (budget - self.bytes_today).max(0))
+    }
+
+    /// Whether the account may download right now.
+    pub fn allows_download(&self, now: i64) -> bool {
+        if self.throttled_until.is_some_and(|until| until > now) {
+            return false;
+        }
+        self.remaining() != Some(0)
+    }
+}
+
+fn row_to_quota(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaLedger> {
+    Ok(QuotaLedger {
+        account_id: row.get(0)?,
+        bytes_today: row.get(1)?,
+        daily_budget: row.get(2)?,
+        window_start: row.get(3)?,
+        throttled_until: row.get(4)?,
+        server_floor: row.get(5)?,
+    })
 }
 
 /// A send being committed to the queue.
@@ -342,6 +406,120 @@ impl UserStore {
         let id = id.to_string();
         self.db.write_blocking(move |conn| {
             Ok(conn.execute("delete from drafts where id = ?1", [id])? > 0)
+        })
+    }
+
+    // ------------------------------------------------------------------ quota ledger
+
+    /// The account's quota state, rolling the window over if a day has passed.
+    ///
+    /// The roll-over happens on read as well as on write so a ledger left over from yesterday cannot
+    /// block today's first download — and so the UI can ask for it without causing a write.
+    pub fn quota(&self, account_id: &str, now: i64, budget: Option<i64>) -> Result<QuotaLedger> {
+        let account = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            let existing = conn
+                .query_row(
+                    "select account_id, bytes_today, daily_budget, window_start, throttled_until,
+                            server_floor
+                     from quota_ledger where account_id = ?1",
+                    [&account],
+                    row_to_quota,
+                )
+                .optional()?;
+
+            match existing {
+                Some(mut ledger) if now - ledger.window_start < QUOTA_WINDOW_SECS => {
+                    // The budget can change under a stored ledger (`set_quota_budget`), so take the
+                    // caller's value: the provider table is the source of truth, not this row.
+                    if budget.is_some() {
+                        ledger.daily_budget = budget;
+                        conn.execute(
+                            "update quota_ledger set daily_budget = ?2 where account_id = ?1",
+                            rusqlite::params![account, budget],
+                        )?;
+                    }
+                    Ok(ledger)
+                }
+                _ => {
+                    // First use, or a new window: reset the bytes but keep the throttle and the
+                    // floor, which are facts about the server rather than about this window.
+                    let (throttled, floor) = existing
+                        .map(|ledger| (ledger.throttled_until, ledger.server_floor))
+                        .unwrap_or((None, None));
+                    conn.execute(
+                        "insert into quota_ledger
+                             (account_id, bytes_today, daily_budget, window_start, throttled_until,
+                              server_floor)
+                         values (?1, 0, ?2, ?3, ?4, ?5)
+                         on conflict(account_id) do update set
+                             bytes_today = 0, daily_budget = excluded.daily_budget,
+                             window_start = excluded.window_start",
+                        rusqlite::params![account, budget, now, throttled, floor],
+                    )?;
+                    Ok(QuotaLedger {
+                        account_id: account,
+                        bytes_today: 0,
+                        daily_budget: budget,
+                        window_start: now,
+                        throttled_until: throttled,
+                        server_floor: floor,
+                    })
+                }
+            }
+        })
+    }
+
+    /// Debit the account for what a batch just downloaded.
+    ///
+    /// Returns the ledger as it stands afterwards, so the caller can decide to stop without another
+    /// read. Called after every network batch — a path that skips it is a path that blows through
+    /// the provider's limit, which is why the gate is asserted in tests.
+    pub fn quota_add_bytes(
+        &self,
+        account_id: &str,
+        bytes: i64,
+        now: i64,
+        budget: Option<i64>,
+    ) -> Result<QuotaLedger> {
+        if bytes > 0 {
+            let account = account_id.to_string();
+            self.db.write_blocking(move |conn| {
+                conn.execute(
+                    "insert into quota_ledger (account_id, bytes_today, window_start)
+                     values (?1, ?2, ?3)
+                     on conflict(account_id) do update set bytes_today = bytes_today + ?2",
+                    rusqlite::params![account, bytes, now],
+                )?;
+                Ok(())
+            })?;
+        }
+        self.quota(account_id, now, budget)
+    }
+
+    /// Record that the provider asked us to slow down, and until when.
+    pub fn set_quota_throttled(&self, account_id: &str, until: i64) -> Result<()> {
+        let account = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "insert into quota_ledger (account_id, throttled_until) values (?1, ?2)
+                 on conflict(account_id) do update set throttled_until = ?2",
+                rusqlite::params![account, until],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record how far back the server is willing to go, once it has made that clear.
+    pub fn set_quota_server_floor(&self, account_id: &str, floor: i64) -> Result<()> {
+        let account = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "insert into quota_ledger (account_id, server_floor) values (?1, ?2)
+                 on conflict(account_id) do update set server_floor = ?2",
+                rusqlite::params![account, floor],
+            )?;
+            Ok(())
         })
     }
 
@@ -761,7 +939,20 @@ impl UserStore {
                      created_at      integer not null,
                      updated_at      integer not null
                  );
-                 create index if not exists pending_ops_queue on pending_ops(state, next_attempt_at);",
+                 create index if not exists pending_ops_queue on pending_ops(state, next_attempt_at);
+
+                 -- The daily download quota ledger (design/04 §5.7). It lives here, in the file that
+                 -- is never deleted, on purpose: a ledger in the deletable cache would forget how
+                 -- much was downloaded today, and the next run would happily blow through the
+                 -- provider's limit and get the account throttled.
+                 create table if not exists quota_ledger (
+                     account_id      text primary key,
+                     bytes_today     integer not null default 0,
+                     daily_budget    integer,
+                     window_start    integer not null default 0,
+                     throttled_until integer,
+                     server_floor    integer
+                 );",
             )?;
 
             let now = std::time::SystemTime::now()
@@ -1004,6 +1195,142 @@ mod tests {
         );
         assert_eq!(store.due_outbox(1_005, 10).expect("due").len(), 1);
         assert!(store.claim_outbox(id, 1_005).expect("claim"));
+    }
+
+    #[test]
+    fn the_quota_ledger_accumulates_and_rolls_over_a_day() {
+        let store = UserStore::open_in_memory().expect("open");
+        let budget = Some(1_000);
+
+        let first = store.quota("acc", 1_000, budget).expect("quota");
+        assert_eq!(first.bytes_today, 0);
+        assert_eq!(first.remaining(), Some(1_000));
+        assert!(first.allows_download(1_000));
+
+        let after = store
+            .quota_add_bytes("acc", 400, 1_100, budget)
+            .expect("add");
+        assert_eq!(after.bytes_today, 400);
+        assert_eq!(after.remaining(), Some(600));
+        assert_eq!(
+            store
+                .quota("acc", 1_200, budget)
+                .expect("quota")
+                .bytes_today,
+            400,
+            "reading must not reset the window"
+        );
+
+        // Exact exhaustion stops downloads, which is the whole point: waiting to be told means the
+        // account is already throttled.
+        let spent = store
+            .quota_add_bytes("acc", 600, 1_300, budget)
+            .expect("add");
+        assert_eq!(spent.remaining(), Some(0));
+        assert!(!spent.allows_download(1_300));
+
+        // A new window forgets the bytes...
+        let next = store
+            .quota("acc", 1_000 + QUOTA_WINDOW_SECS, budget)
+            .expect("quota");
+        assert_eq!(next.bytes_today, 0);
+        assert!(next.allows_download(1_000 + QUOTA_WINDOW_SECS));
+        // ...but not what the account has learned about the server.
+        store.set_quota_server_floor("acc", 500).expect("floor");
+        store.set_quota_throttled("acc", 999_999).expect("throttle");
+        let carried = store
+            .quota("acc", 1_000 + QUOTA_WINDOW_SECS * 2, budget)
+            .expect("quota");
+        assert_eq!(carried.server_floor, Some(500));
+        assert_eq!(carried.throttled_until, Some(999_999));
+        assert!(
+            !carried.allows_download(1_000 + QUOTA_WINDOW_SECS * 2),
+            "a throttle outlives the window that learned about it"
+        );
+        assert!(
+            carried.allows_download(999_999),
+            "and stops mattering when it expires"
+        );
+    }
+
+    #[test]
+    fn a_provider_without_a_documented_limit_is_not_throttled_by_us() {
+        // A made-up budget would stop somebody's mail for no reason, so it has to be possible to say
+        // "no limit" and have that mean exactly that.
+        let store = UserStore::open_in_memory().expect("open");
+        store
+            .quota_add_bytes("acc", 10_000_000, 100, None)
+            .expect("add");
+        let ledger = store.quota("acc", 100, None).expect("quota");
+        assert_eq!(ledger.daily_budget, None);
+        assert_eq!(ledger.remaining(), None);
+        assert!(ledger.allows_download(100));
+    }
+
+    #[test]
+    fn the_quota_ledger_outlives_a_restart_and_a_cache_wipe() {
+        // The design puts this in `user.db` for one reason: a ledger in the deletable cache would
+        // forget today's usage, and the next run would march straight into the provider's limit.
+        let path = temp_path("quota");
+        let budget = Some(1_000);
+
+        {
+            let store = UserStore::open(&path).expect("open");
+            store.quota_add_bytes("acc", 700, 100, budget).expect("add");
+        }
+        let reopened = UserStore::open(&path).expect("reopen");
+        assert_eq!(
+            reopened
+                .quota("acc", 200, budget)
+                .expect("quota")
+                .bytes_today,
+            700,
+            "a restart must not hand back a fresh budget"
+        );
+        assert!(
+            reopened
+                .quota("acc", 200, budget)
+                .expect("quota")
+                .allows_download(200),
+            "300 bytes are still left, so the account may still sync"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_older_user_database_gains_the_ledger_on_open() {
+        // v1 files are already on real machines. `migrate` runs `create table if not exists` for
+        // everything it owns, so an additive table arrives on the next open — this test is what keeps
+        // somebody from "optimising" that into a version check that refuses to open old files.
+        let path = temp_path("upgrade");
+        {
+            let store = UserStore::open(&path).expect("open");
+            assert_eq!(
+                store.schema_version().expect("version"),
+                USER_SCHEMA_VERSION
+            );
+        }
+
+        // Drop the table and the recorded version to simulate a file written by v1.
+        {
+            let db = Db::open(&path, DbKind::User, DbOptions::for_kind(DbKind::User)).expect("db");
+            db.write_blocking(|conn: &Connection| {
+                conn.execute_batch("drop table quota_ledger; pragma user_version = 1;")?;
+                Ok(())
+            })
+            .expect("downgrade");
+        }
+
+        let upgraded = UserStore::open(&path).expect("reopen");
+        assert!(
+            upgraded.has_table("quota_ledger").expect("has_table"),
+            "the additive table must arrive on open"
+        );
+        assert_eq!(
+            upgraded.schema_version().expect("version"),
+            USER_SCHEMA_VERSION
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // ------------------------------------------------------------------- drafts

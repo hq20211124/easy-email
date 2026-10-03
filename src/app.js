@@ -694,10 +694,26 @@ async function backfillColdStart() {
     mailbox: state.mailbox,
     pages: 1,
   }).catch(() => null);
-  if (!report || !report.fetched) return;
+  if (!report) return;
+
+  // The daily quota is a fact about the account, not a failure of this walk — and saying *why* the
+  // client suddenly stopped is the difference between a policy and a bug the user blames on us.
+  if (report.stop === 'quota_spent') {
+    toast(quotaMessage(), 'info', 12000);
+    return;
+  }
+  if (!report.fetched) return;
 
   toast(`按同步窗口补齐了 ${report.fetched} 封更早的邮件`, 'info');
   loadMessages({ reset: true });
+}
+
+/** What to say when the provider's daily download quota is what stopped the sync. */
+function quotaMessage() {
+  const account = state.accounts.find((a) => a.id === state.accountId);
+  const provider = state.providers.find((p) => p.id === account?.provider_id);
+  const whose = provider ? `（${provider.display_name} 对每天下载量有限制）` : '';
+  return `今日同步额度已用完${whose}。明天自动继续，也可以在侧栏「同步窗口」里改成更小的范围。`;
 }
 
 /* ---------------------------------------------------------------- drafts */

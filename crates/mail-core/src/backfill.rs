@@ -27,6 +27,13 @@ pub struct BackfillBudget {
     pub max_pages: u32,
     /// Messages to store at most (counted across pages).
     pub max_messages: u32,
+    /// Bytes to fetch at most, as the sum of the sizes the headers report.
+    ///
+    /// This is the quota bound (`design/04` §5.7): Gmail allows roughly 2.5 GB of IMAP downloads a
+    /// day and throttles the account when it is exceeded, so the walk has to stop on its own rather
+    /// than wait to be told. `u64::MAX` means "no byte bound" — for an account whose provider has no
+    /// documented quota, a made-up number would throttle somebody for no reason.
+    pub max_bytes: u64,
 }
 
 impl Default for BackfillBudget {
@@ -36,6 +43,7 @@ impl Default for BackfillBudget {
         Self {
             max_pages: 1,
             max_messages: INITIAL_SYNC as u32,
+            max_bytes: u64::MAX,
         }
     }
 }
@@ -46,6 +54,7 @@ impl BackfillBudget {
         Self {
             max_pages: 40,
             max_messages: 20_000,
+            max_bytes: u64::MAX,
         }
     }
 }
@@ -63,6 +72,10 @@ pub enum BackfillStop {
     HistoryExhausted,
     /// The budget ran out; asking again continues from here.
     BudgetSpent,
+    /// The account's daily download quota is used up (`design/04` §5.7). Distinct from
+    /// [`BackfillStop::BudgetSpent`] because the user has to be told *why* to stop and when it
+    /// resumes — and because nothing may quietly continue past it.
+    QuotaSpent,
 }
 
 /// What one walk did.
@@ -70,6 +83,8 @@ pub enum BackfillStop {
 pub struct BackfillReport {
     pub pages: u32,
     pub fetched: u32,
+    /// Sum of the message sizes the walk stored, which is what the quota ledger is debited by.
+    pub bytes: u64,
     pub stop: BackfillStop,
 }
 
@@ -88,12 +103,14 @@ pub async fn backfill_older(
     let page_size = INITIAL_SYNC;
     let mut pages = 0u32;
     let mut fetched = 0u32;
+    let mut bytes = 0u64;
 
     loop {
         if pages >= budget.max_pages || fetched >= budget.max_messages {
             return Ok(BackfillReport {
                 pages,
                 fetched,
+                bytes,
                 stop: BackfillStop::BudgetSpent,
             });
         }
@@ -104,6 +121,7 @@ pub async fn backfill_older(
             return Ok(BackfillReport {
                 pages,
                 fetched,
+                bytes,
                 stop: BackfillStop::HistoryExhausted,
             });
         };
@@ -125,6 +143,7 @@ pub async fn backfill_older(
             return Ok(BackfillReport {
                 pages,
                 fetched,
+                bytes,
                 stop: BackfillStop::HistoryExhausted,
             });
         }
@@ -132,9 +151,24 @@ pub async fn backfill_older(
         // Store **before** deciding: the page is what the user is about to see, and a stop decision
         // that discarded it would re-fetch the same page next time.
         let newest_in_page = page.iter().filter_map(|m| m.date).max();
+        let page_bytes: u64 = page.iter().map(|m| u64::from(m.size.unwrap_or(0))).sum();
         cache.upsert_summaries(account_id, folder, &page)?;
         pages += 1;
         fetched += page.len() as u32;
+        bytes += page_bytes;
+
+        // The daily quota is the one limit that must never be crossed quietly: exceeding it gets the
+        // account throttled by the provider, which costs the user far more than stopping here
+        // (`design/04` §5.7). Checked before the window rules, because "the window is satisfied" is
+        // not a reason to keep going if the quota is gone *and* not a reason to hide it either.
+        if bytes >= budget.max_bytes {
+            return Ok(BackfillReport {
+                pages,
+                fetched,
+                bytes,
+                stop: BackfillStop::QuotaSpent,
+            });
+        }
 
         match window {
             SyncWindow::Count(target) => {
@@ -142,6 +176,7 @@ pub async fn backfill_older(
                     return Ok(BackfillReport {
                         pages,
                         fetched,
+                        bytes,
                         stop: BackfillStop::WindowSatisfied,
                     });
                 }
@@ -156,6 +191,7 @@ pub async fn backfill_older(
                     return Ok(BackfillReport {
                         pages,
                         fetched,
+                        bytes,
                         stop: BackfillStop::WindowSatisfied,
                     });
                 }
@@ -166,6 +202,7 @@ pub async fn backfill_older(
                 return Ok(BackfillReport {
                     pages,
                     fetched,
+                    bytes,
                     stop: BackfillStop::WindowSatisfied,
                 });
             }

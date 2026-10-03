@@ -127,6 +127,9 @@
     (draft) => draft.subject === COMPOSER_SUBJECT
   );
   for (const draft of scratch) await invoke('delete_draft', { id: draft.id });
+  // The cancelled row is litter too: a real profile should not keep a fake 探针 message in its
+  // 发件箱. `tools/probe-cleanup.mjs` is the safety net for rows an interrupted run left behind.
+  if (composerRow) await invoke('discard_outbox', { id: composerRow.id });
 
   note('composer', {
     queued: Boolean(composerRow),

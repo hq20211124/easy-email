@@ -92,6 +92,19 @@ impl Provider {
     pub fn needs_oauth(&self) -> bool {
         self.auth == AuthKind::OAuth2
     }
+
+    /// Roughly how many bytes a day this service lets an IMAP client download, when that is known.
+    ///
+    /// Only Gmail documents a number: about 2.5 GB a day, after which the account is throttled for
+    /// the next 24 hours. `design/04` §5.7 keeps 8% back and uses 2.3 GB. Everywhere else the limit
+    /// is undocumented or generous, and **inventing one would stop somebody's mail for no reason**,
+    /// so unknown is `None` — which the ledger reads as "no limit".
+    pub fn daily_download_budget(&self) -> Option<u64> {
+        match self.id {
+            "gmail" => Some(2_300_000_000),
+            _ => None,
+        }
+    }
 }
 
 use AuthKind::{AppPassword, OAuth2, Password};
@@ -557,6 +570,31 @@ pub fn by_email(email: &str) -> Option<&'static Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_service_that_documents_a_download_limit_gets_one() {
+        // Gmail's ~2.5 GB/day is a documented, enforced limit; the ledger uses 2.3 GB of it.
+        let gmail = by_id("gmail").expect("gmail");
+        let budget = gmail.daily_download_budget().expect("gmail has a limit");
+        assert!(
+            (2_000_000_000..2_500_000_000).contains(&budget),
+            "the number has to stay inside the documented limit with margin: {budget}"
+        );
+
+        // Everything else: unknown, and unknown must mean "no limit" rather than a guess. A made-up
+        // budget would stop somebody's mail for a reason that does not exist.
+        for provider in all() {
+            if provider.id == "gmail" {
+                continue;
+            }
+            assert_eq!(
+                provider.daily_download_budget(),
+                None,
+                "{} must not be throttled by an invented number",
+                provider.id
+            );
+        }
+    }
 
     #[test]
     fn ids_are_unique() {

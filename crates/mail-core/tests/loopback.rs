@@ -1257,6 +1257,117 @@ async fn an_already_filed_message_is_found_instead_of_appended_again() {
     );
 }
 
+// ===================================================================== quota
+
+/// `design/04` §5.7's gate: once the daily byte budget is spent the walk must **stop asking**, not
+/// wait to be refused. The provider's refusal is what throttles the account for a day, so "we kept
+/// going and got told off" is the failure this test exists to rule out.
+#[tokio::test]
+async fn the_backfill_stops_fetching_once_the_byte_budget_is_spent() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let cache = Cache::open_in_memory().expect("cache");
+
+    // Two messages are cached, so the walk has somewhere to start; `oldest_uid` is what it asks below.
+    {
+        let mut client = within(ImapClient::connect(&cfg, "app-password"))
+            .await
+            .expect("connect");
+        let page = within(client.fetch_newest_headers("INBOX", 2))
+            .await
+            .expect("prime the cache");
+        cache
+            .upsert_summaries(&cfg.id, "INBOX", &page.summaries)
+            .expect("store");
+    }
+
+    let before = transcript(&log).len();
+    let report = within(backfill_older(
+        &mut within(ImapClient::connect(&cfg, "app-password"))
+            .await
+            .expect("connect"),
+        &cache,
+        &cfg.id,
+        "INBOX",
+        SyncWindow::All,
+        // One byte: the first page's sizes already exceed it, so the walk has to stop after that page
+        // however many pages (or messages) the other limits would still allow.
+        BackfillBudget {
+            max_pages: 40,
+            max_messages: 20_000,
+            max_bytes: 1,
+        },
+        1_700_000_000,
+    ))
+    .await
+    .expect("walk");
+
+    assert_eq!(report.stop, BackfillStop::QuotaSpent, "{report:?}");
+    assert_eq!(
+        report.pages, 1,
+        "it stops after the page that spent the budget, not after the next one"
+    );
+    assert!(report.bytes >= 1, "and it reports what it spent");
+
+    // The proof that it stopped asking: exactly one page worth of FETCH after the priming read.
+    let after = transcript(&log);
+    let fetches = after[before..]
+        .iter()
+        .filter(|line| line.to_ascii_uppercase().contains("UID FETCH"))
+        .count();
+    assert_eq!(
+        fetches,
+        1,
+        "a walk that kept going would show more fetches: {:?}",
+        &after[before..]
+    );
+}
+
+/// The budget is a *stop*, not a cap on what is stored: the page that crossed the line is the page
+/// the user is about to read, so it must land in the cache.
+#[tokio::test]
+async fn the_page_that_spent_the_budget_is_still_stored() {
+    let (addr, _log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+
+    // Four messages cached, then walk with a budget that the first fetched page will exhaust.
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let page = within(client.fetch_newest_headers("INBOX", 4))
+        .await
+        .expect("prime");
+
+    let cache = Cache::open_in_memory().expect("cache");
+    // Only the newest two, so there is something older to walk towards.
+    cache
+        .upsert_summaries(&cfg.id, "INBOX", &page.summaries[2..])
+        .expect("store");
+    let before = cache.summary_count(&cfg.id, "INBOX").expect("count");
+
+    let report = within(backfill_older(
+        &mut client,
+        &cache,
+        &cfg.id,
+        "INBOX",
+        SyncWindow::All,
+        BackfillBudget {
+            max_pages: 40,
+            max_messages: 20_000,
+            max_bytes: 1,
+        },
+        1_700_000_000,
+    ))
+    .await
+    .expect("walk");
+
+    assert_eq!(report.stop, BackfillStop::QuotaSpent);
+    assert!(
+        cache.summary_count(&cfg.id, "INBOX").expect("count") > before,
+        "the page it stopped on has to be readable, or the next walk fetches it again"
+    );
+}
+
 // ===================================================================== helpers
 
 fn account(imap: SocketAddr, smtp_addr: SocketAddr) -> AccountConfig {

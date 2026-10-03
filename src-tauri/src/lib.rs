@@ -20,12 +20,12 @@ use mail_core::providers::{self, Provider};
 #[macro_use]
 extern crate mail_core;
 use mail_core::{
-    AccountConfig, BackfillBudget, BackfillReport, Cache, ConnectionPool, ConnectionReport,
-    FilingReport, FilingRun, MailError, MailboxInfo, MessageDetail, MessageSummary, NewOutbox,
-    OutboxItem, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryReport,
-    RecoveryRun, RunReport, SearchHit, SentCopy, Spool, SyncDriver, SyncOutcome, SyncWindow,
-    account_with_login, backfill_older, ensure_sent_copy, file_sent_copies, file_sha256,
-    prepare_attachments, recover_in_flight, run_due, secret, smtp,
+    AccountConfig, BackfillBudget, BackfillReport, BackfillStop, Cache, ConnectionPool,
+    ConnectionReport, FilingReport, FilingRun, MailError, MailboxInfo, MessageDetail,
+    MessageSummary, NewOutbox, OutboxItem, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent,
+    RecoveryReport, RecoveryRun, RunReport, SearchHit, SentCopy, Spool, SyncDriver, SyncOutcome,
+    SyncWindow, account_with_login, backfill_older, ensure_sent_copy, file_sent_copies,
+    file_sha256, prepare_attachments, recover_in_flight, run_due, secret, smtp,
     userdb::{Draft, UserStore},
     watch,
 };
@@ -521,8 +521,8 @@ async fn delete_draft(state: State<'_, AppState>, id: String) -> Result<bool, St
 ///   becoming a multi-thousand-message download when the window is "all mail".
 /// * `Some(n)` — an explicit "keep walking", bounded by `n` pages.
 ///
-/// The daily byte budget (`design/04` §5.7) is what should pace a longer automatic walk; it is not
-/// built yet, which is exactly why the cold start asks for one page and not for "the whole window".
+/// The daily byte budget (`design/04` §5.7) is now what paces this: the walk is given what is left
+/// of the account's quota for the window, and what it fetched is debited afterwards.
 #[tauri::command]
 async fn backfill_to_window(
     state: State<'_, AppState>,
@@ -534,14 +534,38 @@ async fn backfill_to_window(
     let window = state.user.sync_window().map_err(describe)?;
     let cache = state.cache.clone();
     let password = password_for(&account_id)?;
+    let budget_for_account = mail_core::providers::by_id(&cfg.provider_id)
+        .and_then(|provider| provider.daily_download_budget())
+        .map(|bytes| bytes as i64);
 
-    let budget = match pages {
+    // What is left of today's quota. `None` means the provider has no documented limit, which is the
+    // common case and must not be turned into a guess.
+    let ledger = state
+        .user
+        .quota(&account_id, now_seconds(), budget_for_account)
+        .map_err(describe)?;
+    if !ledger.allows_download(now_seconds()) {
+        // Stop before touching the network: overrunning the quota is what gets the account
+        // throttled, and the provider's own refusal is a much worse way to find out.
+        return Ok(BackfillReport {
+            pages: 0,
+            fetched: 0,
+            bytes: 0,
+            stop: BackfillStop::QuotaSpent,
+        });
+    }
+
+    let mut budget = match pages {
         None => BackfillBudget::default(),
         Some(pages) => BackfillBudget {
             max_pages: pages.max(1),
             max_messages: pages.max(1) * mail_core::sync::INITIAL_SYNC as u32,
+            max_bytes: u64::MAX,
         },
     };
+    if let Some(remaining) = ledger.remaining() {
+        budget.max_bytes = remaining.max(0) as u64;
+    }
 
     let report = pool_op!(&state.pool, &cfg, &password, |client| {
         backfill_older(
@@ -557,12 +581,31 @@ async fn backfill_to_window(
     })
     .map_err(describe)?;
 
+    // Debit **after** storing, and only for what was actually stored: a walk that fetched and then
+    // failed has not delivered anything the user can read, and charging for it would be inventing a
+    // cost. (`design/04` §5.7 asks for the ledger to be incremented per batch; the report's `bytes`
+    // is the sum of the sizes of the messages that landed in the cache.)
+    let ledger = state
+        .user
+        .quota_add_bytes(
+            &account_id,
+            report.bytes as i64,
+            now_seconds(),
+            budget_for_account,
+        )
+        .map_err(describe)?;
+
     log_line(&format!(
-        "[easy-email] 回填到窗口边界 {}：{} 页 / {} 封（{:?}）",
+        "[easy-email] 回填到窗口边界 {}：{} 页 / {} 封 / {} 字节（{:?}）；今日已用 {}",
         window.as_key(),
         report.pages,
         report.fetched,
-        report.stop
+        report.bytes,
+        report.stop,
+        match (ledger.bytes_today, ledger.daily_budget) {
+            (used, Some(budget)) => format!("{used}/{budget}"),
+            (used, None) => format!("{used}（无上限）"),
+        }
     ));
     Ok(report)
 }
