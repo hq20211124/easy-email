@@ -184,6 +184,48 @@ pub async fn sign_in<T: TokenTransport, B: BrowserLauncher>(
     .await
 }
 
+/// Turn a stored refresh token into a usable access token, persisting any rotation.
+///
+/// This is the step every connection needs and the one place where A1-F34 bites: the providers that
+/// rotate (Microsoft, every refresh) invalidate the old refresh token when they issue a new one, so a
+/// refresh that is not written back leaves the account working exactly once more. The write happens
+/// here — before the token is returned — rather than at the caller, because "the caller remembered"
+/// is not a thing that can be tested.
+///
+/// A missing token is not an error about the network: it means this account was never signed in, or
+/// the file was deleted, and the user has to do it again.
+pub async fn fresh_access_token<T: TokenTransport>(
+    transport: &T,
+    store: &crate::tokenstore::TokenStore,
+    account_id: &str,
+    provider: OAuthProvider,
+    client_id: &str,
+    client_secret: Option<&str>,
+) -> Result<String> {
+    let Some(refresh_token) = store.load(account_id)? else {
+        return Err(MailError::Credential(
+            "这个账号还没有授权记录，请重新登录一次。".into(),
+        ));
+    };
+
+    let tokens = refresh(
+        transport,
+        provider,
+        client_id,
+        client_secret,
+        &refresh_token,
+    )
+    .await?;
+
+    if let Some(rotated) = tokens.refresh_token.as_deref() {
+        // Before returning: if the process dies between here and the next connection, the token that
+        // still works is the one on disk.
+        store.save(account_id, rotated)?;
+    }
+
+    Ok(tokens.access_token)
+}
+
 /// Everything the token endpoints need to be called.
 /// A trait with plain `async fn` (edition 2024 has them in traits) so a test can drive the whole
 /// flow against a fake, and so the real one has nothing to do but one HTTP form POST.
@@ -1166,6 +1208,101 @@ mod tests {
             error.to_string().contains("连接令牌端点失败"),
             "a refused connection is a transport failure: {error}"
         );
+    }
+
+    // ---------------------------------------------------------------- refresh before connecting
+
+    #[tokio::test]
+    async fn a_rotated_refresh_token_is_written_back_before_it_is_used() {
+        // A1-F34: Microsoft invalidates the old refresh token as it issues a new one, so an account
+        // that refreshes without persisting works exactly once more. The store is the assertion.
+        let dir = std::env::temp_dir().join(format!(
+            "easy-email-oauth-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = crate::tokenstore::TokenStore::new(&dir);
+        store.save("me@example.com", "old-refresh").expect("seed");
+
+        let transport = Fake::replying(r#"{"access_token":"fresh","refresh_token":"rotated"}"#);
+        let token = fresh_access_token(
+            &transport,
+            &store,
+            "me@example.com",
+            MICROSOFT,
+            "client",
+            None,
+        )
+        .await
+        .expect("refresh");
+
+        assert_eq!(token, "fresh");
+        assert_eq!(
+            store.load("me@example.com").expect("load").as_deref(),
+            Some("rotated"),
+            "the new refresh token has to be on disk before the access token is handed out"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_does_not_rotate_keeps_the_token_it_had() {
+        let dir = std::env::temp_dir().join(format!(
+            "easy-email-oauth-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = crate::tokenstore::TokenStore::new(&dir);
+        store.save("me@example.com", "still-good").expect("seed");
+
+        // Google returns no new refresh token on a plain refresh; overwriting with `None` would.
+        let transport = Fake::replying(r#"{"access_token":"fresh"}"#);
+        fresh_access_token(&transport, &store, "me@example.com", GOOGLE, "client", None)
+            .await
+            .expect("refresh");
+
+        assert_eq!(
+            store.load("me@example.com").expect("load").as_deref(),
+            Some("still-good"),
+            "an absent refresh token must not erase the stored one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_account_that_was_never_signed_in_says_so() {
+        let dir = std::env::temp_dir().join(format!(
+            "easy-email-oauth-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = crate::tokenstore::TokenStore::new(&dir);
+        let transport = Fake::replying(r#"{"access_token":"never"}"#);
+
+        let error = fresh_access_token(&transport, &store, "me@example.com", GOOGLE, "c", None)
+            .await
+            .expect_err("no token, no connection");
+        assert!(
+            error.to_string().contains("重新登录"),
+            "and the message has to be about signing in, not about the network: {error}"
+        );
+        assert!(
+            transport.calls.lock().expect("lock").is_empty(),
+            "nothing should be asked of the provider when there is nothing to refresh"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------------------------------------------------------------- the whole flow
