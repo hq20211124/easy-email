@@ -655,13 +655,17 @@ async function refreshSyncWindow() {
  * built yet). Narrowing never deletes what is already cached — it only stops walking further back,
  * which is what the hint says, because a setting that silently removed mail would be a trap.
  */
-function openSyncWindowPicker() {
+async function openSyncWindowPicker() {
   const current = state.syncWindow ?? { kind: 'years', value: 2 };
+  // The ledger decides when the sync stops; showing the same number here is what keeps "今天不再
+  // 往回取" from looking like "网络坏了" (`design/04` §5.7 asks for exactly this honesty).
+  const quota = await invoke('quota_status', { accountId: state.accountId }).catch(() => null);
   const checked = (kind) => (current.kind === kind ? 'checked' : '');
   const years = current.kind === 'years' ? current.value : 2;
   const count = current.kind === 'count' ? current.value : 2000;
 
   const body = `
+    <div class="quota-status">${escapeHtml(quotaLine(quota))}</div>
     <div class="field sync-options">
       <label class="radio-row">
         <input type="radio" name="sync-window" value="years" ${checked('years')} />
@@ -708,6 +712,23 @@ function openSyncWindowPicker() {
   });
 }
 
+/** Today's download allowance, in the words the user needs when the sync stops on its own. */
+function quotaLine(quota) {
+  if (!quota) return '';
+  const used = formatBytes(quota.bytes_today) || '0 B';
+  if (quota.throttled_until && quota.throttled_until * 1000 > Date.now()) {
+    return `服务器暂时限制了同步频率，会在 ${new Date(
+      quota.throttled_until * 1000
+    ).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 后自动重试。`;
+  }
+  if (quota.daily_budget) {
+    const left = Math.max(quota.daily_budget - quota.bytes_today, 0);
+    return `今日已下载 ${used}，额度 ${formatBytes(quota.daily_budget)}（剩余 ${formatBytes(
+      left
+    )}）；用完后会自动停到明天。`;
+  }
+  return `今日已下载 ${used}（这个服务商没有公开的每日下载上限）。`;
+}
 /** Read the picker's form into the wire shape serde expects (`{kind, value}`). */
 function windowFromForm(kind) {
   switch (kind) {

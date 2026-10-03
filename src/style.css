@@ -847,7 +847,7 @@ textarea {
 
 /* The sync-window picker: one option per line, with the number field sitting inside its label
    ("最近 [2] 年") so the sentence reads as one thing. */
-.sync-options {
+.quota-status {`r`n  font-size: 12px;`r`n  color: var(--text-muted);`r`n  background: var(--surface-2);`r`n  border-radius: 8px;`r`n  padding: 8px 10px;`r`n}`r`n`r`n.sync-options {
   gap: 10px;
 }
 

@@ -934,6 +934,25 @@ async fn set_notify_enabled(
         .set_notify_enabled(&account_id, enabled)
         .map_err(describe)
 }
+/// What the account has downloaded today, and what it is allowed to (`design/04` §5.7).
+///
+/// The ledger decides when the sync stops; this is the same number, shown to the user. Without it the
+/// client would start refusing to fetch mail for a reason nothing on screen explains — "配额用尽"
+/// would look exactly like "网络坏了".
+#[tauri::command]
+async fn quota_status(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<mail_core::userdb::QuotaLedger, String> {
+    let cfg = state.find(&account_id)?;
+    let budget = mail_core::providers::by_id(&cfg.provider_id)
+        .and_then(|provider| provider.daily_download_budget())
+        .map(|bytes| bytes as i64);
+    state
+        .user
+        .quota(&account_id, now_seconds(), budget)
+        .map_err(describe)
+}
 /// The largest message this account may send, in bytes.
 ///
 /// `enqueue_send` enforces this before the bytes are frozen; the composer asks for it as well so an
@@ -2149,6 +2168,7 @@ pub fn run() {
             get_notify_enabled,
             set_notify_enabled,
             refresh_thread_keys,
+            quota_status,
             enqueue_send,
             list_outbox,
             cancel_send,

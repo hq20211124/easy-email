@@ -18,6 +18,9 @@
  */
 (async () => {
   const invoke = window.__TAURI__.core.invoke;
+  // A probe that throws would otherwise come back as `{}` through CDP, which reads as "nothing to
+  // report" — the least useful answer. Caught and reported instead.
+  try {
   const steps = [];
   const note = (step, detail) => steps.push({ step, ...detail });
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -51,16 +54,30 @@
   }
   note('round_trip', { roundTrips });
 
+  // ---------------------------------------------------------------- the quota line
+  // The ledger is what stops a long walk; the dialog has to say so, or "今天不再往回取" reads as
+  // "网络坏了". Asserted through the UI rather than the command, because the point is that the user
+  // can see it.
+  const ledger = await invoke('quota_status', { accountId: state.accountId });
+  await openSyncWindowPicker();
+  const modal = document.querySelector('#modal-root .modal');
+  note('quota', {
+    ledger,
+    line: modal?.querySelector('.quota-status')?.textContent ?? '',
+    mentionsBytes: /(B|KB|MB|GB)/.test(modal?.querySelector('.quota-status')?.textContent ?? ''),
+  });
+  closeModal();
+
   // ---------------------------------------------------------------- the picker itself
   await invoke('set_sync_window', { window: original });
   state.syncWindow = original;
-  openSyncWindowPicker();
-  const modal = document.querySelector('#modal-root .modal');
-  const checkedInitially = modal.querySelector('input[name="sync-window"]:checked')?.value ?? null;
+  await openSyncWindowPicker();
+  const picker = document.querySelector('#modal-root .modal');
+  const checkedInitially = picker.querySelector('input[name="sync-window"]:checked')?.value ?? null;
 
-  modal.querySelector('input[value="years"]').checked = true;
-  modal.querySelector('#sync-years').value = '5';
-  modal.querySelector('[data-role="confirm"]').click();
+  picker.querySelector('input[value="years"]').checked = true;
+  picker.querySelector('#sync-years').value = '5';
+  picker.querySelector('[data-role="confirm"]').click();
   await wait(700);
 
   const afterPick = await invoke('get_sync_window');
@@ -80,6 +97,7 @@
   const failures = steps.flatMap((entry) => {
     const bad = [];
     if (entry.step === 'initial' && (!entry.label || !entry.row)) bad.push('initial');
+    if (entry.step === 'quota' && (!entry.line || !entry.mentionsBytes)) bad.push('quota line');
     if (entry.step === 'cold_start' && !entry.ran) bad.push('cold start did not run');
     if (entry.step === 'round_trip') {
       for (const trip of entry.roundTrips) {
@@ -97,4 +115,7 @@
   });
 
   return { passed: failures.length === 0, failures, steps };
+  } catch (error) {
+    return { failed: String((error && error.stack) || error) };
+  }
 })()
