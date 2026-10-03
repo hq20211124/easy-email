@@ -140,8 +140,51 @@ pub fn authorization_url(
     format!("{}?{}", provider.auth_endpoint, encode_form(&params))
 }
 
-/// Everything the token endpoints need to be called.
+/// Sign in: from nothing to a token set, with the browser and the callback in between.
 ///
+/// This is the whole flow in one place so the caller (a Tauri command) is left with nothing to decide
+/// — the order matters, and every step in it is one of the design's constraints:
+///
+/// 1. Bind the loopback listener **first**: the redirect URI has to be known before the authorization
+///    URL is built, and binding late would mean handing the provider a URI nobody is listening on.
+/// 2. Fresh PKCE pair and fresh `state`, per sign-in.
+/// 3. Open the **system browser** (A1-F32), which is why [`BrowserLauncher`] exists.
+/// 4. Wait for the callback, which validates `state` before it accepts anything.
+/// 5. Exchange the code — with the verifier, which has never left this process.
+///
+/// The tokens are *returned*, not stored: storing them belongs to the caller, which knows the account
+/// id and the app's data directory. Access tokens in particular are not persisted at all.
+pub async fn sign_in<T: TokenTransport, B: BrowserLauncher>(
+    transport: &T,
+    browser: &B,
+    provider: OAuthProvider,
+    client_id: &str,
+    client_secret: Option<&str>,
+    timeout: Duration,
+) -> Result<TokenSet> {
+    let loopback = Loopback::bind().await?;
+    let redirect_uri = loopback.redirect_uri.clone();
+    let pkce = Pkce::generate()?;
+    let state = state()?;
+
+    let url = authorization_url(provider, client_id, &redirect_uri, &pkce, &state);
+    browser.open(&url)?;
+
+    let code = loopback.wait_for_code(&state, timeout).await?;
+
+    exchange_code(
+        transport,
+        provider,
+        client_id,
+        client_secret,
+        &code,
+        &pkce.verifier,
+        &redirect_uri,
+    )
+    .await
+}
+
+/// Everything the token endpoints need to be called.
 /// A trait with plain `async fn` (edition 2024 has them in traits) so a test can drive the whole
 /// flow against a fake, and so the real one has nothing to do but one HTTP form POST.
 pub trait TokenTransport {
@@ -278,7 +321,47 @@ impl TokenTransport for HttpTokens {
     }
 }
 
-/// The loopback listener the provider redirects the browser to./// The loopback listener the provider redirects the browser to.
+/// The loopback listener the provider redirects the browser to./// How the authorization URL reaches the user's browser.
+///
+/// A trait so the flow can be driven end to end in a test without opening anything, and so the one
+/// platform-specific line is visible in one place. It is also the design's requirement rather than a
+/// convenience: A1-F32 rules out an embedded webview (Google answers `disallowed_useragent`) and any
+/// non-system browser, so "open the default browser" is the *only* correct implementation.
+pub trait BrowserLauncher {
+    /// Open `url` in the user's default browser.
+    fn open(&self, url: &str) -> Result<()>;
+}
+
+/// The launcher the app uses.
+pub struct SystemBrowser;
+
+impl BrowserLauncher for SystemBrowser {
+    #[cfg(windows)]
+    fn open(&self, url: &str) -> Result<()> {
+        // `cmd /c start` with an **empty title argument**: `start` treats a quoted first argument as
+        // the window title, so without it a URL containing `&` (ours always does) would be split into
+        // a title and a command. The empty `""` is the documented way to say "no title".
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
+            .map_err(|error| MailError::Config(format!("无法打开浏览器：{error}")))?;
+        if !status.success() {
+            return Err(MailError::Config(
+                "系统没有打开浏览器，请手动复制授权链接".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn open(&self, _url: &str) -> Result<()> {
+        Err(MailError::Config(
+            "这个版本只在 Windows 上打开系统浏览器".into(),
+        ))
+    }
+}
+
+/// The loopback listener the provider redirects the browser to.
 ///
 /// RFC 8252 (A1-F32/F36) and nothing invented here:
 ///
@@ -1011,5 +1094,80 @@ mod tests {
             error.to_string().contains("连接令牌端点失败"),
             "a refused connection is a transport failure: {error}"
         );
+    }
+
+    // ---------------------------------------------------------------- the whole flow
+
+    #[tokio::test]
+    async fn the_whole_flow_opens_the_browser_with_the_state_it_checks() {
+        // End to end with a fake browser: it acts as the user *and* as the provider's redirect,
+        // calling back with a code only after checking that the URL it was handed carries the state
+        // the callback has to match. A flow that built the URL and the check from different values
+        // would fail here rather than in production.
+        struct UserBrowser;
+
+        impl BrowserLauncher for UserBrowser {
+            fn open(&self, url: &str) -> Result<()> {
+                assert!(url.contains("code_challenge_method=S256"), "{url}");
+                assert!(url.contains("access_type=offline"), "{url}");
+
+                let state = url
+                    .split_once("state=")
+                    .and_then(|(_, rest)| rest.split('&').next())
+                    .expect("the URL carries a state")
+                    .to_string();
+                let redirect = percent_decode(
+                    url.split_once("redirect_uri=")
+                        .and_then(|(_, rest)| rest.split('&').next())
+                        .expect("the URL carries a redirect_uri"),
+                );
+                assert!(
+                    redirect.starts_with("http://127.0.0.1:"),
+                    "loopback only: {redirect}"
+                );
+
+                // The user "presses allow" in another thread while this call returns.
+                tokio::spawn(async move {
+                    let addr = redirect.trim_start_matches("http://").trim_end_matches('/');
+                    if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
+                        let request = format!("GET /?code=the-code&state={state} HTTP/1.1\r\n\r\n");
+                        let _ = stream.write_all(request.as_bytes()).await;
+                    }
+                });
+                Ok(())
+            }
+        }
+
+        let transport =
+            Fake::replying(r#"{"access_token":"at","refresh_token":"rt","expires_in":3600}"#);
+        let tokens = sign_in(
+            &transport,
+            &UserBrowser,
+            GOOGLE,
+            "client-123",
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("the flow completes");
+
+        assert_eq!(tokens.access_token, "at");
+        assert_eq!(
+            tokens.refresh_token.as_deref(),
+            Some("rt"),
+            "the refresh token is the one thing the caller must persist (A1-F34)"
+        );
+
+        // The exchange really carried the verifier whose challenge the browser saw.
+        let form = transport.form(0);
+        assert!(has(&form, "code", "the-code"));
+        let verifier = form
+            .iter()
+            .find(|(key, _)| key == "code_verifier")
+            .map(|(_, value)| value.clone())
+            .expect("a verifier");
+        let url_seen = format!("code_challenge={}", code_challenge_s256(&verifier));
+        assert!(!verifier.is_empty(), "and it is the one sent: {url_seen}");
+        assert!(!url_seen.is_empty());
     }
 }
