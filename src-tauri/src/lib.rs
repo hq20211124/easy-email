@@ -764,18 +764,36 @@ async fn discard_outbox(state: State<'_, AppState>, id: i64) -> Result<bool, Str
     Ok(removed)
 }
 
+/// Where a delivered message's Sent copy is, if it was ever filed (`design/07` §5.4).
+///
+/// The outbox row itself only knows the `Message-ID`; the folder and UID live in the cache's
+/// `sent_index`, which is derived data — rebuilding the cache loses the *link*, not the copy.
+#[tauri::command]
+async fn sent_copy(
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+) -> Result<Option<mail_core::cache::SentCopyRecord>, String> {
+    state
+        .cache
+        .clone()
+        .sent_copy(&account_id, &message_id)
+        .map_err(describe)
+}
+
 /// Run one pass of the outbox worker for every configured account.
 ///
 /// One account at a time on purpose: the connection budget in `design/04` is per account, and a
 /// mailbox that is being rate-limited should not be sent two connections' worth of work at once.
 async fn outbox_pass(app: &AppHandle) -> Result<(RunReport, FilingReport), String> {
-    let (accounts, store, spool, pool) = {
+    let (accounts, store, spool, pool, cache) = {
         let state = app.state::<AppState>();
         (
             state.snapshot(),
             state.user.clone(),
             state.spool.clone(),
             state.pool.clone(),
+            state.cache.clone(),
         )
     };
 
@@ -818,6 +836,8 @@ async fn outbox_pass(app: &AppHandle) -> Result<(RunReport, FilingReport), Strin
             FilingRun {
                 store: &store,
                 spool: &spool,
+                cache: &cache,
+                now: now_seconds(),
             },
             |message_id, bytes| {
                 let pool = pool.clone();
@@ -1814,6 +1834,7 @@ pub fn run() {
             cancel_send,
             retry_send,
             discard_outbox,
+            sent_copy,
             load_more_messages,
             fetch_message,
             mark_seen,

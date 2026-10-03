@@ -26,7 +26,24 @@ use crate::error::{MailError, Result};
 use crate::model::{MailboxInfo, MessageDetail, MessageSummary};
 
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Where a delivered message's Sent copy is (`design/07` §5.4).
+///
+/// Derived data: it lives in the rebuildable cache, and losing it costs the "查看已发送副本" link,
+/// nothing more. The *intent* to archive is carried by the spool file's existence instead, which is
+/// why that is in `user.db`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SentCopyRecord {
+    pub account_id: String,
+    pub message_id: String,
+    /// The folder it is in, as the wire name.
+    pub folder: String,
+    /// Its UID, or `None` when the server would not tell us (`APPEND` does not return one; A1-F43).
+    /// `None` means "the copy is there, its number is unknown", never "no copy".
+    pub uid: Option<u32>,
+    pub local_at: i64,
+}
 
 /// How far a folder has been synced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +280,18 @@ impl Cache {
                      subject, from_name, from_addr, to_addrs, body,
                      account_id unindexed, folder unindexed, uid unindexed,
                      tokenize = 'unicode61'
+                 );
+
+                 -- Where each delivered message's Sent copy ended up (design/07 §5.4/§7). Derived
+                 -- data, so it belongs in the cache that can be rebuilt — the *intent* to archive is
+                 -- carried by the spool file's existence, not by this row.
+                 create table if not exists sent_index (
+                     account_id  text not null,
+                     message_id  text not null,
+                     folder      text not null,
+                     uid         integer,
+                     local_at    integer not null,
+                     primary key (account_id, message_id)
                  );",
             )?;
 
@@ -574,6 +603,66 @@ impl Cache {
             |row| row.get(0),
         )?;
         Ok(count as u32)
+    }
+
+    // ------------------------------------------------------------------ sent copies
+
+    /// Schema version recorded in the file.
+    pub fn schema_version(&self) -> Result<i64> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn.query_row("pragma user_version", [], |row| row.get(0))?)
+    }
+
+    /// Remember where a delivered message's Sent copy ended up (`design/07` §5.4).
+    ///
+    /// Upsert on `(account_id, message_id)`: the archive step refuses to write a second copy, so a
+    /// second *record* for the same message can only mean the same copy found again — replacing it is
+    /// right, and two rows would make the link ambiguous.
+    pub fn record_sent_copy(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        folder: &str,
+        uid: Option<u32>,
+        now: i64,
+    ) -> Result<()> {
+        let account_id = account_id.to_string();
+        let message_id = message_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+            conn.execute(
+                "insert into sent_index (account_id, message_id, folder, uid, local_at)
+                 values (?1, ?2, ?3, ?4, ?5)
+                 on conflict(account_id, message_id) do update set
+                     folder = excluded.folder, uid = excluded.uid, local_at = excluded.local_at",
+                params![account_id, message_id, folder, uid.map(i64::from), now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Where this message's Sent copy is, if it was ever filed.
+    pub fn sent_copy(&self, account_id: &str, message_id: &str) -> Result<Option<SentCopyRecord>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn
+            .query_row(
+                "select account_id, message_id, folder, uid, local_at
+                 from sent_index where account_id = ?1 and message_id = ?2",
+                params![account_id, message_id],
+                |row| {
+                    Ok(SentCopyRecord {
+                        account_id: row.get(0)?,
+                        message_id: row.get(1)?,
+                        folder: row.get(2)?,
+                        // A `NULL` uid is the documented APPEND outcome (A1-F43), not a missing copy.
+                        uid: row.get::<_, Option<i64>>(3)?.map(|uid| uid as u32),
+                        local_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Reflect a flag change locally so the list does not disagree with the server.
@@ -1005,6 +1094,114 @@ mod tests {
         cache.rebuild_with_auto_vacuum().expect("rebuild");
         assert!(!cache.needs_auto_vacuum_rebuild().expect("check"));
         drop(cache);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `design/07` §5.4: the link from a delivered message to its copy in 已发送.
+    #[test]
+    fn a_sent_copy_is_recorded_and_found_again() {
+        let cache = Cache::open_in_memory().expect("open");
+        assert_eq!(
+            cache.sent_copy("acc", "<a@x>").expect("read"),
+            None,
+            "nothing recorded yet"
+        );
+
+        cache
+            .record_sent_copy("acc", "<a@x>", "Sent", Some(4242), 100)
+            .expect("record");
+        let found = cache
+            .sent_copy("acc", "<a@x>")
+            .expect("read")
+            .expect("present");
+        assert_eq!(found.folder, "Sent");
+        assert_eq!(found.uid, Some(4242));
+
+        // Another account's message with the same id is a different row: the index is per account.
+        assert_eq!(cache.sent_copy("other", "<a@x>").expect("read"), None);
+
+        // Recording the same message twice must not produce two rows — the archive step refuses to
+        // write a second copy, so a second record is the same copy found again.
+        cache
+            .record_sent_copy("acc", "<a@x>", "Sent", None, 200)
+            .expect("record again");
+        let again = cache
+            .sent_copy("acc", "<a@x>")
+            .expect("read")
+            .expect("present");
+        assert_eq!(again.uid, None, "the later observation wins");
+        assert_eq!(again.local_at, 200);
+    }
+
+    #[test]
+    fn a_sent_copy_without_a_known_uid_is_still_a_copy() {
+        // APPEND does not return a UID (A1-F43), so "we filed it but cannot number it" has to be
+        // representable — otherwise the UI would offer to look up a message that is already there.
+        let cache = Cache::open_in_memory().expect("open");
+        cache
+            .record_sent_copy("acc", "<b@x>", "Sent Messages", None, 1)
+            .expect("record");
+        let found = cache
+            .sent_copy("acc", "<b@x>")
+            .expect("read")
+            .expect("present");
+        assert_eq!(found.uid, None);
+        assert_eq!(found.folder, "Sent Messages");
+    }
+
+    /// A cache written by the previous schema gains `sent_index` on open.
+    ///
+    /// The table is additive, so the same rule as `user.db` applies: `create table if not exists` is
+    /// the migration, and this test is what keeps somebody from turning that into a version check that
+    /// refuses to open old files (which would throw away every user's cached mail).
+    #[test]
+    fn an_older_cache_gains_the_sent_index_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-sent-index-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        // A file at the previous schema version, without the new table.
+        {
+            let cache = Cache::open(&path).expect("open");
+            assert_eq!(cache.schema_version().expect("version"), SCHEMA_VERSION);
+            cache
+                .record_sent_copy("acc", "<c@x>", "Sent", Some(7), 1)
+                .expect("record");
+        }
+        {
+            let db = Db::open(
+                &path,
+                crate::db::DbKind::Cache,
+                crate::db::DbOptions::for_kind(crate::db::DbKind::Cache),
+            )
+            .expect("db");
+            db.write_blocking(|conn: &Connection| {
+                conn.execute_batch("drop table sent_index; pragma user_version = 1;")?;
+                Ok(())
+            })
+            .expect("downgrade");
+        }
+
+        let upgraded = Cache::open(&path).expect("reopen");
+        assert_eq!(
+            upgraded.schema_version().expect("version"),
+            SCHEMA_VERSION,
+            "opening must bring the schema up, not refuse the file"
+        );
+        assert!(
+            upgraded.sent_copy("acc", "<c@x>").expect("read").is_none(),
+            "the dropped rows are gone, which is fine: this is derived data"
+        );
+        upgraded
+            .record_sent_copy("acc", "<d@x>", "Sent", Some(8), 2)
+            .expect("the new table must be usable");
+        assert!(upgraded.sent_copy("acc", "<d@x>").expect("read").is_some());
+        drop(upgraded);
         let _ = std::fs::remove_file(&path);
     }
 

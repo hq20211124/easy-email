@@ -933,6 +933,9 @@ function renderOutbox(list) {
       buttons.appendChild(rowButton('撤销', () => cancelSend(item.id)));
     } else if (state_ === 'failed' || state_ === 'needs_attention' || state_ === 'cancelled') {
       buttons.appendChild(rowButton('重试', () => retrySend(item.id)));
+    } else if (state_ === 'sent') {
+      // The copy is on the server, not in this list: the button opens it where it lives.
+      buttons.appendChild(rowButton('查看副本', () => openSentCopy(item)));
     }
     if (state_ !== 'sending') {
       buttons.appendChild(rowButton('删除', () => discardOutboxItem(item.id)));
@@ -1008,8 +1011,64 @@ async function cancelSend(id) {
   await refreshOutbox();
 }
 
-async function retrySend(id) {
-  const queued = await run('重新发送', () => invoke('retry_send', { id }));
+/**
+ * Open the Sent copy of a delivered message.
+ *
+ * The link (folder + UID) lives in the cache's `sent_index`, keyed by the frozen `Message-ID` — the
+ * same identity the send path used, and the reason the outbox row does not need to remember it. A
+ * `null` UID is a documented outcome (the server does not always return one on APPEND), so the
+ * folder is opened and the user is told rather than being shown a button that does nothing.
+ */
+async function openSentCopy(item) {
+  const preview = outboxPreview(item);
+  const messageId = item.sent_message_id;
+  if (!messageId) {
+    toast('这条记录里没有 Message-ID，找不到对应的副本。', 'err');
+    return;
+  }
+
+  const record = await run('查找已发送副本', () =>
+    invoke('sent_copy', { accountId: state.accountId, messageId })
+  );
+  if (record === null) return;
+
+  if (!record) {
+    toast('这封信的副本没有登记（可能缓存被清理过）。可以在「文件夹 → 已发送」里按主题找。', 'info', 9000);
+    return;
+  }
+
+  const box = state.mailboxes.find((mailbox) => mailbox.name === record.folder);
+  if (!box) {
+    toast(`找不到文件夹「${record.folder}」，它可能已被删除或改名。`, 'err');
+    return;
+  }
+  if (record.uid === undefined || record.uid === null) {
+    toast(`副本在「${box.display_name || box.name}」里，但服务器没有给它的编号，请在那里按主题查找。`, 'info', 9000);
+    return;
+  }
+
+  state.view = 'mail';
+  exitSearchMode({ reload: false });
+  selectMailbox(box);
+  state.limit = PAGE_SIZE;
+  renderMailboxes();
+  await loadMessages({ reset: true });
+
+  // The reader fetches the body by (folder, UID), so the summary handed in only has to be enough to
+  // paint until the detail arrives.
+  await openMessage({
+    uid: record.uid,
+    subject: preview.subject === '(无主题)' ? '' : preview.subject,
+    from_name: null,
+    from_addr: null,
+    date: null,
+    seen: true,
+    size: null,
+    flagged: false,
+  });
+}
+
+async function retrySend(id) {  const queued = await run('重新发送', () => invoke('retry_send', { id }));
   if (queued === null) return;
   toast(queued ? '已重新排队' : '这封信的状态不允许重试', queued ? 'ok' : 'err');
   await refreshOutbox();

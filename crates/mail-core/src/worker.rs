@@ -14,6 +14,7 @@
 use std::future::Future;
 use std::path::Path;
 
+use crate::cache::Cache;
 use crate::error::{MailError, Result};
 use crate::model::{AccountConfig, OutgoingMail};
 use crate::outbox::{Verdict, next_attempt_delay_secs, verdict_for_failure};
@@ -375,6 +376,10 @@ where
 pub struct FilingRun<'a> {
     pub store: &'a UserStore,
     pub spool: &'a Spool,
+    /// Where the resulting link to the copy is recorded (`design/07` §5.4). Derived data, so it
+    /// lives in the rebuildable cache: losing it costs the "查看已发送副本" link and nothing else.
+    pub cache: &'a Cache,
+    pub now: i64,
 }
 
 /// What one filing pass did.
@@ -423,8 +428,20 @@ where
             continue;
         };
 
+        let filed_id = message_id.clone();
         match file_one(message_id, bytes).await {
-            Ok(Some(_copy)) => {
+            Ok(Some(copy)) => {
+                // Record where it is before forgetting the bytes: this row is the only way the UI can
+                // offer "查看已发送副本" later, and the spool is about to go. Best-effort on purpose —
+                // it is derived data, and failing to write it must not fail a send that already
+                // happened (the next pass files and records again).
+                let _ = run.cache.record_sent_copy(
+                    &item.account_id,
+                    &filed_id,
+                    &copy.folder,
+                    copy.uid,
+                    run.now,
+                );
                 run.spool.remove(Path::new(&path));
                 run.store.clear_outbox_spool(item.id)?;
                 report.filed += 1;
@@ -626,6 +643,7 @@ mod tests {
         let spool = Spool::open(&dir).expect("spool");
         let (store, id) = queued(&spool, 0, 1_000);
         let cfg = account();
+        let cache = Cache::open_in_memory().expect("cache");
 
         // Delivered first: the filing pass only ever looks at rows that are already sent.
         run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
@@ -646,6 +664,8 @@ mod tests {
             FilingRun {
                 store: &store,
                 spool: &spool,
+                cache: &cache,
+                now: 1_000,
             },
             move |message_id, _bytes| {
                 log.lock().expect("lock").push(message_id);
@@ -667,6 +687,16 @@ mod tests {
             1,
             "the copy is looked up by the frozen Message-ID"
         );
+        // And the link to the copy is written down: this row is what lets the outbox offer
+        // "查看已发送副本" after the bytes are gone.
+        let filed_id = asked.lock().expect("lock")[0].clone();
+        let recorded = cache
+            .sent_copy("t", &filed_id)
+            .expect("read")
+            .expect("the link must be recorded");
+        assert_eq!(recorded.folder, "Sent");
+        assert_eq!(recorded.uid, Some(4242));
+        assert_eq!(recorded.local_at, 1_000);
         assert!(!Path::new(&path).exists(), "the bytes are gone once filed");
         assert!(
             store.sent_awaiting_copy().expect("awaiting").is_empty(),
@@ -682,6 +712,7 @@ mod tests {
         let spool = Spool::open(&dir).expect("spool");
         let (store, _id) = queued(&spool, 0, 1_000);
         let cfg = account();
+        let cache = Cache::open_in_memory().expect("cache");
         run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
             Ok(())
         })
@@ -692,6 +723,8 @@ mod tests {
             FilingRun {
                 store: &store,
                 spool: &spool,
+                cache: &cache,
+                now: 1_000,
             },
             |_, _| async { Err(MailError::Smtp("connection refused".into())) },
         )
@@ -709,6 +742,7 @@ mod tests {
         let spool = Spool::open(&dir).expect("spool");
         let (store, _id) = queued(&spool, 0, 1_000);
         let cfg = account();
+        let cache = Cache::open_in_memory().expect("cache");
         run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
             Ok(())
         })
@@ -719,6 +753,8 @@ mod tests {
             FilingRun {
                 store: &store,
                 spool: &spool,
+                cache: &cache,
+                now: 1_000,
             },
             |_, _| async { Ok(None) },
         )

@@ -138,6 +138,16 @@
     scratchDraftsRemoved: scratch.length,
   });
 
+  // ---------------------------------------------------------------- 6. the sent-copy link
+  // A message that was never filed has no link, and that has to be an honest `null` rather than an
+  // error: the UI turns it into "去「已发送」里按主题找" instead of a button that does nothing. (A
+  // real link needs a real delivery, which this probe must not do — see the header.)
+  const noLink = await invoke('sent_copy', {
+    accountId: ACCOUNT,
+    messageId: '<never-filed@example.invalid>',
+  });
+  note('sent_copy', { value: noLink, isNull: noLink === null });
+
   const failures = steps.flatMap((entry) => {
     const bad = [];
     if (entry.step === 'enqueue') {
@@ -163,6 +173,7 @@
       if (entry.state !== 'cancelled') bad.push('composer cancel');
       if (!entry.modalClosed) bad.push('composer modal stayed open');
     }
+    if (entry.step === 'sent_copy' && !entry.isNull) bad.push('sent_copy');
     return bad;
   });
 
