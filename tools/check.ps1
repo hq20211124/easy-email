@@ -257,6 +257,47 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'the installer configuration points at files that exist' {
+        # `installerHooks` is a path inside a JSON file: a typo there does not fail anything until
+        # somebody runs `tauri build`, which needs the Tauri CLI and a network — so it would be found
+        # by the person cutting a release, not by the person who broke it. The two things worth
+        # checking are checkable here: the config parses, and every path it names is on disk.
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node -e "
+          const fs = require('fs');
+          const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          const win = conf.bundle?.windows ?? {};
+          const nsis = win.nsis ?? {};
+          const problems = [];
+          if (nsis.installMode !== 'currentUser') {
+            problems.push('nsis.installMode must stay currentUser: an elevated install cannot raise notifications (design/17 §9)');
+          }
+          if (!nsis.installerHooks) {
+            problems.push('nsis.installerHooks is missing: without it the default-apps registration never happens');
+          } else if (!fs.existsSync('src-tauri/' + nsis.installerHooks)) {
+            problems.push('nsis.installerHooks points at a file that does not exist: ' + nsis.installerHooks);
+          }
+          if (win.webviewInstallMode?.type !== 'embedBootstrapper') {
+            problems.push('webviewInstallMode should be embedBootstrapper + silent (design/17 §2)');
+          }
+          for (const icon of [conf.bundle?.icon ?? [], nsis.installerIcon ? [nsis.installerIcon] : []].flat()) {
+            if (!fs.existsSync('src-tauri/' + icon)) problems.push('icon missing: ' + icon);
+          }
+          problems.forEach((p) => console.error('- ' + p));
+          if (problems.length > 0) process.exit(1);
+          console.log('installer: currentUser + hooks (' + nsis.installerHooks + ') + embedBootstrapper, all files present');
+        " 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'the installer configuration would not produce what design/17 describes' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'payloads sent to struct commands match the Rust structs' {
         # `send_mail` takes `mail: OutgoingMail` and `save_draft` takes `draft: Draft`. Tauri only
         # renames the command *argument*; the struct is deserialised by serde under its exact Rust
