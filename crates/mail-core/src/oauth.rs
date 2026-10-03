@@ -1,0 +1,545 @@
+//! OAuth 2.0 for mail accounts: the protocol half.
+//!
+//! `design/05` §3.1 and A1-F32/F33/F34/F36 pin the shape of this, and every one of them is a
+//! constraint that would be expensive to discover later:
+//!
+//! * **Authorization code + PKCE (S256), loopback redirect, system browser.** No OOB (Google shut it
+//!   down in 2022-2023), no embedded webview (Google answers `disallowed_useragent`), no device-code
+//!   flow on Windows. A1-F32.
+//! * **`state` must be high-entropy and must be checked** on the callback: it is the only thing
+//!   stopping a local process from handing us somebody else's authorization code (A1-F36).
+//! * **Microsoft rotates refresh tokens**: every refresh issues a new one and the old one is
+//!   expected to be discarded, so a refresh that succeeds and is not persisted locks the user out
+//!   (A1-F34). That is why [`TokenSet::refresh_token`] is returned from a *refresh* as well as from
+//!   an exchange, and why nothing here keeps tokens in memory beyond the call.
+//! * **`client_secret` is not a secret in a desktop app** (Google's own words, A1-F32) but the
+//!   question that decides the wizard's shape is whether the token endpoint *requires* it — that is
+//!   M0-8, and it is why every call here takes it as an `Option`.
+//!
+//! What is deliberately **not** here: opening the browser and catching the redirect. That half needs
+//! a human to press "allow" and a real client id, so it stays next to the UI where it can be seen
+//! (`design/05` §3.1); this half is pure and testable, and its tests use a fake transport.
+
+use crate::error::{MailError, Result};
+
+/// The pieces of an OAuth token response this client needs.
+///
+/// `refresh_token` is `None` on a refresh where the provider did not rotate — and a *successful*
+/// refresh must persist whatever came back, because the providers that rotate issue a new one every
+/// time (A1-F34).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenSet {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Seconds until the access token expires, as the provider reported it.
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+}
+
+/// A provider's authorization and token endpoints, and the scope that works for IMAP/SMTP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OAuthProvider {
+    pub auth_endpoint: &'static str,
+    pub token_endpoint: &'static str,
+    pub scope: &'static str,
+    /// Whether Google-style extra parameters should be sent (`access_type=offline`, `prompt=consent`).
+    ///
+    /// Without them Google hands back an access token and **no** refresh token, and the account works
+    /// for an hour and then stops — the single most confusing failure this flow can have.
+    pub needs_offline_params: bool,
+}
+
+/// Google's endpoints for a desktop client (A1-F32).
+pub const GOOGLE: OAuthProvider = OAuthProvider {
+    auth_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+    token_endpoint: "https://oauth2.googleapis.com/token",
+    scope: "https://mail.google.com/",
+    needs_offline_params: true,
+};
+
+/// Microsoft's endpoints. The scope must be the full resource URLs (A1-F33) — the short forms are
+/// rejected, and Office 365 needs the `.default`-style resource scopes to consent at all.
+pub const MICROSOFT: OAuthProvider = OAuthProvider {
+    auth_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+    token_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    scope: "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access",
+    needs_offline_params: false,
+};
+
+/// A PKCE verifier and its S256 challenge.
+///
+/// The verifier must be 43-128 characters of unreserved ASCII; `design`'s callers treat it as opaque
+/// and keep it only for the duration of one sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pkce {
+    pub verifier: String,
+    pub challenge: String,
+}
+
+impl Pkce {
+    /// A fresh pair, from the OS random source.
+    ///
+    /// Fallible on purpose: if the OS cannot give us entropy, continuing with a weak verifier would
+    /// defeat the entire mechanism, and the only honest answer is to refuse to start a sign-in.
+    pub fn generate() -> Result<Pkce> {
+        let verifier = random_url_safe(64)?;
+        let challenge = code_challenge_s256(&verifier);
+        Ok(Pkce {
+            verifier,
+            challenge,
+        })
+    }
+}
+
+/// A `state` value for one authorization request (A1-F36: high entropy, and it must be checked).
+pub fn state() -> Result<String> {
+    random_url_safe(32)
+}
+
+/// PKCE's S256 challenge: base64url(SHA-256(verifier)), without padding.
+pub fn code_challenge_s256(verifier: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// The URL the **system browser** is sent to.
+///
+/// Built as a string rather than through a client library on purpose: it is the one part of the flow
+/// a person can look at in the address bar and check against the provider's documentation, and the
+/// tests here assert the exact parameters rather than "a URL was produced".
+pub fn authorization_url(
+    provider: OAuthProvider,
+    client_id: &str,
+    redirect_uri: &str,
+    pkce: &Pkce,
+    state: &str,
+) -> String {
+    let mut params: Vec<(&str, String)> = vec![
+        ("client_id", client_id.to_string()),
+        ("response_type", "code".to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("scope", provider.scope.to_string()),
+        ("state", state.to_string()),
+        ("code_challenge", pkce.challenge.clone()),
+        ("code_challenge_method", "S256".to_string()),
+    ];
+    if provider.needs_offline_params {
+        // Both are required for a refresh token: without `access_type=offline` Google returns none,
+        // and without `prompt=consent` it only returns one the first time the user ever consents.
+        params.push(("access_type", "offline".to_string()));
+        params.push(("prompt", "consent".to_string()));
+    }
+
+    format!("{}?{}", provider.auth_endpoint, encode_form(&params))
+}
+
+/// Everything the token endpoints need to be called.
+///
+/// A trait with plain `async fn` (edition 2024 has them in traits) so a test can drive the whole
+/// flow against a fake, and so the real one has nothing to do but one HTTP form POST.
+pub trait TokenTransport {
+    /// POST `form` to `url` and return the response body, or an error carrying the status.
+    ///
+    /// Spelled as `impl Future + Send` rather than `async fn` deliberately: these calls happen inside
+    /// Tauri commands, which have to stay `Send`, and an `async fn` in a trait cannot promise that.
+    fn post_form(
+        &self,
+        url: &str,
+        form: Vec<(String, String)>,
+    ) -> impl std::future::Future<Output = Result<String>> + Send;
+}
+
+/// Turn an authorization code into tokens.
+///
+/// `client_secret` is `Option` because whether the provider requires one is exactly M0-8's open
+/// question; passing `None` is a legitimate call, not an unfinished one.
+pub async fn exchange_code<T: TokenTransport>(
+    transport: &T,
+    provider: OAuthProvider,
+    client_id: &str,
+    client_secret: Option<&str>,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<TokenSet> {
+    let mut form: Vec<(String, String)> = vec![
+        ("grant_type".to_string(), "authorization_code".to_string()),
+        ("code".to_string(), code.to_string()),
+        ("code_verifier".to_string(), verifier.to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+        ("redirect_uri".to_string(), redirect_uri.to_string()),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret".to_string(), secret.to_string()));
+    }
+
+    let body = transport.post_form(provider.token_endpoint, form).await?;
+    parse_tokens(&body)
+}
+
+/// Get a new access token from a refresh token.
+///
+/// The returned [`TokenSet`] may carry a **new** refresh token, and the caller must store it: the
+/// providers that rotate (Microsoft: every refresh; A1-F34) invalidate the old one, so returning
+/// without persisting would lock the user out on the next launch.
+pub async fn refresh<T: TokenTransport>(
+    transport: &T,
+    provider: OAuthProvider,
+    client_id: &str,
+    client_secret: Option<&str>,
+    refresh_token: &str,
+) -> Result<TokenSet> {
+    let mut form: Vec<(String, String)> = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("refresh_token".to_string(), refresh_token.to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret".to_string(), secret.to_string()));
+    }
+
+    let body = transport.post_form(provider.token_endpoint, form).await?;
+    parse_tokens(&body)
+}
+
+/// Read a token response, or explain what went wrong in terms a person can act on.
+///
+/// The distinctions matter to the caller: `invalid_grant` means the refresh token is dead and the
+/// user has to sign in again (retrying is pointless and would hammer the endpoint), whereas a
+/// transport failure is worth retrying.
+fn parse_tokens(body: &str) -> Result<TokenSet> {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        error_description: String,
+    }
+
+    if let Ok(tokens) = serde_json::from_str::<TokenSet>(body)
+        && !tokens.access_token.is_empty()
+    {
+        return Ok(tokens);
+    }
+
+    let error: ErrorBody = serde_json::from_str(body).unwrap_or(ErrorBody {
+        error: String::new(),
+        error_description: String::new(),
+    });
+
+    Err(match error.error.as_str() {
+        "invalid_grant" => MailError::Credential(format!(
+            "授权已失效，请重新登录这个账号。{}",
+            error.error_description
+        )),
+        "invalid_client" => MailError::Credential(format!(
+            "这个应用没有被服务商接受（client_id/client_secret）。{}",
+            error.error_description
+        )),
+        "invalid_request" => MailError::Config(format!(
+            "授权请求被拒绝，可能是回调地址与注册的不一致。{}",
+            error.error_description
+        )),
+        other => MailError::Config(format!("授权失败（{other}）。{}", error.error_description)),
+    })
+}
+
+/// `application/x-www-form-urlencoded`, which is what both providers require for these calls.
+fn encode_form(params: &[(&str, String)]) -> String {
+    params
+        .iter()
+        .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Percent-encoding for form and query values (RFC 3986 unreserved set only).
+///
+/// Written out rather than pulled from a crate because the rule is short, and because getting it
+/// wrong here corrupts a scope or a redirect URI in a way that only shows up at the provider.
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Cryptographically random, URL-safe, `len` characters.
+///
+/// From the OS (via the same source `secret` uses for the credential store's entropy) rather than a
+/// seeded PRNG: a guessable `state` is a real attack (A1-F36), and a guessable PKCE verifier defeats
+/// the point of PKCE.
+fn random_url_safe(len: usize) -> Result<String> {
+    use base64::Engine as _;
+
+    // 3/4 of the encoded length in bytes, with slack so `take(len)` never runs short.
+    let mut bytes = vec![0u8; len * 3 / 4 + 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| MailError::Config(format!("系统随机源不可用：{error}")))?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+    Ok(encoded.chars().take(len).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// What the fake was asked, in order: `(url, form)`.
+    type Calls = Vec<(String, Vec<(String, String)>)>;
+
+    /// A transport that answers from a script and records what it was asked.
+    struct Fake {
+        answers: Mutex<VecDeque<Result<String>>>,
+        calls: Mutex<Calls>,
+    }
+
+    impl Fake {
+        fn replying(body: &str) -> Fake {
+            Fake {
+                answers: Mutex::new(VecDeque::from([Ok(body.to_string())])),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(error: MailError) -> Fake {
+            Fake {
+                answers: Mutex::new(VecDeque::from([Err(error)])),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn form(&self, index: usize) -> Vec<(String, String)> {
+            self.calls.lock().expect("lock")[index].1.clone()
+        }
+    }
+
+    // The trait spells its signature as `impl Future + Send` so the real transport can be used from
+    // `Send` Tauri commands; here that same future is written out rather than `async fn`, which is
+    // exactly what this allow is about.
+    #[allow(clippy::manual_async_fn)]
+    impl TokenTransport for Fake {
+        fn post_form(
+            &self,
+            url: &str,
+            form: Vec<(String, String)>,
+        ) -> impl std::future::Future<Output = Result<String>> + Send {
+            async move {
+                // Both locks are released before this returns; nothing is held across an await.
+                self.calls
+                    .lock()
+                    .expect("lock")
+                    .push((url.to_string(), form));
+                self.answers
+                    .lock()
+                    .expect("lock")
+                    .pop_front()
+                    .unwrap_or_else(|| Err(MailError::Config("no scripted answer".into())))
+            }
+        }
+    }
+
+    fn has(form: &[(String, String)], key: &str, value: &str) -> bool {
+        form.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    #[test]
+    fn the_challenge_is_the_documented_s256_of_the_verifier() {
+        // RFC 7636's own worked example: pinned so a change in encoding (padding, standard base64
+        // instead of base64url) cannot slip through.
+        assert_eq!(
+            code_challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn a_verifier_is_long_enough_random_and_url_safe() {
+        let first = Pkce::generate().expect("entropy");
+        let second = Pkce::generate().expect("entropy");
+        assert!(first.verifier.len() >= 43, "RFC 7636's minimum");
+        assert!(first.challenge.len() >= 43);
+        assert_ne!(first.verifier, second.verifier, "two sign-ins, two secrets");
+        assert!(
+            first
+                .verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "the verifier has to survive a query string untouched: {}",
+            first.verifier
+        );
+        assert_ne!(
+            state().expect("entropy"),
+            state().expect("entropy"),
+            "a state that repeats is not a state"
+        );
+    }
+
+    #[test]
+    fn the_google_url_carries_every_parameter_the_flow_needs() {
+        let pkce = Pkce::generate().expect("entropy");
+        let url = authorization_url(
+            GOOGLE,
+            "client-123",
+            "http://127.0.0.1:51234/",
+            &pkce,
+            "state-abc",
+        );
+
+        assert!(url.starts_with(GOOGLE.auth_endpoint), "{url}");
+        for expected in [
+            "client_id=client-123",
+            "response_type=code",
+            "redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2F",
+            "code_challenge_method=S256",
+            "state=state-abc",
+            // Both of these are what make Google hand back a **refresh** token; without them the
+            // account works for an hour and then stops.
+            "access_type=offline",
+            "prompt=consent",
+        ] {
+            assert!(url.contains(expected), "expected {expected} in {url}");
+        }
+        assert!(
+            url.contains(&format!("code_challenge={}", pkce.challenge)),
+            "the challenge, not the verifier: {url}"
+        );
+        assert!(
+            !url.contains(&pkce.verifier),
+            "the verifier must never leave this process: {url}"
+        );
+    }
+
+    #[test]
+    fn microsoft_gets_its_resource_scopes_and_no_google_only_parameters() {
+        let pkce = Pkce::generate().expect("entropy");
+        let url = authorization_url(MICROSOFT, "client", "http://127.0.0.1:1/", &pkce, "s");
+        assert!(
+            url.contains("scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All"),
+            "the full resource URL is required (A1-F33): {url}"
+        );
+        assert!(
+            !url.contains("access_type="),
+            "Google-only parameters must not be sent elsewhere: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exchange_sends_the_verifier_and_reads_the_tokens_back() {
+        let fake =
+            Fake::replying(r#"{"access_token":"at","refresh_token":"rt","expires_in":3599}"#);
+        let tokens = exchange_code(
+            &fake,
+            GOOGLE,
+            "client-123",
+            None,
+            "the-code",
+            "the-verifier",
+            "http://127.0.0.1:51234/",
+        )
+        .await
+        .expect("exchange");
+
+        assert_eq!(tokens.access_token, "at");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(tokens.expires_in, Some(3599));
+
+        let form = fake.form(0);
+        assert!(has(&form, "grant_type", "authorization_code"));
+        assert!(has(&form, "code", "the-code"));
+        assert!(has(&form, "code_verifier", "the-verifier"));
+        assert!(has(&form, "client_id", "client-123"));
+        assert!(
+            !form.iter().any(|(k, _)| k == "client_secret"),
+            "no secret was given, so none may be invented"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotated_refresh_token_is_handed_back_to_the_caller() {
+        // Microsoft rotates on every refresh (A1-F34): a refresh that succeeds and is not persisted
+        // locks the user out, so the new token has to come back out of here.
+        let fake = Fake::replying(r#"{"access_token":"at2","refresh_token":"rt2"}"#);
+        let tokens = refresh(&fake, MICROSOFT, "client", None, "rt1")
+            .await
+            .expect("refresh");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rt2"));
+        assert!(has(&fake.form(0), "grant_type", "refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn a_dead_refresh_token_says_so_instead_of_being_retried() {
+        let fake = Fake::replying(
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#,
+        );
+        let error = refresh(&fake, GOOGLE, "client", None, "rt")
+            .await
+            .expect_err("must not be treated as tokens");
+        assert!(
+            error.to_string().contains("重新登录"),
+            "the user has to be told to sign in again: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_client_is_reported_as_such() {
+        // This is the shape M0-8 is about: if the endpoint insists on a secret, the answer looks
+        // like this, and the wizard needs to grow an input box for it.
+        let fake = Fake::replying(
+            r#"{"error":"invalid_client","error_description":"client_secret is missing."}"#,
+        );
+        let error = exchange_code(
+            &fake,
+            GOOGLE,
+            "client",
+            None,
+            "c",
+            "v",
+            "http://127.0.0.1:1/",
+        )
+        .await
+        .expect_err("must fail");
+        assert!(
+            error.to_string().contains("client_id/client_secret"),
+            "the message has to point at the wizard: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_is_not_mistaken_for_a_bad_credential() {
+        let fake = Fake::failing(MailError::Timeout(45));
+        let error = refresh(&fake, GOOGLE, "client", None, "rt")
+            .await
+            .expect_err("must fail");
+        assert!(
+            matches!(error, MailError::Timeout(_)),
+            "a timeout is retryable and must stay distinguishable: {error:?}"
+        );
+    }
+
+    #[test]
+    fn form_encoding_survives_a_scope_full_of_slashes_and_spaces() {
+        let encoded = encode_form(&[
+            (
+                "scope",
+                "https://outlook.office.com/IMAP.AccessAsUser.All offline_access".to_string(),
+            ),
+            ("state", "a-b_c~d".to_string()),
+        ]);
+        assert_eq!(
+            encoded,
+            "scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All%20offline_access&state=a-b_c~d"
+        );
+    }
+}

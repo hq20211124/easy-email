@@ -25,6 +25,7 @@ pub mod idle;
 pub mod imap;
 pub mod model;
 pub mod mutf7;
+pub mod oauth;
 pub mod outbox;
 pub mod pool;
 pub mod providers;
