@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-24 添加附件时就挡住超限 / M1a-23 发信上限预检 |
+| 最新 | M1a-25 更正：通知点击跳转属 M0-6（外部阻塞） / M1a-24 附件超限拦截 |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -52,6 +52,27 @@ M1a-23 把上限拦在**点发送**时，但设计要的是"添加附件/点发�
 
 **证据**：`check.ps1` 15 步全绿（前端命令 **30** 个）、测试 **227**、启动冒烟 10 秒存活。
 估算函数是纯前端，门禁只能证明语法与接线——**没有自动化测试覆盖它**，如实记在这里。
+
+---
+### M1a-25 更正 M1a-18 的一处乐观判断：通知的"点击跳转"是被外部条件卡住的 ✅（第 31 轮）
+
+M1a-18 的盘点表里我把"通知托盘"写成"只差点击跳转与开关"。**这一轮查了插件的实际 API，那句话是错的**，
+按纪律要更正（否则下一轮会去接一个接不上的回调）：
+
+- `tauri-plugin-notification` 2.5.1 的 Rust API 里**桌面端没有任何点击/动作回调**。它确实有
+  `ActionType` / `register_action_types` / `action_type_id` / `auto_cancel`，但源码与文档写得很清楚：
+  这些在桌面端**被忽略**，实现走的是 `run_mobile_plugin("registerActionTypes", …)` ——**移动端能力**。
+  ⇒ "点通知跳到那封邮件"在现在的依赖下**做不了**。
+- 现状（已核对的调用点）：`src-tauri/src/lib.rs:1553` 起，用 `notification().builder().title(账号·文件夹).body(...).show()`
+  发一条普通 toast；失败只记日志（"A refused toast must not break the sync path"）。**这条是好的、够用的**。
+- 所以"通知托盘"的正确拆分是：**能做的**——按账号/文件夹决定要不要发（开关 + 持久化）；
+  **做不了的**——点击跳转与富通知（双按钮、通知内动作），它们要 Windows App SDK 的
+  `AppNotificationManager`，也就是 **M0-6**：本机没有运行时、`src-tauri` 也没有 `windows` crate 依赖。
+  M0-6 的恢复步骤（装运行时 → 加 crate 与 features → Register + 双按钮 + `NotificationInvoked`）
+  早就写在本文档 M0-6 一节，结论不变。
+
+**本轮没有代码改动**：这是一处对自己先前判断的更正，价值在于让"剩下什么"这张表是准的。
+`check.ps1` 15 步全绿、测试 **227**（未变，因为没动代码）。
 
 ---
 ### M1a-23 发信上限预检：编码后超限就地拦住 ✅（第 29 轮）
@@ -690,7 +711,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
 真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v2**（`sent_index`），
 迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 64 个提交）。
+所有改动都在 git 里（基线 `83c1b0c`，共 65 个提交）。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -751,8 +772,9 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
    真迁移**，cache 的 `migrate` 有"版本相等就早退"的守卫，所以这次**必须**升版本号）；
    ② `mail-core` 一个纯函数算稳定会话键（`References` 根，兜底 `Message-ID`，再兜底规范化主题+
    发件人），纯测；③ 列表按会话分组 + 展开/折叠 + 未读聚合，探针验证同会话聚成一行。
-   之后：通知托盘的点击跳转与开关 → 认证轴的 OAuth（**卡在 M0-8：需要你的 client_id**，在那之前
-   做是白做）→ 安装包（签名是外部条件；自动更新完全没有，可做但大）。
+   之后：通知托盘的**开关**（可做；**点击跳转与富通知做不了**——插件桌面端没有动作回调，要 M0-6 的
+   Windows App SDK，见 M1a-25 的更正）→ 认证轴的 OAuth（**卡在 M0-8：需要你的 client_id**，
+   在那之前做是白做）→ 安装包（签名是外部条件；自动更新完全没有，可做但大）。
 
 **运行方式**
 ```
@@ -760,7 +782,7 @@ lettre 只在被要求时才写（`build()` 只补 `Date`），而 `design/07` �
 cargo test --workspace                # 227 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
-git log --oneline                     # 64 个提交；git diff 83c1b0c HEAD 是本次全部改动
+git log --oneline                     # 65 个提交；git diff 83c1b0c HEAD 是本次全部改动
 
 # 真机端到端（要临时把 --remote-debugging-port=9222 加回 tauri.conf.json 再 cargo build）
 node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动保存→关闭保存→草稿箱→丢弃
