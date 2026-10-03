@@ -16,7 +16,7 @@
 
 | SHA | 内容 |
 |---|---|
-| 最新 | M1a-45 OAuth 接上界面（命令 + 向导按钮；差真实端点与 XOAUTH2） |
+| 最新 | M1a-46 XOAUTH2 的四步计划（未动代码；下一步照着做） |
 | — | M1a-16 服务器草稿镜像 / M1a-15 `sent_index` + 查看副本 / M1a-14 配额账本（user.db v2） |
 | — | M1a-13 附件 sha256（路径不是身份；发送前补算与校验） |
 | — | M1a-12 同步窗口选择器 + 冷启动自动回填一页 |
@@ -1230,6 +1230,40 @@ M1a-40 里我记下"还差 `SO_EXCLUSIVEADDRUSE`"，这一轮补上，并且**�
 下一步应让 `ImapClient`/`smtp` 支持 `AUTH XOAUTH2`）。
 
 ---
+### M1a-46 认证轴的最后一步：XOAUTH2 的四步计划（本轮只写计划，未动代码）⚠️（第 52 轮）
+
+我上一轮说"下一轮做 XOAUTH2"。**这一轮我先把这件事的边界量清楚了**，结论是它**不是一个小改动**，
+而我在本会话的有效上下文已接近耗尽——**开工它就极可能留下半条流程**。所以这一轮**不动代码**，
+只把计划写到"下一个会话照着做即可"的程度（这是它能产生的最好结果）。
+
+现状（已核实）：`ImapClient::connect` 在 `crates/mail-core/src/imap.rs:313` 用 `.login(&username, &password)`；
+SMTP 走 `smtp::send` 的密码凭据；`AccountConfig` 里只有 `username`，**没有**认证方式字段。
+OAuth 登录（M1a-45）能拿到令牌并落盘，但**收发信仍走密码那条路**。
+
+**四步**（每步都能独立验证，建议按顺序）：
+
+1. **模型**：`AccountConfig` 增加 `auth: AuthMethod`（`password` | `oauth2`，`#[serde(default)]` 保持
+   老账号可读）+ `oauth_client_id` / `oauth_client_secret: Option<String>`。client_secret 在桌面端
+   **不算机密**（A1-F32 官方原话），但仍不该进日志。
+2. **两条协议**：
+   - IMAP：`AUTHENTICATE XOAUTH2` + `base64("user=" + email + "\x01auth=Bearer " + token + "\x01\x01")`。
+     `imap.rs:313` 那处按 `cfg.auth` 分支。
+   - SMTP：lettre 的 `Mechanism::Xoauth2`（`lettre::transport::smtp::authentication::Mechanism`）。
+   - 夹具要跟上：假 IMAP 服务器现在只认 `LOGIN`，得加 `AUTHENTICATE XOAUTH2`；假 SMTP 要认
+     `AUTH XOAUTH2 <base64>`。**这两处夹具是本步的主要工作量**，也是为什么它不适合"顺手做"。
+3. **取用与刷新**：连接前从 `TokenStore` 取刷新令牌 → `oauth::refresh(...)` → **把轮换后的新令牌写回**
+   （A1-F34，微软每次都换）→ 用返回的访问令牌连。刷新失败若是 `invalid_grant`，让账号进入"需重新登录"
+   状态（文案已就绪：M1a-39 的 `Credential` 分支）。
+4. **接线**：`src-tauri` 的取密码路径（`password_for`）在 `auth == oauth2` 时改走第 3 步；向导
+   `onConfirm` 在 OAuth 已成功时**跳过密码校验**（现在仍要求填密码）。
+
+**验证方式**：第 2 步靠夹具（断言 `AUTHENTICATE XOAUTH2` 与那段 base64 的**逐字**内容）；
+第 3 步靠一个"刷新返回新令牌 ⇒ `TokenStore` 里是新值"的测试；第 4 步靠门禁与探针。
+**真实端点**（Gmail/Outlook 收信）只能在拿到 client_id 后验（M0-8）。
+
+**本轮数字**：`check.ps1` **17 步全绿**（未动代码，与 M1a-45 相同）；测试 **261**。
+
+---
 ## 交接摘要（先读这里）
 
 **当前状态**：`tools/check.ps1` **17 步全绿**；`cargo test --workspace` **261 通过、0 失败**
@@ -1274,11 +1308,11 @@ M1a-40 里我记下"还差 `SO_EXCLUSIVEADDRUSE`"，这一轮补上，并且**�
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近二十九轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+**最近三十轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮；差真实端点验证与 XOAUTH2 收发信）**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮）** · **M1a-46 XOAUTH2 的四步计划（未动代码，交给下一个会话）**。
 
 **若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
 （三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
@@ -1294,7 +1328,10 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
-0. **让已缓存的邮件也拿到精确键**：增量同步只问游标之上的 UID，而这些行的 `References` 没存，
+0. **XOAUTH2（认证轴最后一步）**：四步计划写在 M1a-46——模型加 `auth`/`oauth_client_id`、
+   IMAP 走 `AUTHENTICATE XOAUTH2` + SMTP 走 lettre 的 `Mechanism::Xoauth2`（**夹具要先支持这两种**，
+   这是主要工作量）、连接前刷新令牌并把轮换值写回、`password_for` 与向导按 `auth` 分支。
+1. **让已缓存的邮件也拿到精确键**：增量同步只问游标之上的 UID，而这些行的 `References` 没存，
    所以它们永远停在近似键上。需要一次"重取最近 N 封头部"（很便宜）或接受新旧两制（见 M1a-30）。
 1. ~~会话串的精确键~~：M1a-29 上了近似键（主题+发件人）；真做法是把 `Message-ID`/`References`
    带进列表摘要 ⇒ `cache.db` 加列 + 真迁移（cache 的 migrate 有"版本相等就早退"的守卫，必须升版本号），
