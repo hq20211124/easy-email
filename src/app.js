@@ -1652,6 +1652,8 @@ function openComposer({ mode = 'new', draft = null } = {}) {
   let saveTimer = null;
   /** The 30 s server-mirror timer (`design/07` §5.1); cleared when the composer closes. */
   let mirrorTimer = null;
+  /** Removes the window-focus listener the mirror needs; also cleared on close. */
+  let stopMirrorOnBlur = null;
   /** The save in flight, so a send can wait for it before deleting the draft. */
   let inFlight = Promise.resolve();
 
@@ -1868,12 +1870,25 @@ function openComposer({ mode = 'new', draft = null } = {}) {
       mirrorTimer = setInterval(() => {
         if (!sent) mirrorDraft(draftId, accountId, persisted);
       }, MIRROR_INTERVAL_MS);
+
+      // The design's other trigger: losing focus means the user has gone off to do something else,
+      // which is exactly when they might open the same draft on another device. Listeners are added
+      // per composer and removed on close — a stale one would mirror a draft that is already gone.
+      const onBlur = () => {
+        if (!sent) mirrorDraft(draftId, accountId, persisted);
+      };
+      window.addEventListener('blur', onBlur);
+      stopMirrorOnBlur = () => window.removeEventListener('blur', onBlur);
     },
     onClose: (modal) => {
       clearTimeout(saveTimer);
       saveTimer = null;
       clearInterval(mirrorTimer);
       mirrorTimer = null;
+      if (stopMirrorOnBlur) {
+        stopMirrorOnBlur();
+        stopMirrorOnBlur = null;
+      }
       // A queued send kept the draft on purpose — the worker deletes it once the message is really
       // out — so there is nothing to save again here.
       if (sent) return;
