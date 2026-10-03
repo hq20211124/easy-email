@@ -1091,7 +1091,15 @@ async function openSentCopy(item) {
   if (record === null) return;
 
   if (!record) {
-    toast('这封信的副本没有登记（可能缓存被清理过）。可以在「文件夹 → 已发送」里按主题找。', 'info', 9000);
+    // Two honest reasons, and today they are indistinguishable from here: the copy may never have
+    // been filed (the server refused a copy this large — `design/07` §5.4's `SkippedTooLarge`), or the
+    // cache that held the link was rebuilt. Saying "可能" beats a confident wrong answer.
+    toast(
+      '这封信没有登记副本：可能是副本太大没能归档，也可能是本地缓存被清理过。' +
+        '可以在「文件夹 → 已发送」里按主题找。',
+      'info',
+      9000
+    );
     return;
   }
 
