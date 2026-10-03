@@ -570,6 +570,21 @@ impl Cache {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The date of the oldest message cached for a folder, if any.
+    ///
+    /// Used for one thing: when the walk stops and the provider is one that caps how far back a
+    /// third-party client may read (A1-F2), this is the **observed** floor — the oldest mail the
+    /// account can actually see. Recording it is not a guess about the server; it is what we asked
+    /// for and what came back.
+    pub fn oldest_date(&self, account_id: &str, folder: &str) -> Result<Option<i64>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn.query_row(
+            "select min(date) from messages where account_id = ?1 and folder = ?2",
+            params![account_id, folder],
+            |row| row.get(0),
+        )?)
+    }
     pub fn summary_count(&self, account_id: &str, folder: &str) -> Result<u32> {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
@@ -1412,6 +1427,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_oldest_date_is_what_the_floor_is_derived_from() {
+        let cache = Cache::open_in_memory().expect("open");
+        assert_eq!(cache.oldest_date("acc", "INBOX").expect("read"), None);
+
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "newer", "a@example.com", 2_000),
+                    summary(2, "oldest", "a@example.com", 900),
+                    summary(3, "middle", "a@example.com", 1_500),
+                ],
+            )
+            .expect("store");
+        assert_eq!(cache.oldest_date("acc", "INBOX").expect("read"), Some(900));
+        assert_eq!(
+            cache.oldest_date("acc", "OTHER").expect("read"),
+            None,
+            "and it is per folder"
+        );
+    }
     #[test]
     fn summaries_come_back_newest_first_with_paging() {
         let cache = Cache::open_in_memory().unwrap();

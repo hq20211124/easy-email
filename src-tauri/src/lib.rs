@@ -630,6 +630,25 @@ async fn backfill_to_window(
         )
         .map_err(describe)?;
 
+    // `design/04` §5.7 item 4: when a provider we *know* caps the fetch range and the walk has
+    // reached the end of what the server will give, the oldest date we hold is the observed floor.
+    // Recording it is not an inference about the server — it is what we asked for and what came
+    // back — and it is what lets the UI say "这个邮箱只能取到这一天" instead of looking broken.
+    if report.stop == BackfillStop::HistoryExhausted
+        && mail_core::providers::by_id(&cfg.provider_id)
+            .is_some_and(|provider| provider.caps_third_party_range())
+        && let Some(floor) = state
+            .cache
+            .clone()
+            .oldest_date(&account_id, &mailbox)
+            .map_err(describe)?
+    {
+        state
+            .user
+            .set_quota_server_floor(&account_id, floor)
+            .map_err(describe)?;
+    }
+
     log_line(&format!(
         "[easy-email] 回填到窗口边界 {}：{} 页 / {} 封 / {} 字节（{:?}）；今日已用 {}",
         window.as_key(),

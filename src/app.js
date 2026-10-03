@@ -742,13 +742,17 @@ function quotaLine(quota) {
       quota.throttled_until * 1000
     ).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 后自动重试。`;
   }
-  if (quota.daily_budget) {
-    const left = Math.max(quota.daily_budget - quota.bytes_today, 0);
-    return `今日已下载 ${used}，额度 ${formatBytes(quota.daily_budget)}（剩余 ${formatBytes(
-      left
-    )}）；用完后会自动停到明天。`;
-  }
-  return `今日已下载 ${used}（这个服务商没有公开的每日下载上限）。`;
+  // The observed floor, when there is one: the oldest mail this account can actually reach. Saying it
+  // is the difference between a server policy and "同步坏了" (`design/04` §5.7 item 4).
+  const floor = quota.server_floor
+    ? `服务器只提供到 ${new Date(quota.server_floor * 1000).toLocaleDateString('zh-CN')} 的邮件。`
+    : '';
+  const lead = quota.daily_budget
+    ? `今日已下载 ${used}，额度 ${formatBytes(quota.daily_budget)}（剩余 ${formatBytes(
+        Math.max(quota.daily_budget - quota.bytes_today, 0)
+      )}）；用完后会自动停到明天。`
+    : `今日已下载 ${used}（这个服务商没有公开的每日下载上限）。`;
+  return floor ? `${lead} ${floor}` : lead;
 }
 /** Read the picker's form into the wire shape serde expects (`{kind, value}`). */
 function windowFromForm(kind) {
