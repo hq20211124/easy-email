@@ -1840,8 +1840,13 @@ function openComposer({ mode = 'new', draft = null } = {}) {
       // out — so there is nothing to save again here.
       if (sent) return;
       const fields = readFields(modal);
-      if (isBlank(fields) && !persisted) return;
-      queueSave(fields);
+      const blank = isBlank(fields) && !persisted;
+      if (!blank) queueSave(fields);
+      // `design/07` §3: the local draft is the truth, the server copy is the second one. Best-effort
+      // and after the local save, because a mirror failure must never cost the user what they typed.
+      if (!blank) {
+        inFlight = inFlight.then(() => mirrorDraft(draftId, accountId, persisted)).catch(() => {});
+      }
     },
     onConfirm: async (modal) => {
       const fields = readFields(modal);
@@ -1987,6 +1992,49 @@ function stripTags(html) {
   const div = document.createElement('div');
   div.innerHTML = html;
   return div.textContent || '';
+}
+
+/** The sentence the drafts area shows when the server copy is behind. */
+const CLOUD_DRAFT_PENDING = '本地已保存（云端草稿待同步）';
+
+/**
+ * Copy a saved draft to the server's Drafts folder, best-effort (`design/07` §3).
+ *
+ * Never throws and never toasts an error: the local draft is already on disk, which is the promise
+ * that matters. What a failure does produce is the status line the design asks for, so the user can
+ * tell "saved here and on the server" from "saved here only" — without either of them being an
+ * interruption.
+ *
+ * `persisted` is passed in because the composer's own flag is updated asynchronously; mirroring a
+ * draft the local save never wrote would create a server copy with nothing behind it.
+ */
+async function mirrorDraft(draftId, accountId, persisted) {
+  if (!persisted) return null;
+  try {
+    const report = await invoke('mirror_draft', { draftId });
+    setComposeCloudStatus(report ? '' : CLOUD_DRAFT_PENDING);
+    return report;
+  } catch {
+    setComposeCloudStatus(CLOUD_DRAFT_PENDING);
+    return null;
+  }
+}
+
+/**
+ * Show (or clear) the "cloud copy is behind" note.
+ *
+ * Written into whichever composer surface is still on screen: the status line if the dialog is
+ * open, and the drafts list afterwards — a note that only exists while the dialog is open would
+ * disappear exactly when the user needs it.
+ */
+function setComposeCloudStatus(text) {
+  const status = document.querySelector('#compose-status');
+  if (status) {
+    status.textContent = text;
+    status.className = `compose-status ${text ? 'err' : 'info'}`;
+    return;
+  }
+  if (text) toast(text, 'info', 8000);
 }
 
 /* ---------------------------------------------------------------- account wizard */

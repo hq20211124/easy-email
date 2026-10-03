@@ -21,12 +21,12 @@ use mail_core::providers::{self, Provider};
 extern crate mail_core;
 use mail_core::{
     AccountConfig, BackfillBudget, BackfillReport, BackfillStop, Cache, ConnectionPool,
-    ConnectionReport, FilingReport, FilingRun, MailError, MailboxInfo, MessageDetail,
-    MessageSummary, NewOutbox, OutboxItem, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent,
-    RecoveryReport, RecoveryRun, RunReport, SearchHit, SentCopy, Spool, SyncDriver, SyncOutcome,
-    SyncWindow, account_with_login, backfill_older, ensure_sent_copy, file_sent_copies,
-    file_sha256, prepare_attachments, recover_in_flight, run_due, secret, smtp,
-    userdb::{Draft, UserStore},
+    ConnectionReport, DraftMirrorReport, FilingReport, FilingRun, MailError, MailboxInfo,
+    MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun, OutgoingAttachment,
+    OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit, SentCopy, Spool,
+    SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older, ensure_sent_copy,
+    file_sent_copies, file_sha256, prepare_attachments, recover_in_flight, run_due, secret, smtp,
+    userdb::{Draft, DraftMirror, UserStore},
     watch,
 };
 use tauri::menu::{Menu, MenuItem};
@@ -506,9 +506,42 @@ async fn list_drafts(state: State<'_, AppState>, account_id: String) -> Result<V
 }
 
 /// Discard a draft. Permanent, and it says whether anything was actually removed.
+///
+/// The mirror goes with it: leaving our copy in the user's server-side 草稿箱 would be a copy nothing
+/// can ever clean up, from a button whose whole job is "make this go away" (`design/07` §6).
+/// Best-effort — the local row is what the user asked to remove, and a network failure must not turn
+/// "discarded" into "not discarded".
 #[tauri::command]
 async fn delete_draft(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    state.user.delete_draft(&id).map_err(describe)
+    let mirror = state.user.take_draft_mirror(&id).map_err(describe)?;
+    let removed = state.user.delete_draft(&id).map_err(describe)?;
+    if let Some(copy) = mirror {
+        drop_server_copy(&state, &copy).await;
+    }
+    Ok(removed)
+}
+
+/// Ask the server to drop the copy we wrote, ignoring every failure.
+///
+/// A stale copy is a nuisance; blocking the user's discard on the network is worse. What is *not*
+/// acceptable is failing silently in a way that loses data — and this cannot: it only ever removes a
+/// copy of a draft that is already gone locally.
+async fn drop_server_copy(state: &AppState, copy: &DraftMirror) {
+    let Some(uid) = copy.uid else {
+        // APPEND did not tell us the UID (A1-F43) and the lookup failed at mirror time, so there is
+        // no handle to delete by. The copy is still findable by Message-ID on the next mirror/sweep.
+        return;
+    };
+    let Ok(cfg) = state.find(&copy.account_id) else {
+        return;
+    };
+    let Ok(password) = password_for(&cfg.id) else {
+        return;
+    };
+    let folder = copy.folder.clone();
+    let _ = pool_op!(&state.pool, &cfg, &password, |client| {
+        client.delete_message(&folder, uid).await
+    });
 }
 
 /// Walk backwards until the **chosen sync window** is satisfied, and report where it stopped.
@@ -779,6 +812,60 @@ async fn sent_copy(
         .clone()
         .sent_copy(&account_id, &message_id)
         .map_err(describe)
+}
+
+/// Mirror a draft to the server's Drafts folder, replacing the copy we wrote last time.
+///
+/// Best-effort by design (`design/07` §3): the local draft in `user.db` is the truth, and this is
+/// the second copy that makes the draft show up on another device. A failure here is reported so the
+/// composer can say "本地已保存（云端草稿待同步）" — it must never be why somebody loses what they
+/// typed.
+#[tauri::command]
+async fn mirror_draft(
+    state: State<'_, AppState>,
+    draft_id: String,
+) -> Result<Option<DraftMirrorReport>, String> {
+    let Some(draft) = state.user.load_draft(&draft_id).map_err(describe)? else {
+        // The draft was discarded between the save and the mirror. Not an error: there is nothing to
+        // mirror, and the copy we may have written earlier is now the only stale one left.
+        return Ok(None);
+    };
+    let cfg = state.find(&draft.account_id)?;
+    let password = password_for(&cfg.id)?;
+    let previous = state.user.draft_mirror(&draft_id).map_err(describe)?;
+
+    let report = pool_op!(&state.pool, &cfg, &password, |client| {
+        mail_core::sentcopy::mirror_draft(&mut client, &cfg, &draft, previous.as_ref()).await
+    })
+    .map_err(describe)?;
+
+    if let Some(copy) = &report {
+        state
+            .user
+            .set_draft_mirror(&DraftMirror {
+                draft_id,
+                account_id: draft.account_id.clone(),
+                folder: copy.folder.clone(),
+                uid: copy.uid,
+                message_id: copy.message_id.clone(),
+                updated_at: now_seconds(),
+            })
+            .map_err(describe)?;
+    }
+
+    Ok(report)
+}
+
+/// Where the server-side copy of a draft is, if we ever wrote one.
+///
+/// Exposed so the composer can be honest later ("云端草稿待同步" vs "已同步") without guessing, and
+/// so a future "另一台设备改了这份草稿" prompt has something to compare against.
+#[tauri::command]
+async fn draft_mirror(
+    state: State<'_, AppState>,
+    draft_id: String,
+) -> Result<Option<DraftMirror>, String> {
+    state.user.draft_mirror(&draft_id).map_err(describe)
 }
 
 /// Run one pass of the outbox worker for every configured account.
@@ -1829,6 +1916,8 @@ pub fn run() {
             save_draft,
             list_drafts,
             delete_draft,
+            mirror_draft,
+            draft_mirror,
             enqueue_send,
             list_outbox,
             cancel_send,

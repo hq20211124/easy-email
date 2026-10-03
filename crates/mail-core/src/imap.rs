@@ -364,6 +364,19 @@ impl ImapClient {
             .map(|(mailbox, _)| mailbox.name))
     }
 
+    /// The wire name of the folder that holds drafts, if the server has one.
+    ///
+    /// Same role-based resolution as [`ImapClient::sent_mailbox`], and for the same reason: a server
+    /// may name the folder anything and only say `\Drafts` in the attribute.
+    pub async fn drafts_mailbox(&mut self) -> Result<Option<String>> {
+        Ok(self
+            .list_mailboxes_with_roles()
+            .await?
+            .into_iter()
+            .find(|(mailbox, role)| *role == Some(Role::Drafts) && mailbox.selectable)
+            .map(|(mailbox, _)| mailbox.name))
+    }
+
     /// Every mailbox with the role it was derived from.
     ///
     /// The roles are kept here rather than on [`MailboxInfo`] because the UI has no use for the

@@ -43,7 +43,27 @@ pub const USER_TABLES: &[&str] = &[
     "outbox",
     "pending_ops",
     "quota_ledger",
+    "draft_mirrors",
 ];
+
+/// Where the copy of a draft that **we** wrote to the server's Drafts folder is (`design/07` §5.1).
+///
+/// It exists for one reason: the next mirror of the same draft has to delete this copy first, or the
+/// user's 草稿箱 collects one stale copy per autosave. `uid` is optional because `APPEND` does not
+/// return one (A1-F43).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DraftMirror {
+    pub draft_id: String,
+    /// Which account it belongs to: a folder name alone cannot pick the credentials, and the row
+    /// outlives the draft it describes.
+    pub account_id: String,
+    /// The folder it is in, as the wire name.
+    pub folder: String,
+    pub uid: Option<u32>,
+    /// The `Message-ID` we wrote, which is how the copy is found when the UID is unknown.
+    pub message_id: String,
+    pub updated_at: i64,
+}
 
 /// A draft, as stored in `user.db`.
 ///
@@ -523,6 +543,72 @@ impl UserStore {
         })
     }
 
+    // ------------------------------------------------------------------ draft mirrors
+
+    /// Where the server-side copy of this draft is, if we ever wrote one.
+    pub fn draft_mirror(&self, draft_id: &str) -> Result<Option<DraftMirror>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn
+            .query_row(
+                "select draft_id, account_id, folder, uid, message_id, updated_at
+                 from draft_mirrors where draft_id = ?1",
+                [draft_id],
+                |row| {
+                    Ok(DraftMirror {
+                        draft_id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        folder: row.get(2)?,
+                        uid: row.get::<_, Option<i64>>(3)?.map(|uid| uid as u32),
+                        message_id: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Remember which server-side copy belongs to this draft.
+    pub fn set_draft_mirror(&self, mirror: &DraftMirror) -> Result<()> {
+        let mirror = mirror.clone();
+        self.db.write_blocking(move |conn: &Connection| {
+            conn.execute(
+                "insert into draft_mirrors
+                     (draft_id, account_id, folder, uid, message_id, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6)
+                 on conflict(draft_id) do update set
+                     account_id = excluded.account_id, folder = excluded.folder,
+                     uid = excluded.uid, message_id = excluded.message_id,
+                     updated_at = excluded.updated_at",
+                rusqlite::params![
+                    mirror.draft_id,
+                    mirror.account_id,
+                    mirror.folder,
+                    mirror.uid.map(i64::from),
+                    mirror.message_id,
+                    mirror.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Forget the mirror row, and report what it said.
+    ///
+    /// Returns the row so the caller can delete the server-side copy: dropping the record without
+    /// removing the copy would leave one in the user's 草稿箱 that nothing can ever clean up.
+    pub fn take_draft_mirror(&self, draft_id: &str) -> Result<Option<DraftMirror>> {
+        let existing = self.draft_mirror(draft_id)?;
+        if existing.is_some() {
+            let id = draft_id.to_string();
+            self.db.write_blocking(move |conn: &Connection| {
+                conn.execute("delete from draft_mirrors where draft_id = ?1", [id])?;
+                Ok(())
+            })?;
+        }
+        Ok(existing)
+    }
+
     // ------------------------------------------------------------------ outbox
 
     /// Commit a send to the queue, and report the row id it got.
@@ -952,6 +1038,20 @@ impl UserStore {
                      window_start    integer not null default 0,
                      throttled_until integer,
                      server_floor    integer
+                 );
+
+                 -- Where the copy of a draft that *we* wrote to the server's Drafts folder lives
+                 -- (design/07 §3/§5.1). It has to be remembered for one reason: mirroring the same
+                 -- draft again has to delete the previous copy, or every autosave would leave another
+                 -- one behind in the user's 草稿箱. A table rather than new columns on `drafts`, so
+                 -- that adding it stays additive for files that already exist.
+                 create table if not exists draft_mirrors (
+                     draft_id   text primary key,
+                     account_id text not null default '',
+                     folder     text not null,
+                     uid        integer,
+                     message_id text not null,
+                     updated_at integer not null
                  );",
             )?;
 

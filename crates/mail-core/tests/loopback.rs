@@ -21,10 +21,10 @@ use std::time::Duration;
 
 use mail_core::smtp;
 use mail_core::{
-    AccountConfig, Cache, ConnectionPool, Draft, Endpoint, ImapClient, MailboxInfo, NewOutbox,
-    OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryRun, Security, Spool,
-    SyncDriver, SyncOutcome, UserStore, ensure_sent_copy, pool_op, recover_in_flight, run_due,
-    watch_every,
+    AccountConfig, Cache, ConnectionPool, Draft, DraftMirror, Endpoint, ImapClient, MailboxInfo,
+    NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryRun, Security,
+    Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy, mirror_draft, pool_op,
+    recover_in_flight, run_due, watch_every,
 };
 use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -278,6 +278,11 @@ struct Server {
     /// size and a later `SELECT` sees it. Without this the watcher would compare against a constant
     /// and could never detect anything.
     extra: Arc<AtomicU32>,
+    /// Advertise a `\Drafts` folder.
+    ///
+    /// Off by default because the folder list is asserted on elsewhere, and a fixture that quietly
+    /// grows a folder makes those assertions lie about what they cover.
+    drafts: bool,
 }
 
 impl Default for Server {
@@ -288,6 +293,7 @@ impl Default for Server {
             close_on_noop: Arc::new(AtomicBool::new(false)),
             idle: Arc::new(Mutex::new(Idle::Quiet)),
             extra: Arc::new(AtomicU32::new(0)),
+            drafts: false,
         }
     }
 }
@@ -315,6 +321,7 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
             };
             let log = Arc::clone(&log);
             let uidplus = server.uidplus;
+            let drafts = server.drafts;
             let uidvalidity = Arc::clone(&server.uidvalidity);
             let close_on_noop = Arc::clone(&server.close_on_noop);
             let idle = Arc::clone(&server.idle);
@@ -323,6 +330,7 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
                 let _ = serve_imap(
                     stream,
                     uidplus,
+                    drafts,
                     log,
                     uidvalidity,
                     close_on_noop,
@@ -337,9 +345,13 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
     (addr, transcript)
 }
 
+// The knobs are a parameter list rather than the `Server` struct because the accept loop needs owned
+// `Arc`s per connection, and each one is a deliberate per-connection choice. A test fixture, not an API.
+#[allow(clippy::too_many_arguments)]
 async fn serve_imap(
     stream: TcpStream,
     uidplus: bool,
+    drafts: bool,
     log: Transcript,
     uidvalidity: Arc<AtomicU32>,
     close_on_noop: Arc<AtomicBool>,
@@ -406,6 +418,11 @@ async fn serve_imap(
                 write
                     .write_all(b"* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent\"\r\n")
                     .await?;
+                if drafts {
+                    write
+                        .write_all(b"* LIST (\\HasNoChildren \\Drafts) \"/\" \"Drafts\"\r\n")
+                        .await?;
+                }
                 write
                     .write_all(b"* LIST (\\HasNoChildren) \"/\" \"&UXZO1mWHTvZZOQ-\"\r\n")
                     .await?;
@@ -1366,6 +1383,98 @@ async fn the_page_that_spent_the_budget_is_still_stored() {
         cache.summary_count(&cfg.id, "INBOX").expect("count") > before,
         "the page it stopped on has to be readable, or the next walk fetches it again"
     );
+}
+
+// ===================================================================== draft mirror
+
+/// `design/07` §3: the draft has two copies, and the server one must not pile up.
+///
+/// Two things are easy to get wrong and both are asserted here: a draft mirror must not be marked
+/// `\Seen` (a draft has not been read), and mirroring the same draft again must delete the copy we
+/// wrote last time instead of leaving one more behind at every autosave.
+#[tokio::test]
+async fn mirroring_a_draft_replaces_our_previous_copy() {
+    let (addr, log) = spawn_server(Server {
+        uidplus: true,
+        drafts: true,
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+
+    let mut draft = Draft::new("d1", &cfg.id, 1);
+    draft.to_addrs = "a@example.com".into();
+    draft.subject = "草稿镜像".into();
+    draft.body_text = "正文".into();
+
+    let first = within(mirror_draft(&mut client, &cfg, &draft, None))
+        .await
+        .expect("mirror must succeed")
+        .expect("the fixture advertises a Drafts folder");
+    assert_eq!(first.folder, "Drafts");
+    assert_eq!(
+        first.uid,
+        Some(4242),
+        "the copy is found again by its Message-ID, because APPEND returns no UID"
+    );
+    assert_eq!(first.replaced, None, "there was nothing to replace");
+
+    let lines = transcript(&log);
+    let append = lines
+        .iter()
+        .find(|line| line.to_ascii_uppercase().contains("APPEND"))
+        .unwrap_or_else(|| panic!("no APPEND in {lines:?}"));
+    assert!(
+        append.contains("Drafts"),
+        "the copy belongs in the Drafts folder: {append}"
+    );
+    assert!(
+        !append.to_ascii_uppercase().contains("\\SEEN"),
+        "a draft has not been read: {append}"
+    );
+
+    // Mirroring again: the copy we wrote last time has to go, or every autosave leaves another one.
+    let previous = DraftMirror {
+        draft_id: "d1".into(),
+        account_id: cfg.id.clone(),
+        folder: first.folder.clone(),
+        uid: first.uid,
+        message_id: first.message_id.clone(),
+        updated_at: 1,
+    };
+    let second = within(mirror_draft(&mut client, &cfg, &draft, Some(&previous)))
+        .await
+        .expect("mirror")
+        .expect("folder");
+    assert_eq!(second.replaced, Some(4242), "{second:?}");
+
+    let lines = transcript(&log);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("UID STORE 4242")),
+        "the previous copy is what gets flagged deleted: {lines:?}"
+    );
+}
+
+/// No Drafts folder on the account is not a mirror failure: the local draft is still saved, which is
+/// the promise that matters. `None` says "nowhere to put it".
+#[tokio::test]
+async fn an_account_without_a_drafts_folder_simply_has_no_mirror() {
+    let (addr, _log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+
+    let draft = Draft::new("d1", &cfg.id, 1);
+    let report = within(mirror_draft(&mut client, &cfg, &draft, None))
+        .await
+        .expect("must not be an error");
+    assert_eq!(report, None);
 }
 
 // ===================================================================== helpers
