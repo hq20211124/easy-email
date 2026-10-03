@@ -36,6 +36,7 @@ pub mod spool;
 pub mod sync;
 pub mod threads;
 pub mod tokenstore;
+pub mod update;
 pub mod userdb;
 pub mod worker;
 

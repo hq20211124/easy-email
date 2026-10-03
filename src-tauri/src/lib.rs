@@ -958,6 +958,23 @@ async fn set_notify_enabled(
         .set_notify_enabled(&account_id, enabled)
         .map_err(describe)
 }
+/// What happened to the last update attempt, if anything.
+///
+/// Called once at startup by the renderer. `None` is the ordinary case; `Updated` and `StillOld` are
+/// the two sentences `design/17` §5 asks for, and the note is cleared as it is read so neither is
+/// repeated on the next launch.
+#[tauri::command]
+async fn take_update_outcome(
+    state: State<'_, AppState>,
+) -> Result<Option<mail_core::update::Outcome>, String> {
+    let dir = state
+        .accounts_path
+        .parent()
+        .ok_or_else(|| "无法确定数据目录".to_string())?;
+    mail_core::update::UpdateState::new(dir)
+        .settle(env!("CARGO_PKG_VERSION"))
+        .map_err(describe)
+}
 /// Refresh tokens live beside the account list, in their own subdirectory.
 ///
 /// Derived from `accounts_path` rather than stored as a second field: two paths that must agree are
@@ -2264,6 +2281,7 @@ pub fn run() {
             refresh_thread_keys,
             quota_status,
             oauth_sign_in,
+            take_update_outcome,
             enqueue_send,
             list_outbox,
             cancel_send,
