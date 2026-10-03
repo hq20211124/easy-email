@@ -22,11 +22,11 @@ use std::time::Duration;
 use mail_core::smtp;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, Draft, DraftMirror, Endpoint, ImapClient, MailboxInfo,
-    NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryRun, Security,
-    Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy, mirror_draft, pool_op,
+    MessageSummary, NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryRun,
+    Security, Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy, mirror_draft, pool_op,
     recover_in_flight, run_due, watch_every,
 };
-use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older};
+use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older, fill_thread_keys};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -1513,6 +1513,70 @@ async fn an_account_without_a_drafts_folder_simply_has_no_mirror() {
         .await
         .expect("must not be an error");
     assert_eq!(report, None);
+}
+
+/// The key refresh (`design/07` §2, PROGRESS "会话链"): mail cached before the `thread_key` column
+/// existed has no key, no future sync will fill it (an incremental sync asks only for UIDs above the
+/// cursor), and the rows the user scrolls into are exactly the ones that need it.
+#[tokio::test]
+async fn the_key_refresh_walks_back_and_fills_what_the_sync_will_never_touch() {
+    let (addr, _log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let cache = Cache::open_in_memory().expect("cache");
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+
+    // Stand in for rows written before the column existed: same messages, no key.
+    let primed = within(client.fetch_newest_headers("INBOX", 4))
+        .await
+        .expect("prime");
+    let keyless: Vec<_> = primed
+        .summaries
+        .iter()
+        .map(|summary| MessageSummary {
+            thread_key: None,
+            ..summary.clone()
+        })
+        .collect();
+    cache
+        .upsert_summaries(&cfg.id, "INBOX", &keyless)
+        .expect("store");
+    assert!(
+        cache
+            .list_summaries(&cfg.id, "INBOX", 10, 0)
+            .expect("read")
+            .iter()
+            .all(|row| row.thread_key.is_none()),
+        "the fixture has to start keyless, or this test proves nothing"
+    );
+
+    let filled = within(fill_thread_keys(
+        &mut client,
+        &cache,
+        &cfg.id,
+        "INBOX",
+        3,
+        10,
+    ))
+    .await
+    .expect("refresh");
+
+    assert!(
+        filled > 0,
+        "the headers carry Message-IDs, so keys must appear"
+    );
+    let rows = cache.list_summaries(&cfg.id, "INBOX", 10, 0).expect("read");
+    assert_eq!(
+        rows.len(),
+        keyless.len(),
+        "re-storing headers must not add or remove rows"
+    );
+    assert!(
+        rows.iter().all(|row| row.thread_key.is_some()),
+        "every cached row the walk reached now has its key: {:?}",
+        rows.iter().map(|row| &row.thread_key).collect::<Vec<_>>()
+    );
 }
 
 // ===================================================================== helpers

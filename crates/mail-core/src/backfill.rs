@@ -88,6 +88,74 @@ pub struct BackfillReport {
     pub stop: BackfillStop,
 }
 
+/// Re-store the newest `pages` pages of headers, so cached rows get their conversation keys.
+///
+/// The `thread_key` column arrived after those rows were written, and no future sync will fill them:
+/// an incremental sync asks only for UIDs *above* the cursor, and the rows below it were stored
+/// without their `References` chain. Left alone, old mail keeps the subject-based fallback forever
+/// while new mail groups exactly — two behaviours in one list, which is worse than either.
+///
+/// Bounded on purpose: each page is a round trip, and the rows the user actually looks at are the
+/// newest ones. Returns how many messages came back with a key.
+pub async fn fill_thread_keys(
+    client: &mut ImapClient,
+    cache: &Cache,
+    account_id: &str,
+    folder: &str,
+    pages: u32,
+    page_size: usize,
+) -> Result<u32> {
+    let mut filled = 0u32;
+
+    // The first page is the *newest* one, and it is asked for by count rather than by a UID range:
+    // starting from `u32::MAX` asks the server for `1:4294967294`, a range no real mailbox has — and
+    // which made this walk's own fixture try to allocate for it. Everything after that walks strictly
+    // downwards from the oldest UID in hand.
+    let newest = client.fetch_newest_headers(folder, page_size).await?;
+    filled += newest
+        .summaries
+        .iter()
+        .filter(|summary| summary.thread_key.is_some())
+        .count() as u32;
+    if !newest.summaries.is_empty() {
+        cache.upsert_summaries(account_id, folder, &newest.summaries)?;
+    }
+    let mut before = newest
+        .summaries
+        .iter()
+        .map(|summary| summary.uid)
+        .min()
+        .unwrap_or(0);
+
+    for _ in 1..pages.max(1) {
+        if before <= 1 {
+            break;
+        }
+        let page = client
+            .fetch_older_headers(folder, before, page_size)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+
+        filled += page
+            .iter()
+            .filter(|summary| summary.thread_key.is_some())
+            .count() as u32;
+
+        // `fetch_older_headers` returns ascending UIDs; the next page starts below the oldest one.
+        let oldest = page
+            .iter()
+            .map(|summary| summary.uid)
+            .min()
+            .unwrap_or(before);
+        cache.upsert_summaries(account_id, folder, &page)?;
+        before = oldest.saturating_sub(1);
+    }
+
+    Ok(filled)
+}
+
 /// Page backwards until the window is satisfied, history ends, or the budget is spent.
 ///
 /// `now` is a parameter rather than a clock read so a test can pin the date boundary.

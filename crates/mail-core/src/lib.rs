@@ -38,7 +38,9 @@ pub mod userdb;
 pub mod worker;
 
 pub use attach::{AttachmentIssue, check_attachment, file_sha256, prepare_attachments};
-pub use backfill::{BackfillBudget, BackfillReport, BackfillStop, backfill_older};
+pub use backfill::{
+    BackfillBudget, BackfillReport, BackfillStop, backfill_older, fill_thread_keys,
+};
 pub use cache::{Cache, FolderState, SearchHit};
 pub use error::{AuthHint, MailError, Result};
 pub use idle::{PushEvent, watch, watch_every};

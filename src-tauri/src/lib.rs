@@ -25,7 +25,8 @@ use mail_core::{
     MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun, OutgoingAttachment,
     OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit, SentCopy, Spool,
     SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older, ensure_sent_copy,
-    file_sent_copies, file_sha256, prepare_attachments, recover_in_flight, run_due, secret, smtp,
+    file_sent_copies, file_sha256, fill_thread_keys, prepare_attachments, recover_in_flight,
+    run_due, secret, smtp,
     userdb::{Draft, DraftMirror, UserStore},
     watch,
 };
@@ -891,6 +892,10 @@ async fn mirror_draft(
     Ok(report)
 }
 
+/// How many pages of headers the key refresh walks. Five pages is ~2500 messages on a busy folder,
+/// which covers the conversations a user actually scrolls into.
+const THREAD_KEY_PAGES: u32 = 5;
+
 /// Give the cached mail of one folder the conversation keys it was cached without.
 ///
 /// The `thread_key` column arrived after those rows were written (`cache.db` v3), and an incremental
@@ -911,19 +916,19 @@ async fn refresh_thread_keys(
     let password = password_for(&account_id)?;
     let cache = state.cache.clone();
 
+    // A few pages rather than one: the newest page covers what is on screen, and the pages below it
+    // are where a conversation that started weeks ago still has keyless members. Bounded, because
+    // every page is a round trip (`design/04`'s budget applies to this too).
     let filled = pool_op!(&state.pool, &cfg, &password, |client| {
-        let page = client
-            .fetch_newest_headers(&mailbox, mail_core::sync::INITIAL_SYNC)
-            .await?;
-        let keys = page
-            .summaries
-            .iter()
-            .filter(|summary| summary.thread_key.is_some())
-            .count() as u32;
-        // Upserting the same rows with the key present is the whole point: `upsert_summaries`
-        // overwrites the summary fields, so this cannot duplicate or reorder anything.
-        cache.upsert_summaries(&account_id, &mailbox, &page.summaries)?;
-        Ok(keys)
+        fill_thread_keys(
+            &mut client,
+            &cache,
+            &account_id,
+            &mailbox,
+            THREAD_KEY_PAGES,
+            mail_core::sync::INITIAL_SYNC,
+        )
+        .await
     })
     .map_err(describe)?;
 
