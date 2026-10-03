@@ -18,18 +18,35 @@
  */
 (async () => {
   const invoke = window.__TAURI__.core.invoke;
+
+  // Read **before** anything else, and outside the try, so the catch can put it back. The run before
+  // this one threw in the middle of the round-trip loop and left the profile's setting on the last
+  // value it had tried (`on_demand`) — a probe may not change the user's preference, including when
+  // it fails.
+  const original = await invoke('get_sync_window');
+
+  // Normalise the view before measuring, for the same reason the threads probe clears its folds: the
+  // page stays open between runs, and a previous run that restored the setting through the raw
+  // command left the sidebar row showing what it had set, not what is stored.
+  await refreshSyncWindow();
+
   // A probe that throws would otherwise come back as `{}` through CDP, which reads as "nothing to
-  // report" — the least useful answer. Caught and reported instead.
+  // report" — the least useful answer. Caught, reported, and the setting restored.
   try {
   const steps = [];
   const note = (step, detail) => steps.push({ step, ...detail });
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  const original = await invoke('get_sync_window');
   note('initial', {
     value: original,
     label: windowLabel(original),
     row: document.getElementById('sync-window-value').textContent,
+    // The row is allowed to carry a state suffix ("今日额度已用完"); what it must always contain is
+    // the window itself, because that is the setting the row is for.
+    rowShowsWindow: document
+      .getElementById('sync-window-value')
+      .textContent.includes(windowLabel(original)),
+    paused: quotaPaused(state.quota) !== undefined ? String(quotaPaused(state.quota)) : '',
   });
 
   // The cold start runs inside `loadMailboxes`, which `boot` has already awaited by now. The set is
@@ -96,7 +113,7 @@
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const failures = steps.flatMap((entry) => {
     const bad = [];
-    if (entry.step === 'initial' && (!entry.label || !entry.row)) bad.push('initial');
+    if (entry.step === 'initial' && (!entry.label || !entry.rowShowsWindow)) bad.push('initial row');
     if (entry.step === 'quota' && (!entry.line || !entry.mentionsBytes)) bad.push('quota line');
     if (entry.step === 'cold_start' && !entry.ran) bad.push('cold start did not run');
     if (entry.step === 'round_trip') {
@@ -116,6 +133,14 @@
 
   return { passed: failures.length === 0, failures, steps };
   } catch (error) {
-    return { failed: String((error && error.stack) || error) };
+    // Whatever failed, the profile goes back to the window it had before this probe ran.
+    let restored = null;
+    try {
+      await invoke('set_sync_window', { window: original });
+      restored = await invoke('get_sync_window');
+    } catch {
+      restored = 'restore failed';
+    }
+    return { failed: String((error && error.stack) || error), restored };
   }
 })()

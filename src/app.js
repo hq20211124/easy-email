@@ -644,7 +644,28 @@ async function refreshSyncWindow() {
   const window = await invoke('get_sync_window').catch(() => null);
   if (!window) return;
   state.syncWindow = window;
-  $('sync-window-value').textContent = windowLabel(window);
+
+  // The row is where the *state* of syncing belongs, not just the setting: when the daily quota is
+  // spent or the server has asked us to slow down, "还在往回取" and "今天不会再取了" must not look
+  // the same from the sidebar (`design/04` §5.7's honesty, one line earlier than the dialog).
+  const quota = await invoke('quota_status', { accountId: state.accountId }).catch(() => null);
+  state.quota = quota;
+  $('sync-window-value').textContent = quotaPaused(quota)
+    ? `${windowLabel(window)} · ${quotaPaused(quota)}`
+    : windowLabel(window);
+}
+
+/**
+ * Why the sync is not running right now, or an empty string when it may.
+ *
+ * Kept separate from the dialog's sentence: this one has to fit a sidebar row, and it is a state
+ * ("今天不再取") rather than an explanation.
+ */
+function quotaPaused(quota) {
+  if (!quota) return '';
+  if (quota.throttled_until && quota.throttled_until * 1000 > Date.now()) return '服务器限流中';
+  if (quota.daily_budget && quota.bytes_today >= quota.daily_budget) return '今日额度已用完';
+  return '';
 }
 
 /**
@@ -793,6 +814,8 @@ async function backfillColdStart() {
   // client suddenly stopped is the difference between a policy and a bug the user blames on us.
   if (report.stop === 'quota_spent') {
     toast(quotaMessage(), 'info', 12000);
+    // The sidebar row says "今日额度已用完" from here on, without opening the dialog.
+    refreshSyncWindow();
     return;
   }
 
