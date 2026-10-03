@@ -263,6 +263,14 @@ impl ImapClient {
     /// The token comes from `oauth::refresh`, and it is short-lived by design: this function does not
     /// cache or renew it, so the caller renews before each connection rather than discovering halfway
     /// through a sync that the token expired.
+    /// Connect with whichever credential the caller resolved.
+    pub async fn connect_credential(cfg: &AccountConfig, credential: &Credential) -> Result<Self> {
+        match credential {
+            Credential::Password(password) => Self::connect(cfg, password).await,
+            Credential::OAuth2(token) => Self::connect_oauth(cfg, token).await,
+        }
+    }
+
     pub async fn connect_oauth(cfg: &AccountConfig, access_token: &str) -> Result<Self> {
         Self::connect_with(cfg, Login::OAuth2(access_token.to_string())).await
     }
@@ -998,6 +1006,17 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         seen,
         flagged,
     }
+}
+
+/// The credential for one connection, as the app hands it over.
+///
+/// A type rather than a string plus a flag, for the reason the SMTP side already spells out: the two
+/// shapes behave differently (a token expires and is renewable; a password is neither), and a flag at
+/// every call site is where that difference gets lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Credential {
+    Password(String),
+    OAuth2(String),
 }
 
 /// How the client proves who it is, for the two shapes the providers ship.

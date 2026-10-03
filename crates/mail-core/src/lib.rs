@@ -47,6 +47,7 @@ pub use backfill::{
 pub use cache::{Cache, FolderState, SearchHit};
 pub use error::{AuthHint, MailError, Result};
 pub use idle::{PushEvent, watch, watch_every};
+pub use imap::Credential;
 pub use imap::{HeaderPage, ImapClient};
 pub use model::{
     AccountConfig, AttachmentMeta, AuthKind, ConnectionReport, Endpoint, InlineImage, MailboxInfo,

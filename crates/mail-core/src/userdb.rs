@@ -35,6 +35,24 @@ pub const QUOTA_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// `kv` key holding the chosen sync window.
 pub const SYNC_WINDOW_KEY: &str = "sync_window";
 
+/// The client registration an OAuth account signs in with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OAuthSettings {
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+/// `kv` key holding one account's OAuth client id.
+pub fn oauth_client_id_key(account_id: &str) -> String {
+    format!("oauth_client_id:{account_id}")
+}
+
+/// `kv` key holding one account's OAuth client secret, if the provider needs one.
+pub fn oauth_client_secret_key(account_id: &str) -> String {
+    format!("oauth_client_secret:{account_id}")
+}
+
 /// `kv` key holding one account's notification preference.
 ///
 /// Per account on purpose: somebody with a noisy work mailbox and a quiet personal one wants to
@@ -437,6 +455,43 @@ impl UserStore {
         })
     }
 
+    // ------------------------------------------------------------------ OAuth settings
+
+    /// What a signed-in OAuth account needs to renew its token.
+    ///
+    /// Stored in `kv` beside the other per-account settings rather than in `accounts.json`: that file
+    /// is the *account list* (addresses, servers, display names) and is meant to be readable and
+    /// copyable, while these two values are what the client registration consists of. A1-F32 is
+    /// explicit that a desktop `client_secret` is not actually a secret — this is about keeping the
+    /// account list clean, not about hiding the value.
+    ///
+    /// `client_secret` is optional because whether a provider demands one is exactly M0-8's open
+    /// question.
+    pub fn oauth_settings(&self, account_id: &str) -> Result<Option<OAuthSettings>> {
+        let Some(client_id) = self.kv_get(&oauth_client_id_key(account_id))? else {
+            return Ok(None);
+        };
+        if client_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(OAuthSettings {
+            client_id,
+            client_secret: self
+                .kv_get(&oauth_client_secret_key(account_id))?
+                .filter(|value| !value.is_empty()),
+        }))
+    }
+
+    /// Remember which client registration an account signs in with.
+    pub fn set_oauth_settings(&self, account_id: &str, settings: &OAuthSettings) -> Result<()> {
+        self.kv_set(&oauth_client_id_key(account_id), &settings.client_id)?;
+        match settings.client_secret.as_deref() {
+            // An empty value *removes* the secret: a blank box in the wizard means "this provider
+            // does not need one", and keeping the old value would quietly keep using it.
+            None => self.kv_set(&oauth_client_secret_key(account_id), ""),
+            Some(secret) => self.kv_set(&oauth_client_secret_key(account_id), secret),
+        }
+    }
     // ------------------------------------------------------------------ notification preference
 
     /// Whether this account shows a system notification when new mail arrives.
@@ -1533,6 +1588,58 @@ mod tests {
             USER_SCHEMA_VERSION
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oauth_settings_round_trip_and_a_blank_secret_removes_it() {
+        let store = UserStore::open_in_memory().expect("open");
+        assert_eq!(
+            store.oauth_settings("me@example.com").expect("read"),
+            None,
+            "an account with no registration is a password account"
+        );
+
+        store
+            .set_oauth_settings(
+                "me@example.com",
+                &OAuthSettings {
+                    client_id: "client-123".into(),
+                    client_secret: Some("shh".into()),
+                },
+            )
+            .expect("write");
+        assert_eq!(
+            store.oauth_settings("me@example.com").expect("read"),
+            Some(OAuthSettings {
+                client_id: "client-123".into(),
+                client_secret: Some("shh".into())
+            })
+        );
+
+        // A blank box in the wizard means "this provider does not require a secret"; keeping the old
+        // value would quietly keep sending it.
+        store
+            .set_oauth_settings(
+                "me@example.com",
+                &OAuthSettings {
+                    client_id: "client-456".into(),
+                    client_secret: None,
+                },
+            )
+            .expect("write");
+        assert_eq!(
+            store.oauth_settings("me@example.com").expect("read"),
+            Some(OAuthSettings {
+                client_id: "client-456".into(),
+                client_secret: None
+            })
+        );
+
+        assert_eq!(
+            store.oauth_settings("other@example.com").expect("read"),
+            None,
+            "settings are per account"
+        );
     }
 
     #[test]

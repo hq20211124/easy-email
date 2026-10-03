@@ -22,10 +22,10 @@ use std::time::Duration;
 use base64::Engine as _;
 use mail_core::smtp;
 use mail_core::{
-    AccountConfig, Cache, ConnectionPool, Draft, DraftMirror, Endpoint, ImapClient, MailboxInfo,
-    MessageSummary, NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent, RecoveryRun,
-    Security, Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy, mirror_draft, pool_op,
-    recover_in_flight, run_due, watch_every,
+    AccountConfig, Cache, ConnectionPool, Credential, Draft, DraftMirror, Endpoint, ImapClient,
+    MailboxInfo, MessageSummary, NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent,
+    RecoveryRun, Security, Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy,
+    mirror_draft, pool_op, recover_in_flight, run_due, watch_every,
 };
 use mail_core::{BackfillBudget, BackfillStop, SyncWindow, backfill_older, fill_thread_keys};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1537,6 +1537,32 @@ async fn an_account_without_a_drafts_folder_simply_has_no_mirror() {
         .await
         .expect("must not be an error");
     assert_eq!(report, None);
+}
+
+/// The pool hands back a working connection whichever credential it was given, and reuses it.
+///
+/// This is the seam the app will use for an OAuth account: `acquire_with` has to reach the same
+/// `AUTHENTICATE XOAUTH2` path that `connect_credential` does, including for a *reused* connection
+/// (where no authentication happens at all).
+#[tokio::test]
+async fn the_pool_acquires_with_either_credential() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let pool = ConnectionPool::new();
+
+    {
+        let _client = within(pool.acquire_with(&cfg, &Credential::OAuth2("token".into())))
+            .await
+            .expect("a pooled OAuth connection");
+    }
+
+    let lines = transcript(&log);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("AUTHENTICATE XOAUTH2")),
+        "the pool must reach the XOAUTH2 path: {lines:?}"
+    );
 }
 
 /// `design/05` §3.2: an OAuth2 account authenticates with `AUTHENTICATE XOAUTH2`, and the string it

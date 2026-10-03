@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
-use crate::imap::ImapClient;
+use crate::imap::{Credential, ImapClient};
 use crate::model::AccountConfig;
 
 /// How old an idle connection may be before it is not worth probing.
@@ -48,6 +48,20 @@ impl ConnectionPool {
 
     /// Take a connection for `cfg`, reusing an idle one when possible.
     pub async fn acquire(&self, cfg: &AccountConfig, password: &str) -> Result<PooledClient<'_>> {
+        self.acquire_with(cfg, &Credential::Password(password.to_string()))
+            .await
+    }
+
+    /// The same, with whichever credential the account uses (`design/05` §3.2).
+    ///
+    /// One entry point rather than two: everything about reusing a connection — the idle window, the
+    /// `NOOP` probe, the per-account limit — is independent of how the connection authenticated, and
+    /// duplicating it would be two places for that logic to drift apart.
+    pub async fn acquire_with(
+        &self,
+        cfg: &AccountConfig,
+        credential: &Credential,
+    ) -> Result<PooledClient<'_>> {
         let key = cfg.id.clone();
 
         // Move a candidate out from under the lock first: the `NOOP` below is an await, and the
@@ -72,7 +86,7 @@ impl ConnectionPool {
             }
         }
 
-        let client = ImapClient::connect(cfg, password).await?;
+        let client = ImapClient::connect_credential(cfg, credential).await?;
         Ok(PooledClient {
             pool: self,
             key,
