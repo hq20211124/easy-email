@@ -936,18 +936,26 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         .header()
         .and_then(|raw| MessageParser::default().parse(raw));
 
-    let (subject, from_name, from_addr, date) = match parsed {
+    let (subject, from_name, from_addr, date, thread_key) = match parsed {
         Some(msg) => {
             let from = msg.from().and_then(|a| a.first());
+            // The thread key comes from headers already in hand: the root of the `References` chain,
+            // or the message's own id. Computing it here — rather than when the list is read — is what
+            // lets the cache store it and the renderer group without the chain.
+            let key = crate::threads::root_of(
+                msg.message_id().unwrap_or_default(),
+                msg.header_raw("References").unwrap_or_default(),
+            );
             (
                 msg.subject().unwrap_or("(无主题)").to_string(),
                 from.and_then(|a| a.name()).map(str::to_string),
                 from.and_then(|a| a.address()).map(str::to_string),
                 msg.date().map(date_to_unix),
+                (!key.is_empty()).then_some(key),
             )
         }
         // A malformed header must not sink the whole list; show a placeholder row instead.
-        None => ("(无法解析的邮件头)".to_string(), None, None, None),
+        None => ("(无法解析的邮件头)".to_string(), None, None, None, None),
     };
 
     MessageSummary {
@@ -957,6 +965,7 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         from_addr,
         date,
         size: fetch.size,
+        thread_key,
         seen,
         flagged,
     }
@@ -1301,6 +1310,7 @@ mod tests {
             size: Some(100),
             seen: false,
             flagged: false,
+            thread_key: None,
         }
     }
 

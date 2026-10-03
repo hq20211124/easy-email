@@ -82,6 +82,15 @@
    * would hide mail. It gets a key of its own, derived from the message.
    */
   function conversationKey(message) {
+    // The exact key first: the backend computes it from the `References` chain when it parses the
+    // headers (`crate::threads::root_of`) and stores it beside the row. It is the one key that joins
+    // a reply to the message it answers *and* to the message that started the thread, including a
+    // reply the user sent — which is exactly what the fallback below cannot do.
+    const exact = message.thread_key;
+    if (typeof exact === 'string' && exact.length > 0) {
+      return exact;
+    }
+
     const subject = normaliseSubject(message.subject);
     if (!subject) {
       return `solo:${message.folder ?? ''}:${message.uid ?? ''}`;

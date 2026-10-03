@@ -127,6 +127,14 @@ pub struct MessageSummary {
     pub size: Option<u32>,
     pub seen: bool,
     pub flagged: bool,
+    /// The thread this message belongs to, from its `References` chain (`crate::threads::root_of`).
+    ///
+    /// `None` for rows written before this existed, and for a message with no identity at all — the
+    /// renderer then falls back to grouping by subject and sender, which is a guess but a labelled
+    /// one. Stored rather than recomputed because the list is read from the cache far more often
+    /// than it is fetched, and the headers are not kept.
+    #[serde(default)]
+    pub thread_key: Option<String>,
 }
 
 /// Metadata for an attachment. The bytes are fetched separately, on demand.

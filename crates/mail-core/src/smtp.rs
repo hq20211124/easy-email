@@ -572,6 +572,7 @@ mod tests {
             size: None,
             seen: false,
             flagged: false,
+            thread_key: None,
         };
         let json = serde_json::to_string(&s).expect("serialise");
         assert!(json.contains("\"uid\":1"));

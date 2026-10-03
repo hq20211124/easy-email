@@ -26,7 +26,7 @@ use crate::error::{MailError, Result};
 use crate::model::{MailboxInfo, MessageDetail, MessageSummary};
 
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Where a delivered message's Sent copy is (`design/07` §5.4).
 ///
@@ -297,6 +297,12 @@ impl Cache {
 
             conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+
+            // A column cannot arrive through `create table if not exists`: for a file that already
+            // has the table, SQLite reads the existing definition and ignores the new one — so the
+            // statement would succeed while the column silently never appeared. This is the first
+            // *column* this schema has added, which is why it is spelled out rather than assumed.
+            add_column_if_missing(conn, "messages", "thread_key", "text")?;
             Ok(())
 
         })
@@ -490,12 +496,12 @@ impl Cache {
         let folder = folder.to_string();
         let summaries = summaries.to_vec();
         self.db.write_blocking(move |conn: &Connection| {
-
             for summary in summaries {
                 conn.execute(
                     "insert into messages
-                         (account_id, folder, uid, subject, from_name, from_addr, date, size, seen, flagged)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                         (account_id, folder, uid, subject, from_name, from_addr, date, size, seen,
+                          flagged, thread_key)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                      on conflict(account_id, folder, uid) do update set
                          subject   = excluded.subject,
                          from_name = excluded.from_name,
@@ -503,7 +509,8 @@ impl Cache {
                          date      = excluded.date,
                          size      = excluded.size,
                          seen      = excluded.seen,
-                         flagged   = excluded.flagged",
+                         flagged   = excluded.flagged,
+                         thread_key = excluded.thread_key",
                     params![
                         account_id,
                         folder,
@@ -515,12 +522,12 @@ impl Cache {
                         summary.size.map(i64::from),
                         i64::from(summary.seen),
                         i64::from(summary.flagged),
+                        summary.thread_key,
                     ],
                 )?;
                 Self::refresh_search_row(conn, &account_id, &folder, summary.uid)?;
             }
             Ok(())
-
         })
     }
 
@@ -536,7 +543,7 @@ impl Cache {
         let conn: &Connection = &guard;
 
         let mut stmt = conn.prepare(
-            "select uid, subject, from_name, from_addr, date, size, seen, flagged
+            "select uid, subject, from_name, from_addr, date, size, seen, flagged, thread_key
              from messages
              where account_id = ?1 and folder = ?2
              order by date desc, uid desc
@@ -554,6 +561,9 @@ impl Cache {
                     size: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
                     seen: row.get::<_, i64>(6)? != 0,
                     flagged: row.get::<_, i64>(7)? != 0,
+                    // `None` for rows written before the column existed: the renderer falls back to
+                    // grouping by subject and sender, which is a guess but a visible one.
+                    thread_key: row.get(8)?,
                 })
             },
         )?;
@@ -869,6 +879,24 @@ impl Cache {
     }
 }
 
+/// Add a column to an existing table, once.
+///
+/// SQLite has no `alter table ... add column if not exists`, so the check has to be made explicitly.
+/// Doing it by asking the schema rather than by trusting the recorded version is deliberate: the two
+/// can disagree (an interrupted migration, a file copied between versions), and the schema is what
+/// the query will actually run against.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if !existing.iter().any(|name| name == column) {
+        conn.execute_batch(&format!("alter table {table} add column {column} {kind};"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +912,7 @@ mod tests {
             size: Some(1024),
             seen: false,
             flagged: false,
+            thread_key: None,
         }
     }
 
@@ -1205,6 +1234,79 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The first *column* this schema has ever added.
+    ///
+    /// A new table arrives through `create table if not exists`, but a new column cannot: against an
+    /// existing table SQLite keeps the old definition and ignores the new one, so the statement
+    /// succeeds and the column never appears. This test is what keeps that from being discovered by
+    /// a user whose cache was written by the previous version.
+    #[test]
+    fn an_older_cache_gains_the_thread_key_column_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-thread-key-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        // A v2 file: the `messages` table without `thread_key`, and a row already in it.
+        {
+            let conn = Connection::open(&path).expect("legacy open");
+            conn.execute_batch(
+                "pragma user_version = 2;
+                 create table messages (
+                     account_id text not null, folder text not null, uid integer not null,
+                     subject text not null default '', from_name text, from_addr text,
+                     to_addrs text, date integer, size integer, seen integer not null default 0,
+                     flagged integer not null default 0,
+                     primary key (account_id, folder, uid)
+                 );
+                 -- Present in v2 as well: the search index is what `upsert_summaries` writes to, and
+                 -- a fixture that omits it would fail on the first write for the wrong reason.
+                 create virtual table search using fts5(
+                     subject, from_name, from_addr, to_addrs, body,
+                     account_id unindexed, folder unindexed, uid unindexed,
+                     tokenize = 'unicode61'
+                 );
+                 insert into messages (account_id, folder, uid, subject, seen, flagged)
+                 values ('acc', 'INBOX', 7, 'OLD', 0, 0);",
+            )
+            .expect("legacy schema");
+        }
+
+        let cache = Cache::open(&path).expect("opening must migrate, not refuse");
+        assert_eq!(cache.schema_version().expect("version"), SCHEMA_VERSION);
+        let rows = cache.list_summaries("acc", "INBOX", 10, 0).expect("read");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the row written before the migration survives"
+        );
+        assert_eq!(rows[0].subject, "OLD");
+        assert_eq!(
+            rows[0].thread_key, None,
+            "a row that predates the column has no key, and the renderer falls back for it"
+        );
+
+        // And the column is usable from here on.
+        let mut fresh = rows[0].clone();
+        fresh.uid = 8;
+        fresh.thread_key = Some("<root@x>".to_string());
+        cache
+            .upsert_summaries("acc", "INBOX", &[fresh])
+            .expect("write");
+        let after = cache.list_summaries("acc", "INBOX", 10, 0).expect("read");
+        assert!(
+            after
+                .iter()
+                .any(|row| row.thread_key.as_deref() == Some("<root@x>"))
+        );
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The upgrade path for databases created before M0-7: the pragma cannot be enabled in place,
     /// so the only correct answer is a full rebuild — and the helper must be idempotent.
     #[test]
@@ -1277,6 +1379,7 @@ mod tests {
             size: Some(4096),
             seen: false,
             flagged: false,
+            thread_key: None,
         }
     }
 

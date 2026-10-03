@@ -33,6 +33,7 @@ pub mod sentcopy;
 pub mod smtp;
 pub mod spool;
 pub mod sync;
+pub mod threads;
 pub mod userdb;
 pub mod worker;
 
@@ -55,6 +56,7 @@ pub use providers::Provider;
 pub use sentcopy::{DraftMirrorReport, SentCopy, draft_to_mail, ensure_sent_copy, mirror_draft};
 pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
+pub use threads::root_of;
 pub use userdb::{Draft, DraftMirror, NewOutbox, OutboxItem, UserStore};
 pub use worker::{
     DEFAULT_CRASH_RESEND_LIMIT, FilingReport, FilingRun, OutboxRun, Recovery, RecoveryQuestion,

@@ -406,6 +406,7 @@ mod tests {
             size: None,
             seen: false,
             flagged: false,
+            thread_key: None,
         }
     }
 

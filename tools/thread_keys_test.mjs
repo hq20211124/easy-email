@@ -97,6 +97,33 @@ check(
   'different subjects are different conversations'
 );
 
+// ---------------------------------------------------------------- the exact key wins
+check(
+  'a backend thread key replaces the fallback',
+  conversationKey(message({ subject: 'Re: anything', thread_key: '<root@x>' })) === '<root@x>',
+  'the References-derived key must be used when the backend supplied one'
+);
+check(
+  'messages of one real thread group even with different subjects',
+  conversationKey(message({ subject: 'Re: hi', thread_key: '<root@x>' })) ===
+    conversationKey(message({ subject: 'completely different', thread_key: '<root@x>' })),
+  'a subject change mid-thread is normal (people edit subjects) and must not split the thread'
+);
+check(
+  'a sent reply joins its thread through the exact key',
+  conversationKey(
+    message({ subject: 'Re: hi', from_addr: 'me@example.com', thread_key: '<root@x>' })
+  ) ===
+    conversationKey(message({ subject: 'hi', from_addr: 'a@example.com', thread_key: '<root@x>' })),
+  'this is the limitation the exact key exists to remove'
+);
+check(
+  'an empty backend key falls back to subject and sender',
+  conversationKey(message({ subject: 'hi', thread_key: '' })) ===
+    conversationKey(message({ subject: 'hi' })),
+  'rows written before the column existed must still group by the fallback'
+);
+
 // ---------------------------------------------------------------- grouping
 const thread = groupConversations([
   message({ uid: 3, subject: 'Re: 十月报销' }),

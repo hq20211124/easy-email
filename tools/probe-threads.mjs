@@ -34,6 +34,9 @@
 
   return {
     messages: state.messages.length,
+    exactKeys: state.messages.filter((m) => typeof m.thread_key === 'string' && m.thread_key)
+      .length,
+    fallbackOnly: state.messages.filter((m) => !m.thread_key).length,
     expectedRows: expected,
     renderedRows: rendered.length,
     hasCounts: badges.length > 0,
