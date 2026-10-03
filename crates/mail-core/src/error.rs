@@ -53,6 +53,16 @@ pub enum MailError {
     #[error("本地缓存错误 — {0}")]
     Cache(String),
 
+    /// A failure from a local database whose *kind* the raw SQL layer cannot know.
+    ///
+    /// `From<rusqlite::Error>` serves both databases, and the advice that is right for one is
+    /// destructive for the other: deleting `cache.db` costs a re-sync, while deleting `user.db` costs
+    /// the user's drafts and outbox. Saying "本地缓存错误 — 可以删掉缓存文件" for a `user.db` problem
+    /// (found on a real profile, M1a-60) is therefore not a wording nit: it points at the wrong file.
+    /// This variant exists so the message can say what is true of both without inviting that.
+    #[error("本地数据库出错 — {0}")]
+    LocalDb(String),
+
     /// The database was locked by another writer. Separate from `Cache` because it is *retryable*:
     /// the caller (see `Db::write_retry`) can run the same transaction again, whereas a corrupt file
     /// or a missing table cannot be fixed by waiting.
@@ -71,7 +81,7 @@ impl From<rusqlite::Error> for MailError {
         if is_lock_error(&error) {
             MailError::Busy(error.to_string())
         } else {
-            MailError::Cache(error.to_string())
+            MailError::LocalDb(error.to_string())
         }
     }
 }
@@ -190,6 +200,10 @@ impl MailError {
             MailError::Cache(_) => Some(
                 "本地缓存数据库读写失败。可以删掉缓存文件后重启 —— \
                  服务器上的邮件不受影响，只是需要重新同步一次。",
+            ),
+            MailError::LocalDb(_) => Some(
+                "本地数据库读写失败。**不要**删除 user.db：草稿和发件箱都在那里，删了就找不回来。\
+                 缓存文件（cache.db）可以删，代价只是重新同步一次。",
             ),
             MailError::Credential(_) => Some("无法读写 Windows 凭据管理器，请检查账户权限。"),
             _ => None,
