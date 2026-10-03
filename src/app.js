@@ -2499,6 +2499,22 @@ function openAccountWizard() {
       }
 
       if (!verified) {
+        // An OAuth account that has already been authorized is **kept** even when the reachability
+        // probe fails, because the two failures are not alike: the authorization is a real, stored,
+        // revocable thing the user just did in a browser, while "IMAP did not answer" is often just the
+        // network (Gmail is unreachable from parts of China, and the provider note says as much).
+        // Throwing the account away here would make the user redo the browser dance for nothing.
+        if (oauthAccount && oauthAuthorized) {
+          pendingWizardAccountId = null;
+          toast(
+            `已保存 ${email}：浏览器授权成功，但这次没连上服务器。网络恢复后会自动开始收信。`,
+            'info',
+            15000
+          );
+          await refreshAccounts();
+          return true;
+        }
+
         pendingWizardAccountId = accountId;
         const retry = modal.querySelector('[data-role="confirm"]');
         if (retry) retry.textContent = '重试';
