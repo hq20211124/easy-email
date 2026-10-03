@@ -1059,7 +1059,13 @@ async fn outbox_pass(app: &AppHandle) -> Result<(RunReport, FilingReport), Strin
                 let pool = pool.clone();
                 let cfg = account.clone();
                 let password = password.clone();
-                async move { file_one_copy(&pool, &cfg, &password, &message_id, bytes).await }
+                // The size limit is the provider's *append* limit, not its SMTP one (A1-F3): the
+                // archive copy is an IMAP upload, and the two numbers belong to different services.
+                let append_limit = mail_core::providers::by_id(&cfg.provider_id)
+                    .and_then(|provider| provider.append_limit_bytes());
+                async move {
+                    file_one_copy(&pool, &cfg, &password, &message_id, bytes, append_limit).await
+                }
             },
         )
         .await
@@ -1080,9 +1086,10 @@ async fn file_one_copy(
     password: &str,
     message_id: &str,
     bytes: Vec<u8>,
+    append_limit: Option<u64>,
 ) -> mail_core::Result<Option<SentCopy>> {
     pool_op!(pool, cfg, password, |client| {
-        ensure_sent_copy(&mut client, &bytes, message_id).await
+        ensure_sent_copy(&mut client, &bytes, message_id, append_limit).await
     })
 }
 

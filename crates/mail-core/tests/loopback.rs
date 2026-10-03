@@ -1248,10 +1248,15 @@ async fn an_already_filed_message_is_found_instead_of_appended_again() {
 
     let raw = b"From: me@example.com\r\nTo: them@example.com\r\n\
                 Message-ID: <filed@example.com>\r\nSubject: hi\r\n\r\nbody\r\n";
-    let copy = within(ensure_sent_copy(&mut client, raw, "<filed@example.com>"))
-        .await
-        .expect("filing must succeed")
-        .expect("the fixture has a Sent folder");
+    let copy = within(ensure_sent_copy(
+        &mut client,
+        raw,
+        "<filed@example.com>",
+        None,
+    ))
+    .await
+    .expect("filing must succeed")
+    .expect("the fixture has a Sent folder");
 
     assert_eq!(copy.folder, "Sent");
     assert!(
@@ -1457,6 +1462,39 @@ async fn mirroring_a_draft_replaces_our_previous_copy() {
             .iter()
             .any(|line| line.to_ascii_uppercase().contains("UID STORE 4242")),
         "the previous copy is what gets flagged deleted: {lines:?}"
+    );
+}
+
+/// `design/07` §5.4's `SkippedTooLarge`: when the server has told us the message is too big for an
+/// APPEND, the attempt must not happen at all — and, just as importantly, the caller must not retry.
+#[tokio::test]
+async fn a_copy_larger_than_the_append_limit_is_never_appended() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+
+    let raw = b"From: me@example.com\r\nMessage-ID: <huge@example.com>\r\n\r\nbody\r\n";
+    let copy = within(ensure_sent_copy(
+        &mut client,
+        raw,
+        "<huge@example.com>",
+        Some(1), // one byte: everything is too big for this server
+    ))
+    .await
+    .expect("must not be an error");
+
+    assert_eq!(
+        copy, None,
+        "nothing is filed, and nothing ever will be for this message"
+    );
+    let lines = transcript(&log);
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("APPEND")),
+        "an APPEND the server has already refused must not be attempted: {lines:?}"
     );
 }
 

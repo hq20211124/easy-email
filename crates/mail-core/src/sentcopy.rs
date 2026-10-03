@@ -51,16 +51,30 @@ pub struct SentCopy {
 
 /// Make sure the account's Sent folder holds this message, and say where it is.
 ///
-/// `None` means the account has no Sent folder to file into — a fact about the account, not a
-/// failure of this message, and one the caller must not retry forever.
+/// `None` means **nothing will ever be filed** for this message: either the account has no Sent
+/// folder, or the message is larger than the server's documented append limit (`design/07` §5.4's
+/// `SkippedTooLarge`). Both are facts rather than failures, and both mean the same thing to the
+/// caller — stop, and do not retry.
 pub async fn ensure_sent_copy(
     client: &mut ImapClient,
     raw: &[u8],
     message_id: &str,
+    append_limit: Option<u64>,
 ) -> Result<Option<SentCopy>> {
     let Some(folder) = client.sent_mailbox().await? else {
         return Ok(None);
     };
+
+    // `design/07` §5.4 calls this `SkippedTooLarge`: the server has told us (A1-F3) that it will not
+    // take a message this big, so attempting the APPEND can only fail — and retrying it can only fail
+    // again. `None` is the same answer to the caller as "no Sent folder": nothing is filed, nothing
+    // will ever be filed, stop and do not retry. (The user-facing "副本太大，已保存在本机" is a
+    // follow-up; today the outbox simply reports it as skipped.)
+    if let Some(limit) = append_limit
+        && raw.len() as u64 > limit
+    {
+        return Ok(None);
+    }
 
     for delay in POLL_LADDER {
         if !delay.is_zero() {
