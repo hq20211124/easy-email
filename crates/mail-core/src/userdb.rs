@@ -842,6 +842,118 @@ mod tests {
         drop(again);
         let _ = std::fs::remove_file(&path);
     }
+    // ------------------------------------------------------------------- outbox
+
+    fn queued_send(account: &str, at: i64) -> NewOutbox {
+        NewOutbox {
+            account_id: account.to_string(),
+            draft_id: None,
+            payload_json: r#"{"to":["a@example.com"],"subject":"s"}"#.to_string(),
+            spool_path: None,
+            spool_bytes: 0,
+            undo_until: 0,
+            scheduled_at: 0,
+            created_at: at,
+        }
+    }
+
+    #[test]
+    fn the_outbox_badge_counts_only_what_is_still_open() {
+        // The table keeps sent and cancelled rows as history. Counting them would leave a badge on
+        // screen that never goes away, which is how a user learns to ignore the badge.
+        let store = UserStore::open_in_memory().expect("open");
+        let first = store
+            .enqueue_outbox(&queued_send("acc", 1))
+            .expect("enqueue");
+        let second = store
+            .enqueue_outbox(&queued_send("acc", 2))
+            .expect("enqueue");
+        assert_eq!(store.outbox_count().expect("count"), 2);
+
+        store
+            .mark_outbox_sent(first, Some("<id@example.com>"), 9)
+            .expect("sent");
+        assert_eq!(store.outbox_count().expect("count"), 1);
+
+        // In flight still counts: the user is waiting for it.
+        assert!(store.claim_outbox(second, 0).expect("claim"));
+        assert_eq!(store.outbox_count().expect("count"), 1);
+        assert!(
+            store.due_outbox(9_999, 10).expect("due").is_empty(),
+            "an in-flight row is not due, whatever the clock says"
+        );
+
+        assert!(!store.cancel_outbox(second).expect("cancel"), "too late");
+        assert_eq!(
+            store.outbox_count().expect("count"),
+            1,
+            "a message already on the wire stays open"
+        );
+    }
+
+    #[test]
+    fn a_retry_goes_back_to_queued_but_a_permanent_failure_does_not() {
+        // The difference between "wait and try again" and "stop, and tell the user". Getting it
+        // wrong in one direction loops forever; in the other it drops somebody's mail.
+        let store = UserStore::open_in_memory().expect("open");
+        let retrying = store
+            .enqueue_outbox(&queued_send("acc", 1))
+            .expect("enqueue");
+        let dead = store
+            .enqueue_outbox(&queued_send("acc", 2))
+            .expect("enqueue");
+        // Which rows are eligible right now, by id: the other row in this fixture is queued and due
+        // as well, so a bare count would pass for the wrong reason.
+        let due = |now: i64| -> Vec<i64> {
+            store
+                .due_outbox(now, 10)
+                .expect("due")
+                .into_iter()
+                .map(|item| item.id)
+                .collect()
+        };
+
+        assert!(store.claim_outbox(retrying, 10).expect("claim"));
+        store
+            .mark_outbox_retry(retrying, "421 try later", 40)
+            .expect("retry");
+        let item = store.outbox_item(retrying).expect("item").expect("present");
+        assert_eq!(item.parsed_state(), OutboxState::Queued);
+        assert_eq!(item.attempts, 1);
+        assert!(!due(39).contains(&retrying), "the backoff has not elapsed");
+        assert!(due(40).contains(&retrying));
+
+        assert!(store.claim_outbox(dead, 10).expect("claim"));
+        store
+            .mark_outbox_failed(dead, "550 no such user", false)
+            .expect("failed");
+        assert!(
+            !due(i64::MAX / 2).contains(&dead),
+            "a permanent failure must never become eligible again"
+        );
+        assert!(
+            store.requeue_outbox(dead).expect("requeue"),
+            "…unless a human asks for it"
+        );
+        assert!(due(20).contains(&dead));
+    }
+
+    #[test]
+    fn a_send_is_not_due_until_its_undo_window_has_passed() {
+        let store = UserStore::open_in_memory().expect("open");
+        let mut item = queued_send("acc", 1_000);
+        item.undo_until = 1_005;
+        let id = store.enqueue_outbox(&item).expect("enqueue");
+
+        assert!(store.due_outbox(1_004, 10).expect("due").is_empty());
+        assert!(
+            !store.claim_outbox(id, 1_004).expect("claim"),
+            "claiming inside the undo window would be the 'not really cancellable' lie"
+        );
+        assert_eq!(store.due_outbox(1_005, 10).expect("due").len(), 1);
+        assert!(store.claim_outbox(id, 1_005).expect("claim"));
+    }
+
     // ------------------------------------------------------------------- drafts
 
     fn draft(id: &str, account: &str, now: i64) -> Draft {
