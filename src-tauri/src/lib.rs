@@ -42,6 +42,8 @@ struct AppState {
     /// Where the non-secret account list is persisted.
     accounts_path: PathBuf,
     accounts: Mutex<Vec<AccountConfig>>,
+    /// Access tokens already fetched, per account, so concurrent work refreshes once.
+    tokens: mail_core::oauth::TokenCache,
     /// The open cache handle, shared by every command.
     ///
     /// A handle rather than a bare connection (and rather than a path): `Cache` is `Clone + Send +
@@ -177,16 +179,22 @@ async fn secret_for(state: &AppState, cfg: &AccountConfig) -> Result<String, Str
 
     let store = token_store(state)?;
     let transport = http_tokens()?;
-    mail_core::oauth::fresh_access_token(
-        &transport,
-        &store,
-        &cfg.id,
-        provider,
-        &settings.client_id,
-        settings.client_secret.as_deref(),
-    )
-    .await
-    .map_err(describe)
+    // Through the cache, so two commands that need this account at the same time refresh **once**:
+    // with rotation (A1-F34) two racing refreshes can leave the older token on disk, and the account
+    // then signs itself out at the next launch (`design/05`'s acceptance list asks for exactly this).
+    state
+        .tokens
+        .access_token(
+            &transport,
+            &store,
+            &cfg.id,
+            provider,
+            &settings.client_id,
+            settings.client_secret.as_deref(),
+            now_seconds(),
+        )
+        .await
+        .map_err(describe)
 }
 
 // ---------------------------------------------------------------- provider database
@@ -2381,6 +2389,7 @@ pub fn run() {
             app.manage(AppState {
                 accounts_path,
                 accounts: Mutex::new(accounts),
+                tokens: mail_core::oauth::TokenCache::new(),
                 cache,
                 last_sync_error: Mutex::new(None),
                 pool: Arc::new(ConnectionPool::new()),

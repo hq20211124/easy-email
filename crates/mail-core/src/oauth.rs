@@ -330,6 +330,105 @@ pub async fn sign_in_as<T: TokenTransport, B: BrowserLauncher>(
     .await
 }
 
+/// Access tokens that have already been fetched, so a burst of work does not refresh once per call.
+///
+/// `design/05`'s acceptance list asks for exactly this: "两个并发请求只触发一次刷新，且落盘的是**最后
+/// 一次**返回的令牌". Both halves matter, and the second one is the dangerous one — with rotation
+/// (A1-F34), two refreshes racing can leave the **older** token on disk, and the account is then signed
+/// out by its own client on the next launch.
+///
+/// The lock is per account, so one slow mailbox does not hold up another, and the cached token is
+/// discarded a minute before it expires: a token that dies mid-sync produces an error that looks like
+/// a server problem.
+#[derive(Default)]
+pub struct TokenCache {
+    locks:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    tokens: std::sync::Mutex<std::collections::HashMap<String, Cached>>,
+}
+
+struct Cached {
+    access_token: String,
+    /// Unix seconds after which this must not be reused.
+    good_until: i64,
+}
+
+impl TokenCache {
+    pub fn new() -> TokenCache {
+        TokenCache::default()
+    }
+
+    fn lock_for(&self, account_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().expect("token cache mutex");
+        std::sync::Arc::clone(
+            locks
+                .entry(account_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// A usable access token for this account, refreshing **at most once** per expiry window.
+    ///
+    /// `now` is a parameter rather than a clock read so a test can pin the boundary.
+    // Every parameter is something this function must know and none of them is derivable from another;
+    // bundling them into a struct would only move the same list one line up.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn access_token<T: TokenTransport>(
+        &self,
+        transport: &T,
+        store: &crate::tokenstore::TokenStore,
+        account_id: &str,
+        provider: OAuthProvider,
+        client_id: &str,
+        client_secret: Option<&str>,
+        now: i64,
+    ) -> Result<String> {
+        // Serialise per account: the second caller waits, then finds the first caller's token in the
+        // cache instead of refreshing again.
+        let lock = self.lock_for(account_id);
+        let _guard = lock.lock().await;
+
+        if let Some(cached) = self
+            .tokens
+            .lock()
+            .expect("token cache mutex")
+            .get(account_id)
+            && cached.good_until > now
+        {
+            return Ok(cached.access_token.clone());
+        }
+
+        let refresh_token = store.load(account_id)?.ok_or_else(|| {
+            MailError::Credential("这个账号还没有授权记录，请重新登录一次。".into())
+        })?;
+
+        let tokens = refresh(
+            transport,
+            provider,
+            client_id,
+            client_secret,
+            &refresh_token,
+        )
+        .await?;
+
+        if let Some(rotated) = tokens.refresh_token.as_deref() {
+            // Under the lock, so a slower refresh cannot overwrite a newer token.
+            store.save(account_id, rotated)?;
+        }
+
+        let good_until = now + tokens.expires_in.unwrap_or(3600) - 60;
+        self.tokens.lock().expect("token cache mutex").insert(
+            account_id.to_string(),
+            Cached {
+                access_token: tokens.access_token.clone(),
+                good_until,
+            },
+        );
+
+        Ok(tokens.access_token)
+    }
+}
+
 /// Turn a stored refresh token into a usable access token, persisting any rotation.
 ///
 /// This is the step every connection needs and the one place where A1-F34 bites: the providers that
@@ -1473,6 +1572,130 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- refresh before connecting
+
+    #[tokio::test]
+    async fn two_concurrent_refreshes_happen_once_and_persist_the_last_token() {
+        // `design/05`'s acceptance list, both halves. The dangerous half is the second: with rotation
+        // (A1-F34), two refreshes racing can leave the *older* refresh token on disk, and the account
+        // signs itself out at the next launch.
+        let dir = std::env::temp_dir().join(format!(
+            "easy-email-token-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = crate::tokenstore::TokenStore::new(&dir);
+        store.save("me@example.com", "refresh-0").expect("seed");
+
+        // Each answer rotates the refresh token, so "which one is on disk" is observable.
+        struct Counting {
+            calls: Mutex<Vec<String>>,
+        }
+        // The trait spells its signature as `impl Future + Send` so the real transport can be used from
+        // `Send` Tauri commands; this test writes that same future out rather than `async fn`.
+        #[allow(clippy::manual_async_fn)]
+        impl TokenTransport for Counting {
+            fn post_form(
+                &self,
+                _url: &str,
+                form: Vec<(String, String)>,
+            ) -> impl std::future::Future<Output = Result<String>> + Send {
+                async move {
+                    // A real endpoint takes a moment; without it the two callers would not overlap and
+                    // the test would pass even with no lock at all.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let mut calls = self.calls.lock().expect("calls");
+                    let seen = form
+                        .iter()
+                        .find(|(key, _)| key == "refresh_token")
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_default();
+                    calls.push(seen);
+                    let n = calls.len();
+                    Ok(format!(
+                        r#"{{"access_token":"access-{n}","refresh_token":"refresh-{n}","expires_in":3600}}"#
+                    ))
+                }
+            }
+        }
+
+        let transport = Counting {
+            calls: Mutex::new(Vec::new()),
+        };
+        let cache = TokenCache::new();
+
+        let (first, second) = tokio::join!(
+            cache.access_token(
+                &transport,
+                &store,
+                "me@example.com",
+                GOOGLE,
+                "c",
+                None,
+                1_000
+            ),
+            cache.access_token(
+                &transport,
+                &store,
+                "me@example.com",
+                GOOGLE,
+                "c",
+                None,
+                1_000
+            ),
+        );
+        let first = first.expect("first");
+        let second = second.expect("second");
+
+        assert_eq!(
+            transport.calls.lock().expect("calls").len(),
+            1,
+            "two concurrent callers must trigger one refresh, not two"
+        );
+        assert_eq!(first, second, "and both must get the same access token");
+        assert_eq!(
+            store.load("me@example.com").expect("load").as_deref(),
+            Some("refresh-1"),
+            "the token on disk is the one the refresh returned"
+        );
+
+        // A third call inside the same window reuses the cached token rather than refreshing again.
+        let third = cache
+            .access_token(
+                &transport,
+                &store,
+                "me@example.com",
+                GOOGLE,
+                "c",
+                None,
+                1_100,
+            )
+            .await
+            .expect("third");
+        assert_eq!(third, first);
+        assert_eq!(transport.calls.lock().expect("calls").len(), 1);
+
+        // ...and once it is past its expiry, it refreshes again.
+        let later = cache
+            .access_token(
+                &transport,
+                &store,
+                "me@example.com",
+                GOOGLE,
+                "c",
+                None,
+                99_999,
+            )
+            .await
+            .expect("later");
+        assert_eq!(later, "access-2");
+        assert_eq!(transport.calls.lock().expect("calls").len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn a_rotated_refresh_token_is_written_back_before_it_is_used() {
