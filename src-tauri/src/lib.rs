@@ -872,6 +872,47 @@ async fn mirror_draft(
     Ok(report)
 }
 
+/// Give the cached mail of one folder the conversation keys it was cached without.
+///
+/// The `thread_key` column arrived after those rows were written (`cache.db` v3), and an incremental
+/// sync will never fill them: it asks only for UIDs *above* the cursor, and the rows below it were
+/// stored without their `References` chain. Left alone, old mail keeps the subject-based fallback
+/// forever while new mail groups exactly — two behaviours in one list, which is worse than either.
+///
+/// One re-fetch of the newest page fixes it for everything the list actually shows, and it is cheap:
+/// headers only, the same call the cold sync already makes. Requested by the renderer, once per
+/// account per session, and only when it can see rows without a key.
+#[tauri::command]
+async fn refresh_thread_keys(
+    state: State<'_, AppState>,
+    account_id: String,
+    mailbox: String,
+) -> Result<u32, String> {
+    let cfg = state.find(&account_id)?;
+    let password = password_for(&account_id)?;
+    let cache = state.cache.clone();
+
+    let filled = pool_op!(&state.pool, &cfg, &password, |client| {
+        let page = client
+            .fetch_newest_headers(&mailbox, mail_core::sync::INITIAL_SYNC)
+            .await?;
+        let keys = page
+            .summaries
+            .iter()
+            .filter(|summary| summary.thread_key.is_some())
+            .count() as u32;
+        // Upserting the same rows with the key present is the whole point: `upsert_summaries`
+        // overwrites the summary fields, so this cannot duplicate or reorder anything.
+        cache.upsert_summaries(&account_id, &mailbox, &page.summaries)?;
+        Ok(keys)
+    })
+    .map_err(describe)?;
+
+    log_line(&format!(
+        "[easy-email] 为 {account_id} 的 {mailbox} 补齐会话键：{filled} 封"
+    ));
+    Ok(filled)
+}
 /// Whether new mail for this account shows a system notification.
 #[tauri::command]
 async fn get_notify_enabled(
@@ -2107,6 +2148,7 @@ pub fn run() {
             max_send_bytes,
             get_notify_enabled,
             set_notify_enabled,
+            refresh_thread_keys,
             enqueue_send,
             list_outbox,
             cancel_send,

@@ -748,6 +748,20 @@ async function backfillColdStart() {
   }).catch(() => null);
   if (!report) return;
 
+  // Mail cached before `thread_key` existed has no conversation key, and no future sync will fill it
+  // (an incremental sync only asks for UIDs above the cursor). One header re-fetch fixes the rows the
+  // list actually shows, once per account per session, and only when the list can see they are
+  // missing — otherwise every startup would pay for a round trip nobody needs.
+  if (state.messages.some((message) => !message.thread_key)) {
+    const filled = await invoke('refresh_thread_keys', {
+      accountId,
+      mailbox: state.mailbox,
+    }).catch(() => 0);
+    if (filled > 0) {
+      await loadMessages({ reset: true });
+    }
+  }
+
   // The daily quota is a fact about the account, not a failure of this walk — and saying *why* the
   // client suddenly stopped is the difference between a policy and a bug the user blames on us.
   if (report.stop === 'quota_spent') {
