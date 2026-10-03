@@ -37,9 +37,12 @@ getrandom = "0.3"
 # The OAuth token endpoints are HTTPS POSTs of a form. rustls (not native-tls) because only its
 # crate set is available in this environment's offline registry (M1a-38 measured that).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Needed to set SO_EXCLUSIVEADDRUSE *before* bind: the option cannot be applied to a socket that is
+# already listening, and tokio binds for us (A1-F36).
+socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Networking_WinSock"] }
 
 serde.workspace = true
 serde_json.workspace = true

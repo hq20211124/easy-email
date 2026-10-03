@@ -381,12 +381,61 @@ pub struct Loopback {
     pub redirect_uri: String,
 }
 
+/// Bind the loopback listener with `SO_EXCLUSIVEADDRUSE`.
+///
+/// A1-F36 asks for this one specifically, and it is not the same as `SO_REUSEADDR`: on Windows,
+/// `SO_REUSEADDR` **lets** another process bind the same address, which is exactly the race worth
+/// closing — a local process that grabs the port between our bind and the browser's redirect would
+/// receive the authorization code. The option has to be set **before** `bind`, so the socket is built
+/// by hand and converted to a tokio listener afterwards.
+fn bind_exclusive_loopback() -> Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|error| MailError::Config(format!("无法创建监听套接字：{error}")))?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        // Safety: a plain `setsockopt` on the socket we just created, with a well-formed bool.
+        let value: i32 = 1;
+        let set = unsafe {
+            windows_sys::Win32::Networking::WinSock::setsockopt(
+                socket.as_raw_socket() as usize,
+                windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
+                windows_sys::Win32::Networking::WinSock::SO_EXCLUSIVEADDRUSE,
+                &value as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if set != 0 {
+            return Err(MailError::Config(format!(
+                "无法独占监听端口：{}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    let address: std::net::SocketAddr = "127.0.0.1:0".parse().expect("literal address");
+    socket
+        .bind(&address.into())
+        .map_err(|error| MailError::Config(format!("无法监听本机端口：{error}")))?;
+    socket
+        .listen(16)
+        .map_err(|error| MailError::Config(format!("无法监听本机端口：{error}")))?;
+
+    let listener: std::net::TcpListener = socket.into();
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| MailError::Config(format!("无法设置非阻塞：{error}")))?;
+    TcpListener::from_std(listener)
+        .map_err(|error| MailError::Config(format!("无法注册到运行时：{error}")))
+}
+
 impl Loopback {
     /// Bind an ephemeral port on loopback and work out the redirect URI.
     pub async fn bind() -> Result<Loopback> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(|error| MailError::Config(format!("无法监听本机端口：{error}")))?;
+        let listener = bind_exclusive_loopback()?;
         let port = listener
             .local_addr()
             .map_err(|error| MailError::Config(format!("无法读取监听端口：{error}")))?
@@ -908,6 +957,29 @@ mod tests {
             loopback.redirect_uri
         );
         assert!(loopback.redirect_uri.ends_with('/'));
+    }
+
+    #[test]
+    fn another_process_cannot_take_the_port_between_bind_and_redirect() {
+        // The property A1-F36 asks for. On Windows `SO_REUSEADDR` **allows** a second bind of the
+        // same address, so a local process could sit on our port and receive the authorization code;
+        // `SO_EXCLUSIVEADDRUSE` is what refuses it. Asserted the only way it can be: try to take it.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let loopback = Loopback::bind().await.expect("bind");
+            let port = loopback
+                .redirect_uri
+                .trim_start_matches("http://127.0.0.1:")
+                .trim_end_matches('/')
+                .parse::<u16>()
+                .expect("port");
+
+            let stolen = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+            assert!(
+                stolen.is_err(),
+                "the port must not be bindable while a sign-in is in progress"
+            );
+        });
     }
 
     #[test]
