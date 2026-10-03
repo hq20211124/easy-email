@@ -20,6 +20,9 @@ const { listen } = window.__TAURI__.event;
  */
 const payload = window.__easyEmailPayload;
 
+/** Conversation grouping; pure functions in threads.js so `tools/thread_keys_test.mjs` can pin them. */
+const threads = window.__easyEmailThreads;
+
 const PAGE_SIZE = 50;
 
 /** How many local search hits to ask for. Higher than a page because results span all folders. */
@@ -1267,17 +1270,29 @@ function renderMessages() {
     return;
   }
 
-  for (const message of state.messages) {
+  // One row per conversation rather than one per message (`design/07` §2). The key is an
+  // approximation of the `References` chain — see `src/threads.js` for what it does and does not
+  // group — and the count on the row says how many messages were folded, so nothing is hidden.
+  const conversations = threads.groupConversations(state.messages);
+
+  for (const conversation of conversations) {
+    const message = conversation.messages[0];
+    const extra = conversation.messages.length - 1;
     const button = document.createElement('button');
     const selected =
       message.uid === state.selectedUid && state.mailbox === state.selectedFolder;
-    button.className = 'msg' + (message.seen ? '' : ' unread') + (selected ? ' selected' : '');
+    // A conversation is unread when any of its messages is: hiding an unread one behind a read
+    // subject is how a list starts lying about what needs attention.
+    const unread = conversation.messages.some((entry) => !entry.seen);
+    button.className = 'msg' + (unread ? ' unread' : '') + (selected ? ' selected' : '');
     button.innerHTML = `
       <div class="msg-top">
         <span class="msg-from">${escapeHtml(senderLabel(message))}</span>
         <span class="msg-date">${escapeHtml(formatDate(message.date))}</span>
       </div>
-      <div class="msg-subject">${escapeHtml(message.subject)}</div>`;
+      <div class="msg-subject">${escapeHtml(message.subject)}${
+        extra > 0 ? `<span class="msg-count" title="这个会话里的邮件数">${conversation.messages.length}</span>` : ''
+      }</div>`;
     button.addEventListener('click', () => openMessage(message));
     list.appendChild(button);
   }

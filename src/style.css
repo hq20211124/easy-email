@@ -420,6 +420,17 @@ textarea {
   font-weight: 700;
 }
 
+/* How many messages a conversation row stands for. Muted rather than bold: it is context, not a
+   notification — the bold subject already says whether something in there is unread. */
+.msg-count {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
 .msg.unread {
   box-shadow: inset 3px 0 0 var(--unread);
 }

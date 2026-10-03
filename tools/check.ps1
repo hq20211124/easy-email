@@ -239,6 +239,24 @@ try {
 
     # ------------------------------------------------------------ rust
 
+    Step 'conversation grouping joins replies and refuses to merge strangers' {
+        # The list groups by a *fallback* key (normalised subject + sender), because the exact one —
+        # the References chain — is not in the list rows yet. A fallback like that fails in two
+        # directions, and one of them is expensive: a reply that misses its thread is a nuisance,
+        # but two unrelated messages folded into one row hides mail. Both directions are asserted.
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/thread_keys_test.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'conversation grouping drifted' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'payloads sent to struct commands match the Rust structs' {
         # `send_mail` takes `mail: OutgoingMail` and `save_draft` takes `draft: Draft`. Tauri only
         # renames the command *argument*; the struct is deserialised by serde under its exact Rust
