@@ -1712,6 +1712,13 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
    结论只有两种：能不带 `client_secret` 换到令牌（PKCE 够）或不能（BYO 向导要加一个输入框）。
 
 **下一步优先级**（每一件都自包含，做完各让 `check.ps1` 与测试保持全绿）
+
+**0. 一个真机探针暴露出来的小缺陷（建议先修它，我尚未动手）**：`user.db` 的 SQL 错误被全局
+`From<rusqlite::Error>` 映射成了 `MailError::Cache`，于是界面对**用户数据库**的列缺失说
+"本地缓存错误 …… 可以删掉缓存文件后重启"——**建议是错的，而且带着破坏性倾向**（删 cache 不解决问题，
+用户可能删错文件）。M1a-60 就是从这个文案里看到 `no such column: account_id` 才找到 bug 的。
+修法：给 `MailError` 加一个 `UserDb(String)` 变体（或让 `UserStore` 在入口处包一层），
+让"删缓存重同步"这句话**只**出现在真属于缓存的问题上。
 0. **XOAUTH2（认证轴最后一步）**：四步计划写在 M1a-46——模型加 `auth`/`oauth_client_id`、
    IMAP 走 `AUTHENTICATE XOAUTH2` + SMTP 走 lettre 的 `Mechanism::Xoauth2`（**夹具要先支持这两种**，
    这是主要工作量）、连接前刷新令牌并把轮换值写回、`password_for` 与向导按 `auth` 分支。
