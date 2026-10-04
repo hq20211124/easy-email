@@ -257,6 +257,24 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'every id the stylesheet styles still exists' {
+        # A layout broke exactly here (M1a-67): the three-column grid moved back to `#app`, the wrapper
+        # element was deleted, and `#shell { grid-template-columns: … }` stayed behind. CSS happily
+        # styles elements that do not exist, so nothing failed — the app just became one column with
+        # the sidebar squashed to a sliver. A screenshot caught it; this is the gate catching it.
+        if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            Write-Host "python not found on PATH; skipping. Install Python to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        python tools/css_ids_check.py 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'the stylesheet references elements that no longer exist' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'the auth axis keeps its promises (no token in a log, PKCE, no embedded webview)' {
         # `design/05` §10 lists these as gate items, and they are the kind of thing that is true today
         # and quietly stops being true: somebody adds a debug log with the token in it, or reaches for

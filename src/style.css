@@ -89,9 +89,31 @@ textarea {
 /* ---------------------------------------------------------------- layout */
 
 #app {
-  /* Back to the plain three-column grid: the window controls float inside the reading pane's corner
-     instead of occupying a row of their own (M1a-67). */
+  /*
+    The three-column grid, and it has to live *here*: `#app` is the element in the markup, and a
+    template left behind on a wrapper that no longer exists is how the panes silently became one
+    column stacked on top of each other (M1a-67 → caught by looking at a screenshot, not by measuring).
+
+    minmax() rather than fixed widths: on a small or high-DPI display the window can be only ~650 CSS
+    px wide, and a fixed `232px 340px 1fr` leaves the reading pane with nothing. With these minimums
+    the side panes give way first and the reader keeps a usable 240px.
+
+    Both side panes are deliberately narrow: this is a reading app, and the mail itself is the only
+    thing that needs room. At the 993 CSS px this machine provides, these maximums leave the reader
+    ~569px instead of the ~421px the previous 232/340 gave it. Labels that no longer fit ellipsize
+    (`.row .label`) and carry a `title`, so nothing becomes unreachable.
+  */
   display: grid;
+  grid-template-columns: minmax(116px, 180px) minmax(168px, 244px) minmax(280px, 1fr);
+  /*
+    The row must be pinned too. With `grid-auto-rows: auto` the single implicit row is sized by
+    content, so the panes grew to their full content height (~3363px on a real mailbox) and
+    overflowed the viewport, where `body { overflow: hidden }` silently clipped them. That also
+    starved each pane's own `overflow-y: auto`, since a flex child only scrolls when its height
+    is constrained. `minmax(0, 1fr)` supplies the constraint: `1fr` alone would keep an `auto`
+    minimum and let the content win again.
+  */
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
 }
 
@@ -141,32 +163,6 @@ textarea {
 .winbtn.danger:hover {
   background: #dc2626;
   color: #fff;
-}
-
-#shell {
-  display: grid;
-  /*
-    minmax() rather than fixed widths: on a small or high-DPI display the window can be only
-    ~650 CSS px wide, and a fixed `232px 340px 1fr` leaves the reading pane with nothing. With
-    these minimums the side panes give way first and the reader keeps a usable 240px.
-  */
-  /*
-    Both side panes are deliberately narrow: this is a reading app, and the mail itself is the only
-    thing that needs room. At the 993 CSS px this machine provides, these maximums leave the reader
-    ~569px instead of the ~421px the previous 232/340 gave it. Labels that no longer fit ellipsize
-    (`.row .label`) and carry a `title`, so nothing becomes unreachable.
-  */
-  grid-template-columns: minmax(116px, 180px) minmax(168px, 244px) minmax(280px, 1fr);
-  /*
-    The row must be pinned too. With `grid-auto-rows: auto` the single implicit row is sized by
-    content, so the panes grew to their full content height (~3363px on a real mailbox) and
-    overflowed the viewport, where `body { overflow: hidden }` silently clipped them. That also
-    starved each pane's own `overflow-y: auto`, since a flex child only scrolls when its height
-    is constrained. `minmax(0, 1fr)` supplies the constraint: `1fr` alone would keep an `auto`
-    minimum and let the content win again.
-  */
-  grid-template-rows: minmax(0, 1fr);
-  height: 100vh;
 }
 
 #reader {
