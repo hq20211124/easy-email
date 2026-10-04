@@ -1247,6 +1247,36 @@ async fn oauth_sign_in(
         message
     })?;
 
+    // The browser signed in as *someone*, and it is not necessarily whoever was typed into the form:
+    // the two are decided in different places and nothing used to compare them. An account whose
+    // address does not match its token cannot ever authenticate — it fails on every connection, for
+    // ever — so this is the last moment where the difference can become a sentence the user can act on,
+    // instead of a saved account that will never work and a message blaming the network (M1a-82).
+    //
+    // Every branch says which of the three happened, because "we did not check" and "we checked and it
+    // matched" look identical from the outside and only one of them is reassuring.
+    match tokens
+        .id_token
+        .as_deref()
+        .and_then(mail_core::oauth::email_from_id_token)
+    {
+        Some(authorized) if !authorized.eq_ignore_ascii_case(email.trim()) => {
+            let message = format!(
+                "浏览器里授权的账号是 {authorized}，但上面填的地址是 {}。保存这样一个账号没有意义 —— \
+                 服务器每次都会拒绝它。请把地址改成 {authorized}，再点一次「打开浏览器登录」。",
+                email.trim()
+            );
+            log_line(&format!(
+                "[easy-email] OAuth 授权账号与填写的地址不一致：{message}"
+            ));
+            return Err(message);
+        }
+        Some(_) => log_line("[easy-email] OAuth 授权账号已核对（与填写的地址一致）"),
+        None => log_line(
+            "[easy-email] 服务商没有返回可用的 id_token，这次无法核对浏览器里授权的是哪个账号",
+        ),
+    }
+
     // The registration is stored with the token: a refresh needs both, and asking the user for the
     // client id a second time would be asking them to remember something we already know.
     state

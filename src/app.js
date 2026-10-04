@@ -3109,17 +3109,30 @@ function openAccountWizard() {
         status.className = 'oauth-status';
         status.innerHTML = '<span class="spinner"></span>已打开浏览器，请在那里点「允许」（两分钟内）…';
 
-        const tokens = await run('OAuth 登录', () =>
-          invoke('oauth_sign_in', {
-            email: address,
-            providerId: chosen.id,
-            clientId,
-            clientSecret: secret || null,
-          })
-        );
+        const tokens = await (async () => {
+          try {
+            return await invoke('oauth_sign_in', {
+              email: address,
+              providerId: chosen.id,
+              clientId,
+              clientSecret: secret || null,
+            });
+          } catch (error) {
+            // In the status box *and* as a toast: this is where the user is looking, and some of these
+            // messages ("浏览器里授权的账号是 X，但你填的是 Y") are ones they have to read rather than
+            // catch out of the corner of an eye before a toast fades.
+            const reason = errText(error);
+            status.className = 'oauth-status bad';
+            status.textContent = reason;
+            toast(`OAuth 登录：${reason}`, 'err', 20000);
+            return null;
+          }
+        })();
         if (!tokens) {
-          status.className = 'oauth-status bad';
-          status.textContent = '没有完成授权。可以再点一次「打开浏览器登录」。';
+          if (!status.textContent) {
+            status.className = 'oauth-status bad';
+            status.textContent = '没有完成授权。可以再点一次「打开浏览器登录」。';
+          }
           return;
         }
 

@@ -38,6 +38,18 @@ pub struct TokenSet {
     /// Seconds until the access token expires, as the provider reported it.
     #[serde(default)]
     pub expires_in: Option<i64>,
+    /// The signed assertion of *who* authorized, when the provider issues one.
+    ///
+    /// Parsed from the token response because it is the only thing in the whole flow that answers
+    /// "which account did the browser actually use?" — and that question went unanswered for a long
+    /// time, which is how an account whose typed address differed from the authorized one became a
+    /// permanent `AUTHENTICATIONFAILED` loop (M1a-82). See [`email_from_id_token`] for why it is read
+    /// without verifying its signature.
+    ///
+    /// Not serialised: the renderer has no use for a JWT, and the fewer copies of an identity assertion
+    /// that travel, the better.
+    #[serde(default, skip_serializing)]
+    pub id_token: Option<String>,
 }
 
 /// What the wizard should put in its client-id fields, and what to say about it.
@@ -165,19 +177,27 @@ pub struct OAuthProvider {
 }
 
 /// Google's endpoints for a desktop client (A1-F32).
+///
+/// `openid email` is here for one reason, and it is not signing the user in: it is what makes the
+/// token response carry an `id_token` naming the account that authorized, so the wizard can check the
+/// address it is about to save instead of trusting a text box (`email_from_id_token`). The cost is one
+/// extra line on the consent screen ("see your primary Google Account email address").
 pub const GOOGLE: OAuthProvider = OAuthProvider {
     auth_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
     token_endpoint: "https://oauth2.googleapis.com/token",
-    scope: "https://mail.google.com/",
+    scope: "https://mail.google.com/ openid email",
     needs_offline_params: true,
 };
 
 /// Microsoft's endpoints. The scope must be the full resource URLs (A1-F33) — the short forms are
 /// rejected, and Office 365 needs the `.default`-style resource scopes to consent at all.
+///
+/// `openid email` for the same reason as Google's: without it there is nothing in the response that
+/// says which account was authorized.
 pub const MICROSOFT: OAuthProvider = OAuthProvider {
     auth_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
     token_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-    scope: "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access",
+    scope: "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send openid email offline_access",
     needs_offline_params: false,
 };
 
@@ -249,6 +269,42 @@ pub fn authorization_url(
     }
 
     format!("{}?{}", provider.auth_endpoint, encode_form(&params))
+}
+
+/// The address a provider says it signed in, read out of the `id_token` it just handed us.
+///
+/// **The signature is not verified, deliberately.** This token did not come from the browser: it came
+/// in the body of our own TLS response to our own token request, so there is no attacker on this path
+/// to defend against — and defending against one would need a JWKS fetch and clock handling that buy
+/// nothing here. What it does buy is the one fact the wizard otherwise has to take on trust: that the
+/// address typed into the form and the account authorized in the browser are the same one. Taking that
+/// on trust is what produced an account that was rejected on every connection, for ever (M1a-82).
+///
+/// `None` means "the provider did not tell us" — no `id_token`, no `email` claim, the scope was not
+/// granted, or it is not a JWT at all. Callers must treat `None` as *unknown*, never as a mismatch:
+/// refusing to save an account because a provider was silent would be a worse bug than the one this
+/// exists to prevent.
+pub fn email_from_id_token(id_token: &str) -> Option<String> {
+    use base64::Engine as _;
+
+    // `header.payload.signature`; only the payload is interesting.
+    let payload = id_token.split('.').nth(1)?.trim_end_matches('=');
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+
+    // Google puts the address in `email`; Microsoft's tokens carry it in `email` or, for work
+    // accounts, `preferred_username`. Anything without an `@` is not an address we can compare.
+    for key in ["email", "preferred_username"] {
+        if let Some(value) = claims.get(key).and_then(|value| value.as_str()) {
+            let value = value.trim();
+            if value.contains('@') {
+                return Some(value.to_ascii_lowercase());
+            }
+        }
+    }
+    None
 }
 
 /// Sign in: from nothing to a token set, with the browser and the callback in between.
@@ -1173,6 +1229,104 @@ mod tests {
             !url.contains("access_type="),
             "Google-only parameters must not be sent elsewhere: {url}"
         );
+    }
+
+    /// `openid email` is not decoration: without it the response carries nothing that names the
+    /// account, and the wizard is back to trusting its own text box (M1a-82).
+    #[test]
+    fn the_scopes_ask_who_authorized_as_well_as_for_mail_access() {
+        for (name, provider, mail) in [
+            ("google", GOOGLE, "https://mail.google.com/"),
+            ("microsoft", MICROSOFT, "IMAP.AccessAsUser.All"),
+        ] {
+            assert!(
+                provider.scope.contains("openid"),
+                "{name}: {}",
+                provider.scope
+            );
+            assert!(
+                provider.scope.contains("email"),
+                "{name}: {}",
+                provider.scope
+            );
+            assert!(provider.scope.contains(mail), "{name}: {}", provider.scope);
+        }
+        assert!(
+            MICROSOFT.scope.contains("SMTP.Send") && MICROSOFT.scope.contains("offline_access"),
+            "the mail scopes microsoft already needed must not have been dropped: {}",
+            MICROSOFT.scope
+        );
+    }
+
+    /// A JWT-shaped string with the given claims, and a signature nobody looks at.
+    fn id_token_with(claims: &str) -> String {
+        use base64::Engine as _;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        format!("{header}.{payload}.signature-not-checked")
+    }
+
+    #[test]
+    fn the_authorized_address_comes_out_of_the_id_token() {
+        assert_eq!(
+            email_from_id_token(&id_token_with(
+                r#"{"email":"RealUser@Gmail.com","sub":"1"}"#
+            ))
+            .as_deref(),
+            Some("realuser@gmail.com"),
+            "lowercased: account ids are compared lowercased everywhere else"
+        );
+        assert_eq!(
+            email_from_id_token(&id_token_with(
+                r#"{"preferred_username":"a.b@contoso.com"}"#
+            ))
+            .as_deref(),
+            Some("a.b@contoso.com"),
+            "a work account's address arrives under the other claim name"
+        );
+        assert_eq!(
+            email_from_id_token(&id_token_with(
+                r#"{"email":"a.b@x.com","preferred_username":"other@y.com"}"#
+            ))
+            .as_deref(),
+            Some("a.b@x.com"),
+            "`email` wins when the provider sends both"
+        );
+        // Padding is not always stripped; the decoder must not care.
+        use base64::Engine as _;
+        let padded =
+            base64::engine::general_purpose::URL_SAFE.encode(br#"{"email":"padded@x.com"}"#);
+        assert_eq!(
+            email_from_id_token(&format!("h.{padded}.s")).as_deref(),
+            Some("padded@x.com")
+        );
+    }
+
+    /// "The provider did not say" must never be read as "the address is wrong": refusing to save a
+    /// good account because a token was silent would be a worse bug than the one this prevents.
+    #[test]
+    fn an_id_token_that_says_nothing_useful_is_unknown_rather_than_a_mismatch() {
+        for claims in [
+            r#"{"sub":"1"}"#,
+            r#"{"email":"not-an-address"}"#,
+            r#"{"email":""}"#,
+            r#"{"email":null}"#,
+        ] {
+            assert_eq!(
+                email_from_id_token(&id_token_with(claims)),
+                None,
+                "{claims}"
+            );
+        }
+        for garbage in [
+            "",
+            "onlyonesegment",
+            "aaa.!!!not-base64!!!.ccc",
+            "aaa.bm90LWpzb24.ccc",
+            "..",
+        ] {
+            assert_eq!(email_from_id_token(garbage), None, "{garbage:?}");
+        }
     }
 
     #[tokio::test]
