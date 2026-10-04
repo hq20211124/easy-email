@@ -18,7 +18,7 @@
         "minHeight": 460,
         "resizable": true,
         "decorations": false,
-        "additionalBrowserArgs": "--remote-debugging-port=9222 --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication"
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication"
       }
     ],
     "security": {

@@ -11,6 +11,9 @@ oauth-client.json
 # Generated artifacts kept out of history
 /src-tauri/target
 *.log
+# `tools/screenshot.mjs` writes this where it is run from. The *tool* is committed (it is how M1a-78's
+# broken layout was found); the picture of the moment is not.
+/screenshot.png
 
 # Sahara / editor noise
 .DS_Store

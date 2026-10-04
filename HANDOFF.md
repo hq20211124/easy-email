@@ -22,7 +22,9 @@
 前端语法（`src/*.js` + `tools/*.mjs`）→ index.html 引用的资源是否真的存在 → 前端 id 引用 → 正文默认仍然拦截远程图片
 → 正文的宽度规则仍然放过百分比布局 → 本地搜索仍然用能搜中文的分词器 → **前端调的每个命令都已定义且已注册**
 → `fmt` → `clippy -D warnings` → `cargo build`（抓 linker 警告，clippy 看不到）→ `cargo test`
-→ **exe 的 PE 头 Subsystem 必须是 2**（GUI，否则会有 cmd 窗口）。目前 **126 passed**（4 + 94 + 28 + 0，见 `tools/check.ps1`）。
+→ **exe 的 PE 头 Subsystem 必须是 2**（GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**
+（CDP 探针要用，但留下等于把 webview 交给任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
+目前 **19 步全绿**、**297 passed**（+4 ignored，见 `tools/check.ps1`）。
 加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。
 
 改任何东西后跑它。加新 crate 依赖后也要跑，因为 `cargo build` 那一步会抓 MSVC linker 警告
@@ -38,8 +40,16 @@
   的记录就是被这个误差带偏的，别再照着它判断布局。
 - **前端资源在编译期嵌进二进制**，运行时不再读磁盘。改 `src/` 下任何文件都必须重新 `cargo build`
   （实测：把 `src/theme.js` 移走、不重新构建直接启动已构建的 exe，界面照样完全正常）。
-- **Gmail SMTP（smtp.gmail.com:465）从大陆连不上，IMAP 通。** 这是网络事实，不是配置错误。
+- **Gmail 从这台机器是"间歇性可达"，不是"连不上"**（2026-10-04 实测更正）：
+  `imap.gmail.com:993` 5 次里 2 次通、`smtp.gmail.com:465` 2 次里 1 次通。收信时好时坏、发信基本不通。
   可达性测试特意把这种情况判成"不可达告警"而不是失败，**别把它改回硬失败**。
+- **本机有系统代理（`ProxyEnable=1`、`ProxyServer=127.0.0.1:7897`），而应用必须走它。**
+  `reqwest` 是我们唯一直连外网的客户端（OAuth 换令牌），而它的 **`system-proxy` 特性是载荷性的**：
+  `default-features = false` 会把它一起丢掉，于是 reqwest 不去读
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`（Edge 用的同一份设置），
+  浏览器能打开 Google 而应用 30 秒超时 —— 症状是"浏览器显示登录完成、应用说没成功"。
+  **别为了减小依赖树把它去掉**；`check.ps1` 抓不到它，只有真机登录能抓到。
+  另外 IMAP/SMTP 是裸 TCP，**不**走 HTTP 代理：想稳定收发 Gmail 需要代理开 TUN/虚拟网卡模式。
 - **cargo 走清华 tuna 镜像**（`~/.cargo/config.toml`）。`cargo search` 不可用（会报
   "crates-io is replaced with non-remote-registry source"），要查版本用 `cargo add` 让它自己解析。
 - 工具链：rustc 1.98 (MSVC) / VS2022 BuildTools / WebView2 154 / Node 24。
@@ -170,14 +180,42 @@
 - **推送的实现形状是"窗口 + 重新比对"，不是"等推送消息"。** 原因见上面的库限制。
   当前只监听 INBOX；要扩展成多文件夹就是多开几组 pump/handler。
   托盘与通知都在 `src-tauri`：托盘在 `setup` 里建，通知从 Rust 侧发（前端没有打包器）。
+- **对话视图只有**一个**正文渲染面（`#body-surface`），它在两个视图之间被"搬动"，不是各渲染一份。**
+  两个理由，缺一不可：① 沙箱 iframe 是"显示图片"那次解锁的边界，两份就意味着解锁能从一封泄漏到另一封；
+  ② 20 封的会话不该有 20 份渲染器。`renderThreadReader()` 在清空气泡列表**之前**必须把 surface 挪回
+  `#reader-body`——它正住在聚焦气泡里，`innerHTML = ''` 会把它（和活着的 iframe）一起扔掉。
+  `check.ps1` 第 4 步现在钉住"`index.html` 里恰好一个 `#body-surface` / `#body-frame`"。
+- **`.bubble` 必须 `flex: none`。** 在可滚动的 flex 列里 `flex-shrink` 默认为 1，而**自动最小尺寸只在
+  `overflow: visible` 时生效** —— 只有聚焦气泡带 `overflow: hidden`（圆角裁切），于是只有它被压成 1px，
+  旁边的预览气泡因为有自动最小尺寸而毫发无损。这个失败模式**测量脚本会正常报数**、只有看截图才像坏了。
+- **正文的取件是"聚焦那封 + 有界预取 ≤8、顺序、就地更新"。** 会话里点开一封要立刻有正文，
+  其余的慢慢填；每到一个就只改那一个气泡的预览（整体重渲染会搬动 surface 并重载用户正在读的 iframe）。
+  没有精确 `thread_key` 的旧行走前端近似分组（只看得见当前文件夹），**不**在 SQL 里猜 ——
+  猜错会把两个不相干的会话永久合并。
+- **`cache.db` 的索引必须建在 `add_column_if_missing` 之后。** v2 老库到达迁移时 `messages` 表根本没有
+  `thread_key` 列，把索引写进同一个 schema 批次会让 `Cache::open` 直接失败（`no such column`），
+  连带两条迁移测试一起红 —— 已证伪过，别"整理"成一批。
 
 ## 6. 已经验到什么程度
 
-**已验证**：**126 个测试**；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
+**已验证**：**297 个测试**（+4 ignored）；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
+
+**Gmail（2026-10-04）：认证轴第一次在真实 Google 端点上跑通，而且收信也通了。**
+`realuser@gmail.com` —— OAuth 授权 → 刷新令牌 DPAPI 落盘 → **INBOX 实收 289 封**
+（`folders.last_uid=289`、`synced` 是本次会话内，全部带 `thread_key`），`[Gmail]/` 八个文件夹也枚举出来了。
+这一条路上抓到并修掉了**四个**真 bug（按钮没绑事件、`cmd` 截断授权 URL、reqwest 丢 `system-proxy`、
+地址与授权账号不一致），叙述在 PROGRESS 的 M1a-79…M1a-83。
+**未验**：Gmail 的**发信**（SMTP:465 基本不通，见上面的网络事实）；Outlook 的 OAuth 路径（代码就绪、
+`setup_note` 已改成指向它，但**从没在真实 Outlook 账号上走过**）。
 
 **并且已经用真实 QQ 邮箱账号跑通了完整收信闭环**（2026-10-02）：
 登录 → 文件夹列表 → 邮件列表 → 显示真实邮件。过程中发现并修掉了三个真实问题，见 README。
 所以"服务商是否真的接受我们这套"对 **QQ 系**已经有答案了。
+
+**对话模式也验过了**（2026-10-04，QQ 账号，CDP 探针 + 截图）：20 封的真实会话聚成气泡，
+**其中包含只存在于「已发送」里的回复**（跨文件夹取件，界面上给 6 封自己的邮件靠右），
+全场只有一个沙箱 iframe 且在聚焦气泡内，点另一封能把焦点与正文搬过去，切回单封视图后
+surface 回到原位。`cache.db` v3 → v4 的迁移**在真实库上实做过**：467 封邮件一封没丢、索引出现。
 
 **真实邮件渲染也已经验过了**（2026-10-02，同一账号，CDP 探针 + 截图）：
 扫了 INBOX 前 20 封 —— 20/20 都能解析出 HTML 与纯文本正文、0 错误；3 封的附件条正确显示
@@ -221,12 +259,18 @@
 
 **还没验证的**，别以为已经验过：
 
-1. **除 QQ 系以外的服务商，从没用真实账号登录过。** 尤其是 **163/126 的 `ID` 命令格式** ——
-   `needs_id_command` 目前只有 loopback 假服务器验过，没对着真网易服务器验过。
-2. **`tauri build` 打成 NSIS 安装包没验过**，只验了 `cargo build` + 直接运行 exe。
-3. **`@foxmail.com` 别名**：QQ 号地址能登录，同一授权码下 foxmail 别名被拒。
+1. **除 QQ 系与 Gmail 以外的服务商（17 家），从没用真实账号登录过。** 尤其是 **163/126 的 `ID` 命令格式**
+   —— `needs_id_command` 目前只有 loopback 假服务器验过，没对着真网易服务器验过。
+   服务商表里的 `verified: true` 指的是**服务器地址**实测过（40 个端点的 TCP+TLS+问候语），
+   **不是**"登录实测过"；这两个差别很大，别把前者当成后者。
+2. **Outlook / Microsoft 365 的 OAuth 路径没走过**：代码就绪（Microsoft 端点、scope、XOAUTH2 都在），
+   `setup_note` 已改成指向它，但没有真实 Outlook 账号试过；用它还需要用户自己在 Azure 注册一个应用。
+3. **`tauri build` 打成 NSIS 安装包没验过**，只验了 `cargo build` + 直接运行 exe。
+4. **`@foxmail.com` 别名**：QQ 号地址能登录，同一授权码下 foxmail 别名被拒。
    已加了「登录用户名」覆盖字段来应对，但**没有实测确认**哪种填法能通。
    如果以后能拿到一个 foxmail 别名账号，这是第一件该验的事。
+5. **没有"自定义服务器"入口**：向导只能从服务商表里选，自建邮局（Postfix/Dovecot）现在还连不上。
+   `design/05` 里有这个东西，属于没做，不是做不了。
 
 ## 7. 下一步（用户已选定三件，①② 已完成）
 

@@ -158,6 +158,18 @@ pub struct MessageSummary {
     pub thread_key: Option<String>,
 }
 
+/// One message of a conversation, with the folder it lives in (`design/08` §4.2's `ThreadMessage`).
+///
+/// The folder is the whole point: a conversation crosses folders, because the user's own replies are
+/// in the Sent folder. A thread view built from one folder would show an argument in which only one
+/// side ever speaks — which is why the backend, and not the renderer, answers "what is in this
+/// conversation".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMember {
+    pub folder: String,
+    pub summary: MessageSummary,
+}
+
 /// Metadata for an attachment. The bytes are fetched separately, on demand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentMeta {
@@ -276,6 +288,17 @@ pub struct ConnectionReport {
     pub smtp_ok: bool,
     pub imap_detail: String,
     pub smtp_detail: String,
+    /// True when the server **answered** and rejected the credential, rather than not answering.
+    ///
+    /// The two look the same in `imap_ok` and they must not be confused, because the right advice is
+    /// opposite. "IMAP 没应答" is usually this network (measured 2026-10-04: Gmail's 993 answers two
+    /// times out of five from here) and is worth waiting out. An explicit `AUTHENTICATIONFAILED` is the
+    /// server's final answer about *these* credentials, and it never repairs itself: a freshly
+    /// authorized OAuth account that gets one is almost always an account whose address does not match
+    /// the Google/Microsoft account the browser actually authorized — the wizard takes the address
+    /// from a text box and the token from whoever signed in, and nothing used to compare them.
+    #[serde(default)]
+    pub imap_auth_rejected: bool,
     /// Mailboxes found, when the IMAP step succeeded.
     pub mailboxes: Vec<String>,
 }

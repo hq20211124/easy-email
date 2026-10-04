@@ -2337,6 +2337,11 @@ async fn verify_account_skips_smtp_when_imap_authentication_fails() {
     let report = within(mail_core::verify_account(&cfg, "wrong-code")).await;
 
     assert!(!report.imap_ok, "{}", report.imap_detail);
+    assert!(
+        report.imap_auth_rejected,
+        "the server answered NO to LOGIN, so this is a rejection and not silence: {}",
+        report.imap_detail
+    );
     assert_eq!(
         smtp_connections.load(Ordering::SeqCst),
         0,
@@ -2359,11 +2364,42 @@ async fn verify_account_does_probe_smtp_when_imap_authentication_succeeds() {
     let report = within(mail_core::verify_account(&cfg, "app-password")).await;
 
     assert!(report.imap_ok, "{}", report.imap_detail);
+    assert!(
+        !report.imap_auth_rejected,
+        "nothing was rejected — the login succeeded"
+    );
     assert!(!report.mailboxes.is_empty(), "mailboxes should be reported");
     assert!(report.smtp_ok, "{}", report.smtp_detail);
     assert!(
         smtp_connections.load(Ordering::SeqCst) >= 1,
         "SMTP must actually be probed when the credential is good"
+    );
+}
+
+/// The other half of the distinction the wizard depends on.
+///
+/// `verify_account` answers two different questions with the same `imap_ok: false`, and the advice for
+/// them is opposite: "the server refused this credential" means the account can never work, while "no
+/// answer" is usually the network (measured 2026-10-04: Gmail's 993 answers about two times in five
+/// from a mainland network) and is worth waiting out. Collapsing them is what keeps a permanently
+/// broken OAuth account alive under a promise that it will start working later.
+#[tokio::test]
+async fn verify_account_does_not_call_silence_a_rejection() {
+    // Bind and drop, so the port is real but nothing is listening: the connection is refused at once.
+    let closed = {
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        probe.local_addr().expect("addr")
+    };
+    let (smtp, _captured, _connections) = spawn_smtp_counted().await;
+    let cfg = account(closed, smtp);
+
+    let report = within(mail_core::verify_account(&cfg, "app-password")).await;
+
+    assert!(!report.imap_ok, "{}", report.imap_detail);
+    assert!(
+        !report.imap_auth_rejected,
+        "a refused connection is the network, not the credential: {}",
+        report.imap_detail
     );
 }
 

@@ -77,6 +77,12 @@
         <header class="pane-header" data-tauri-drag-region>
           <h1 id="mailbox-title">收件箱</h1>
           <div class="pane-actions">
+            <!--
+              One switch for the whole app, not one per conversation: the user asked for "选了一个模式就
+              全是这个模式". It is a preference, so it is remembered across restarts, and the label says
+              which mode is *active* rather than what clicking will do.
+            -->
+            <button id="btn-view-mode" class="btn ghost" title="切换阅读视图">💬 对话</button>
             <button id="btn-refresh" class="btn ghost" title="重新拉取">↻ 刷新</button>
           </div>
         </header>
@@ -141,27 +147,55 @@
             </div>
           </header>
 
-          <div id="attachment-bar" class="attachment-bar" hidden></div>
+          <!--
+            The body rendering surface. It is a single element that *moves*: in 单封 view it lives here,
+            and in 对话 view it is mounted into the focused bubble. One surface rather than two means one
+            sandboxed iframe on screen at a time — which is what keeps "显示图片" from leaking across a
+            conversation, and what keeps a 20-message thread from being 20 copies of the renderer.
+          -->
+          <div id="body-surface">
+            <div id="attachment-bar" class="attachment-bar" hidden></div>
 
-          <div class="body-switch">
-            <button id="tab-html" class="tab active">HTML</button>
-            <button id="tab-text" class="tab">纯文本</button>
-            <span class="remote-note">内嵌图片正常显示 · 远程图片默认拦截</span>
+            <div class="body-switch">
+              <button id="tab-html" class="tab active">HTML</button>
+              <button id="tab-text" class="tab">纯文本</button>
+              <span class="remote-note">内嵌图片正常显示 · 远程图片默认拦截</span>
+            </div>
+
+            <div id="remote-image-bar" class="remote-image-bar" hidden>
+              <span id="remote-image-text"></span>
+              <button id="btn-show-remote" class="btn ghost">显示图片</button>
+            </div>
+
+            <iframe
+              id="body-frame"
+              class="body-frame"
+              sandbox
+              referrerpolicy="no-referrer"
+            ></iframe>
+            <pre id="body-text" class="body-text" hidden></pre>
           </div>
-
-          <div id="remote-image-bar" class="remote-image-bar" hidden>
-            <span id="remote-image-text"></span>
-            <button id="btn-show-remote" class="btn ghost">显示图片</button>
-          </div>
-
-          <iframe
-            id="body-frame"
-            class="body-frame"
-            sandbox
-            referrerpolicy="no-referrer"
-          ></iframe>
-          <pre id="body-text" class="body-text" hidden></pre>
         </article>
+
+        <!--
+          对话视图 (design/08 §2/§5.2): the conversation as bubbles, oldest at the top, the user's own
+          messages on the right. Exactly one bubble is *focused* and holds the full body; the others
+          show a text preview. That is the design's "最新一封展开，其余折叠" and it is also what keeps
+          the security boundary intact — see the note on `#body-surface`.
+        -->
+        <div id="thread-view" hidden>
+          <header class="thread-header">
+            <h2 id="thread-subject"></h2>
+            <div id="thread-meta" class="muted"></div>
+            <div class="reader-toolbar">
+              <button id="btn-thread-reply" class="btn ghost">回复</button>
+              <button id="btn-thread-forward" class="btn ghost">转发</button>
+              <button id="btn-thread-toggle-read" class="btn ghost">标为未读</button>
+              <button id="btn-thread-delete" class="btn danger">删除</button>
+            </div>
+          </header>
+          <div id="thread-bubbles" class="thread-bubbles"></div>
+        </div>
       </section>
     </div>
 

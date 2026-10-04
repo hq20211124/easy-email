@@ -302,3 +302,39 @@ fn providers_serialise_for_the_ui() {
     assert_eq!(json["quirks"]["needs_id"], true);
     assert_eq!(json["auth"], "app_password");
 }
+
+/// The OAuth token endpoint, reached through **production's own HTTP client**.
+///
+/// This exists because of a bug that a real user hit (2026-10-04): `reqwest` was declared with
+/// `default-features = false`, which silently drops `system-proxy`. On a machine whose browser goes
+/// through a local proxy (`ProxyEnable=1`, `ProxyServer=127.0.0.1:7897`) the consent screen
+/// completed in the browser while the app — connecting directly — timed out 30 seconds into the
+/// token exchange. The user saw "登录完成" in the browser and "服务器响应超时" in the app, and those
+/// two statements cannot both be about the network.
+///
+/// A **provider answer** is the proof, so a rejection is a pass: getting `invalid_client` back means
+/// DNS, TCP, TLS, the system proxy, the form encoding and the response parser all worked. A transport
+/// error is the failure, and the assertion names it that way rather than "the test is flaky".
+#[tokio::test]
+#[ignore = "requires public internet access (and, on some networks, a system proxy)"]
+async fn the_oauth_http_client_reaches_the_token_endpoint() {
+    use mail_core::MailError;
+    use mail_core::oauth::{GOOGLE, HttpTokens, refresh};
+
+    let transport = HttpTokens::new().expect("an HTTP client");
+    let error = refresh(
+        &transport,
+        GOOGLE,
+        "not-a-real-client-id",
+        None,
+        "not-a-real-refresh-token",
+    )
+    .await
+    .expect_err("a bogus refresh token cannot be exchanged");
+
+    assert!(
+        !matches!(error, MailError::Timeout(_) | MailError::Connect { .. }),
+        "no round trip happened — the system proxy is probably not being used: {error}"
+    );
+    println!("token endpoint answered (a rejection is the point): {error}");
+}

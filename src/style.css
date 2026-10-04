@@ -800,6 +800,151 @@ textarea {
   background: var(--surface);
 }
 
+/* The body surface lives in two places — inside `#reader-body` for 单封 view, and inside the focused
+   bubble for 对话 view — so it carries its own layout rather than inheriting from either parent. */
+#body-surface {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---------------------------------------------------------------- conversation view */
+
+#thread-view {
+  display: flex;
+  flex-direction: column;
+  /* `flex: 1` rather than `height: 100%`: the parent is a flex column whose own height comes from the
+     grid row, and a percentage against it is the kind of thing that silently resolves to auto. */
+  flex: 1;
+  min-height: 0;
+}
+
+.thread-header {
+  padding: 11px 14px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex: none;
+}
+
+.thread-header h2 {
+  margin: 0 0 6px;
+  font-size: 15.5px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.thread-bubbles {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* A bubble hugs its content and stays on one side. The focused one takes the full width instead,
+   because it contains the message itself rather than a preview of it. */
+.bubble {
+  align-self: flex-start;
+  /* Not optional in a scrollable flex column. `flex-shrink` defaults to 1, and the *automatic minimum
+     size* that normally stops an item being squashed below its content only applies while `overflow` is
+     `visible` — so the focused bubble, which clips its corners, collapsed to 1px while every preview
+     beside it stayed 55px. Measured, not guessed: `min-height: auto` and `overflow: hidden` cannot both
+     hold. */
+  flex: none;
+  max-width: 78%;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 7px 11px 9px;
+  cursor: pointer;
+}
+
+.bubble.mine {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+
+.bubble.focused {
+  align-self: stretch;
+  max-width: none;
+  cursor: default;
+  padding: 0;
+  overflow: hidden;
+}
+
+.bubble-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.bubble.focused .bubble-head {
+  padding: 8px 12px 4px;
+}
+
+.bubble-head .who {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The point of a preview is that it is short: anything longer is read by focusing the bubble. */
+.bubble-preview {
+  margin-top: 3px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.bubble-note {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.bubble-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.bubble-body #body-surface {
+  flex: none;
+}
+
+/* The body frame gets a bounded height inside a conversation: it scrolls its own content, and the
+   column keeps scrolling past it, so a 5000-word reply does not push the rest of the thread away. */
+.bubble.focused .body-frame {
+  flex: none;
+  height: min(58vh, 560px);
+}
+
+.bubble.focused .body-text {
+  flex: none;
+  max-height: min(58vh, 560px);
+}
+
+.bubble .body-switch,
+.bubble .remote-image-bar,
+.bubble .attachment-bar {
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
 /* ---------------------------------------------------------------- modal */
 
 .modal-root {

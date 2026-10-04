@@ -142,12 +142,28 @@ try {
             $problems += 'src/app.js: the allowRemoteImages branch no longer selects the permissive policy'
         }
 
+        # Exactly one body surface. It is the only sandboxed iframe, and the conversation view *moves* it
+        # into the focused bubble rather than rendering a second one. Two would mean "显示图片" could
+        # unlock one message of a conversation while the user is looking at another — the same leak the
+        # per-message default above exists to prevent, arriving through a different door.
+        $surfaces = ([regex]::Matches($html, 'id="body-surface"')).Count
+        if ($surfaces -ne 1) {
+            $problems += "src/index.html: expected exactly 1 #body-surface, found $surfaces"
+        }
+        $frames = ([regex]::Matches($html, 'id="body-frame"')).Count
+        if ($frames -ne 1) {
+            $problems += "src/index.html: expected exactly 1 #body-frame, found $frames"
+        }
+        if ($flat -notmatch 'function mountBodySurface\(host\)') {
+            $problems += 'src/app.js: the body surface must be moved by mountBodySurface(), not re-created'
+        }
+
         if ($problems.Count -gt 0) {
             $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
             $global:LASTEXITCODE = 1
             return
         }
-        Write-Host 'shell permits https/http; the per-message default still blocks it'
+        Write-Host 'shell permits https/http; one body surface; the per-message default still blocks it'
         $global:LASTEXITCODE = 0
     }
 
@@ -334,6 +350,22 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+
+    Step 'no debug port is left open in the shipped webview arguments' {
+        # The CDP probes need `--remote-debugging-port=9222`, and HANDOFF's rule has always been "put it
+        # back when you are done". It was left in and committed anyway — and that port lets *any* local
+        # process drive the webview, which is a bigger hole than the probes are worth. Making the rule
+        # mechanical is the only version of it that holds.
+        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw
+        if ($conf -match 'remote-debugging-port') {
+            Write-Host 'src-tauri/tauri.conf.json: remove --remote-debugging-port before shipping' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'webview arguments carry no remote debugging port'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'payloads sent to struct commands match the Rust structs' {
         # `send_mail` takes `mail: OutgoingMail` and `save_draft` takes `draft: Draft`. Tauri only
         # renames the command *argument*; the struct is deserialised by serde under its exact Rust

@@ -525,6 +525,38 @@ async fn list_messages(
     }
 }
 
+/// Every cached message of one conversation, across folders, oldest first.
+///
+/// No network: the conversation is assembled from what is already on disk, so this is the cheap half
+/// of opening a thread and the reason the reader can show a whole exchange instantly. Bodies are a
+/// separate, on-demand call per message (`fetch_message`), because most of a conversation is headers.
+///
+/// The limit is a bound on a `limit`-able query, not a product rule: the UI shows a conversation, and
+/// "a conversation" has no upper bound in the data. Rows that predate `thread_key` are absent here by
+/// design — the renderer groups those from the list it already has, and guessing in SQL would merge
+/// conversations permanently.
+#[tauri::command]
+async fn list_thread(
+    state: State<'_, AppState>,
+    account_id: String,
+    thread_key: String,
+) -> Result<Vec<mail_core::model::ThreadMember>, String> {
+    if thread_key.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    state
+        .cache
+        .clone()
+        .thread_summaries(&account_id, &thread_key, THREAD_MEMBERS_MAX)
+        .map_err(describe)
+}
+
+/// How many messages of one conversation are read from the cache.
+///
+/// Generous on purpose: this is a disk read of rows the account already has, and truncating a real
+/// conversation is the failure the feature exists to prevent. It is a bound, not a budget.
+const THREAD_MEMBERS_MAX: u32 = 500;
+
 #[tauri::command]
 async fn fetch_message(
     state: State<'_, AppState>,
@@ -2475,6 +2507,7 @@ pub fn run() {
             verify_account,
             list_mailboxes,
             list_messages,
+            list_thread,
             get_sync_window,
             set_sync_window,
             backfill_to_window,

@@ -23,10 +23,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::{Db, DbKind, DbOptions};
 use crate::error::{MailError, Result};
-use crate::model::{MailboxInfo, MessageDetail, MessageSummary};
+use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Where a delivered message's Sent copy is (`design/07` §5.4).
 ///
@@ -303,6 +303,17 @@ impl Cache {
             // statement would succeed while the column silently never appeared. This is the first
             // *column* this schema has added, which is why it is spelled out rather than assumed.
             add_column_if_missing(conn, "messages", "thread_key", "text")?;
+
+            // **After** the column, not with the other index above it. The conversation query filters
+            // on `thread_key`, and without this it is a scan of the account's rows; but a v2 file
+            // reaches this function with a `messages` table that has no such column yet, so creating
+            // the index in the same batch would fail with "no such column" and the whole upgrade with
+            // it. Index creation is idempotent, and it runs inside the version-guarded block, so an
+            // already-current file never repeats the work.
+            conn.execute(
+                "create index if not exists messages_by_thread on messages(account_id, thread_key)",
+                [],
+            )?;
             Ok(())
 
         })
@@ -567,6 +578,57 @@ impl Cache {
                 })
             },
         )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every cached message that belongs to one conversation, oldest first.
+    ///
+    /// Across folders on purpose (see [`crate::model::ThreadMember`]): half of a conversation is
+    /// usually the user's own replies, and those live in the Sent folder. Reading only the folder on
+    /// screen would answer "what did they say" while silently dropping "what did I say" — a thread
+    /// view that is worse than no thread view, because it looks complete.
+    ///
+    /// Only rows carrying the exact `thread_key` are returned. Rows written before the column existed
+    /// have `None`, and the renderer groups those from the list it already holds (subject plus
+    /// counterpart). That is a guess, and it is deliberately not made here, where guessing wrong would
+    /// silently merge two unrelated conversations.
+    ///
+    /// Local only — no network — so opening a conversation is a disk read (`design/08` §8). `limit`
+    /// exists because "a conversation" has no upper bound in the data, and the caller is a UI.
+    pub fn thread_summaries(
+        &self,
+        account_id: &str,
+        thread_key: &str,
+        limit: u32,
+    ) -> Result<Vec<ThreadMember>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        // Oldest first: a conversation is read in the order it happened. The UI is what decides which
+        // end to focus, and it needs the whole thing either way.
+        let mut stmt = conn.prepare(
+            "select folder, uid, subject, from_name, from_addr, date, size, seen, flagged, thread_key
+             from messages
+             where account_id = ?1 and thread_key = ?2
+             order by date asc, uid asc
+             limit ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, thread_key, i64::from(limit)], |row| {
+            Ok(ThreadMember {
+                folder: row.get(0)?,
+                summary: MessageSummary {
+                    uid: row.get::<_, i64>(1)? as u32,
+                    subject: row.get(2)?,
+                    from_name: row.get(3)?,
+                    from_addr: row.get(4)?,
+                    date: row.get(5)?,
+                    size: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    seen: row.get::<_, i64>(7)? != 0,
+                    flagged: row.get::<_, i64>(8)? != 0,
+                    thread_key: row.get(9)?,
+                },
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1305,6 +1367,26 @@ mod tests {
             "a row that predates the column has no key, and the renderer falls back for it"
         );
 
+        // The conversation index exists, and it was created **after** the column it indexes. That
+        // ordering is the whole reason this assertion is here: a v2 file arrives at the migration with
+        // a `messages` table that has no `thread_key`, so indexing it alongside the other schema would
+        // fail with "no such column" and take the entire upgrade down with it.
+        {
+            let guard = cache.db.read_guard();
+            let indexed: i64 = guard
+                .query_row(
+                    "select count(*) from sqlite_master where type = 'index' \
+                     and name = 'messages_by_thread'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("schema");
+            assert_eq!(
+                indexed, 1,
+                "the conversation index must exist after upgrade"
+            );
+        }
+
         // And the column is usable from here on.
         let mut fresh = rows[0].clone();
         fresh.uid = 8;
@@ -1318,6 +1400,69 @@ mod tests {
                 .iter()
                 .any(|row| row.thread_key.as_deref() == Some("<root@x>"))
         );
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A conversation is assembled across folders, and never across accounts.
+    ///
+    /// The cross-folder half is the feature: the user's own replies are in the Sent folder, so a
+    /// thread read from one folder would show an argument in which only the other side speaks. The
+    /// account half is the safety rail, because a thread key is only unique within an account.
+    #[test]
+    fn a_conversation_crosses_folders_and_stops_at_the_account() {
+        let (cache, path) = temp_cache("thread-members");
+        let key = "<root@example.com>";
+
+        let mut root = summary(10, "项目进度", "boss@example.com", 1_000);
+        root.thread_key = Some(key.to_string());
+        let mut reply = summary(2, "Re: 项目进度", "me@example.com", 2_000);
+        reply.thread_key = Some(key.to_string());
+        let mut unrelated = summary(3, "别的会话", "someone@example.com", 3_000);
+        unrelated.thread_key = Some("<other@example.com>".to_string());
+        let mut foreign = summary(4, "Re: 项目进度", "me@example.com", 4_000);
+        foreign.thread_key = Some(key.to_string());
+
+        cache
+            .upsert_summaries("acc", "INBOX", &[root, unrelated])
+            .expect("write");
+        // The same UID space, a different folder: this is where the reply actually lives.
+        cache
+            .upsert_summaries("acc", "Sent Messages", &[reply])
+            .expect("write");
+        cache
+            .upsert_summaries("other", "INBOX", &[foreign])
+            .expect("write");
+
+        let members = cache.thread_summaries("acc", key, 100).expect("read");
+        assert_eq!(members.len(), 2, "{members:?}");
+        // Oldest first — a conversation reads in the order it happened.
+        assert_eq!(members[0].folder, "INBOX");
+        assert_eq!(members[0].summary.uid, 10);
+        assert_eq!(members[1].folder, "Sent Messages");
+        assert_eq!(members[1].summary.uid, 2);
+
+        assert_eq!(
+            cache
+                .thread_summaries("acc", "<other@example.com>", 100)
+                .expect("read")
+                .len(),
+            1,
+            "a different conversation is a different list"
+        );
+        assert!(
+            cache
+                .thread_summaries("acc", "<nobody@example.com>", 100)
+                .expect("read")
+                .is_empty(),
+            "an unknown key is an empty conversation, not an error"
+        );
+        assert_eq!(
+            cache.thread_summaries("acc", key, 1).expect("read").len(),
+            1,
+            "the limit bounds the read"
+        );
+
         drop(cache);
         let _ = std::fs::remove_file(&path);
     }

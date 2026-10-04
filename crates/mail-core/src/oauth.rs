@@ -619,17 +619,43 @@ pub trait BrowserLauncher {
     fn open(&self, url: &str) -> Result<()>;
 }
 
+/// The command that hands a URL to the shell.
+///
+/// **It must not go through `cmd`.** `cmd /C start "" <url>` is the idiom everyone writes, and it is
+/// silently wrong for any URL with a query string. Measured on Windows (2026-10-04):
+///
+/// ```text
+/// cmd /C echo "" https://x/?a=1&b=2
+///   stdout: "" https://x/?a=1
+///   stderr: 'b' is not recognized as an internal or external command
+/// ```
+///
+/// `cmd` only preserves quoted text when exactly two quotes are on the line and there is whitespace
+/// between them; otherwise it strips the outermost pair and reparses the rest, so every `&` becomes a
+/// command separator. The empty `""` title is one of the quotes that gets stripped, so it does not
+/// help. For an authorization URL — where `client_id` is the first parameter and `response_type` the
+/// second — the browser received `…?client_id=…` and nothing else, and Google answered
+/// `Required Parameter is missing: response_type`. That is the whole bug: the button worked, the
+/// browser opened, and the URL had been cut in half on the way.
+///
+/// `url.dll,FileProtocolHandler` is started **directly**, so the argument list is parsed once, by the
+/// CRT, and `&`/`%` are ordinary characters. It resolves through the same shell association a
+/// double-click uses, which is what keeps the promise "the **default** browser opens" (A1-F32 rules
+/// out an embedded webview and any hardcoded browser).
+#[cfg(windows)]
+fn browser_command(url: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("rundll32.exe");
+    command.args(["url.dll,FileProtocolHandler", url]);
+    command
+}
+
 /// The launcher the app uses.
 pub struct SystemBrowser;
 
 impl BrowserLauncher for SystemBrowser {
     #[cfg(windows)]
     fn open(&self, url: &str) -> Result<()> {
-        // `cmd /c start` with an **empty title argument**: `start` treats a quoted first argument as
-        // the window title, so without it a URL containing `&` (ours always does) would be split into
-        // a title and a command. The empty `""` is the documented way to say "no title".
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+        let status = browser_command(url)
             .status()
             .map_err(|error| MailError::Config(format!("无法打开浏览器：{error}")))?;
         if !status.success() {
@@ -1089,6 +1115,50 @@ mod tests {
             !url.contains(&pkce.verifier),
             "the verifier must never leave this process: {url}"
         );
+    }
+
+    /// The regression witness for a bug that shipped and reached a real user's browser.
+    ///
+    /// The launcher used to run `cmd /C start "" <url>`. `cmd` strips the outermost quotes whenever
+    /// there are more than two on the line — including the `""` that was supposed to be the window
+    /// title — and then reads the now-unquoted `&` as a command separator. The browser was handed
+    /// `…?client_id=…` and nothing after the first `&`, so Google answered
+    /// `Required Parameter is missing: response_type`.
+    ///
+    /// Restoring `cmd` here fails this test on the first assertion, which is the point: nothing about
+    /// the URL looks wrong at the call site, and only the shape of the launched command can tell.
+    #[cfg(windows)]
+    #[test]
+    fn the_authorization_url_is_handed_to_the_shell_whole_and_without_a_shell() {
+        let pkce = Pkce::generate().expect("entropy");
+        let url = authorization_url(
+            GOOGLE,
+            "client-123",
+            "http://127.0.0.1:51234/",
+            &pkce,
+            "state-abc",
+        );
+        // The parameter `cmd` used to eat, and it is not the first one.
+        assert!(url.contains("&response_type=code"), "{url}");
+
+        let command = browser_command(&url);
+        let program = command.get_program().to_string_lossy().to_lowercase();
+        assert_ne!(program, "cmd", "cmd reparses the argument list");
+        assert_ne!(program, "cmd.exe", "cmd reparses the argument list");
+        assert_ne!(program, "powershell", "a shell reparses the argument list");
+        assert_ne!(
+            program, "powershell.exe",
+            "a shell reparses the argument list"
+        );
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        // Exactly two arguments: where the URL handler lives, and the URL — whole, and as one
+        // argument. Splitting it is what the old launcher did, one layer further down.
+        assert_eq!(args.len(), 2, "{args:?}");
+        assert_eq!(args[1], url, "the URL must arrive byte for byte");
     }
 
     #[test]

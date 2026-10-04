@@ -2072,15 +2072,268 @@ CSS 对"不存在的元素"照写不误、不会报错，于是 `#app` 只剩 `d
 **数字**：`check.ps1` **18 步全绿**；测试 **292**；包已重打（10.03 MB）并实测启动。
 
 ---
+### M1a-79 「打开浏览器登录」点了没反应：两个真 bug（真机复现）✅（第 85 轮）
+
+用户原话："我添加谷歌邮箱账号点击打开浏览器登录没反应"。**不是一个 bug，是两个**，而且第二个比第一个深。
+
+**Bug A —— 按钮根本没绑定点击事件。** CDP 探针在真实窗口上按用户的操作顺序走了一遍：
+
+```
+只输入 someone@gmail.com（服务商自动识别为 Gmail，不再触发第二次事件）
+  → oauthAvailable="1"  pathHidden=false   ← 按钮出现在屏幕上
+    goWired=null                            ← 但没有任何点击事件
+    BUG_CONFIRMED: true
+```
+
+监听器挂在 `updateDetected()` 里、条件是 `oauthEligible()`，而它是 `oauth_client_default` 的**异步**答案；
+那个 `.then()` 只重连了"登录方式"单选按钮。于是"最后一次 DOM 事件就是触发这次请求的那次"时，
+按钮出现即死。修法是首次即挂（不再以"已知有 OAuth 路径"为前提），**服务商在点击时现取**——
+先挂上的闭包会存活，捕获旧值会拿错 provider。复验 `goWired="1"`、`BUG_CONFIRMED: false`。
+
+**Bug B —— 授权 URL 被 `cmd` 从第一个 `&` 处截断。** 浏览器里 Google 报的是
+`invalid_request — Required Parameter is missing: response_type`。等价实验：
+
+```
+cmd /C echo "" https://x/?a=1&b=2
+  stdout: "" https://x/?a=1
+  stderr: 'b' is not recognized as an internal or external command
+```
+
+`cmd.exe` 在一行引号多于两个时**剥掉最外层引号**（包括那个本意是"空标题"的 `""`），
+于是 `&` 变成命令分隔符。授权 URL 第一个参数是 `client_id`、第二个才是 `response_type`，
+所以浏览器只拿到了前半截 —— 那句注释说明作者知道 `&` 有风险，但"空标题"这个防法在 cmd 的引号规则下**根本不生效**。
+
+修法：不再经 shell，直接 CreateProcess 调 `url.dll,FileProtocolHandler`，URL 作为一个参数原样到达，
+仍走系统的默认浏览器关联（`oauth.rs::browser_command`）。
+**证伪**：把实现改回 `cmd`，新测试立刻红 ——
+`assertion left != right failed: cmd reparses the argument list`。
+
+**顺带修掉一个同类隐患**：`oauthAuthorized` 原本是**模块级变量**且从不重置，授权成功过一次后
+再开向导会被当成"已授权"，按钮文案直接变「验证并保存」——等于**允许保存一个从未授权的账号**。
+现在它挂在 modal 元素上（`modal.dataset.oauthAuthorized`），新向导必然是新元素，结构上不可能泄漏。
+
+**证据**：`tools/probe-oauth-wizard.mjs`（不点按钮、只查"可见的按钮是否是活的"）；
+Edge 窗口标题从 `accounts.google.com/signin/oauth/error?authError=…response_type…` 变成「登录 - Google 账号」。
+
+---
+
+### M1a-80 应用**完全不使用系统代理**（reqwest 丢了 `system-proxy`）——"浏览器成功、应用超时"的真因 ✅（第 86 轮）
+
+M1a-79 修完后用户授权，浏览器显示"登录完成，可以回到 Easy Email 了"（那是我们的回环服务器发的页面），
+**应用这边却说没成功**。日志里两条时间戳相差 20 秒的记录暴露了形状：
+
+```
+OAuth 登录失败（gmail）：操作超时（30 秒）     ← 30 秒 = HTTP 客户端超时，不是等浏览器
+OAuth 登录失败（gmail）：操作超时（120 秒）    ← 这一条是另一次尝试在等回调
+```
+
+30 秒那个**只可能**来自向 `oauth2.googleapis.com` 换令牌那一步。查下去：
+
+```
+Internet Settings: ProxyEnable = 1, ProxyServer = 127.0.0.1:7897    ← Edge 走它，所以浏览器能打开谷歌
+直连 oauth2.googleapis.com:443 → TcpTestSucceeded = False
+cargo tree: reqwest features = __rustls, json, rustls-tls …          ← 没有 system-proxy
+            hyper-util features = client, client-proxy …             ← 没有 client-proxy-system
+```
+
+`default-features = false` 把 `system-proxy` 一起丢掉了，而这正是让 reqwest 去读
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`（`hyper-util/src/client/proxy/matcher.rs:696`）
+的那个特性 —— 也就是 Edge 用的同一份设置。**浏览器能通、应用不通，是因为两者走的根本不是同一条路。**
+
+**修法**：`crates/mail-core/Cargo.toml` 加回 `"system-proxy"`（新增传递依赖 `windows-registry 0.6.1`，
+已进 `Cargo.lock`，离线构建可用）。
+
+**双向验证**（新增 `--ignored` 网络测试 `the_oauth_http_client_reaches_the_token_endpoint`，
+用生产同一套 `HttpTokens`）：
+
+| | 结果 |
+|---|---|
+| 启用后 | **0.48 秒**拿到 Google 的答复（假 client_id 换来的 `The OAuth client was not found`） |
+| **证伪**：去掉该特性 | 同一测试立刻失败，报错**逐字就是用户看到的那句** `操作超时（30 秒）` |
+
+**教训**：`default-features = false` 不是"少装点东西"，它会静默拿掉行为特性。
+
+---
+
+### M1a-81 真实 Google 端点登录跑通：认证轴闭环 + Gmail 收信 ✅（第 87 轮）
+
+`design/05` §10 的认证轴（PKCE → 系统浏览器 → 回环回调 → 换令牌 → XOAUTH2 → 刷新令牌落盘）
+**第一次在真实 Google 端点上跑通**。M1a-71 起一直挂着的"仅差你在浏览器里点一次"到此闭合。
+
+三条独立证据：
+
+```
+日志:      [1791111456] realuser@gmail.com 的 OAuth 刷新令牌已保存
+令牌库:    %APPDATA%\com.easyemail.desktop\tokens\token-*.bin   326 B（DPAPI）
+账号表:    realuser@gmail.com  provider=gmail  auth="o_auth2"
+```
+
+**并且收信也通了**（`cache.db` 实查，不是推断）：
+
+```
+realuser@gmail.com  INBOX  last_uid=289  synced=0h ago   ← 本次会话内同步，289 封
+                                        folders: INBOX（全部 289 封都带 thread_key）
+realuser@gmail.com  [Gmail]/Drafts, Sent Mail, Spam, Trash, All Mail, Starred, Important  ← 文件夹列表已拿到
+bodies: 1 封正文已读
+```
+
+**顺带修正一条项目里写错的事实**：HANDOFF 一直写着"Gmail 从大陆连不上"。实测是**间歇性**的：
+
+```
+imap.gmail.com:993   5 次里 2 次通        smtp.gmail.com:465   2 次里 1 次通
+```
+
+所以收信时好时坏、发信基本不通。这不是我们的 bug，但"连不上"这个说法太绝对，已更正。
+
+**用户看到的那句 toast 要这么读**：`verify_account` 要求 IMAP 与 SMTP 都通，而 SMTP:465 基本不通，
+于是报"这次没连上服务器"。**M1a-69 的降级（授权成功即保存账号）是对的**，只是它的措辞让 SMTP 的问题
+看起来像网络问题。想发信需要把代理开成 TUN/虚拟网卡模式（现在只管 HTTP/HTTPS）。
+
+---
+
+### M1a-82 向导填的地址 ≠ 浏览器授权的账号：永久认证失败 + 一句误导文案 ✅（第 88 轮）
+
+用户的这次点击暴露了一个真 bug，而且**我为其中一半负责**（我的探针往向导里填了假地址 `someone@gmail.com`）：
+
+```
+[1791110613] 已开始监听 someone@gmail.com 的 INBOX
+[1791110615] 推送连接失败：imap.gmail.com 认证失败 — [AUTHENTICATIONFAILED] Invalid credentials
+   …每 80 秒重复一次，持续 14 分钟…
+[1791111428] 已停止监听 someone@gmail.com
+```
+
+账号的身份取自**向导的文本框**，令牌却属于**浏览器里真正授权的那个账号**，两者从无校验。
+后果是一个**永远修不好**的账号，以及一句永远不会成真的话："网络恢复后会自动开始收信"——
+服务器是**明确拒绝**了凭据，不是没应答。
+
+**M1a-69 的原意是"网络没应答也保存"，但它没有区分"没应答"与"被拒绝"。** 这一轮把这个区分做出来：
+
+- `ConnectionReport.imap_auth_rejected`（`model.rs`）：服务器**答复了**且拒绝凭据时为真。
+  在 `verify_account` 里从原始错误判定（`matches!(e, MailError::Auth { .. })`），那里还看得见分类。
+- 向导：**被明确拒绝**时不保存、不甩锅给网络，如实说"你填的地址和浏览器里授权的账号很可能不是同一个，
+  授权由谁完成只有浏览器知道"；**没应答**时仍走 M1a-69 的保存路径。
+- 测试三条：拒绝 ⇒ 标志为真；登录成功 ⇒ 为假；**连不上（端口无人监听）⇒ 为假**（"沉默不是拒绝"）。
+
+**未做**：让应用**知道**浏览器里授权的是哪个账号（要加 `openid email` scope 并解 `id_token`）。
+现在只是把陷阱说出来，没有拆掉它——地址仍需用户自己填对；写在这里以免下一轮以为它已经解决了。
+
+---
+
+### M1a-83 Outlook 的两处过期文案（`design/05` §7 的遗留项）✅（第 89 轮）
+
+`design/05` §7 第 401-402 行早就写着"要更新 `error.rs` 里两条过期文案（`AuthHint::OAuth2Required`
+现在写的是'当前版本尚未支持 OAuth2'，已经不对了）"。它们一直留着，而现在的后果比"措辞旧"严重：
+
+- `providers.rs` 的 outlook `setup_note` 说"当前版本尚未实现 OAuth2，因此暂时无法登录 Outlook 账号"
+  —— 而 OAuth2 **已经实现**，Microsoft 端点也接好了（M1a-49/73）。等于把一个**已经能用的功能**
+  在界面上说成"暂不支持"，用户看到就不会去试。
+- `AuthHint::OAuth2Required` 同样在否认这个功能，而它正是用户撞上它时会照着做的那一句话。
+
+两处都改成指向真正的路径：Outlook 那条写清"需要你自己到 Azure 注册一个应用（微软没有公开可借的注册），
+把客户端 ID 填进「高级」"并**如实标注这条路尚未在真实 Outlook 账号上走通过**；
+`OAuth2Required` 改成"请在添加账号时选「用浏览器登录」；向导里没有出现这条路径，
+说明这个服务商还没有可用的 OAuth 端点"。
+
+---
+
+### M1a-84 对话模式：跨文件夹会话 + 气泡视图（`cache.db` v3 → v4）✅（第 90 轮）
+
+用户要求："邮件可以加一个对话模式吗，像聊微信一样的界面对话看"，并确认两条口径：
+**① 跨文件夹（"我和某个人的互发邮件，就像私聊一样对话，都要看到"）；② 模式可以切换，选了一个模式就全是这个模式。**
+
+**先反驳自己，再定方案**（六条，完整版在本轮对话里），其中三条改变了设计：
+
+1. "N 个沙箱 iframe = 安全与性能灾难" —— **成立**。于是**只有一个 `#body-surface`**，
+   它在 单封 与 聚焦气泡 之间**被搬动**，而不是每封各渲染一份。
+2. "跨文件夹才是真会话，但会牵动删除/已读/附件的作用域" —— **最危险的一条**。
+   这五处此前都用 `state.mailbox`，之所以没出错只是因为 `openHit` 会把 `state.mailbox` 改成命中那封的文件夹
+   ——是个巧合。跨文件夹会话一进来这个巧合就破了。**已在阶段 B 改成 `state.selectedFolder` +
+   `state.selectedMessage`**（后者替代"在 `state.messages` 里按 UID 找"）。
+3. "微信式应该在气泡里直接打字发送" —— **不做**。M1a-9 专门删掉 `send_mail`，理由就是"两个入口里有一个
+   会绕过撤销窗口/退避/崩溃恢复"。底部「回复」打开现有写信窗口（走 `enqueue_send`）。
+
+**后端**：`cache.rs` `SCHEMA_VERSION` 3→4；`Cache::thread_summaries(account_id, thread_key, limit)`
+（**跨文件夹**、按时间正序、只认精确键）；`model::ThreadMember { folder, summary }`；
+`src-tauri` 新命令 `list_thread`（**只读本地缓存、不发网络**）并注册（前端命令 37 → **38**）。
+**索引建在 `add_column_if_missing` 之后**——这条顺序是必须的，证据见下。
+
+**前端**：全局持久化的阅读模式（`localStorage['ee.readerMode']`，默认对话，按钮显示**当前**模式）；
+`#thread-view` 与气泡；自己的邮件靠右（按账号地址判定）；**只有聚焦气泡**渲染完整正文与附件条，
+其余显示纯文本预览（`textContent`，**绝不 innerHTML**）；正文按需、顺序、**有界（≤8 封）**预取，
+到达时**就地**更新那一个气泡（整体重渲染会搬动 body surface 并重载用户正在读的 iframe）；
+只有聚焦那封标已读（`design/08` §5.2）；列表高亮改按会话键。
+
+**真机证据**（`tools/probe-thread-view.mjs`，QQ 账号，20 封的真实会话）：
+
+```
+listRows 37 · conversationRows 1 · rowCount 14          ← 列表折叠成一行
+bubbles 20  ← 比列表里的 14 封多：**跨文件夹取到了 Sent 里的回复**
+focused 1 · mine 6 · previews 8 · notes 11（有界预取的余量）
+surfaces 1 · frames 1 · surfaceInsideFocused true        ← 安全不变量：全场只有一个沙箱 iframe
+refocus: 点另一封 ⇒ 仍是 1 个 focused、1 个 surface，且在它内部
+singleView: 切回单封 ⇒ surface 回到 #reader-body，thread 隐藏  · 用户偏好已还原
+```
+
+**过程中被截图与实测抓到的两个我自己的 bug**（都是"测量看不出、看图才看出"那一类）：
+
+1. **聚焦气泡被压成 1px 高**（子元素加起来 433px）。原因是 `flex-shrink` 默认为 1，
+   而**自动最小尺寸只在 `overflow: visible` 时生效** —— 只有聚焦气泡带 `overflow: hidden`（圆角裁切），
+   于是只有它被压扁。修法 `.bubble { flex: none }`。测得的 computed 值：`min-height: auto` 与 `overflow: hidden` 不能共存。
+2. **聚焦气泡没滚动到视野内**：`scrollIntoView` 跑在布局落定之前，量到的是更矮的元素。加一帧 `requestAnimationFrame`。
+
+**迁移核验（真机实做，不是推断）**：把真实 `cache.db` 做一份一致副本（走 SQLite backup API，含 WAL），
+`drop index messages_by_thread` + `pragma user_version = 3` 假装成升级前的文件，换上去让应用真的升一次：
+
+```
+升级前: user_version=3  messages=467  by_thread_index=0
+升级后: user_version=4  messages=467  by_thread_index=1     ← 一封没丢，索引出现
+```
+
+**证伪（索引顺序）**：把索引建回 schema 批次里 ⇒ **两条**既有迁移测试立刻红，报错逐字是
+`no such column: thread_key`（v2 老库的 `messages` 表根本没有这一列）。所以"建在加列之后"不是风格，是正确性。
+
+**门禁**：第 4 步（正文安全）增加"`index.html` 里必须**恰好**一个 `#body-surface`、一个 `#body-frame`，
+且搬动必须经由 `mountBodySurface()`"——两个 surface 就意味着"显示图片"能从一封泄漏到另一封。
+
+**未做**：没有精确键的旧行仍走前端近似分组（只看得见当前文件夹）；气泡内直接发送；
+跨账号会话合并；会话级批量删除。有界预取之外的正文要用户点开才取（气泡上如实写"点开查看正文"）。
+
+---
+
+### M1a-85 收尾：调试端口门禁 + release 便携包 ✅（第 91 轮）
+
+- **`--remote-debugging-port=9222` 从 `tauri.conf.json` 删除**。HANDOFF 的规则一直是"验完必须删"，
+  但它**曾经被留在配置里并提交**——而这个端口任何本机进程都能驱动 webview，比探针的价值大得多。
+  现在有了机器检查（见下），规则才真的成立。
+- **新门禁**（`check.ps1` 18 → **19 步**）：`tauri.conf.json` 出现 `remote-debugging-port` 即失败。
+  在此之前 CDP 探针都跑完了，所以这是最后做的一步。
+- **release 便携包重打**：`C:\Users\72492\Desktop\easy-email-latest\easy-email.exe`，**10.06 MB**。
+  **包内构建实测**：启动 12 秒存活；**`http://127.0.0.1:9222/json/version` 不可达**（端口确实没了）。
+
+**数字**：`check.ps1` **19 步全绿**；`cargo test --workspace` **297 通过、0 失败**
+（243 mail-core lib + 46 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri），另有 4 条 ignored
+（2 条真实端点 + 2 条 doctest）。
+
+---
+
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **18 步全绿**；`cargo test --workspace` **292 通过、0 失败**
-（186 lib + 39 loopback + 4 reachability）；`python design/tools/audit.py` **0 失败**（本轮实测，不再只是继承上个会话的结论）；
-应用启动冒烟通过（10 秒存活）。**用户已确认**：真机发出去的信收到了（他自己试的）——
-这是发件箱全链（入队 → worker → SMTP → 已发送副本）在真实账号上的第一次人证。
-真机两个库都已随本轮升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v3**（`sent_index` + `thread_key`），
-迁移前后行数不变（缓存里 158 封邮件一封没动）。
-所有改动都在 git 里（基线 `83c1b0c`，共 94 个提交）。
+**当前状态**：`tools/check.ps1` **19 步全绿**；`cargo test --workspace` **297 通过、0 失败**
+（243 mail-core lib + 46 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri；另有 4 条 ignored）；
+`python design/tools/audit.py` **0 失败**；应用启动冒烟通过。
+**认证轴已在真实 Google 端点上跑通并完成闭环**（M1a-81）：`realuser@gmail.com` 的刷新令牌已落盘（DPAPI），
+**Gmail INBOX 实收 289 封**（`last_uid=289`、`synced=0h ago`，全部带 `thread_key`），`[Gmail]/` 文件夹列表也拿到了。
+**用户已确认**：真机发出去的信收到了（他自己试的）——发件箱全链在真实账号上的第一次人证。
+真机两个库都已升级：`user.db` **v2**（`quota_ledger`）、`cache.db` **v4**（`sent_index` + `thread_key` +
+`messages_by_thread` 索引）；**v3 → v4 在真实库上实做过一次**（467 封一封没丢，见 M1a-84）。
+所有改动都在 git 里（基线 `83c1b0c`）。
+
+**两条被实测推翻/更正过的环境事实**（不要再照旧说法判断）：
+1. **Gmail 从这台机器是"间歇性可达"，不是"连不上"**：`imap.gmail.com:993` 5 次里 2 次通、
+   `smtp.gmail.com:465` 2 次里 1 次通。收信时好时坏、发信基本不通。
+2. **应用必须走系统代理**：本机 `ProxyEnable=1 / ProxyServer=127.0.0.1:7897`；`reqwest` 的
+   `system-proxy` 特性是**载荷性**的，去掉它 OAuth 换令牌就会 30 秒超时（M1a-80 有双向证据）。
+   但 IMAP/SMTP 是裸 TCP，**不**走 HTTP 代理 —— 想稳定收发 Gmail 需要把代理开成 TUN/虚拟网卡模式。
 
 **磁盘上已验证的三件事**（不是文档结论，是真机查过的）：
 - `%APPDATA%\com.easyemail.desktop\cache.db`：`auto_vacuum = 2`（老库已后台重建为 incremental）、
@@ -2120,11 +2373,14 @@ CSS 对"不存在的元素"照写不误、不会报错，于是 `#app` 只剩 `d
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮）** · **M1a-46 XOAUTH2 的四步计划** · **M1a-47 更新状态（成功/没生效各说一次）** · **M1a-48 XOAUTH2 发送半边** · **M1a-49 XOAUTH2 接收半边** · **M1a-50 连接前刷新令牌（轮换先落盘）** · **M1a-51 OAuth 设置进 user.db + Credential 类型** · **M1a-52 账号自带 auth** · **M1a-53 `secret_for`：OAuth 账号连接前刷新令牌** · **M1a-54 OAuth 账号能被创建** · **M1a-55 OAuth 发信（队列）也走 XOAUTH2 + 测试** · **M1a-56 重新登录入口（`oauth_relogin` + 账号行 ↻）** · **M1a-58 真机验证①崩溃恢复** · **M1a-59 真机验证②附件改动（入队拦住 + 实收 31 字节证明冻结）** · **M1a-60 真机验证③抓到真 bug（草稿镜像缺 account_id 迁移，已修）** · **M1a-61 真机验证④查看副本——四件真机验证全部通过** · **M1a-62 本地库错误文案修正 + 测试信删除** · **M1a-63 预填 Mozilla 公开注册** · **M1a-64 读用户自己的 Google 注册** · **M1a-65 自绘顶栏 + release 便携包** · **M1a-66 添加账号两条路径分开、修掉"点旁边就关窗"** · **M1a-67 去掉整条顶栏，窗口按钮浮在右上角** · **M1a-68 Web 类型客户端当场拒绝** · **M1a-69 OAuth 已授权时网络不通也保存账号** · **M1a-70 OAuth 失败写日志 + 测试模式 7 天过期提醒** · **M1a-71 目标五项逐条对账** · **M1a-72 接缝测试（真实 transport + 真实回环）** · **M1a-73 采用注册文件里的端点** · **M1a-74 补 design/05 §10 三条门禁 + auth 快照** · **M1a-75 §10.1 向导改由服务商表决定** · **M1a-76 刷新令牌并发单飞** · **M1a-77 令牌库"损坏"一例** · **M1a-78 修好被我改坏的布局（截图发现）+ 新门禁：样式表的 id 必须存在**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮）** · **M1a-46 XOAUTH2 的四步计划** · **M1a-47 更新状态（成功/没生效各说一次）** · **M1a-48 XOAUTH2 发送半边** · **M1a-49 XOAUTH2 接收半边** · **M1a-50 连接前刷新令牌（轮换先落盘）** · **M1a-51 OAuth 设置进 user.db + Credential 类型** · **M1a-52 账号自带 auth** · **M1a-53 `secret_for`：OAuth 账号连接前刷新令牌** · **M1a-54 OAuth 账号能被创建** · **M1a-55 OAuth 发信（队列）也走 XOAUTH2 + 测试** · **M1a-56 重新登录入口（`oauth_relogin` + 账号行 ↻）** · **M1a-58 真机验证①崩溃恢复** · **M1a-59 真机验证②附件改动（入队拦住 + 实收 31 字节证明冻结）** · **M1a-60 真机验证③抓到真 bug（草稿镜像缺 account_id 迁移，已修）** · **M1a-61 真机验证④查看副本——四件真机验证全部通过** · **M1a-62 本地库错误文案修正 + 测试信删除** · **M1a-63 预填 Mozilla 公开注册** · **M1a-64 读用户自己的 Google 注册** · **M1a-65 自绘顶栏 + release 便携包** · **M1a-66 添加账号两条路径分开、修掉"点旁边就关窗"** · **M1a-67 去掉整条顶栏，窗口按钮浮在右上角** · **M1a-68 Web 类型客户端当场拒绝** · **M1a-69 OAuth 已授权时网络不通也保存账号** · **M1a-70 OAuth 失败写日志 + 测试模式 7 天过期提醒** · **M1a-71 目标五项逐条对账** · **M1a-72 接缝测试（真实 transport + 真实回环）** · **M1a-73 采用注册文件里的端点** · **M1a-74 补 design/05 §10 三条门禁 + auth 快照** · **M1a-75 §10.1 向导改由服务商表决定** · **M1a-76 刷新令牌并发单飞** · **M1a-77 令牌库"损坏"一例** · **M1a-78 修好被我改坏的布局（截图发现）+ 新门禁：样式表的 id 必须存在** · **M1a-79「打开浏览器登录」没反应 = 两个 bug（按钮没绑事件 + `cmd` 把授权 URL 从第一个 `&` 截断，含 `cmd` 引号条款的实测与证伪）** · **M1a-80 应用完全不使用系统代理（`default-features=false` 丢掉 `system-proxy`）——"浏览器成功、应用超时"的真因，双向验证** · **M1a-81 真实 Google 端点登录跑通 + Gmail 实收 289 封（认证轴闭环）** · **M1a-82 填的地址 ≠ 浏览器授权的账号（永久认证失败 + 误导文案）→ 区分"被拒绝"与"没应答"** · **M1a-83 Outlook 两处过期文案（`design/05` §7 的遗留项）** · **M1a-84 对话模式：跨文件夹会话 + 气泡视图（`cache.db` v4 + `messages_by_thread` 索引 + `list_thread` + 全局模式开关；真机 20 封会话、跨文件夹、全场仅 1 个沙箱 iframe；抓到并修掉"聚焦气泡被压成 1px"）** · **M1a-85 收尾：调试端口门禁（18 → 19 步）+ release 便携包 10.06 MB，包内实测 9222 不可达**。
 
-**若继续，从这里开始**（按性价比）：① **会话串**——唯一无外部依赖的大件，**建议开新会话**
-（三步与"cache 必须升版本号"写在 M1a-18 一节）；② 把"副本太大"说准（`ensure_sent_copy` 返回三态 +
-outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5.4 末尾）；④ 安装包自动更新（大）。
+**若继续，从这里开始**（按性价比）：
+① **说准"副本太大"**（`ensure_sent_copy` 返回三态 + outbox 行记标记，见 M1a-28）——最小、已诊断清楚；
+② **让应用知道浏览器授权的账号**（M1a-82 的"未做"）：加 `openid email` scope 并解 `id_token`，
+   把地址不一致这个陷阱**拆掉**而不是只说清楚；
+③ 归档时的 `sent_index` 对账（§5.4 末尾）；④ 自定义服务器入口（`design/05`，会动向导表单结构）；
+⑤ 安装包自动更新（大）。
 **需要你点头才能做的**：四件真机验证（发信→查看副本、崩溃恢复时序、附件被改动提醒、草稿镜像落位），
 其中只有"草稿镜像落位"会真的往你邮箱写东西。
 
@@ -2174,8 +2430,8 @@ outbox 行记标记，见 M1a-28）；③ 归档时的 `sent_index` 对账（§5
 
 **运行方式**
 ```
-.\tools\check.ps1                     # 17 步门禁（前端不变量 / 会话键 / 负载契约 / 安装包配置 / fmt / clippy / build / test / PE=2）
-cargo test --workspace                # 292 个测试
+.\tools\check.ps1                     # 19 步门禁（前端不变量 / 会话键 / 负载契约 / 安装包配置 / 无调试端口 / fmt / clippy / build / test / PE=2）
+cargo test --workspace                # 297 个测试
 python design\tools\audit.py          # 设计文档一致性（对应 design/ 的 23 份文档）
 python tools\inspect-local-db.py <标签> [user|cache]   # 真机库的版本/表/行数（迁移前后对比用）
 git log --oneline                     # 94 个提交；git diff 83c1b0c HEAD 是本次全部改动
@@ -2185,7 +2441,13 @@ node tools/inspect-dom.mjs @tools/probe-drafts.mjs       # 草稿：写→自动
 node tools/inspect-dom.mjs @tools/probe-outbox.mjs       # 发件箱：入队→撤销→删除→写信点发送真的入队
 node tools/inspect-dom.mjs @tools/probe-sync-window.mjs  # 同步窗口：四种窗口往返 + 冷启动回填（会还原设置）
 node tools/inspect-dom.mjs @tools/probe-cleanup.mjs      # 清掉探针在真机上留下的历史行
+node tools/inspect-dom.mjs @tools/probe-thread-view.mjs  # 对话视图：跨文件夹会话、只一个 body surface、聚焦切换、切回单封（会还原模式偏好）
+node tools/inspect-dom.mjs @tools/probe-oauth-wizard.mjs # OAuth 向导：可见的按钮必须是活的（不点它，不会弹浏览器）
+node tools/screenshot.mjs                                # 截图（CDP）；布局类问题只有看图能抓到（M1a-78/M1a-84 各一次）
 ```
+
+**⚠️ 调试端口的纪律现在是机器检查的**：探针需要 `--remote-debugging-port=9222`，用完必须删；
+`check.ps1` 第 19 步会在它还在时失败。删掉之后**探针全部不可用**，所以顺序永远是"先跑探针，再收尾"。
 
 ---
 

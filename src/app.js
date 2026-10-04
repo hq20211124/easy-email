@@ -90,7 +90,37 @@ const state = {
    * wrong row.
    */
   selectedFolder: null,
+  /**
+   * The summary of the message the reader is showing, if any.
+   *
+   * Held rather than looked up in `state.messages`, because the reader's message does not have to be
+   * in the list being displayed: a conversation spans folders, and a search hit is not in the folder
+   * on screen either. Everything that acts on "the open message" reads this.
+   */
+  selectedMessage: null,
   detail: null,
+  /**
+   * The conversation the reader is showing, oldest first; `[]` when the open message is not part of one.
+   *
+   * Read from the cache by the backend, across folders — the user's own replies live in the Sent
+   * folder, and a conversation assembled from one folder would look complete while showing only half
+   * of it.
+   */
+  threadMembers: [],
+  /** The `References` root of the open conversation, or `null`. Used to keep the list row highlighted. */
+  threadKey: null,
+  /** `folder|uid` of the bubble whose body is rendered in full. */
+  threadFocus: null,
+  /** Bodies already fetched for the open conversation, keyed `folder|uid`. */
+  threadBodies: new Map(),
+  /**
+   * Which reading view the user chose — one switch for the whole app, remembered across restarts.
+   *
+   * Global on purpose: the user asked for "模式可以切换，选了一个模式就全是这个模式", and a per-thread
+   * memory would make the same list behave differently from one row to the next. Filled in by
+   * `loadReaderMode()` at boot; the literal here is only the shape.
+   */
+  readerMode: 'thread',
   bodyMode: 'html',
   /** Per-message opt-in; reset every time a different message is opened. */
   allowRemoteImages: false,
@@ -192,11 +222,13 @@ async function run(label, fn) {
 /* ---------------------------------------------------------------- boot */
 
 async function boot() {
+  state.readerMode = loadReaderMode();
   state.providers = (await run('读取内置邮箱配置', () => invoke('list_providers'))) ?? [];
   await refreshSyncWindow();
   await refreshAccounts();
   wireGlobalEvents();
   syncThemeButton();
+  syncViewModeButton();
   await wirePushEvents();
   // One timer for the whole window, rather than one per open composer or per outbox row: it is a
   // text update on whatever countdown is on screen, and it does nothing when none is.
@@ -279,12 +311,65 @@ function syncThemeButton() {
   button.setAttribute('aria-label', label);
 }
 
+/* ---------------------------------------------------------------- reading view mode */
+
+const READER_MODE_KEY = 'ee.readerMode';
+
+/**
+ * The reading view the user last chose.
+ *
+ * `localStorage`, for the same reason the theme lives there: it is a view preference, not account data,
+ * and it belongs to this installation rather than to a mailbox. As with the theme, the "never chosen"
+ * state is left unwritten on startup, so a default can change later without overriding a real choice.
+ */
+function loadReaderMode() {
+  try {
+    const stored = localStorage.getItem(READER_MODE_KEY);
+    if (stored === 'single' || stored === 'thread') return stored;
+  } catch {
+    // A locked-down profile can refuse storage; the default is a fine answer.
+  }
+  return 'thread';
+}
+
+function setReaderMode(mode) {
+  if (mode !== 'single' && mode !== 'thread') return;
+  state.readerMode = mode;
+  try {
+    localStorage.setItem(READER_MODE_KEY, mode);
+  } catch {
+    // Not fatal: the choice just will not survive a restart.
+  }
+  syncViewModeButton();
+}
+
+/** The button says which mode is *active*, not what clicking will do — the title says the rest. */
+function syncViewModeButton() {
+  const button = $('btn-view-mode');
+  const thread = state.readerMode === 'thread';
+  button.textContent = thread ? '💬 对话' : '✉ 单封';
+  button.title = thread
+    ? '当前是对话视图：整个会话按气泡显示，自己的邮件在右边。点一下改成单封视图。'
+    : '当前是单封视图：一次只看一封。点一下改成对话视图。';
+}
+
+/** Switch the view, and re-read the conversation when switching *into* it. */
+async function toggleReaderMode() {
+  setReaderMode(state.readerMode === 'thread' ? 'single' : 'thread');
+  const message = state.selectedMessage;
+  if (message && state.readerMode === 'thread') {
+    await loadConversation(message, state.selectedFolder);
+  }
+  renderReader();
+}
+
 function wireGlobalEvents() {
   $('btn-theme').addEventListener('click', () => {
     window.__easyEmailTheme.toggle();
     syncThemeButton();
   });
   $('btn-add-account').addEventListener('click', () => openAccountWizard());
+  $('btn-view-mode').addEventListener('click', toggleReaderMode);
   $('btn-refresh').addEventListener('click', () => {
     // Refresh means "re-read what this pane is showing": for a local list that is `user.db`, not the
     // server, so it must not silently jump back to the folder.
@@ -299,6 +384,13 @@ function wireGlobalEvents() {
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
   $('btn-forward').addEventListener('click', () => openComposer({ mode: 'forward' }));
+  // The conversation view has its own toolbar and acts on the **focused** message — which is exactly
+  // what `state.detail` and `state.selectedFolder` hold in both views. Wiring them to the same
+  // handlers is what keeps the two toolbars from drifting apart.
+  $('btn-thread-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
+  $('btn-thread-forward').addEventListener('click', () => openComposer({ mode: 'forward' }));
+  $('btn-thread-toggle-read').addEventListener('click', toggleRead);
+  $('btn-thread-delete').addEventListener('click', deleteSelected);
   $('search-input').addEventListener('input', scheduleSearch);
   $('search-input').addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
@@ -1300,7 +1392,14 @@ async function loadMessages({ reset = false } = {}) {
   if (reset) {
     state.limit = PAGE_SIZE;
     state.selectedUid = null;
+    state.selectedMessage = null;
     state.detail = null;
+    // A conversation belongs to the message that was open, not to the folder or the search that comes
+    // next; keeping it would paint the previous thread's bubbles over the new list.
+    state.threadMembers = [];
+    state.threadFocus = null;
+    state.threadKey = null;
+    state.threadBodies = new Map();
     // Folds belong to the rows on screen; a different folder or a search is a different list.
     state.expandedThreads.clear();
     // A new folder (or a refresh) starts over: whatever we learned about the bottom of the previous
@@ -1372,8 +1471,12 @@ function renderMessages() {
     const extra = conversation.messages.length - 1;
     const folded = state.expandedThreads.has(conversation.key);
     const button = document.createElement('button');
+    // Highlighted by conversation as well as by message: in the conversation view the reader can be
+    // focused on a reply that lives in another folder, and the row on screen is still the one the user
+    // is reading. Without this the list would look unselected while a message from it is open.
     const selected =
-      message.uid === state.selectedUid && state.mailbox === state.selectedFolder;
+      (message.uid === state.selectedUid && state.mailbox === state.selectedFolder) ||
+      (state.threadKey !== null && message.thread_key === state.threadKey);
     // A conversation is unread when any of its messages is: hiding an unread one behind a read
     // subject is how a list starts lying about what needs attention.
     const unread = conversation.messages.some((entry) => !entry.seen);
@@ -1466,13 +1569,24 @@ function renderSearchHits(list) {
   }
 }
 
-async function openMessage(message) {
+async function openMessage(message, folder = state.mailbox) {
   state.selectedUid = message.uid;
-  state.selectedFolder = state.mailbox;
+  // The folder travels with the message, not with the list. They used to be assumed equal, which held
+  // only because `openHit` rewrites `state.mailbox` to a search hit's folder — a coincidence, and not
+  // one a conversation view can keep, because a thread spans folders. Everything that acts on "the
+  // open message" (read, delete, attachments, fetching the body) now asks `state.selectedFolder`,
+  // so the message being looked at and the message being modified cannot drift apart.
+  state.selectedFolder = folder;
+  state.selectedMessage = message;
   state.detail = null;
   state.bodyMode = 'html';
   // Blocking is the default for every message; an opt-in must not leak into the next one.
   state.allowRemoteImages = false;
+  // A different message is a different conversation until proven otherwise.
+  state.threadMembers = [];
+  state.threadFocus = null;
+  state.threadKey = null;
+  state.threadBodies = new Map();
   renderMessages();
 
   $('reader-placeholder').hidden = true;
@@ -1491,37 +1605,127 @@ async function openMessage(message) {
   const detail = await run('读取邮件正文', () =>
     invoke('fetch_message', {
       accountId: state.accountId,
-      mailbox: state.mailbox,
+      mailbox: folder,
       uid: message.uid,
     })
   );
   if (!detail) return;
 
   state.detail = detail;
-  renderReader();
+  // The clicked message is the one the user is reading, so its body is already in hand for the
+  // conversation view — the focused bubble never waits.
+  state.threadBodies.set(`${folder}|${message.uid}`, detail);
 
-  // Reading a message marks it \Seen; reflect that locally so the list agrees with the server.
-  if (!message.seen) {
-    message.seen = true;
-    renderMessages();
-    run('标记已读', () =>
-      invoke('mark_seen', {
+  await loadConversation(message, folder);
+  renderReader();
+  markSeen(message, folder);
+}
+
+/**
+ * Work out whether the open message belongs to a conversation, and load its members if it does.
+ *
+ * Two sources, in this order, and the difference matters:
+ *
+ * 1. **The exact key**, answered by the backend across folders. This is the one that can show the
+ *    user's own replies, because those live in the Sent folder rather than in the list on screen.
+ * 2. **The list's own grouping** (subject + counterpart), used only when the row predates
+ *    `thread_key`. It can only see the folder on display, so it is an approximation — and the bubble
+ *    view does not pretend otherwise: it simply contains what it has.
+ *
+ * A conversation of one is not a conversation: nothing is loaded, and the reader stays on the single
+ * message, so an ordinary email does not change appearance for the sake of the feature.
+ */
+async function loadConversation(message, folder) {
+  state.threadMembers = [];
+  state.threadFocus = null;
+  state.threadKey = null;
+  if (state.readerMode !== 'thread') return;
+
+  if (message.thread_key) {
+    const members = await run('读取会话', () =>
+      invoke('list_thread', {
         accountId: state.accountId,
-        mailbox: state.mailbox,
-        uid: message.uid,
-        seen: true,
+        threadKey: message.thread_key,
       })
     );
+    if (members && members.length > 1) {
+      state.threadMembers = members;
+      state.threadKey = message.thread_key;
+      state.threadFocus = `${folder}|${message.uid}`;
+      // Not awaited: the conversation paints from headers immediately and fills in as bodies arrive.
+      void prefetchThreadBodies(members, state.threadFocus);
+      return;
+    }
   }
+
+  // Only rows without an exact key reach here, and only from a real folder listing: search hits come
+  // from several folders at once, so "the conversation" is not a thing this approximation can see.
+  if (state.view !== 'mail' || state.searchQuery) return;
+  const key = window.__easyEmailThreads.conversationKey(message);
+  const siblings = state.messages.filter(
+    (entry) => window.__easyEmailThreads.conversationKey(entry) === key
+  );
+  if (siblings.length < 2) return;
+
+  state.threadMembers = siblings
+    .slice()
+    .sort((a, b) => (a.date ?? 0) - (b.date ?? 0))
+    .map((summary) => ({ folder: state.mailbox, summary }));
+  state.threadFocus = `${folder}|${message.uid}`;
+  void prefetchThreadBodies(state.threadMembers, state.threadFocus);
+}
+
+/**
+ * Move the (single) body rendering surface into whichever view is showing it.
+ *
+ * There is exactly one, and it holds the only sandboxed iframe on screen. Two consequences, both
+ * wanted: "显示图片" can never leak from one message of a conversation to the next, and a twenty-message
+ * thread is not twenty copies of the renderer.
+ */
+function mountBodySurface(host) {
+  const surface = $('body-surface');
+  if (surface.parentElement !== host) host.appendChild(surface);
+  return surface;
+}
+
+/** Reading a message marks it \Seen; reflect that locally so the list agrees with the server. */
+function markSeen(summary, folder) {
+  if (!summary || summary.seen) return;
+  summary.seen = true;
+  renderMessages();
+  run('标记已读', () =>
+    invoke('mark_seen', {
+      accountId: state.accountId,
+      mailbox: folder,
+      uid: summary.uid,
+      seen: true,
+    })
+  );
 }
 
 function renderReader() {
   const detail = state.detail;
+  const conversation = state.readerMode === 'thread' && state.threadMembers.length > 1;
+
+  if (conversation) {
+    $('reader-placeholder').hidden = true;
+    $('reader-body').hidden = true;
+    $('thread-view').hidden = false;
+    renderThreadReader();
+    return;
+  }
+
+  $('thread-view').hidden = true;
+
   if (!detail) {
     $('reader-placeholder').hidden = false;
     $('reader-body').hidden = true;
     return;
   }
+
+  $('reader-placeholder').hidden = true;
+  $('reader-body').hidden = false;
+  mountBodySurface($('reader-body'));
 
   $('reader-subject').textContent = detail.subject;
   $('reader-from-name').textContent = detail.from_name || detail.from_addr || '(未知发件人)';
@@ -1538,7 +1742,12 @@ function renderReader() {
   if (detail.cc.length) recipients.push(`抄送：${detail.cc.join(', ')}`);
   $('reader-to').textContent = recipients.join('　');
 
-  // Attachments
+  renderAttachmentBar(detail);
+  applyBodyMode();
+}
+
+/** The attachment chips for one message. Shared by both views, because the surface is shared. */
+function renderAttachmentBar(detail) {
   const bar = $('attachment-bar');
   bar.innerHTML = '';
   if (detail.attachments.length) {
@@ -1557,8 +1766,211 @@ function renderReader() {
   } else {
     bar.hidden = true;
   }
+}
 
-  applyBodyMode();
+/**
+ * The conversation, drawn as bubbles (`design/08` §2/§5.2).
+ *
+ * One bubble per message with the user's own on the right; exactly one is **focused** and holds the
+ * full body, the rest show a short text preview. That is the design's "最新一封展开，其余折叠", and it
+ * is also what keeps a conversation to a single sandboxed iframe.
+ */
+function renderThreadReader() {
+  const members = state.threadMembers;
+  const focusedKey = state.threadFocus;
+  const newest = members[members.length - 1];
+
+  $('thread-subject').textContent = newest.summary.subject || '(无主题)';
+  const people = [...new Set(members.map((member) => member.summary.from_addr).filter(Boolean))];
+  $('thread-meta').textContent = `共 ${members.length} 封　${people.join('、')}`;
+
+  // Park the shared surface in the reader *before* clearing the list: it lives inside the focused
+  // bubble, and wiping the list would throw the element — and the live iframe in it — away.
+  const surface = $('body-surface');
+  if (surface && !$('reader-body').contains(surface)) $('reader-body').appendChild(surface);
+
+  const list = $('thread-bubbles');
+  list.innerHTML = '';
+
+  let focusedBubble = null;
+  for (const member of members) {
+    const key = bubbleKey(member);
+    const bubble = renderBubble(member, key === focusedKey);
+    if (key === focusedKey) focusedBubble = bubble;
+    list.appendChild(bubble);
+  }
+
+  if (focusedBubble) {
+    mountBodySurface(focusedBubble.querySelector('.bubble-body'));
+    renderAttachmentBar(state.detail);
+    applyBodyMode();
+    // Deferred by one frame: the bubble's height comes from the body surface that was just mounted into
+    // it, and scrolling before that layout pass measured a shorter element — which left the focused
+    // message half below the fold. Measured, not assumed.
+    requestAnimationFrame(() => focusedBubble.scrollIntoView({ block: 'nearest' }));
+  }
+}
+
+const bubbleKey = (member) => `${member.folder}|${member.summary.uid}`;
+
+function renderBubble(member, focused) {
+  const summary = member.summary;
+  const key = bubbleKey(member);
+  const detail = state.threadBodies.get(key);
+
+  const bubble = document.createElement('div');
+  bubble.className =
+    'bubble' + (isMine(summary.from_addr) ? ' mine' : '') + (focused ? ' focused' : '');
+  bubble.dataset.key = key;
+
+  const head = document.createElement('div');
+  head.className = 'bubble-head';
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = senderLabel(summary);
+  who.title = summary.from_addr || '';
+  const when = document.createElement('time');
+  when.textContent = summary.date ? new Date(summary.date * 1000).toLocaleString('zh-CN') : '';
+  head.append(who, when);
+  bubble.appendChild(head);
+
+  if (focused) {
+    const body = document.createElement('div');
+    body.className = 'bubble-body';
+    bubble.appendChild(body);
+    return bubble;
+  }
+
+  // A collapsed bubble shows what we already have and says so when we have nothing. It is always
+  // `textContent`, never `innerHTML`: the sandboxed iframe stays the only place mail HTML is rendered.
+  const preview = document.createElement('div');
+  if (detail) {
+    preview.className = 'bubble-preview';
+    preview.textContent = previewText(detail);
+  } else {
+    preview.className = 'bubble-note';
+    preview.textContent = summary.subject
+      ? `${summary.subject} —— 点开查看正文`
+      : '点开查看正文';
+  }
+  bubble.appendChild(preview);
+  bubble.addEventListener('click', () => focusBubble(key));
+  return bubble;
+}
+
+/** Move the focus to one message of the conversation: its body renders in full, the others collapse. */
+async function focusBubble(key) {
+  if (state.threadFocus === key) return;
+  const member = state.threadMembers.find((entry) => bubbleKey(entry) === key);
+  if (!member) return;
+
+  state.threadFocus = key;
+  state.selectedUid = member.summary.uid;
+  state.selectedFolder = member.folder;
+  state.selectedMessage = member.summary;
+  // Per message, exactly as in the single view: unlocking images in one bubble must not unlock the next.
+  state.allowRemoteImages = false;
+  state.bodyMode = 'html';
+
+  if (!state.threadBodies.has(key)) {
+    const detail = await run('读取邮件正文', () =>
+      invoke('fetch_message', {
+        accountId: state.accountId,
+        mailbox: member.folder,
+        uid: member.summary.uid,
+      })
+    );
+    if (!detail) return;
+    state.threadBodies.set(key, detail);
+  }
+
+  state.detail = state.threadBodies.get(key);
+  renderThreadReader();
+  renderMessages();
+  markSeen(member.summary, member.folder);
+}
+
+/**
+ * Fetch the rest of the conversation's bodies, newest first, bounded and one at a time.
+ *
+ * Bounded because "a conversation" has no upper bound in the data and every fetch is a round trip;
+ * sequential because this is background work the user did not ask for, sharing a small connection pool.
+ * Each arrival fills one preview **in place** — a full re-render would move the body surface and reload
+ * the iframe the user is reading.
+ */
+async function prefetchThreadBodies(members, focusedKey) {
+  const queue = members
+    .slice()
+    .reverse()
+    .filter((member) => bubbleKey(member) !== focusedKey && !state.threadBodies.has(bubbleKey(member)))
+    .slice(0, THREAD_PREFETCH_MAX);
+
+  for (const member of queue) {
+    // The user moved on: stop doing work for a conversation nobody is looking at.
+    if (state.threadFocus !== focusedKey) return;
+
+    let detail = null;
+    try {
+      detail = await invoke('fetch_message', {
+        accountId: state.accountId,
+        mailbox: member.folder,
+        uid: member.summary.uid,
+      });
+    } catch {
+      // Background work must not raise a toast: the bubble keeps saying "点开查看正文", and clicking it
+      // fetches in the foreground where a failure is explained.
+      return;
+    }
+    if (!detail) return;
+    state.threadBodies.set(bubbleKey(member), detail);
+
+    const bubble = $('thread-bubbles').querySelector(`[data-key="${bubbleKey(member)}"] > div:last-child`);
+    if (bubble) {
+      bubble.className = 'bubble-preview';
+      bubble.textContent = previewText(detail);
+    }
+  }
+}
+
+/** How many bodies a conversation fetches in the background. */
+const THREAD_PREFETCH_MAX = 8;
+/** How much of a message a collapsed bubble shows. */
+const PREVIEW_CHARS = 220;
+
+/**
+ * A one-glance version of a message body, for a collapsed bubble.
+ *
+ * Plain text on purpose — the caller writes it with `textContent` — so nothing in an untrusted body
+ * can become markup here.
+ */
+function previewText(detail) {
+  const source = (detail.body_text && detail.body_text.trim()) || detail.body_html || '';
+  const text = decodeEntities(stripTags(source)).replace(/\s+/g, ' ').trim();
+  return text.slice(0, PREVIEW_CHARS) || '(空邮件)';
+}
+
+/**
+ * The handful of entities that actually turn up in mail, decoded once for text that is about to be
+ * *read as text* rather than parsed. `&amp;` goes last so `&amp;lt;` decodes to `&lt;` and not `<`.
+ */
+function decodeEntities(text) {
+  return text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, '&');
+}
+
+/** Whether an address is one of the user's own — which is what puts a bubble on the right. */
+function isMine(addr) {
+  const value = String(addr ?? '')
+    .trim()
+    .toLowerCase();
+  if (!value) return false;
+  if (state.accountId && state.accountId.toLowerCase() === value) return true;
+  return state.accounts.some((account) => String(account.email).toLowerCase() === value);
 }
 
 /**
@@ -1577,7 +1989,7 @@ async function saveAttachment(chip, attachment) {
     const saved = await run('保存附件', () =>
       invoke('save_attachment', {
         accountId: state.accountId,
-        mailbox: state.mailbox,
+        mailbox: state.selectedFolder,
         uid: detail.uid,
         part: attachment.part,
         name: attachment.name,
@@ -1764,13 +2176,16 @@ function buildSandboxedDocument(html, allowRemoteImages) {
 
 async function deleteSelected() {
   if (!state.detail) return;
-  const message = state.messages.find((m) => m.uid === state.selectedUid);
+  // The open message, not a lookup in the list: a conversation can be reading a message that is not in
+  // the folder being listed, so searching `state.messages` would find nothing (and, for a UID that
+  // exists in both folders, find the wrong one).
+  const message = state.selectedMessage;
   if (!confirm(`删除这封邮件？\n\n${message ? message.subject : ''}`)) return;
 
   const ok = await run('删除邮件', async () => {
     await invoke('delete_message', {
       accountId: state.accountId,
-      mailbox: state.mailbox,
+      mailbox: state.selectedFolder,
       uid: state.selectedUid,
     });
     return true;
@@ -1778,8 +2193,11 @@ async function deleteSelected() {
 
   if (ok) {
     toast('邮件已删除', 'ok');
-    state.messages = state.messages.filter((m) => m.uid !== state.selectedUid);
+    state.messages = state.messages.filter(
+      (m) => !(m.uid === state.selectedUid && state.selectedFolder === state.mailbox)
+    );
     state.selectedUid = null;
+    state.selectedMessage = null;
     state.detail = null;
     renderMessages();
     renderReader();
@@ -1788,14 +2206,14 @@ async function deleteSelected() {
 
 async function toggleRead() {
   if (!state.detail) return;
-  const message = state.messages.find((m) => m.uid === state.selectedUid);
+  const message = state.selectedMessage;
   if (!message) return;
   const nextSeen = !message.seen;
 
   const ok = await run('修改已读状态', async () => {
     await invoke('mark_seen', {
       accountId: state.accountId,
-      mailbox: state.mailbox,
+      mailbox: state.selectedFolder,
       uid: message.uid,
       seen: nextSeen,
     });
@@ -2336,9 +2754,6 @@ function setComposeCloudStatus(text) {
  */
 let pendingWizardAccountId = null;
 
-/** Set once the browser half of an OAuth sign-in has succeeded for the wizard currently open. */
-let oauthAuthorized = false;
-
 function openAccountWizard() {
   pendingWizardAccountId = null;
 
@@ -2463,7 +2878,10 @@ function openAccountWizard() {
       const oauthAccount =
         modal.querySelector('#wiz-auth-choice').dataset.oauthAvailable === '1' &&
         modal.querySelector('input[name="wiz-auth"]:checked')?.value === 'oauth';
-      if (oauthAccount && !oauthAuthorized) {
+      // The authorization flag lives on the dialog element, not in a module variable: a module
+      // variable outlives the dialog, so opening the wizard a second time would already look
+      // "authorized" and let the user save an OAuth account that was never authorized.
+      if (oauthAccount && modal.dataset.oauthAuthorized !== '1') {
         toast('请先点上面的「打开浏览器登录」完成授权。', 'err', 9000);
         return false;
       }
@@ -2482,6 +2900,9 @@ function openAccountWizard() {
       // If they give up and close the dialog, `closeModal` cleans up.
       const accountId = email.toLowerCase();
       let verified = false;
+      // Read outside the `try` because the decision below needs it: "the server refused" and "the
+      // server said nothing" both leave `verified` false and lead to opposite conclusions.
+      let result = null;
 
       try {
         await invoke('save_account', {
@@ -2493,7 +2914,7 @@ function openAccountWizard() {
           username: username || null,
         });
 
-        const result = await invoke('verify_account', { accountId });
+        result = await invoke('verify_account', { accountId });
         renderReport(report, result);
         verified = result.imap_ok && result.smtp_ok;
       } catch (error) {
@@ -2501,12 +2922,32 @@ function openAccountWizard() {
       }
 
       if (!verified) {
-        // An OAuth account that has already been authorized is **kept** even when the reachability
-        // probe fails, because the two failures are not alike: the authorization is a real, stored,
+        // A **rejection** is not the same failure as silence, and for OAuth it is the one case that
+        // must not be saved: the credential was refused, so the account can never work, and every
+        // later message about it ("网络恢复后会自动开始收信") would be false. Nothing used to compare
+        // the address typed here with the account the browser authorized, so the trap is easy to walk
+        // into: the browser signs in as A, the field says B, and the result is an account that is
+        // rejected forever, retried on every startup.
+        if (oauthAccount && modal.dataset.oauthAuthorized === '1' && result?.imap_auth_rejected) {
+          pendingWizardAccountId = accountId;
+          report.innerHTML =
+            '<div class="report bad"><strong>服务器拒绝了这次登录</strong><br>' +
+            '浏览器授权成功了，但邮件服务器明确拒绝了这些凭据。最可能的原因是：' +
+            '<b>你在浏览器里授权的账号，和上面填的地址不是同一个</b> —— ' +
+            '授权是由谁完成的只有浏览器知道，应用看不到。' +
+            '请把地址改成你刚才授权的那个，再点一次「打开浏览器登录」。<br>' +
+            '其次的可能：该账号已被停用，或授权时没有勾选读取邮件的权限。</div>';
+          const retry = modal.querySelector('[data-role="confirm"]');
+          if (retry) retry.textContent = '重试';
+          return false;
+        }
+
+        // An OAuth account that has already been authorized is **kept** when the probe simply got no
+        // answer, because the two failures are not alike: the authorization is a real, stored,
         // revocable thing the user just did in a browser, while "IMAP did not answer" is often just the
-        // network (Gmail is unreachable from parts of China, and the provider note says as much).
+        // network (measured: Gmail's 993 answers about two times in five from this network).
         // Throwing the account away here would make the user redo the browser dance for nothing.
-        if (oauthAccount && oauthAuthorized) {
+        if (oauthAccount && modal.dataset.oauthAuthorized === '1') {
           pendingWizardAccountId = null;
           toast(
             `已保存 ${email}：浏览器授权成功，但这次没连上服务器。网络恢复后会自动开始收信。`,
@@ -2574,7 +3015,7 @@ function openAccountWizard() {
         // The button at the bottom means different things on the two paths, and saying which is the
         // difference between "what do I know now?" and a finished setup.
         confirm.textContent =
-          path === 'oauth' && oauthEligible() && !oauthAuthorized
+          path === 'oauth' && oauthEligible() && modal.dataset.oauthAuthorized !== '1'
             ? '先完成上面的浏览器登录'
             : '验证并保存';
       }
@@ -2619,17 +3060,42 @@ function openAccountWizard() {
             clientIdField.value = client.client_id;
             clientSecretField.value = client.client_secret ?? '';
           }
-          modal.querySelector('#wiz-oauth-notice').textContent = client?.notice ?? '';
+          // Where the pre-filled value came from is the one thing the user cannot check for
+          // themselves: both sources look identical in the two fields. `own` means the JSON they
+          // dropped into the app data directory is already the one in use, so the honest answer to
+          // "do I have to do anything here?" is visible instead of implied.
+          const notice = modal.querySelector('#wiz-oauth-notice');
+          notice.textContent =
+            client?.source === 'own'
+              ? '正在使用你自己放进应用数据目录的注册（oauth-client.json）—— 这里不用改。'
+              : client?.notice ?? '';
         })
         .catch(() => {});
     }
+    // Attached on the first pass, **without** asking whether this provider has an OAuth path.
+    //
+    // That condition used to be part of the guard, and it is an *asynchronous* answer: it only
+    // becomes true when `oauth_client_default` comes back. When the last thing the user did was the
+    // typing/choosing that started that request, no further `updateDetected()` ran, so the path was
+    // revealed by the `.then()` while this listener was never attached — a visible button wired to
+    // nothing. A real user reported exactly that: "点击打开浏览器登录没反应".
+    //
+    // The provider is therefore resolved at *click* time rather than captured here, because the
+    // closure that attaches first is the one that survives, and it would otherwise hold whatever
+    // provider was selected before the address was typed.
     const go = modal.querySelector('#wiz-oauth-go');
-    if (oauthEligible() && !go.dataset.wired) {
+    if (!go.dataset.wired) {
       go.dataset.wired = '1';
       go.addEventListener('click', async () => {
         const address = emailInput.value.trim();
         if (!address) {
           toast('先填邮箱地址', 'err');
+          return;
+        }
+        const chosen = state.providers.find((p) => p.id === providerSelect.value);
+        if (!chosen) return;
+        if (!oauthEligible()) {
+          toast('这个服务商不走浏览器登录，请用密码 / 授权码。', 'err', 9000);
           return;
         }
         const clientId = modal.querySelector('#wiz-client-id').value.trim();
@@ -2646,7 +3112,7 @@ function openAccountWizard() {
         const tokens = await run('OAuth 登录', () =>
           invoke('oauth_sign_in', {
             email: address,
-            providerId: provider.id,
+            providerId: chosen.id,
             clientId,
             clientSecret: secret || null,
           })
@@ -2657,7 +3123,7 @@ function openAccountWizard() {
           return;
         }
 
-        oauthAuthorized = true;
+        modal.dataset.oauthAuthorized = '1';
         status.className = 'oauth-status ok';
         status.textContent = tokens.refresh_token
           ? '✓ 已授权，授权已保存在本机。现在点下面的「验证并保存」即可。'

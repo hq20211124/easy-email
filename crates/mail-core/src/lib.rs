@@ -147,6 +147,7 @@ pub async fn verify_account(cfg: &AccountConfig, password: &str) -> ConnectionRe
         smtp_ok: false,
         imap_detail: String::new(),
         smtp_detail: String::new(),
+        imap_auth_rejected: false,
         mailboxes: Vec::new(),
     };
 
@@ -167,7 +168,13 @@ pub async fn verify_account(cfg: &AccountConfig, password: &str) -> ConnectionRe
             }
             let _ = client.logout().await;
         }
-        Err(e) => report.imap_detail = describe(&e),
+        Err(e) => {
+            // A rejection is the server's answer; everything else is the network's silence. The
+            // caller decides differently on the two, so the distinction is recorded here, where the
+            // raw error is still available.
+            report.imap_auth_rejected = matches!(e, MailError::Auth { .. });
+            report.imap_detail = describe(&e);
+        }
     }
 
     // Only try SMTP once the credential is known good.

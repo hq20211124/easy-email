@@ -424,8 +424,10 @@ pub const PROVIDERS: &[Provider] = &[
         supports_imap: true,
         quirks: Quirks::STANDARD,
         setup_note: "微软已于 2024 年 9 月彻底关闭个人账号的基本认证，IMAP/SMTP 现在只能使用 \
-                     OAuth2 授权登录。当前版本尚未实现 OAuth2，因此暂时无法登录 Outlook 账号；\
-                     该支持已在计划中。",
+                     OAuth2 授权登录。本程序支持这条路：微软没有公开可借的应用注册，需要你先到 \
+                     Azure 门户注册一个应用（类型选「移动和桌面应用程序」），把它下载到的客户端 \
+                     ID 填进向导「高级」里，再点「打开浏览器登录」。\
+                     这条路尚未在真实 Outlook 账号上走通过 —— 如果卡住，请把浏览器里的原文发来。",
         enable_url: "https://support.microsoft.com/account-billing",
         verified: true,
     },

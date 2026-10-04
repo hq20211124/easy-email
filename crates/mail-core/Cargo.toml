@@ -36,7 +36,20 @@ getrandom = "0.3"
 # Entra refresh tokens are 1-4 KB (A1-F35). User scope only, never LOCAL_MACHINE.
 # The OAuth token endpoints are HTTPS POSTs of a form. rustls (not native-tls) because only its
 # crate set is available in this environment's offline registry (M1a-38 measured that).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+#
+# `system-proxy` is **not optional here**, and it is the one feature a `default-features = false`
+# build silently loses. Without it reqwest ignores the system proxy entirely — including the
+# `HTTPS_PROXY` environment variable — and connects directly. On a machine behind a local proxy
+# (measured 2026-10-04: `ProxyEnable=1`, `ProxyServer=127.0.0.1:7897`) the browser reaches Google
+# and the app does not, so the consent screen completes and the token exchange times out: the user
+# sees "登录完成" in the browser and a failure in the app, which looks like *our* bug because it is.
+# Enabling it makes `hyper-util` read the same
+# `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` the browser obeys.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "system-proxy",
+] }
 # Needed to set SO_EXCLUSIVEADDRUSE *before* bind: the option cannot be applied to a socket that is
 # already listening, and tokio binds for us (A1-F36).
 socket2 = "0.6"

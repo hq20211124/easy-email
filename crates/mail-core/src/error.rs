@@ -130,8 +130,12 @@ impl AuthHint {
                  然后生成授权码再重试。"
             }
             AuthHint::OAuth2Required => {
-                "该服务商已停用基本认证，必须使用 OAuth2 授权登录。\
-                 当前版本尚未支持 OAuth2，请改用该服务商的应用专用密码（若有），或换用其他邮箱。"
+                // This used to end with "当前版本尚未支持 OAuth2", which stopped being true when the
+                // auth axis landed and is the one sentence a user hitting it would act on. `design/05`
+                // §7 names it as a stale string to fix; it points at the feature now.
+                "该服务商已停用基本认证，只能使用 OAuth2 授权登录。\
+                 请在添加账号时选「用浏览器登录」；向导里没有出现这条路径，说明这个服务商\
+                 还没有可用的 OAuth 端点。"
             }
             AuthHint::NeteaseNeedsId => {
                 "网易邮箱要求客户端先发送 IMAP ID 命令。请确认已勾选「网易邮箱（需要 ID 命令）」选项，\
