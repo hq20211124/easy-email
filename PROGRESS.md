@@ -2504,13 +2504,54 @@ XOAUTH2、队列发信全部就绪），这一轮做的是**真实登录会踩�
 
 ---
 
+### M1a-90 三个真机问题：列表只能看到最新一页（真 bug）+ 单封也要对话模式 + 为什么不合并 ✅（第 96 轮）
+
+用户 2026-10-06 提了三件事，逐件查、逐件答。**先说结论：第一件是真 bug，第二件是漏做的需求，第三件不是 bug。**
+
+**① 「只能拉到 10.2 之后的邮件」= 真 bug，已修。**
+用真实库先把事实摆出来（`python tools/inspect-cache-detail.py`，这轮新加的常驻工具）：
+QQ INBOX 缓存里 **192 封、UID 5662..5856、日期 2026-09-02 .. 2026-10-06**，而列表只显示 **50 封**（一页），
+最后一行是 10/2。点「加载更多」立刻显示"没有更早的邮件了"，行数一点不变。
+根因：`loadOlder()` **直接问服务器**（`load_more_messages` → `fetch_older_headers(before_uid = 缓存最旧)`），
+从不让本地窗口变大 —— 而服务器**确实**没有更早的邮件（`UID SEARCH 1:5661` 返回空），
+于是本地那 142 封已经下载好的邮件**永远看不到**。这不是"服务器没有"，是"我们自己没显示"。
+修法：顺序反过来，抽成纯函数 `src/history.js` 的 `historyStep`：
+**缓存优先 → 缓存穷了再问服务器 → 两边都穷了才算到底**；规则由 `tools/history_test.mjs`
+与门禁新一步（22 → **23 步**）钉住，**证伪过**（去掉"缓存优先"那一支 ⇒ 4 条断言红，
+其中一条正是用户看到的 `done`）。
+**真机验证**（同一个真实账号）：22 行/10-2 → **70 行/9-22** → **120 行/9-14** → **162 行/9-2**（缓存最早那封），
+再点一次才（如实）说"没有更早的邮件了"。
+**顺带回答了"到底有没有更早的邮件"**：QQ 服务器上这个 INBOX 确实只有 9/2 起的那 195 封（UID 从 5662 开始），
+所以再往前是没有的 —— 这也解释了为什么修好之后仍然停在 9/2。
+
+**② 单封邮件也要对话模式 = 漏做的需求，已做。**
+原来 `loadConversation` 要求 `> 1` 个成员、`renderReader` 也要求 `> 1`，所以单独一封会掉回普通模式。
+现在 `>= 1`：一封也是「一封的会话」，照样气泡显示、可展开、底部回复框在。
+**真机验证**：点一封没有被折叠的行 → `#thread-view` 可见、**恰好 1 个气泡**、默认折叠、展开后正文框高 360px、
+回复框显示"回复给 noreply@openrouter.ai"。搜索命中与草稿/发件箱列表仍然不进对话模式（跨文件夹，会话无从谈起）。
+
+**③ 「wangfang@example.com 和我有互发，为什么不在一起」= 不是 bug，是事实。**
+把 4 封的线程头打出来（`tools/inspect-cache-detail.py`）：
+每封都是 `in_reply_to = None`、`references = []`，而 `thread_key` **各不相同**（各自是根）——
+也就是说**它们彼此之间没有任何回复关系**，是 4 封独立邮件（主题恰好都叫「王芳 您好」，10/2 与 10/6 各两封）。
+按 `References` 判定会话是**有意**的设计：只按"同一对方 + 同一主题"合并，会把同主题但不相干的信**永久**并到一起。
+另外要如实说：用户自己回的邮件**没有一封在缓存里**（「已发送」只缓存了 209 封里的 8 封），
+所以就算回复带了正确的链，界面此刻也看不到它 —— 想看的话在「已发送」里按「加载更多」。
+**要不要加"同对方+同主题就合并"的启发式，是产品决定，留给用户选**（Gmail/Thunderbird 大致这么做；
+代价见上）。
+
+**数字**：`check.ps1` **23 步全绿**；`cargo test --workspace` **322 通过 / 0 失败**（无 Rust 改动）；
+新增门禁测试文件 `tools/history_test.mjs`、常驻诊断工具 `tools/inspect-cache-detail.py`。
+
+---
+
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **22 步全绿**（离线；`-Network` 会多跑一步真实端点）；`cargo test --workspace`
+**当前状态**：`tools/check.ps1` **23 步全绿**（离线；`-Network` 会多跑一步真实端点）；`cargo test --workspace`
 **322 通过、0 失败**（267 mail-core lib + 47 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri；
 另有 **5** 条 ignored：3 条真实端点 + 2 条 doctest）；
 `python design/tools/audit.py` **0 失败**；应用启动冒烟通过。新增的 JS 门禁：
-`node tools/wizard_verdict_test.mjs`、`node tools/reply_test.mjs`、`node tools/payload_keys.mjs`（含 `EndpointOverride`）。
+`node tools/wizard_verdict_test.mjs`、`node tools/reply_test.mjs`、`node tools/history_test.mjs`、`node tools/payload_keys.mjs`（含 `EndpointOverride`）。
 **认证轴已在真实 Google 端点上跑通并完成闭环**（M1a-81）：`realuser@gmail.com` 的刷新令牌已落盘（DPAPI），
 **Gmail INBOX 实收 289 封**（`last_uid=289`、`synced=0h ago`，全部带 `thread_key`），`[Gmail]/` 文件夹列表也拿到了。
 **用户已确认**：真机发出去的信收到了（他自己试的）——发件箱全链在真实账号上的第一次人证。

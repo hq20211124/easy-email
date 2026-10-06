@@ -273,6 +273,23 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'the load-more button shows cached mail before it asks the network' {
+        # Live bug on a real mailbox (2026-10-06): the list shows one page while the first sync stores a
+        # whole window, so the cache holds far more. 加载更多 went straight to the server, the server had
+        # nothing older, and it said "没有更早的邮件了" — with 142 already-downloaded messages never shown.
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/history_test.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '加载更多 would skip mail that is already cached on this machine' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'a conversation reply reaches the counterpart and joins the thread' {
         # Two silent failures, both loud in a real mailbox: "answer the newest message" addresses the
         # user themselves whenever they replied last, and a reply without the References chain arrives

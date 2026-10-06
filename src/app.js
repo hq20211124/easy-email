@@ -32,6 +32,14 @@ const threads = window.__easyEmailThreads;
  */
 const reply = window.__easyEmailReply;
 
+/**
+ * Which source the next page of older mail comes from (cache first, then the server, then "no more").
+ *
+ * Pure, in history.js, because the wrong order is invisible on screen — both branches end with more
+ * rows in the list — and it silently skipped everything the cache held beyond the first page.
+ */
+const history = window.__easyEmailHistory;
+
 const PAGE_SIZE = 50;
 
 /** How many local search hits to ask for. Higher than a page because results span all folders. */
@@ -1358,11 +1366,18 @@ async function discardOutboxItem(id) {
 /* ---------------------------------------------------------------- messages */
 
 /**
- * Fetch the page of mail just older than what the cache holds, and prepend it.
+ * Fetch the next page of older mail: **from the cache first**, then from the server.
  *
- * The list only ever holds the newest window, so this is the only way back into an old mailbox. The
- * backend does the "which UIDs" work (`load_more_messages` -> `fetch_older_headers`); this function
- * only decides what the user sees, and it keeps the incremental cursor out of the picture entirely.
+ * The two sources are not interchangeable and the order is the whole point. The list shows one page
+ * (`PAGE_SIZE`) while the first sync stores a whole window (500) and every history fetch adds to the
+ * cache too — so the cache almost always holds more than the list is showing. Going straight to the
+ * server (which is what this did until 2026-10-06) meant that on a mailbox with nothing older on the
+ * server, the button announced "没有更早的邮件了" while 142 already-downloaded messages were never
+ * shown; `src/history.js` owns the rule and `tools/history_test.mjs` pins it.
+ *
+ * The backend does the "which UIDs" work for the server leg (`load_more_messages` ->
+ * `fetch_older_headers`), and neither leg touches the incremental cursor: `last_uid` keeps pointing at
+ * the newest stored message, so scrolling into history can never make the updater skip mail.
  */
 async function loadOlder() {
   if (state.historyDone || !state.accountId || !state.mailbox) return;
@@ -1370,6 +1385,44 @@ async function loadOlder() {
   const button = $('btn-load-more');
   button.disabled = true;
   button.textContent = '正在加载更早的邮件…';
+
+  const local = await run('读取本地缓存', () =>
+    invoke('list_messages', {
+      accountId: state.accountId,
+      mailbox: state.mailbox,
+      // One page more than what is on screen. `list_messages` reads the cache newest-first, so this is
+      // "the same list, one page longer".
+      limit: state.limit + PAGE_SIZE,
+    })
+  );
+  if (local === null) {
+    // Failed: put the button back so the user can retry, and leave the list alone.
+    button.disabled = false;
+    renderHistoryButton();
+    return;
+  }
+
+  const step = history.historyStep({
+    shownCount: state.messages.length,
+    cachedCount: local.length,
+    serverDone: state.historyDone,
+  });
+
+  if (step === 'show-cached') {
+    state.limit += PAGE_SIZE;
+    state.messages = local.slice().sort((a, b) => b.uid - a.uid);
+    renderMessages();
+    button.disabled = false;
+    renderHistoryButton();
+    return;
+  }
+
+  if (step === 'done') {
+    state.historyDone = true;
+    button.disabled = false;
+    renderHistoryButton();
+    return;
+  }
 
   const page = await run('加载更早的邮件', () =>
     invoke('load_more_messages', {
@@ -1380,7 +1433,6 @@ async function loadOlder() {
   );
 
   if (page === null) {
-    // Failed: put the button back so the user can retry, and leave the list alone.
     button.disabled = false;
     renderHistoryButton();
     return;
@@ -1390,12 +1442,16 @@ async function loadOlder() {
     const known = new Set(state.messages.map((m) => m.uid));
     const added = page.messages.filter((m) => !known.has(m.uid));
     state.messages = state.messages.concat(added).sort((a, b) => b.uid - a.uid);
+    // The visible window grew by exactly what arrived, so the next press asks the cache for the window
+    // after this one rather than asking for a page that is already on screen.
+    state.limit = state.messages.length;
     renderMessages();
   }
 
   if (page.done || page.messages.length === 0) {
     state.historyDone = true;
   }
+  button.disabled = false;
   renderHistoryButton();
 }
 
@@ -1671,7 +1727,7 @@ async function loadConversation(message) {
         threadKey: message.thread_key,
       })
     );
-    if (members && members.length > 1) {
+    if (members && members.length >= 1) {
       state.threadMembers = members;
       state.threadKey = message.thread_key;
       // Everything starts **collapsed** (user's request, 2026-10-06), so opening a conversation shows
@@ -1691,7 +1747,7 @@ async function loadConversation(message) {
   const siblings = state.messages.filter(
     (entry) => window.__easyEmailThreads.conversationKey(entry) === key
   );
-  if (siblings.length < 2) return;
+  if (siblings.length < 1) return;
 
   state.threadMembers = siblings
     .slice()
@@ -1731,7 +1787,11 @@ function markSeen(summary, folder) {
 
 function renderReader() {
   const detail = state.detail;
-  const conversation = state.readerMode === 'thread' && state.threadMembers.length > 1;
+  // 对话模式 applies to **every** message, including one that is not part of a thread (user's request,
+  // 2026-10-06): a single message is a conversation of one, and showing it as a bubble keeps the view
+  // from changing shape depending on what happens to be in the mailbox. `threadMembers` is empty only
+  // when the mode is 普通模式, or for a search hit / local view the conversation cannot be assembled for.
+  const conversation = state.readerMode === 'thread' && state.threadMembers.length >= 1;
 
   if (conversation) {
     $('reader-placeholder').hidden = true;

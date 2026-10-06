@@ -34,6 +34,46 @@
   const list = q('#message-list');
   log.listRows = list.querySelectorAll('.msg').length;
 
+  // ---- a single message is a conversation of one, and 对话模式 applies to it too (user's request,
+  // 2026-10-06). Checked first, because it needs a row that the list did *not* fold.
+  if (q('#btn-view-mode').textContent.includes('对话')) {
+    q('#btn-view-mode').click();
+    await sleep(800);
+  }
+  const singleRow = [...list.querySelectorAll('.msg')].find((row) => !row.querySelector('.msg-count'));
+  log.singleMessageRow = singleRow ? singleRow.textContent.trim().slice(0, 60) : null;
+  if (singleRow) {
+    singleRow.click();
+    await sleep(2000);
+    if (q('#btn-view-mode').textContent.includes('普通')) {
+      q('#btn-view-mode').click();
+      await sleep(2500);
+    }
+    const only = [...document.querySelectorAll('#thread-bubbles .bubble')];
+    log.singleMessage = {
+      threadViewVisible: !q('#thread-view').hidden,
+      bubbles: only.length,
+      expandedAtFirstPaint: only.filter((b) => b.classList.contains('focused')).length,
+      meta: q('#thread-meta')?.textContent?.trim() ?? null,
+      replyBoxVisible: (q('#thread-reply')?.getBoundingClientRect().height ?? 0) > 0,
+      surfaces: document.querySelectorAll('#body-surface').length,
+      frames: document.querySelectorAll('#body-frame').length,
+    };
+    only[0]?.querySelector('.bubble-head')?.click();
+    await sleep(2500);
+    log.singleMessage.afterExpand = {
+      expanded: document.querySelectorAll('#thread-bubbles .bubble.focused').length,
+      frameHeight: Math.round(q('#body-frame')?.getBoundingClientRect().height ?? 0),
+    };
+    q('#btn-view-mode').click();
+    await sleep(1200);
+    if (q('#btn-view-mode').textContent.includes('对话')) {
+      // Back to 普通模式 for the multi-message part below, which drives the mode itself.
+      q('#btn-view-mode').click();
+      await sleep(800);
+    }
+  }
+
   // A conversation row is the one the list already folded: it carries the message count.
   const rows = [...list.querySelectorAll('.msg')];
   const conversationRow = rows.find((row) => row.querySelector('.msg-count'));
