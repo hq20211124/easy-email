@@ -2273,12 +2273,127 @@ function applyBodyMode() {
       detail.inline_images || []
     );
     updateRemoteImageBar(html);
+    updateLinkBar(html);
     frame.srcdoc = buildSandboxedDocument(html, state.allowRemoteImages);
   } else {
     frame.hidden = true;
     pre.hidden = false;
     $('remote-image-bar').hidden = true;
+    $('link-bar').hidden = true;
     pre.textContent = detail.body_text || '(无正文)';
+  }
+}
+
+/**
+ * The links in this message, as `{ href, text }`.
+ *
+ * `data-ee-href` rather than `href` because the body has no followable `href` at all: the reading
+ * pane is a sandboxed frame that could otherwise navigate itself to a page of the sender's choosing
+ * (`sanitize::sanitize_mail_html` strips them, and that is the point). Parsed with `DOMParser`, which
+ * has no browsing context — reading the links must not fetch them.
+ */
+function linksInHtml(html) {
+  const parsed = new DOMParser().parseFromString(String(html ?? ''), 'text/html');
+  const seen = new Set();
+  const links = [];
+  for (const anchor of parsed.querySelectorAll('a[data-ee-href], area[data-ee-href]')) {
+    const href = anchor.getAttribute('data-ee-href') || '';
+    if (!href || seen.has(href)) continue;
+    seen.add(href);
+    const text = (anchor.textContent || '').trim().slice(0, 60);
+    links.push({ href, text });
+  }
+  return links;
+}
+
+/** Render one chip per link, labelled with the host it will really visit. */
+function updateLinkBar(html) {
+  const bar = $('link-bar');
+  const links = linksInHtml(html);
+  if (!links.length) {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+
+  bar.hidden = false;
+  bar.innerHTML = `<span class="link-bar-title">邮件里的链接（${links.length}）</span>`;
+  for (const link of links) {
+    const button = document.createElement('button');
+    button.className = 'link-chip';
+    button.type = 'button';
+    // `textContent`, never `innerHTML`: this is mail-derived text.
+    button.textContent = link.text ? `${link.text} — ${hostOf(link.href)}` : hostOf(link.href);
+    button.title = link.href;
+    button.addEventListener('click', () => askAboutLink(link));
+    bar.appendChild(button);
+  }
+}
+
+/** The host as it will actually be connected to, or the raw string when it is not a URL. */
+function hostOf(href) {
+  try {
+    return new URL(href).host || href;
+  } catch {
+    return href;
+  }
+}
+
+/**
+ * Classify first, open second.
+ *
+ * Nothing but an ordinary link opens on the first click. A different domain in the text, a punycode
+ * host or a shortener all put the verdict in front of the user *before* the browser is launched —
+ * which is the whole reason the link bar exists rather than a clickable `href`.
+ */
+async function askAboutLink(link) {
+  const verdict = await invoke('classify_link', { url: link.href, text: link.text }).catch((error) => {
+    toast(errText(error), 'bad');
+    return null;
+  });
+  if (!verdict) return;
+
+  if (verdict.risk === 'safe') {
+    await openClassifiedLink(link, verdict);
+    return;
+  }
+
+  const bar = $('link-bar');
+  bar.hidden = false;
+  bar.innerHTML = '';
+
+  const warning = document.createElement('span');
+  warning.className = 'link-warning';
+  // The reason comes from Rust and is already a sentence; it names the real host.
+  warning.textContent = `${verdict.reason} 完整地址：${verdict.full}`;
+
+  const confirm = document.createElement('button');
+  confirm.className = 'btn ghost';
+  confirm.type = 'button';
+  confirm.textContent = verdict.risk === 'dangerous_scheme' ? '不打开' : '仍要打开';
+  confirm.addEventListener('click', () => {
+    if (verdict.risk === 'dangerous_scheme') {
+      updateLinkBar(state.detail?.body_html || '');
+      return;
+    }
+    openClassifiedLink(link, verdict);
+  });
+
+  const cancel = document.createElement('button');
+  cancel.className = 'btn ghost';
+  cancel.type = 'button';
+  cancel.textContent = '取消';
+  cancel.addEventListener('click', () => updateLinkBar(state.detail?.body_html || ''));
+
+  bar.append(warning, confirm, cancel);
+}
+
+async function openClassifiedLink(link, verdict) {
+  try {
+    await invoke('open_link', { url: link.href, text: link.text });
+    toast(`已在浏览器打开 ${verdict.host || verdict.full}`, 'info');
+  } catch (error) {
+    toast(errText(error), 'bad');
   }
 }
 

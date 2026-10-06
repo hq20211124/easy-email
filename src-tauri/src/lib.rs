@@ -1404,6 +1404,36 @@ async fn max_send_bytes(state: State<'_, AppState>, account_id: String) -> Resul
         mail_core::providers::by_id(&cfg.provider_id),
     ))
 }
+
+/// What is really behind a link in a message (`design/14` §4.2).
+///
+/// The renderer never follows a link from a message body: the sanitiser strips every `href` and keeps
+/// the target as `data-ee-href`, so the reading pane cannot navigate anywhere. When the user asks to
+/// open one, this is what they are shown first — the host that would really be connected to, and
+/// whether the visible text contradicts it.
+#[tauri::command]
+fn classify_link(url: String, text: String) -> mail_core::links::LinkVerdict {
+    mail_core::links::classify_link(&url, &text)
+}
+
+/// Open a link in the system browser, but only after classifying it again.
+///
+/// The verdict is computed **here** rather than taken from the caller: a renderer bug (or a future
+/// caller that forgets) must not be able to turn "show the user what this is" into "open whatever the
+/// mail said". A dangerous scheme is refused with the reason, not silently ignored.
+#[tauri::command]
+fn open_link(url: String, text: String) -> Result<(), String> {
+    use mail_core::oauth::{BrowserLauncher, SystemBrowser};
+
+    let verdict = mail_core::links::classify_link(&url, &text);
+    if !verdict.openable() {
+        return Err(verdict.reason);
+    }
+    SystemBrowser
+        .open(&verdict.full)
+        .map_err(|error| format!("{}（{error}）", verdict.reason))
+}
+
 /// The sentence to show when a sync stopped because the server will not go further back.
 ///
 /// Only for services known to cap how far back a third-party client may read (A1-F2, the NetEase
@@ -2639,6 +2669,8 @@ pub fn run() {
             draft_mirror,
             range_cap_hint,
             max_send_bytes,
+            classify_link,
+            open_link,
             get_notify_enabled,
             set_notify_enabled,
             refresh_thread_keys,

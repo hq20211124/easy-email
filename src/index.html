@@ -167,6 +167,14 @@
               <button id="btn-show-remote" class="btn ghost">显示图片</button>
             </div>
 
+            <!--
+              Links (design/14 §5.3). The body never carries a followable `href` — the sanitiser keeps
+              the target as `data-ee-href` — so this bar is how a link is opened at all. It shows the
+              real host for every one of them, which is the part a click inside the frame could never
+              tell the user.
+            -->
+            <div id="link-bar" class="link-bar" hidden></div>
+
             <iframe
               id="body-frame"
               class="body-frame"

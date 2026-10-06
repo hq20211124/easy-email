@@ -789,6 +789,52 @@ textarea {
   min-height: 0;
 }
 
+/*
+  Links (design/14 §5.3). Shown only when the body contains any, because the frame never carries a
+  followable `href` — every link is opened from here, and every chip names the host it will visit.
+*/
+.link-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12.5px;
+  flex: none;
+}
+
+.link-bar-title {
+  color: var(--muted);
+  margin-right: 4px;
+}
+
+.link-chip {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.link-chip:hover {
+  border-color: var(--accent);
+}
+
+.link-warning {
+  flex: 1;
+  min-width: 240px;
+  overflow-wrap: anywhere;
+  color: #b45309;
+}
+
 .body-text {
   flex: 1;
   margin: 0;

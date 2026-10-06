@@ -204,6 +204,23 @@ try {
             $problems += 'app.js: the inert HTML-to-text helper (DOMParser) has gone'
         }
 
+        # Links (design/14 §5.3). A sandboxed frame cannot be stopped from navigating *itself*, so a
+        # leftover `href` in a body is a page of the sender's choosing painted in the reading pane.
+        # The two halves have to agree: the sanitiser moves the target to `data-ee-href`, and the
+        # renderer offers it back through `classify_link`/`open_link`.
+        if ($sanitize -notmatch 'data-ee-href') {
+            $problems += 'sanitize.rs: link targets are no longer moved out of href'
+        }
+        if ($js -notmatch 'linksInHtml') {
+            $problems += 'app.js: the link bar has gone, so no link can be opened deliberately'
+        }
+        if ($js -notmatch "data-ee-href") {
+            $problems += 'app.js: the link bar no longer reads the attribute the sanitiser writes'
+        }
+        if ($js -notmatch "invoke\('classify_link'" -or $js -notmatch "invoke\('open_link'") {
+            $problems += 'app.js: a link would be opened without asking Rust what it is'
+        }
+
         if ($problems.Count -gt 0) {
             $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
             $global:LASTEXITCODE = 1

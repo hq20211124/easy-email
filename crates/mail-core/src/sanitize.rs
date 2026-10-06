@@ -57,6 +57,9 @@ const DROP_TAG: [&str; 6] = ["meta", "base", "link", "frame", "embed", "basefont
 ///
 /// `srcdoc` is a whole document in an attribute; `formaction` overrides a form's target on the
 /// button itself, so filtering `<form>` alone would not be enough.
+///
+/// `data-ee-href` is handled in [`rebuild_tag`] rather than here: it is kept on a link that has no
+/// `href` of its own (so the sanitiser is a fixed point) and dropped everywhere else.
 const DROP_ATTR: [&str; 6] = [
     "srcdoc",
     "formaction",
@@ -342,24 +345,94 @@ fn parse_tag(src: &str) -> Piece {
 /// The kept attributes are copied verbatim from the input rather than re-serialised, so quoting and
 /// spacing survive exactly as the sender wrote them and this function cannot introduce a new
 /// quoting bug of its own.
+///
+/// **Links lose their `href` here.** That is the second half of the "no unsolicited network access"
+/// promise: a sandboxed frame without `allow-top-navigation` can still navigate *itself*, so a click
+/// on `<a href="https://evil.example">` used to paint the attacker's page inside the reading pane,
+/// with no URL shown and nothing the user could check. The target is kept as `data-ee-href`, which is
+/// inert in a document with no script, and the renderer offers it back as a deliberate, labelled
+/// action after classifying it (`links.rs`).
 fn rebuild_tag(original: &str, tag: &Tag) -> String {
+    let anchor = matches!(tag.name.as_str(), "a" | "area");
+
+    // An `href` on a link decides the target, and it is decided **before** the loop: attribute order
+    // belongs to the sender, so a `data-ee-href` placed first must not win over the real `href`.
+    let href_attr = if anchor {
+        tag.attrs
+            .iter()
+            .find(|a| a.name == "href" && a.has_value && !a.value.starts_with('#'))
+    } else {
+        None
+    };
+    let target_from_href = href_attr
+        .filter(|a| !is_dangerous_url(&a.value))
+        .map(|a| escape_attribute(&a.value));
+
     let mut kept = String::with_capacity(original.len());
     let mut cursor = 0;
+    let mut kept_existing_target = false;
 
     for attr in &tag.attrs {
-        if drop_attribute(attr) {
+        let mut cut = drop_attribute(attr);
+
+        if attr.name == "data-ee-href" {
+            // Exactly one, only on a link, only when the tag carries no `href` of its own, and never
+            // one pointing at a dangerous scheme. Keeping a *valid* one is what makes this function a
+            // fixed point — the read path re-runs the sanitiser over HTML the write path already
+            // cleaned, and dropping it there would silently disarm every link cached before today.
+            let usable = anchor
+                && href_attr.is_none()
+                && !kept_existing_target
+                && attr.has_value
+                && !is_dangerous_url(&attr.value);
+            cut = !usable;
+            kept_existing_target = usable;
+        } else if anchor && attr.name == "href" {
+            // A fragment cannot leave the document, so "jump to the footnote" keeps working;
+            // anything else never stays followable.
+            cut = !attr.value.starts_with('#');
+        }
+
+        if cut {
             // Also swallow the whitespace immediately before the attribute.
-            let mut cut = attr.start;
-            while cut > cursor && original.as_bytes()[cut - 1].is_ascii_whitespace() {
-                cut -= 1;
+            let mut start = attr.start;
+            while start > cursor && original.as_bytes()[start - 1].is_ascii_whitespace() {
+                start -= 1;
             }
-            kept.push_str(&original[cursor..cut]);
+            kept.push_str(&original[cursor..start]);
             cursor = attr.end;
         }
     }
     kept.push_str(&original[cursor..]);
 
+    if let Some(target) = target_from_href {
+        // Re-escaped rather than copied: `attr.value` is the *decoded* URL, so an `&` has to go back
+        // to `&amp;` and a `"` to `&quot;` or the attribute would end early.
+        let attribute = format!(" data-ee-href=\"{target}\"");
+        // **Before the closing bracket**, not after: `kept` already holds the whole tag including its
+        // `>`, and appending would produce `<a> data-ee-href="…"`. A self-closing slash stays outside
+        // the new attribute.
+        match kept.rfind('>') {
+            Some(bracket) => {
+                let mut at = bracket;
+                if at > 0 && kept.as_bytes()[at - 1] == b'/' {
+                    at -= 1;
+                }
+                kept.insert_str(at, &attribute);
+            }
+            None => kept.push_str(&attribute),
+        }
+    }
     kept
+}
+
+/// Make a value safe to sit inside a double-quoted attribute.
+fn escape_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn drop_attribute(attr: &Attr) -> bool {
@@ -629,13 +702,52 @@ mod tests {
             r#"<p style="color:red">你好</p>"#,
             r#"<table width="100%"><tr><td style="width:720px">cell</td></tr></table>"#,
             r#"<img src="data:image/png;base64,iVBORw0KGgo=" width="16" height="16">"#,
-            r#"<a href="https://example.com/a?b=c&amp;d=e">link</a>"#,
             r#"<blockquote>quoted</blockquote>"#,
-            r#"<span class="x" data-ee-href="https://example.com">y</span>"#,
+            r#"<span class="x">y</span>"#,
         ];
         for html in keep {
             assert_eq!(sanitize_mail_html(html), html, "must be untouched: {html}");
         }
+    }
+
+    /// A link keeps its text and its target, but the target stops being followable.
+    #[test]
+    fn a_link_loses_its_href_and_keeps_its_target_as_data() {
+        assert_eq!(
+            sanitize_mail_html(r#"<a href="https://example.com/a?b=c&amp;d=e">link</a>"#),
+            r#"<a data-ee-href="https://example.com/a?b=c&amp;d=e">link</a>"#
+        );
+        // A relative link is rewritten the same way — it is still a navigation.
+        assert_eq!(
+            sanitize_mail_html(r#"<a href="/account/login">登录</a>"#),
+            r#"<a data-ee-href="/account/login">登录</a>"#
+        );
+        // An in-page fragment is left alone: it cannot leave the document.
+        assert_eq!(
+            sanitize_mail_html(r##"<a href="#footnote">脚注</a>"##),
+            r##"<a href="#footnote">脚注</a>"##
+        );
+        // A dangerous scheme gets neither an href nor a target to offer.
+        assert_eq!(
+            sanitize_mail_html(r#"<a href="javascript:alert(1)">x</a>"#),
+            "<a>x</a>"
+        );
+        // The attribute is only meaningful on a link; anywhere else it is dropped.
+        assert_eq!(
+            sanitize_mail_html(r#"<span data-ee-href="https://evil.example">x</span>"#),
+            "<span>x</span>"
+        );
+        // On a link, a `href` always wins over a smuggled target — the sender does not get to
+        // choose which one the renderer reads.
+        assert_eq!(
+            sanitize_mail_html(
+                r#"<a data-ee-href="https://evil.example" href="https://good.example">x</a>"#
+            ),
+            r#"<a data-ee-href="https://good.example">x</a>"#
+        );
+        // The escaped form survives a round trip, i.e. sanitising twice is still a no-op.
+        let once = sanitize_mail_html(r#"<a href="https://example.com/a?b=c&amp;d=e">link</a>"#);
+        assert_eq!(sanitize_mail_html(&once), once);
     }
 
     #[test]

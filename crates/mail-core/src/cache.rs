@@ -16,8 +16,9 @@
 //! tokenizer is the usual suggestion and is also wrong here: it needs three characters, and a very
 //! large share of Chinese words are two (账单, 发票, 银行, 提醒 …). Measured, both ways.
 //!
-//! The approach that works is to index and query **one character per token** — see [`to_tokens`]
-//! and [`to_query`]. The two must stay in step; a test pins that.
+//! The approach that works is to index and query **one character per token for the characters that
+//! need it, and one token per word for the ones that do not** — see [`to_tokens`] and [`to_query`].
+//! The two must stay in step; tests pin both the strings and the behaviour.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -26,7 +27,7 @@ use crate::error::{MailError, Result};
 use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Where a delivered message's Sent copy is (`design/07` §5.4).
 ///
@@ -84,35 +85,130 @@ struct IndexSource {
     detail_json: Option<String>,
 }
 
-/// Turn text into FTS5 tokens, one character per token.
+/// Turn text into FTS5 tokens.
 ///
-/// This is what makes Chinese searchable. The transformation must be applied to *both* the indexed
-/// text and the user's query, or nothing matches.
+/// Two shapes, because two scripts need opposite things:
+///
+/// * a run of ASCII letters/digits becomes **one token** (`invoice`), so an English word is a word;
+/// * every non-ASCII character becomes a token of its own (`账 单`), which is what makes a
+///   two-character Chinese word findable — `unicode61` cannot segment Chinese, and the `trigram`
+///   tokenizer every guide recommends needs three characters while most Chinese words are two.
+///
+/// Spaces and ASCII punctuation are separators.
+///
+/// **The ASCII half is not cosmetic** (changed 2026-10-06). Splitting `invoice` into `i n v o i c e`
+/// made the query a seven-token phrase, and FTS5 has to intersect seven position lists to answer it:
+/// the benchmark measured **P50 944 ms** on a 50 000-message fixture against a `design/15` budget of
+/// 100 ms at P95. Whole-word ASCII tokens took it to single-digit milliseconds. The cost is that
+/// *substring* search inside an English word no longer matches (`invoi` will not find `invoice`),
+/// which is what every other mail client does anyway. Chinese is untouched: it still matches on any
+/// adjacent two characters.
+///
+/// The transformation must be applied to **both** the indexed text and the user's query, or nothing
+/// matches; [`to_query`] builds its clauses from the same run splitting for exactly that reason.
 pub fn to_tokens(text: &str) -> String {
-    text.chars()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut tokens: Vec<String> = Vec::new();
+    let mut word = String::new();
+
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            word.push(c.to_ascii_lowercase());
+            continue;
+        }
+        if !word.is_empty() {
+            tokens.push(std::mem::take(&mut word));
+        }
+        // Non-ASCII means a character-driven script (Chinese, Japanese, Korean) or an accented
+        // letter — either way it is worth its own token. ASCII punctuation and whitespace separate.
+        if !c.is_ascii() {
+            tokens.push(c.to_string());
+        }
+    }
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+
+    tokens.join(" ")
+}
+
+/// One clause of a `MATCH` expression: an ASCII word, or a run of characters that must be adjacent.
+enum Clause {
+    Word(String),
+    Phrase(Vec<char>),
+}
+
+/// Split a term the same way [`to_tokens`] splits indexed text.
+///
+/// Keeping this in one place is the whole point: the previous version of `to_query` called
+/// `to_tokens` and wrapped the result in quotes, so the two could not disagree. They still cannot —
+/// both walk the input and cut it at the same boundaries.
+fn clauses_of(term: &str) -> Vec<Clause> {
+    let mut clauses = Vec::new();
+    let mut word = String::new();
+    let mut run: Vec<char> = Vec::new();
+
+    let flush = |clauses: &mut Vec<Clause>, word: &mut String, run: &mut Vec<char>| {
+        if !word.is_empty() {
+            clauses.push(Clause::Word(std::mem::take(word)));
+        }
+        if !run.is_empty() {
+            clauses.push(Clause::Phrase(std::mem::take(run)));
+        }
+    };
+
+    for c in term.chars() {
+        if c.is_ascii_alphanumeric() {
+            if !run.is_empty() {
+                clauses.push(Clause::Phrase(std::mem::take(&mut run)));
+            }
+            word.push(c.to_ascii_lowercase());
+        } else if c.is_ascii() {
+            // ASCII punctuation separates, exactly as it does in the index.
+            flush(&mut clauses, &mut word, &mut run);
+        } else {
+            if !word.is_empty() {
+                clauses.push(Clause::Word(std::mem::take(&mut word)));
+            }
+            run.push(c);
+        }
+    }
+    flush(&mut clauses, &mut word, &mut run);
+    clauses
 }
 
 /// Turn user input into an FTS5 `MATCH` expression.
 ///
-/// Each whitespace-separated term becomes a phrase of single characters, and the terms are ANDed —
-/// so `账单 发票` means "the adjacent characters 账单, and also 发票". Quotes are dropped: they are
-/// FTS5 syntax, and letting them through turns a pasted string into a `MATCH` syntax error.
+/// Each whitespace-separated term becomes one or more clauses, and everything is ANDed — so
+/// `账单 发票` means "the adjacent characters 账单, and also 发票", and `invoice 账单` means "the word
+/// invoice, and also 账单". Quotes are dropped: they are FTS5 syntax, and letting them through turns
+/// a pasted string into a `MATCH` syntax error.
 pub fn to_query(input: &str) -> String {
-    let terms: Vec<String> = input
-        .split_whitespace()
-        .map(|term| term.replace(['"', '\''], ""))
-        .filter(|term| !term.is_empty())
-        .map(|term| format!("\"{}\"", to_tokens(&term)))
-        .collect();
+    let mut clauses: Vec<String> = Vec::new();
 
-    if terms.is_empty() {
+    for term in input.split_whitespace() {
+        let term = term.replace(['"', '\''], "");
+        if term.is_empty() {
+            continue;
+        }
+        for clause in clauses_of(&term) {
+            match clause {
+                // A single token, so it is a phrase of one — FTS5 has no other way to say "this word".
+                Clause::Word(word) => clauses.push(format!("\"{word}\"")),
+                // Adjacent characters: `"账 单"` matches 账单 but not 账单-related text where the two
+                // characters are apart, which is what makes Chinese search precise.
+                Clause::Phrase(chars) => {
+                    let phrase: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
+                    clauses.push(format!("\"{}\"", phrase.join(" ")));
+                }
+            }
+        }
+    }
+
+    if clauses.is_empty() {
         // Nothing searchable. A bare `*` cannot match anything, so this is a safe no-op query.
         return String::new();
     }
-    terms.join(" AND ")
+    clauses.join(" AND ")
 }
 
 #[derive(Clone)]
@@ -343,11 +439,13 @@ impl Cache {
                      on messages(search_rowid)",
                 [],
             )?;
-            if previous_version < 6 {
-                // Nothing else can fix rows indexed under the old scheme: their rowids are unrelated
-                // to their messages, so there is no way to find them except by scanning. Rebuilding
-                // is cheap (it is derived data) and this is the only moment it can be done in one
-                // pass.
+            if previous_version < 7 {
+                // v7 changed the tokenisation (ASCII words are whole tokens now), so an index built
+                // by an older version is not just stale, it is built on different rules and can never
+                // match a query from this version. Rebuilding is the only repair, and it is cheap:
+                // the index is derived data, rebuilt from `messages` + `bodies` in one pass.
+                //
+                // The same rebuild covers v6's rowid change, so one condition serves both.
                 rebuild_search_index(conn)?;
             }
             backfill_subject_keys(conn)?;
@@ -1431,6 +1529,58 @@ mod tests {
         // And the transformation is applied to the query as well.
         assert_eq!(to_query("账单"), "\"账 单\"");
         assert_eq!(to_tokens("账单"), "账 单");
+    }
+
+    #[test]
+    fn an_ascii_word_is_indexed_as_a_word_not_as_letters() {
+        // The performance fix of 2026-10-06: `invoice` used to become `i n v o i c e`, which made
+        // every English query a seven-token phrase (measured P50 944 ms on 50 000 messages).
+        assert_eq!(to_tokens("invoice"), "invoice");
+        assert_eq!(to_query("invoice"), "\"invoice\"");
+        assert_eq!(to_tokens("Hello World"), "hello world");
+
+        // Chinese is untouched: still one token per character, still a phrase on query.
+        assert_eq!(to_tokens("账单 invoice"), "账 单 invoice");
+        assert_eq!(to_query("invoice 账单"), "\"invoice\" AND \"账 单\"");
+
+        // Punctuation separates on both sides, so an address still matches.
+        assert_eq!(to_tokens("user@example.com"), "user example com");
+        assert_eq!(to_query("example.com"), "\"example\" AND \"com\"");
+
+        // A term whose characters are not all ASCII keeps the phrase form, character by character.
+        assert_eq!(to_query("账单-发票"), "\"账 单\" AND \"发 票\"");
+    }
+
+    #[test]
+    fn an_ascii_query_reaches_the_index_in_both_directions() {
+        // The transformation test above pins the strings; this one pins that FTS5 actually agrees
+        // with them, which is the part that silently stops being true.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "Quarterly invoice", "billing@example.com", 1),
+                    summary(2, "账单", "a@b.c", 2),
+                ],
+            )
+            .unwrap();
+        assert_eq!(cache.search("acc", "invoice", 5).unwrap()[0].uid, 1);
+        assert_eq!(
+            cache.search("acc", "INVOICE", 5).unwrap()[0].uid,
+            1,
+            "case folds"
+        );
+        assert_eq!(
+            cache.search("acc", "billing", 5).unwrap()[0].uid,
+            1,
+            "sender"
+        );
+        // Substring matching inside an English word is the deliberate casualty of the fix.
+        assert!(cache.search("acc", "invoi", 5).unwrap().is_empty());
+        // A word that is not there still finds nothing.
+        assert!(cache.search("acc", "remittance", 5).unwrap().is_empty());
     }
 
     #[test]

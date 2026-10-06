@@ -23,6 +23,7 @@ pub mod error;
 pub mod folders;
 pub mod idle;
 pub mod imap;
+pub mod links;
 pub mod model;
 pub mod mutf7;
 pub mod oauth;

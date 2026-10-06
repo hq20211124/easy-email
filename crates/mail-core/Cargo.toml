@@ -53,6 +53,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 # Needed to set SO_EXCLUSIVEADDRUSE *before* bind: the option cannot be applied to a socket that is
 # already listening, and tokio binds for us (A1-F36).
 socket2 = "0.6"
+# Link classification (`links.rs`): reading a host out of a URL by hand is exactly the kind of parsing
+# that gets `https://evil.example\@good.example` wrong. Already in the tree via reqwest, so this adds
+# no package — only a direct edge to one that is there.
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Networking_WinSock"] }
