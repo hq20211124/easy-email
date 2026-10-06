@@ -1140,6 +1140,26 @@ impl Cache {
     /// fixture: P50 769 ms, P95 2 380 ms, against a `design/15` budget of 100 ms at P95 on ten times
     /// that data. The subquery takes the matching FTS rowids first (an index lookup) and
     /// `messages_by_search_rowid` turns each into the message row.
+    ///
+    /// **Three alternatives were measured on 2026-10-06 and rejected**, each in the same run as the
+    /// query above (the fixture harness prints the comparison):
+    ///
+    /// * driving from `messages` and testing membership (`search_rowid in (…)`) — P50 279 ms against
+    ///   43 ms, because SQLite picks `messages_by_subject_key` plus a bloom filter and never gets the
+    ///   early stop the shape was supposed to buy;
+    /// * taking the best 500 by `rank` before joining — P50 317 ms, *and* it answers a different
+    ///   question ("the best matches" rather than "the newest"), so it also returns different rows;
+    /// * splitting into "sort narrow, then fetch the page wide" — P50 40 ms against 44 ms for the
+    ///   single query, i.e. inside the noise. The shape is tempting (SQLite's sorter stores the whole
+    ///   result row, so it *looks* like the seven columns cost something) but the measurement says
+    ///   otherwise, and the extra statement is not worth an unproven claim.
+    ///
+    /// **One thing this file cannot explain, recorded so it is not lost:** in the benchmark the query
+    /// above measures ~175 ms while the *identical* SQL with the same plan, same fixture and same run
+    /// measures ~44 ms (`bench_fixture`'s shapes A/F). A 4× gap between the statement and the
+    /// application's own measurement is a property of the measurement or of the connection the
+    /// application uses — not of the SQL — and until it is explained, the P4 numbers should be read as
+    /// an upper bound rather than as the cost of the query.
     pub fn search(&self, account_id: &str, query: &str, limit: u32) -> Result<Vec<SearchHit>> {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;

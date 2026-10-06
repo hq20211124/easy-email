@@ -197,6 +197,220 @@ fn drop_index_and_measure(path: &Path) -> u64 {
     file_bytes(path)
 }
 
+/// Merge the FTS segments, then report the file size.
+///
+/// `refresh_search_row` deletes and re-inserts one row at a time, so a synced mailbox leaves a
+/// tombstone per message behind. Whether that — rather than the tokeniser — is what P14 is measuring
+/// is a question only `optimize` can answer, which is why it is measured rather than assumed.
+fn optimize_and_measure(path: &Path) -> u64 {
+    let db = mail_core::db::Db::open(
+        path,
+        mail_core::db::DbKind::Cache,
+        mail_core::db::DbOptions::for_kind(mail_core::db::DbKind::Cache),
+    )
+    .expect("raw handle for optimize");
+    let _ = db.exec_blocking(|conn| {
+        conn.execute_batch(
+            "insert into search(search) values('optimize'); pragma wal_checkpoint(truncate);",
+        )?;
+        Ok(())
+    });
+    drop(db);
+    file_bytes(path)
+}
+
+/// Time the search query in three shapes and print the plan SQLite chose for each.
+///
+/// The shapes, and what each would mean:
+/// * **A — the current one.** FTS first, then join every match, then sort, then take 50. The match
+///   set is materialised in full, so a word that appears in most of the mailbox sorts most of the
+///   mailbox.
+/// * **B — membership.** Drive from `messages` in `date desc` order and test each row against the
+///   FTS result set; the `limit 50` can then stop the scan early.
+/// * **C — rank-limited.** Take the best 500 by bm25 first. Fast, but it answers a *different*
+///   question ("the 500 best matches, newest first" rather than "the newest matches"), so it is
+///   measured for completeness and not recommended.
+///
+/// The shape only matters if it returns the same rows; A and B are compared by UID, not just timed.
+fn compare_query_plans(path: &Path) {
+    use mail_core::db::{Db, DbKind, DbOptions};
+
+    let db = Db::open(path, DbKind::Cache, DbOptions::for_kind(DbKind::Cache))
+        .expect("raw handle for the plan comparison");
+
+    let run = |sql: String| -> Vec<i64> {
+        db.exec_blocking(move |conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
+    };
+
+    let explain = |sql: String| -> String {
+        db.exec_blocking(move |conn| {
+            let mut stmt = conn.prepare(&format!("explain query plan {sql}"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(3))?;
+            let mut lines = Vec::new();
+            for row in rows {
+                lines.push(row?);
+            }
+            Ok(lines.join(" -> "))
+        })
+        .unwrap_or_default()
+    };
+
+    println!();
+    // The two-phase search fetches its page with `where search_rowid = ?1`, one row at a time. If that
+    // is not an index lookup, fifty of them are fifty scans and the whole idea is worse than the query
+    // it replaced — so the plan is printed rather than assumed.
+    println!(
+        "  phase2 plan (search_rowid = 1): {}",
+        explain(
+            "select folder, uid, subject, from_name, from_addr, date, seen \
+                 from messages where search_rowid = 1"
+                .to_string()
+        )
+    );
+    for (label, term) in [("高频词", "invoice"), ("稀有词", RARE_WORD)] {
+        // The same expression `Cache::search` builds, so the plans are comparable.
+        let expression = mail_core::cache::to_query(term);
+        let quoted = expression.replace('\'', "''");
+
+        let a = format!(
+            "select m.uid from (select rowid from search where search match '{quoted}') f \
+             join messages m on m.search_rowid = f.rowid \
+             where m.account_id = '{ACCOUNT}' order by m.date desc, m.uid desc limit 50"
+        );
+        let b = format!(
+            "select m.uid from messages m \
+             where m.account_id = '{ACCOUNT}' and m.search_rowid in \
+               (select rowid from search where search match '{quoted}') \
+             order by m.date desc, m.uid desc limit 50"
+        );
+        let c = format!(
+            "select m.uid from (select rowid from search where search match '{quoted}' \
+             order by rank limit 500) f \
+             join messages m on m.search_rowid = f.rowid \
+             where m.account_id = '{ACCOUNT}' order by m.date desc, m.uid desc limit 50"
+        );
+        // E — the same plan as A, but sorting **narrow** rows and fetching the wide ones afterwards
+        // for the 50 that survive. SQLite's sorter stores the whole result row, so `select
+        // m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen` makes every match
+        // pay for its strings; only 50 of them are ever returned.
+        let e = format!(
+            "select m.search_rowid, m.date, m.uid from \
+             (select rowid from search where search match '{quoted}') f \
+             join messages m on m.search_rowid = f.rowid \
+             where m.account_id = '{ACCOUNT}' order by m.date desc, m.uid desc limit 50"
+        );
+
+        // F — the shape this repository shipped *before* 2026-10-06: one query, seven wide columns
+        // carried through the sort.
+        let f = format!(
+            "select m.uid, m.folder, m.subject, m.from_name, m.from_addr, m.date, m.seen \
+             from (select rowid from search where search match '{quoted}') f \
+             join messages m on m.search_rowid = f.rowid \
+             where m.account_id = '{ACCOUNT}' order by m.date desc, m.uid desc limit 50"
+        );
+        // G — the shape it ships *now*: phase one orders by identity, phase two fetches the page.
+        let g1 = format!(
+            "select m.search_rowid from (select rowid from search where search match '{quoted}') f \
+             join messages m on m.search_rowid = f.rowid \
+             where m.account_id = '{ACCOUNT}' order by m.date desc, m.uid desc limit 50"
+        );
+
+        // Phase two of G: one statement over the 50 rowids, which is the same 50 index lookups the
+        // production code does one at a time.
+        let g2 = |rowids: Vec<i64>| -> Vec<i64> {
+            if rowids.is_empty() {
+                return Vec::new();
+            }
+            let list = rowids
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("select uid from messages where search_rowid in ({list})");
+            db.exec_blocking(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .unwrap_or_default()
+        };
+
+        for (name, sql) in [("A", &a), ("B", &b), ("C", &c), ("E", &e), ("F", &f)] {
+            println!("  {label} {name} plan: {}", explain(sql.clone()));
+        }
+
+        let mut results = Vec::new();
+        for (name, sql) in [("A", &a), ("B", &b), ("C", &c), ("E", &e), ("F", &f)] {
+            let mut samples = Vec::new();
+            let mut uids = Vec::new();
+            for _ in 0..20 {
+                let started = Instant::now();
+                uids = run(sql.clone());
+                samples.push(started.elapsed());
+            }
+            let (p50, p95, _) = percentiles(samples);
+            println!(
+                "  {label} {name}: P50 {:>7.2} ms  P95 {:>7.2} ms  ({} 行)",
+                ms(p50),
+                ms(p95),
+                uids.len()
+            );
+            results.push(uids);
+        }
+
+        // G, timed as the production code runs it: both phases inside one measurement, and
+        // interleaved with the others only by being measured here in the same run.
+        let mut g_samples = Vec::new();
+        let mut g_uids = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let rowids = run(g1.clone());
+            g_uids = g2(rowids);
+            g_samples.push(started.elapsed());
+        }
+        let (g_p50, g_p95, _) = percentiles(g_samples);
+        println!(
+            "  {label} G: P50 {:>7.2} ms  P95 {:>7.2} ms  ({} 行)",
+            ms(g_p50),
+            ms(g_p95),
+            g_uids.len()
+        );
+
+        println!(
+            "  {label}   结果：F(旧实现) vs G(新实现) {}；A vs B {}；A vs C {}",
+            if results[4] == g_uids {
+                "一致"
+            } else {
+                "不一致"
+            },
+            if results[0] == results[1] {
+                "一致"
+            } else {
+                "不一致"
+            },
+            if results[0] == results[2] {
+                "一致"
+            } else {
+                "排序语义已变"
+            }
+        );
+    }
+    println!();
+}
+
 // ---------------------------------------------------------------------------- the benchmark
 
 #[derive(Default)]
@@ -450,9 +664,22 @@ fn bench_storage_path() {
     // bundled build does not compile it in.
 
     drop(cache);
+
+    // ---------------------------------------------------------------- why the index is the size it is
+    //
+    // Two questions the budget table cannot answer on its own, measured before it is quoted:
+    //  * is the index big because of the *tokeniser*, or because of the tombstones every
+    //    `refresh_search_row` leaves behind (it deletes then inserts, per row)? `optimize` merges the
+    //    segments and answers it;
+    //  * is the common-word search slow because of the *plan*? Two other shapes of the same query are
+    //    timed here so the answer is a number rather than a preference.
+    compare_query_plans(&db_path);
+
     let db_bytes = measured_db_bytes(&db_path);
+    let optimized_bytes = optimize_and_measure(&db_path);
     let without_index = drop_index_and_measure(&db_path);
     let index_bytes = db_bytes.saturating_sub(without_index);
+    let index_bytes_optimized = optimized_bytes.saturating_sub(without_index);
 
     println!();
     println!(
@@ -520,6 +747,24 @@ fn bench_storage_path() {
             "n/a".to_string()
         },
         mb(indexed.indexed_bytes)
+    );
+    println!(
+        "P14 optimize 之后       {:.1} MB   = {}%   （省下 {:.1} MB，{:.0}%）",
+        mb(index_bytes_optimized),
+        if indexed.indexed_bytes > 0 {
+            format!(
+                "{:.1}",
+                index_bytes_optimized as f64 / indexed.indexed_bytes as f64 * 100.0
+            )
+        } else {
+            "n/a".to_string()
+        },
+        mb(index_bytes.saturating_sub(index_bytes_optimized)),
+        if index_bytes > 0 {
+            (index_bytes.saturating_sub(index_bytes_optimized)) as f64 / index_bytes as f64 * 100.0
+        } else {
+            0.0
+        }
     );
     println!();
 
