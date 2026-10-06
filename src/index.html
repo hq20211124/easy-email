@@ -82,7 +82,7 @@
               全是这个模式". It is a preference, so it is remembered across restarts, and the label says
               which mode is *active* rather than what clicking will do.
             -->
-            <button id="btn-view-mode" class="btn ghost" title="切换阅读视图">💬 对话</button>
+            <button id="btn-view-mode" class="btn ghost" title="切换阅读视图">💬 对话模式</button>
             <button id="btn-refresh" class="btn ghost" title="重新拉取">↻ 刷新</button>
           </div>
         </header>
@@ -178,10 +178,11 @@
         </article>
 
         <!--
-          对话视图 (design/08 §2/§5.2): the conversation as bubbles, oldest at the top, the user's own
-          messages on the right. Exactly one bubble is *focused* and holds the full body; the others
-          show a text preview. That is the design's "最新一封展开，其余折叠" and it is also what keeps
-          the security boundary intact — see the note on `#body-surface`.
+          对话模式 (design/08 §2/§5.2): the conversation as bubbles, oldest at the top, the user's own
+          messages on the right. Exactly one bubble can be *expanded* and it holds the full body; every
+          other bubble shows a text preview, and the whole conversation starts collapsed. That is what
+          keeps the security boundary intact — see the note on `#body-surface`: there is one sandboxed
+          renderer, so at most one message can be showing rendered HTML at a time.
         -->
         <div id="thread-view" hidden>
           <header class="thread-header">
@@ -195,6 +196,22 @@
             </div>
           </header>
           <div id="thread-bubbles" class="thread-bubbles"></div>
+          <!--
+            Reply without leaving the conversation. Pinned below the bubbles rather than scrolling with
+            them, because the moment you want it is the moment you have finished reading. It goes
+            through the outbox like every other send, so the undo window applies here too.
+          -->
+          <div id="thread-reply" class="thread-reply">
+            <textarea
+              id="thread-reply-text"
+              rows="3"
+              placeholder="在这里直接回复这个会话…（Ctrl+Enter 发送）"
+            ></textarea>
+            <div class="thread-reply-foot">
+              <span id="thread-reply-target" class="hint"></span>
+              <button id="btn-thread-send" class="btn primary">发送</button>
+            </div>
+          </div>
         </div>
       </section>
     </div>
@@ -206,6 +223,7 @@
     <script src="window.js"></script>
     <script src="payload.js"></script>
     <script src="threads.js"></script>
+    <script src="reply.js"></script>
     <script src="wizard.js"></script>
     <script src="app.js"></script>
   </body>

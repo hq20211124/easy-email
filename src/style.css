@@ -844,7 +844,7 @@ textarea {
   gap: 10px;
 }
 
-/* A bubble hugs its content and stays on one side. The focused one takes the full width instead,
+/* A bubble hugs its content and stays on one side. The expanded one takes the full width instead,
    because it contains the message itself rather than a preview of it. */
 .bubble {
   align-self: flex-start;
@@ -871,9 +871,14 @@ textarea {
 .bubble.focused {
   align-self: stretch;
   max-width: none;
-  cursor: default;
   padding: 0;
   overflow: hidden;
+}
+
+/* Only the head collapses an expanded bubble: the body below it is a live document the user is
+   reading, selecting text in, and clicking links inside. */
+.bubble.focused .bubble-head {
+  cursor: pointer;
 }
 
 .bubble-head {
@@ -883,6 +888,19 @@ textarea {
   gap: 10px;
   font-size: 11.5px;
   color: var(--text-muted);
+}
+
+/* ▸ collapsed / ▾ expanded — the affordance that says a bubble is clickable at all. */
+.bubble-head .chevron {
+  flex: none;
+  width: 1em;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-muted);
+}
+
+.bubble-head .spacer {
+  flex: 1;
 }
 
 .bubble.focused .bubble-head {
@@ -943,6 +961,51 @@ textarea {
 .bubble .attachment-bar {
   padding-left: 12px;
   padding-right: 12px;
+}
+
+/* ---------------------------------------------------------------- replying inside a conversation */
+
+/* Pinned under the bubbles, never scrolled away with them: the moment it is wanted is the moment the
+   last message has been read. `flex: none` on a flex column is what keeps it from being squeezed by a
+   long conversation above it. */
+.thread-reply {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding: 9px 14px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.thread-reply textarea {
+  width: 100%;
+  min-height: 54px;
+  max-height: 30vh;
+  resize: vertical;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.thread-reply-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+/* The address line is the one thing that must not be a surprise: it says who the reply goes to before
+   the button is pressed, and it is recomputed whenever the expanded bubble changes. */
+.thread-reply-foot .hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------------------------------------------------------------- modal */

@@ -2465,13 +2465,48 @@ XOAUTH2、队列发信全部就绪），这一轮做的是**真实登录会踩�
 
 ---
 
+### M1a-89 对话模式的交互改造：默认普通模式 + 全部折叠 + 底部直接回复 ✅（第 95 轮）
+
+用户 2026-10-06 要求三件事，逐条做：
+
+1. 顶部按钮文案「💬 对话」→「💬 对话模式」、另一态「✉ 单封」→「✉ 普通模式」，
+   **默认改成普通模式**（`loadReaderMode()` 的兜底值）。`localStorage` 里"没选过就不写盘"的规矩不变，
+   所以以后再改默认值仍然不会覆盖用户的真实选择。
+2. 对话模式里**所有气泡默认折叠**（原来是"最新一封展开，其余折叠"），点一下展开、点它的头部再收起。
+3. 会话底部新增**直接回复框**：打字 → 发送，不用开写信窗口。
+
+- **一个真 bug，是探针抓到的，不是推演出来的**：气泡头和气泡本身都监听点击 ⇒ 一次点击 toggle 两次
+  （先展开、立刻又收起），现象正好是"点了没反应"。修法：头部的处理函数 `stopPropagation`。
+- **同时最多展开一封**，这不是偷懒，是"只有一个 `#body-surface`"的算术结果 —— 那条约束本身就是安全边界
+  （解锁远程图片不能跨邮件泄漏，20 封也不该有 20 份渲染器）。展开第二封会把第一封收起；
+  要真正多封同时展开，得先解决"多个渲染器"或"第二条渲染路径"。
+- **顺手修掉两个既有隐患**（都在正文预取里）：① 就地更新原来按 `> div:last-child` 找预览，
+  可用户展开之后那个位置是住着活 surface 的 `.bubble-body`，覆盖它等于毁掉正在读的邮件 —— 改成按 class 找；
+  ② 预取的"用户走开了"判据原来盯着展开项，一展开就放弃其余预览的填充 —— 改成盯成员列表本身。
+- **规则抽成纯函数**：新文件 `src/reply.js`（回给谁 / 主题前缀 / 线程头）+ `tools/reply_test.mjs`
+  + 门禁新一步（21 → **22 步**）。**两条证伪都做过**：去掉"跳过自己的邮件"⇒ 那条红；
+  不把 `message_id` 追加进 References 链 ⇒ 链那条红。主题前缀顺带变得大小写与中文都认
+  （原来只认逐字的 `Re:`，于是 `RE:` 会越滚越长）。
+- **真机验证**（CDP 探针 + 截图，真实 35 封会话，QQ 账号）：首屏 **0 封展开**、
+  点一下展开（`▾` + `aria-expanded=true` + surface 搬进那一封）、点头部收起、展开另一封时第一封收起
+  （那封来自 `Sent Messages` ⇒ 跨文件夹照旧）、**在展开气泡的正文里点击不会误收起**、
+  底部回复框显示"回复给 correspondent@example.com"（最新一封**不是自己**的那封）、
+  空内容点发送只得到"先写点内容再发送。"且**发件箱没有多出任何东西**、切回普通模式后 surface 回到读信栏；
+  全程 **1 个 `#body-surface` / 1 个 `#body-frame`**。
+- **没验的**：真的点「发送」—— 那会给真人发信，所以探针刻意不点；入队那条路由
+  `probe-outbox.mjs`（入队 → 撤销）与 Rust loopback 测试覆盖。
+
+**数字**：`check.ps1` **22 步全绿**；`cargo test --workspace` **322 通过 / 0 失败**（无 Rust 改动）。
+
+---
+
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **21 步全绿**（离线；`-Network` 会多跑一步真实端点）；`cargo test --workspace`
+**当前状态**：`tools/check.ps1` **22 步全绿**（离线；`-Network` 会多跑一步真实端点）；`cargo test --workspace`
 **322 通过、0 失败**（267 mail-core lib + 47 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri；
 另有 **5** 条 ignored：3 条真实端点 + 2 条 doctest）；
-`python design/tools/audit.py` **0 失败**；应用启动冒烟通过。新增的两条 JS 门禁：
-`node tools/wizard_verdict_test.mjs`、`node tools/payload_keys.mjs`（含 `EndpointOverride`）。
+`python design/tools/audit.py` **0 失败**；应用启动冒烟通过。新增的 JS 门禁：
+`node tools/wizard_verdict_test.mjs`、`node tools/reply_test.mjs`、`node tools/payload_keys.mjs`（含 `EndpointOverride`）。
 **认证轴已在真实 Google 端点上跑通并完成闭环**（M1a-81）：`realuser@gmail.com` 的刷新令牌已落盘（DPAPI），
 **Gmail INBOX 实收 289 封**（`last_uid=289`、`synced=0h ago`，全部带 `thread_key`），`[Gmail]/` 文件夹列表也拿到了。
 **用户已确认**：真机发出去的信收到了（他自己试的）——发件箱全链在真实账号上的第一次人证。

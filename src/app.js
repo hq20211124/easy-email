@@ -23,6 +23,15 @@ const payload = window.__easyEmailPayload;
 /** Conversation grouping; pure functions in threads.js so `tools/thread_keys_test.mjs` can pin them. */
 const threads = window.__easyEmailThreads;
 
+/**
+ * Who a conversation reply answers, and the headers that keep it in the thread.
+ *
+ * Pure functions in reply.js, for the same reason: "reply to the newest message" addresses the user
+ * themselves whenever they replied last, and a reply without the `References` chain arrives as a brand
+ * new conversation. `tools/reply_test.mjs` pins both.
+ */
+const reply = window.__easyEmailReply;
+
 const PAGE_SIZE = 50;
 
 /** How many local search hits to ask for. Higher than a page because results span all folders. */
@@ -109,7 +118,7 @@ const state = {
   threadMembers: [],
   /** The `References` root of the open conversation, or `null`. Used to keep the list row highlighted. */
   threadKey: null,
-  /** `folder|uid` of the bubble whose body is rendered in full. */
+  /** `folder|uid` of the bubble whose body is rendered in full, or `null` when all are collapsed. */
   threadFocus: null,
   /** Bodies already fetched for the open conversation, keyed `folder|uid`. */
   threadBodies: new Map(),
@@ -120,7 +129,7 @@ const state = {
    * memory would make the same list behave differently from one row to the next. Filled in by
    * `loadReaderMode()` at boot; the literal here is only the shape.
    */
-  readerMode: 'thread',
+  readerMode: 'single',
   bodyMode: 'html',
   /** Per-message opt-in; reset every time a different message is opened. */
   allowRemoteImages: false,
@@ -321,6 +330,9 @@ const READER_MODE_KEY = 'ee.readerMode';
  * `localStorage`, for the same reason the theme lives there: it is a view preference, not account data,
  * and it belongs to this installation rather than to a mailbox. As with the theme, the "never chosen"
  * state is left unwritten on startup, so a default can change later without overriding a real choice.
+ *
+ * The default is **普通模式** (user's request, 2026-10-06): the conversation view is opt-in, and the
+ * literal here is what a fresh installation gets.
  */
 function loadReaderMode() {
   try {
@@ -329,7 +341,7 @@ function loadReaderMode() {
   } catch {
     // A locked-down profile can refuse storage; the default is a fine answer.
   }
-  return 'thread';
+  return 'single';
 }
 
 function setReaderMode(mode) {
@@ -347,10 +359,10 @@ function setReaderMode(mode) {
 function syncViewModeButton() {
   const button = $('btn-view-mode');
   const thread = state.readerMode === 'thread';
-  button.textContent = thread ? '💬 对话' : '✉ 单封';
+  button.textContent = thread ? '💬 对话模式' : '✉ 普通模式';
   button.title = thread
-    ? '当前是对话视图：整个会话按气泡显示，自己的邮件在右边。点一下改成单封视图。'
-    : '当前是单封视图：一次只看一封。点一下改成对话视图。';
+    ? '当前是对话模式：整个会话按气泡显示，自己的邮件在右边，默认全部折叠。点一下改成普通模式。'
+    : '当前是普通模式：一次只看一封。点一下改成对话模式（整个会话按气泡显示）。';
 }
 
 /** Switch the view, and re-read the conversation when switching *into* it. */
@@ -358,7 +370,7 @@ async function toggleReaderMode() {
   setReaderMode(state.readerMode === 'thread' ? 'single' : 'thread');
   const message = state.selectedMessage;
   if (message && state.readerMode === 'thread') {
-    await loadConversation(message, state.selectedFolder);
+    await loadConversation(message);
   }
   renderReader();
 }
@@ -391,6 +403,17 @@ function wireGlobalEvents() {
   $('btn-thread-forward').addEventListener('click', () => openComposer({ mode: 'forward' }));
   $('btn-thread-toggle-read').addEventListener('click', toggleRead);
   $('btn-thread-delete').addEventListener('click', deleteSelected);
+  $('btn-thread-send').addEventListener('click', () => {
+    void sendThreadReply();
+  });
+  $('thread-reply-text').addEventListener('keydown', (event) => {
+    // Ctrl+Enter sends; a bare Enter is a new line, because a reply is usually a paragraph rather than
+    // a one-liner — and this box is the one place where a stray Enter would send mail.
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      void sendThreadReply();
+    }
+  });
   $('search-input').addEventListener('input', scheduleSearch);
   $('search-input').addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
@@ -1613,10 +1636,10 @@ async function openMessage(message, folder = state.mailbox) {
 
   state.detail = detail;
   // The clicked message is the one the user is reading, so its body is already in hand for the
-  // conversation view — the focused bubble never waits.
+  // conversation view — expanding its bubble never waits for a round trip.
   state.threadBodies.set(`${folder}|${message.uid}`, detail);
 
-  await loadConversation(message, folder);
+  await loadConversation(message);
   renderReader();
   markSeen(message, folder);
 }
@@ -1635,7 +1658,7 @@ async function openMessage(message, folder = state.mailbox) {
  * A conversation of one is not a conversation: nothing is loaded, and the reader stays on the single
  * message, so an ordinary email does not change appearance for the sake of the feature.
  */
-async function loadConversation(message, folder) {
+async function loadConversation(message) {
   state.threadMembers = [];
   state.threadFocus = null;
   state.threadKey = null;
@@ -1651,9 +1674,12 @@ async function loadConversation(message, folder) {
     if (members && members.length > 1) {
       state.threadMembers = members;
       state.threadKey = message.thread_key;
-      state.threadFocus = `${folder}|${message.uid}`;
+      // Everything starts **collapsed** (user's request, 2026-10-06), so opening a conversation shows
+      // the shape of it — who said what, when — rather than one message in full. The opened message is
+      // still what `state.selectedMessage`/`state.detail` point at, so the toolbar keeps working on it.
+      state.threadFocus = null;
       // Not awaited: the conversation paints from headers immediately and fills in as bodies arrive.
-      void prefetchThreadBodies(members, state.threadFocus);
+      void prefetchThreadBodies(members);
       return;
     }
   }
@@ -1671,8 +1697,8 @@ async function loadConversation(message, folder) {
     .slice()
     .sort((a, b) => (a.date ?? 0) - (b.date ?? 0))
     .map((summary) => ({ folder: state.mailbox, summary }));
-  state.threadFocus = `${folder}|${message.uid}`;
-  void prefetchThreadBodies(state.threadMembers, state.threadFocus);
+  state.threadFocus = null;
+  void prefetchThreadBodies(state.threadMembers);
 }
 
 /**
@@ -1771,9 +1797,12 @@ function renderAttachmentBar(detail) {
 /**
  * The conversation, drawn as bubbles (`design/08` §2/§5.2).
  *
- * One bubble per message with the user's own on the right; exactly one is **focused** and holds the
- * full body, the rest show a short text preview. That is the design's "最新一封展开，其余折叠", and it
- * is also what keeps a conversation to a single sandboxed iframe.
+ * One bubble per message with the user's own on the right. **Every bubble starts collapsed** and
+ * clicking one expands it; clicking its head again collapses it (user's request, 2026-10-06). At most
+ * one bubble is expanded at a time, and that is not a shortcut: there is exactly one body surface and
+ * therefore exactly one sandboxed renderer, which is what stops "显示图片" from leaking between the
+ * messages of a conversation (`check.ps1` pins the single surface). Expanding a second bubble
+ * therefore collapses the first.
  */
 function renderThreadReader() {
   const members = state.threadMembers;
@@ -1782,9 +1811,11 @@ function renderThreadReader() {
 
   $('thread-subject').textContent = newest.summary.subject || '(无主题)';
   const people = [...new Set(members.map((member) => member.summary.from_addr).filter(Boolean))];
-  $('thread-meta').textContent = `共 ${members.length} 封　${people.join('、')}`;
+  $('thread-meta').textContent =
+    `共 ${members.length} 封　${people.join('、')}` +
+    (focusedKey ? '' : '　·　点任意一封展开');
 
-  // Park the shared surface in the reader *before* clearing the list: it lives inside the focused
+  // Park the shared surface in the reader *before* clearing the list: it lives inside the expanded
   // bubble, and wiping the list would throw the element — and the live iframe in it — away.
   const surface = $('body-surface');
   if (surface && !$('reader-body').contains(surface)) $('reader-body').appendChild(surface);
@@ -1800,6 +1831,8 @@ function renderThreadReader() {
     list.appendChild(bubble);
   }
 
+  renderThreadReplyTarget();
+
   if (focusedBubble) {
     mountBodySurface(focusedBubble.querySelector('.bubble-body'));
     renderAttachmentBar(state.detail);
@@ -1813,28 +1846,44 @@ function renderThreadReader() {
 
 const bubbleKey = (member) => `${member.folder}|${member.summary.uid}`;
 
-function renderBubble(member, focused) {
+function renderBubble(member, expanded) {
   const summary = member.summary;
   const key = bubbleKey(member);
   const detail = state.threadBodies.get(key);
 
   const bubble = document.createElement('div');
   bubble.className =
-    'bubble' + (isMine(summary.from_addr) ? ' mine' : '') + (focused ? ' focused' : '');
+    'bubble' + (isMine(summary.from_addr) ? ' mine' : '') + (expanded ? ' focused' : '');
   bubble.dataset.key = key;
 
   const head = document.createElement('div');
   head.className = 'bubble-head';
+  const chevron = document.createElement('span');
+  chevron.className = 'chevron';
+  chevron.textContent = expanded ? '▾' : '▸';
   const who = document.createElement('span');
   who.className = 'who';
   who.textContent = senderLabel(summary);
   who.title = summary.from_addr || '';
   const when = document.createElement('time');
   when.textContent = summary.date ? new Date(summary.date * 1000).toLocaleString('zh-CN') : '';
-  head.append(who, when);
+  head.append(chevron, who, when);
+  head.setAttribute('role', 'button');
+  head.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  head.title = expanded ? '收起这一封' : '展开这一封';
+  // The head toggles in **both** directions. On an expanded bubble it is the only clickable part: the
+  // body below is a live document the user is reading and selecting text in.
+  //
+  // `stopPropagation` is not optional: a collapsed bubble also listens on itself (so that clicking
+  // anywhere on it works), and without this the one click would toggle twice — expand, then collapse —
+  // which is exactly how this read on the running app: "点了一点反应都没有". Measured, not guessed.
+  head.addEventListener('click', (event) => {
+    event.stopPropagation();
+    void toggleBubble(key);
+  });
   bubble.appendChild(head);
 
-  if (focused) {
+  if (expanded) {
     const body = document.createElement('div');
     body.className = 'bubble-body';
     bubble.appendChild(body);
@@ -1849,18 +1898,47 @@ function renderBubble(member, focused) {
     preview.textContent = previewText(detail);
   } else {
     preview.className = 'bubble-note';
-    preview.textContent = summary.subject
-      ? `${summary.subject} —— 点开查看正文`
-      : '点开查看正文';
+    preview.textContent = summary.subject ? `${summary.subject} —— 点开查看正文` : '点开查看正文';
   }
   bubble.appendChild(preview);
-  bubble.addEventListener('click', () => focusBubble(key));
+  // A collapsed bubble is clickable anywhere — the whole thing is the target, not just the head. Its
+  // head click stops propagation (see above), so this never fires twice for one click.
+  bubble.addEventListener('click', () => {
+    void toggleBubble(key);
+  });
   return bubble;
 }
 
-/** Move the focus to one message of the conversation: its body renders in full, the others collapse. */
-async function focusBubble(key) {
-  if (state.threadFocus === key) return;
+/** The body of one message of the conversation, fetched once and kept for the life of the thread. */
+async function ensureThreadDetail(key) {
+  if (state.threadBodies.has(key)) return state.threadBodies.get(key);
+  const member = state.threadMembers.find((entry) => bubbleKey(entry) === key);
+  if (!member) return null;
+
+  const detail = await run('读取邮件正文', () =>
+    invoke('fetch_message', {
+      accountId: state.accountId,
+      mailbox: member.folder,
+      uid: member.summary.uid,
+    })
+  );
+  if (!detail) return null;
+  state.threadBodies.set(key, detail);
+  return detail;
+}
+
+/**
+ * Expand one message of the conversation, or collapse it again if it is the expanded one.
+ *
+ * Expanding a different bubble collapses the current one — see the note on `renderThreadReader`.
+ */
+async function toggleBubble(key) {
+  if (state.threadFocus === key) {
+    state.threadFocus = null;
+    renderThreadReader();
+    return;
+  }
+
   const member = state.threadMembers.find((entry) => bubbleKey(entry) === key);
   if (!member) return;
 
@@ -1872,19 +1950,10 @@ async function focusBubble(key) {
   state.allowRemoteImages = false;
   state.bodyMode = 'html';
 
-  if (!state.threadBodies.has(key)) {
-    const detail = await run('读取邮件正文', () =>
-      invoke('fetch_message', {
-        accountId: state.accountId,
-        mailbox: member.folder,
-        uid: member.summary.uid,
-      })
-    );
-    if (!detail) return;
-    state.threadBodies.set(key, detail);
-  }
+  const detail = await ensureThreadDetail(key);
+  if (!detail) return;
 
-  state.detail = state.threadBodies.get(key);
+  state.detail = detail;
   renderThreadReader();
   renderMessages();
   markSeen(member.summary, member.folder);
@@ -1898,16 +1967,18 @@ async function focusBubble(key) {
  * Each arrival fills one preview **in place** — a full re-render would move the body surface and reload
  * the iframe the user is reading.
  */
-async function prefetchThreadBodies(members, focusedKey) {
+async function prefetchThreadBodies(members) {
   const queue = members
     .slice()
     .reverse()
-    .filter((member) => bubbleKey(member) !== focusedKey && !state.threadBodies.has(bubbleKey(member)))
+    .filter((member) => !state.threadBodies.has(bubbleKey(member)))
     .slice(0, THREAD_PREFETCH_MAX);
 
   for (const member of queue) {
-    // The user moved on: stop doing work for a conversation nobody is looking at.
-    if (state.threadFocus !== focusedKey) return;
+    // The user moved on: stop doing work for a conversation nobody is looking at. Keyed on the member
+    // list itself rather than on the expanded bubble — the whole point of this pass is the *collapsed*
+    // previews, and expanding one must not abandon the rest of them.
+    if (state.threadMembers !== members) return;
 
     let detail = null;
     try {
@@ -1924,10 +1995,15 @@ async function prefetchThreadBodies(members, focusedKey) {
     if (!detail) return;
     state.threadBodies.set(bubbleKey(member), detail);
 
-    const bubble = $('thread-bubbles').querySelector(`[data-key="${bubbleKey(member)}"] > div:last-child`);
-    if (bubble) {
-      bubble.className = 'bubble-preview';
-      bubble.textContent = previewText(detail);
+    // Addressed by class, not by position: `> div:last-child` used to be the preview, but on a bubble
+    // the user has since expanded it is the `.bubble-body` that holds the live body surface, and
+    // overwriting that would destroy the message being read.
+    const preview = $('thread-bubbles').querySelector(
+      `[data-key="${bubbleKey(member)}"] .bubble-preview, [data-key="${bubbleKey(member)}"] .bubble-note`
+    );
+    if (preview) {
+      preview.className = 'bubble-preview';
+      preview.textContent = previewText(detail);
     }
   }
 }
@@ -1971,6 +2047,101 @@ function isMine(addr) {
   if (!value) return false;
   if (state.accountId && state.accountId.toLowerCase() === value) return true;
   return state.accounts.some((account) => String(account.email).toLowerCase() === value);
+}
+
+/* ---------------------------------------------------------------- replying inside a conversation */
+
+/**
+ * The message a reply typed at the bottom of the conversation will answer.
+ *
+ * `src/reply.js` owns the rule; this only hands it the account list it deliberately does not know
+ * about, and the expanded bubble (the message the user is pointing at).
+ */
+function threadReplyTarget() {
+  const focused =
+    state.threadMembers.find((member) => bubbleKey(member) === state.threadFocus) ?? null;
+  return reply.replyTarget(state.threadMembers, focused, isMine);
+}
+
+/** Say who the reply goes to *before* the button is pressed — never after. */
+function renderThreadReplyTarget() {
+  const line = $('thread-reply-target');
+  if (!line) return;
+  const target = threadReplyTarget();
+  const address = target ? target.summary.reply_to || target.summary.from_addr : '';
+  line.textContent = address
+    ? `回复给 ${address}`
+    : '这个会话里只有你自己的邮件，没有可回复的对方地址';
+}
+
+/**
+ * Send what is in the conversation's reply box.
+ *
+ * Deliberately not routed through `openComposer`: the whole point of this box is that answering costs
+ * one line of typing and no dialog. Everything that matters is still shared with the composer — the
+ * payload builder (`payload.outgoingMail`), the threading headers (`reply.replyHeaders`) and the
+ * outbox, which is what keeps the undo window and the delivery guarantees identical.
+ */
+async function sendThreadReply() {
+  if (!state.accountId) {
+    toast('请先添加一个邮箱账号。', 'err');
+    return;
+  }
+  const box = $('thread-reply-text');
+  const text = box.value.trim();
+  if (!text) {
+    toast('先写点内容再发送。', 'err');
+    box.focus();
+    return;
+  }
+
+  const target = threadReplyTarget();
+  if (!target) {
+    toast('这个会话里只有你自己的邮件。请用上面的「回复」打开完整写信窗口填写收件人。', 'err', 9000);
+    return;
+  }
+
+  const detail = await ensureThreadDetail(bubbleKey(target));
+  if (!detail) return;
+  const headers = reply.replyHeaders(detail);
+  if (!headers.to) {
+    toast('这封邮件没有可用的发件人地址，请用上面的「回复」打开完整写信窗口。', 'err', 9000);
+    return;
+  }
+
+  const outgoing = payload.outgoingMail({
+    to: [headers.to],
+    cc: [],
+    bcc: [],
+    subject: headers.subject,
+    bodyText: text,
+    // Plain text, exactly like the composer: the send path builds the alternative part from it.
+    bodyHtml: null,
+    inReplyTo: headers.inReplyTo,
+    references: headers.references,
+    attachments: [],
+  });
+
+  const ok = await run('加入发件箱', async () => {
+    // Through the outbox like every other send: that is what the undo window and the "survives a
+    // crash mid-transfer" guarantee come from. The worker owns delivery from here.
+    await invoke('enqueue_send', {
+      accountId: state.accountId,
+      mail: outgoing,
+      // No draft: this box is a reply, not a document to come back to. The outbox keeps the copy.
+      draftId: null,
+      undoSeconds: UNDO_SECONDS,
+    });
+    return true;
+  });
+  if (!ok) return;
+
+  box.value = '';
+  toast(`已加入发件箱（${UNDO_SECONDS} 秒内可撤销）`, 'ok', 6000, {
+    label: '撤销',
+    onClick: () => cancelNewestSend(),
+  });
+  refreshOutbox();
 }
 
 /**
@@ -2282,12 +2453,14 @@ function openComposer({ mode = 'new', draft = null } = {}) {
     bodyText = draft.body_text;
   } else if (mode === 'reply' && detail) {
     to = detail.reply_to || detail.from_addr || '';
-    subject = detail.subject.startsWith('Re:') ? detail.subject : `Re: ${detail.subject}`;
+    // The prefix rule lives in reply.js so the composer and the conversation's inline reply box cannot
+    // disagree about what makes a subject a reply (`Re:`, `RE:`, `回复：` all count).
+    subject = reply.replySubject(detail.subject);
     inReplyTo = detail.message_id;
     references = [...detail.references, detail.message_id].filter(Boolean);
     bodyText = quoteOriginal(detail);
   } else if (mode === 'forward' && detail) {
-    subject = detail.subject.startsWith('Fwd:') ? detail.subject : `Fwd: ${detail.subject}`;
+    subject = reply.forwardSubject(detail.subject);
     bodyText = quoteOriginal(detail);
   }
 

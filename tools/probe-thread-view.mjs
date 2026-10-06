@@ -1,12 +1,19 @@
 /**
  * The conversation view, checked against the running app's real cache.
  *
- * What it is really testing is not the looks but the two invariants the design rests on:
+ * What it is really testing is not the looks but the invariants the design rests on:
  *   1. a conversation is assembled **across folders** — so at least one bubble can come from a folder
  *      other than the one being listed (the user's own reply, which lives in Sent);
- *   2. exactly **one** body surface exists on screen, and it is inside the focused bubble. Two would
+ *   2. exactly **one** body surface exists on screen, and it is inside the expanded bubble. Two would
  *      mean "显示图片" could leak from one message of a conversation to another, which is the security
- *      boundary `check.ps1` pins for the single view.
+ *      boundary `check.ps1` pins for the single view;
+ *   3. the interaction the user asked for (2026-10-06): every bubble starts collapsed, clicking one
+ *      expands it, clicking its head collapses it again, and the reply box at the bottom names the
+ *      address it would answer **before** the button is pressed.
+ *
+ * It deliberately never presses 发送: the reply would go to a real correspondent. What is checked is
+ * that the box is wired and refuses an empty message — the enqueue path itself is the composer's, and
+ * `tools/probe-outbox.mjs` already drives it end to end.
  *
  * Main frame only; timers work here (unlike the sandboxed body frame).
  */
@@ -32,7 +39,7 @@
   const conversationRow = rows.find((row) => row.querySelector('.msg-count'));
   log.conversationRows = rows.filter((row) => row.querySelector('.msg-count')).length;
   if (!conversationRow) {
-    return { ...log, skipped: '这个文件夹里没有多封会话，无法验证对话视图' };
+    return { ...log, skipped: '这个文件夹里没有多封会话，无法验证对话模式' };
   }
   log.rowCount = conversationRow.querySelector('.msg-count').textContent;
 
@@ -40,48 +47,101 @@
   // Leave time for: the body fetch, `list_thread`, and the first paint.
   await sleep(2500);
 
+  // ---- the default: everything collapsed
   const view = q('#thread-view');
   log.threadViewVisible = view ? !view.hidden : false;
   log.readerBodyHidden = q('#reader-body').hidden;
 
-  const bubbles = [...document.querySelectorAll('#thread-bubbles .bubble')];
+  let bubbles = [...document.querySelectorAll('#thread-bubbles .bubble')];
   log.bubbles = bubbles.length;
-  log.focused = bubbles.filter((b) => b.classList.contains('focused')).length;
+  log.expandedAtFirstPaint = bubbles.filter((b) => b.classList.contains('focused')).length;
   log.mine = bubbles.filter((b) => b.classList.contains('mine')).length;
   log.previews = bubbles.filter((b) => b.querySelector('.bubble-preview')).length;
   log.notes = bubbles.filter((b) => b.querySelector('.bubble-note')).length;
+  log.chevrons = bubbles.map((b) => b.querySelector('.chevron')?.textContent ?? null).slice(0, 4);
+  log.hintWhileAllCollapsed = q('#thread-meta')?.textContent?.includes('点任意一封展开') ?? false;
 
-  // The invariant: one surface, inside the focused bubble.
-  const surfaces = document.querySelectorAll('#body-surface');
-  log.surfaces = surfaces.length;
+  // The invariant: one surface on screen, parked in the hidden reader while nothing is expanded.
+  log.surfaces = document.querySelectorAll('#body-surface').length;
   log.frames = document.querySelectorAll('#body-frame').length;
-  const focused = bubbles.find((b) => b.classList.contains('focused'));
-  log.surfaceInsideFocused =
-    !!focused && !!surfaces[0] && surfaces[0].parentElement === focused.querySelector('.bubble-body');
-  log.frameHeight = q('#body-frame')?.getBoundingClientRect().height ?? 0;
-  log.bubbleWidths = bubbles.slice(0, 4).map((b) => Math.round(b.getBoundingClientRect().width));
+  log.surfaceParkedWhenCollapsed =
+    document.querySelector('#body-surface')?.parentElement?.id === 'reader-body';
 
-  // Which folders the bubbles came from: the cross-folder claim, measured rather than asserted in prose.
-  log.foldersBehindBubbles = bubbles.length;
+  // ---- the reply box, before anything is expanded
+  log.replyBox = {
+    present: !!q('#thread-reply-text'),
+    visible: q('#thread-reply') ? q('#thread-reply').getBoundingClientRect().height > 0 : false,
+    target: q('#thread-reply-target')?.textContent?.trim() ?? null,
+    sendLabel: q('#btn-thread-send')?.textContent?.trim() ?? null,
+  };
 
-  // Move the focus with a real click on a collapsed bubble.
-  const collapsed = bubbles.find((b) => !b.classList.contains('focused'));
-  if (collapsed) {
-    const wanted = collapsed.dataset.key;
-    collapsed.click();
+  // An empty box must refuse to queue anything — which also proves the button is wired at all.
+  q('#btn-thread-send').click();
+  await sleep(600);
+  log.emptySend = {
+    toast: q('#toast-root')?.textContent?.trim().slice(0, 40) ?? null,
+    textareaStillEmpty: q('#thread-reply-text').value === '',
+    outboxBadge: q('#outbox-count')?.textContent?.trim() ?? null,
+  };
+  q('#toast-root')?.replaceChildren();
+  await sleep(200);
+
+  // ---- expanding one bubble
+  const first = bubbles[0];
+  first.querySelector('.bubble-head').click();
+  await sleep(2500);
+  bubbles = [...document.querySelectorAll('#thread-bubbles .bubble')];
+  const expanded = bubbles.filter((b) => b.classList.contains('focused'));
+  log.afterExpand = {
+    expandedCount: expanded.length,
+    expandedKey: expanded[0]?.dataset.key ?? null,
+    matchesClicked: expanded[0]?.dataset.key === first.dataset.key,
+    chevron: expanded[0]?.querySelector('.chevron')?.textContent ?? null,
+    ariaExpanded: expanded[0]?.querySelector('.bubble-head')?.getAttribute('aria-expanded') ?? null,
+    surfaces: document.querySelectorAll('#body-surface').length,
+    frames: document.querySelectorAll('#body-frame').length,
+    surfaceInsideExpanded:
+      !!expanded[0] &&
+      document.querySelector('#body-surface')?.parentElement ===
+        expanded[0].querySelector('.bubble-body'),
+    frameHeight: Math.round(q('#body-frame')?.getBoundingClientRect().height ?? 0),
+    replyTarget: q('#thread-reply-target')?.textContent?.trim() ?? null,
+    hintGone: !(q('#thread-meta')?.textContent?.includes('点任意一封展开') ?? false),
+  };
+
+  // Clicking the *body* must not collapse it: that is a live document being read and selected.
+  q('#body-frame')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(400);
+  log.clickInsideBodyKeepsItExpanded =
+    document.querySelectorAll('#thread-bubbles .bubble.focused').length === 1;
+
+  // ---- collapsing it again, from its head
+  document.querySelector('#thread-bubbles .bubble.focused .bubble-head')?.click();
+  await sleep(1200);
+  log.afterCollapse = {
+    expandedCount: document.querySelectorAll('#thread-bubbles .bubble.focused').length,
+    surfaces: document.querySelectorAll('#body-surface').length,
+    frames: document.querySelectorAll('#body-frame').length,
+    surfaceParked: document.querySelector('#body-surface')?.parentElement?.id === 'reader-body',
+    hintBack: q('#thread-meta')?.textContent?.includes('点任意一封展开') ?? false,
+  };
+
+  // ---- and expanding a *different* one collapses the first (one sandboxed renderer)
+  if (bubbles.length > 1) {
+    document.querySelectorAll('#thread-bubbles .bubble')[0].querySelector('.bubble-head').click();
     await sleep(2500);
-    const after = [...document.querySelectorAll('#thread-bubbles .bubble')];
-    const nowFocused = after.filter((b) => b.classList.contains('focused'));
-    log.refocus = {
-      focusedCount: nowFocused.length,
-      focusedKey: nowFocused[0]?.dataset.key ?? null,
-      matchesClicked: nowFocused[0]?.dataset.key === wanted,
+    document.querySelectorAll('#thread-bubbles .bubble')[1].querySelector('.bubble-head').click();
+    await sleep(2500);
+    const all = [...document.querySelectorAll('#thread-bubbles .bubble')];
+    const only = all.filter((b) => b.classList.contains('focused'));
+    log.switchingBubbles = {
+      expandedCount: only.length,
+      expandedKey: only[0]?.dataset.key ?? null,
       surfaces: document.querySelectorAll('#body-surface').length,
       frames: document.querySelectorAll('#body-frame').length,
-      surfaceInsideFocused:
-        !!nowFocused[0] &&
-        document.querySelector('#body-surface')?.parentElement ===
-          nowFocused[0].querySelector('.bubble-body'),
+      surfaceInsideExpanded:
+        !!only[0] &&
+        document.querySelector('#body-surface')?.parentElement === only[0].querySelector('.bubble-body'),
     };
   }
 

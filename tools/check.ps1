@@ -273,6 +273,24 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'a conversation reply reaches the counterpart and joins the thread' {
+        # Two silent failures, both loud in a real mailbox: "answer the newest message" addresses the
+        # user themselves whenever they replied last, and a reply without the References chain arrives
+        # as a brand new conversation. `src/reply.js` is where those rules live, so both are pinned here
+        # rather than discovered by a correspondent.
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/reply_test.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'a conversation reply would reach the wrong person or start a new thread' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'the wizard decides what a failed connection test means' {
         # The verdict on a failed probe used to live inside `openAccountWizard`'s closure, where three
         # separate bugs were fixed one at a time (M1a-69 "network silence is not a failure", M1a-82
