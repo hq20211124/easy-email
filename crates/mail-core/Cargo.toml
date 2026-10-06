@@ -69,3 +69,8 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
+# The benchmark needs to run the *same* SQL the application runs, including its bound parameters —
+# comparing a literal against a parameter is the whole point of `compare_search_paths`, and it is the
+# one difference that could explain a 4x gap between the two. Same version as the dependency above,
+# so no new package enters the tree.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
