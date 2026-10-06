@@ -407,6 +407,7 @@ mod tests {
             seen: false,
             flagged: false,
             thread_key: None,
+            subject_key: None,
         }
     }
 

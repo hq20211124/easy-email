@@ -139,6 +139,111 @@ check(
 check('an empty list makes no groups', groupConversations([]).length === 0, 'expected none');
 check('a missing list is not a crash', groupConversations(undefined).length === 0, 'expected none');
 
+// ---------------------------------------------------------------- the two signals, unioned
+// Reported 2026-10-06: a correspondent sent four separate messages under one subject, none of them a
+// reply to anything (no `references`), so each carried its own `thread_key` — and the list showed four
+// rows. The backend stores a second, heuristic key for exactly this mail
+// (`crate::threads::subject_key`); the two signals are unioned, never ranked, so nothing that groups
+// today can be split by the guess.
+const keyed = (over) => message({ thread_key: null, subject_key: null, ...over });
+
+const sameSubject = [
+  keyed({ uid: 10, thread_key: '<a@outlook>', subject_key: 'subj:王芳 您好|wangfang@example.com' }),
+  keyed({ uid: 11, thread_key: '<b@outlook>', subject_key: 'subj:王芳 您好|wangfang@example.com' }),
+  keyed({
+    uid: 12,
+    thread_key: '<c@outlook>',
+    subject_key: 'subj:王芳 您好|wangfang@example.com',
+    subject: 'Re: 王芳 您好',
+  }),
+];
+const merged = groupConversations(sameSubject);
+check('separate messages under one subject become one row', merged.length === 1, `got ${merged.length}`);
+check(
+  'and the row keeps all of them',
+  merged[0].messages.length === 3,
+  `got ${merged[0].messages.length}`
+);
+check(
+  'the row is opened with a key the backend accepts',
+  merged[0].key === '<a@outlook>',
+  `got ${merged[0].key}`
+);
+
+// A different sender with the same subject is a different conversation: the heuristic is
+// sender-and-subject, not subject.
+check(
+  'a different sender is never folded in',
+  groupConversations([
+    ...sameSubject,
+    keyed({ uid: 13, thread_key: '<d@else>', subject_key: 'subj:王芳 您好|someone@else.com' }),
+  ]).length === 2,
+  'sender is half of the key'
+);
+
+// The user's own mail carries no heuristic key (the backend refuses to guess which of several
+// recipients a fresh mail belongs to), so it keeps its own row.
+check(
+  'mail the user sent is not folded in by subject',
+  groupConversations([...sameSubject, keyed({ uid: 14, thread_key: '<e@qq>', from_addr: 'me@example.com' })])
+    .length === 2,
+  'your own fresh mail is not a conversation by subject'
+);
+
+// The union can only add: a chain whose subject was edited mid-thread keeps its chain, because its
+// members share the exact key even though their subjects differ.
+check(
+  'an edited subject does not split a chain',
+  groupConversations([
+    keyed({ uid: 20, thread_key: '<root@x>', subject_key: 'subj:十月报销|boss@example.com' }),
+    keyed({ uid: 21, thread_key: '<root@x>', subject: '改成别的主题了' }),
+  ]).length === 1,
+  'the chain is a fact and outranks the guess'
+);
+
+// ...and a chain absorbs a lone message that shares the heuristic key, which is what makes a fresh
+// mail from the same person with the same subject join the conversation it belongs to.
+const chainPlusLone = groupConversations([
+  keyed({ uid: 30, thread_key: '<root2@x>', subject_key: 'subj:发票|billing@example.com' }),
+  keyed({ uid: 31, thread_key: '<root2@x>', from_addr: 'me@example.com' }),
+  keyed({ uid: 32, thread_key: '<lone@x>', subject_key: 'subj:发票|billing@example.com' }),
+]);
+check('a chain absorbs a lone message with its subject key', chainPlusLone.length === 1, `got ${chainPlusLone.length}`);
+check('and keeps all three', chainPlusLone[0].messages.length === 3, `got ${chainPlusLone[0].messages.length}`);
+
+// A row from before either column existed still groups the old way, which is what the conversation
+// view falls back to as well.
+check(
+  'a row with no stored signal falls back to sender and subject',
+  groupConversations([message({ uid: 40, subject: 'Re: 十月报销' }), message({ uid: 41, subject: '十月报销' })])
+    .length === 1,
+  'the pre-migration fallback must still work'
+);
+
+// The bound on the heuristic, and the reason it exists: recurring notifications reuse one subject for
+// years (Google's 安全提醒, 24 times over 4.7 years in the real cache), while the case that asked for
+// the heuristic is a burst inside a day. `THREAD_SESSION_GAP_SECS` in `cache.rs` is the same week.
+const DAY = 86_400;
+const sameWeek = groupConversations([
+  keyed({ uid: 50, thread_key: '<g1@x>', subject_key: 'subj:安全提醒|no-reply@accounts.google.com', date: DAY * 100 }),
+  keyed({ uid: 51, thread_key: '<g2@x>', subject_key: 'subj:安全提醒|no-reply@accounts.google.com', date: DAY * 102 }),
+]);
+check('messages two days apart under one subject are one conversation', sameWeek.length === 1, `got ${sameWeek.length}`);
+
+const monthsApart = groupConversations([
+  keyed({ uid: 60, thread_key: '<h1@x>', subject_key: 'subj:安全提醒|no-reply@accounts.google.com', date: DAY * 100 }),
+  keyed({ uid: 61, thread_key: '<h2@x>', subject_key: 'subj:安全提醒|no-reply@accounts.google.com', date: DAY * 140 }),
+]);
+check('the same subject six weeks later is a different conversation', monthsApart.length === 2, `got ${monthsApart.length}`);
+
+// Chained, not anchored: a running exchange never splits just because it outlives one window.
+const chained = groupConversations([
+  keyed({ uid: 70, thread_key: '<i1@x>', subject_key: 'subj:日结单|s@bank.hk', date: DAY * 100 }),
+  keyed({ uid: 71, thread_key: '<i2@x>', subject_key: 'subj:日结单|s@bank.hk', date: DAY * 105 }),
+  keyed({ uid: 72, thread_key: '<i3@x>', subject_key: 'subj:日结单|s@bank.hk', date: DAY * 110 }),
+]);
+check('a chain of short gaps stays one conversation', chained.length === 1, `got ${chained.length}`);
+
 if (failures.length > 0) {
   for (const failure of failures) console.error(`- ${failure}`);
   console.error('\nconversation grouping disagrees with what a person would call one thread');

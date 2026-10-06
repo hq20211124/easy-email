@@ -1740,13 +1740,17 @@ async function loadConversation(message) {
     }
   }
 
-  // Only rows without an exact key reach here, and only from a real folder listing: search hits come
-  // from several folders at once, so "the conversation" is not a thing this approximation can see.
+  // Only rows with no exact key reach here, and only from a real folder listing: search hits come from
+  // several folders at once, so "the conversation" is not a thing this approximation can see.
+  //
+  // It groups the page exactly the way the list does (`threads.groupConversations`, which unions the
+  // chain with the sender-and-subject heuristic) rather than by one key, so a row the backend cannot
+  // answer for and the row it is drawn next to cannot disagree about how many messages there are.
   if (state.view !== 'mail' || state.searchQuery) return;
-  const key = window.__easyEmailThreads.conversationKey(message);
-  const siblings = state.messages.filter(
-    (entry) => window.__easyEmailThreads.conversationKey(entry) === key
-  );
+  const group = threads
+    .groupConversations(state.messages)
+    .find((entry) => entry.messages.some((member) => member.uid === message.uid));
+  const siblings = group?.messages ?? [];
   if (siblings.length < 1) return;
 
   state.threadMembers = siblings

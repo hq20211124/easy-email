@@ -236,6 +236,18 @@
   每封 `references=[]`、`in_reply_to=None` —— 它们真是 4 封独立邮件，`thread_key` 各不相同（各自是根）。
   只按主题合并会把同主题但不相干的信**永久**并到一起，所以宁可分成 4 行。
   诊断入口：`python tools/inspect-cache-detail.py <地址>`（打印每封的 `thread_key` 与线程头）。
+- **会话分组是两条信号的**并集**：`References` 链（事实）+ `subject_key`（猜测，同一对方+同一主题）。
+  用户 2026-10-06 选的。要点，缺一条就会做错：**
+  ① **只对用户收到的邮件**算 `subject_key`（发件人是本账号的不参与）——发出去的新邮件收件人有多个，
+  只按"主题+自己"合并会把互不相干的信并到一起；
+  ② **必须限时间窗**（`THREAD_SESSION_GAP_SECS` = 7 天，相邻两封的间隔）：没有窗的实测结果是
+  Google「安全提醒」24 封跨 4.7 年并成一行；加窗后 24 → 15 段，而用户报告的 4 封（跨 1 天）仍是 1 段；
+  ③ **两侧同一规则**：Rust（`Cache::thread_summaries` 的闭包：链 → 会话 → 再链）与
+  JS（`threads.js::groupConversations` 的 union-find，列表用它折叠）。不一致的症状是"行数 ≠ 气泡数"；
+  ④ **先合并完再分组**：union-find 边合并边建组会把前面已经建好的组留在旧根上，一个会话被拆成两个
+  （测试抓到过，别改回去）；
+  ⑤ 迁移 v5 只用行内数据回填 `subject_key`（不联网），`messages` 一行不丢。
+  诊断入口：`python tools/inspect-cache-detail.py <地址>`。
 - **会话底部的回复框不走 `openComposer`**：它的意义就是"回一句话不用开对话框"。共用的部分一个不少 ——
   负载构造（`payload.outgoingMail`）、线程头（`src/reply.js` 的 `replyHeaders`）、发件箱（撤销窗口与
   "崩溃后仍会送达"都来自它）。"回给谁"和"主题前缀"两条规则在 `src/reply.js` 里，

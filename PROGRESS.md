@@ -2548,10 +2548,49 @@ QQ INBOX 缓存里 **192 封、UID 5662..5856、日期 2026-09-02 .. 2026-10-06*
 
 ---
 
+### M1a-91 会话分组加启发式：同一对方 + 同一主题（**并集**，且限 7 天会话窗）✅（第 97 轮）
+
+用户 2026-10-06 选了"加启发式"。实现刻意做成**两条信号的并集**，而不是"用主题替换 References"：
+
+- **信号一（事实）**：`References` 链的根 —— 今天能合并的，一个都不会被拆开（主题被中途改过、
+  链比缓存更长，这两种情况都还是靠它）。
+- **信号二（猜测）**：`subject_key` = `subj:<去掉 Re:/Fwd:/回复：等前缀的主题>|<发件人>`，
+  **只对用户收到的邮件**计算（发件人是本账号的不参与 —— 发出去的新邮件收件人有多个，
+  只按主题+自己合并会把互不相干的信并到一起）。
+- 两侧都要用同一规则：**Rust**（`Cache::thread_summaries` 的闭包查询，跨文件夹取全部成员）与
+  **JS**（`threads.js::groupConversations` 的 union-find，列表用它折叠）。否则"行数"和"气泡数"会对不上。
+
+**必须限时间窗，数据是这么说的**：第一次实现没有窗口，实测立刻暴露 —— Google 的「安全提醒」
+24 封跨 **4.7 年**被并成一行，X 的"异常登录"11 封跨 52 天。所以加 **7 天间隔链**（
+`THREAD_SESSION_GAP_SECS`）：相邻两封的间隔在 7 天内就接上，超过就断成新的一段。整库实测：
+
+| 会话 | 不加窗 | 加窗后 |
+|---|---|---|
+| 用户报告的那 4 封（跨 1.0 天） | 1 行 | **1 行** ✓ |
+| Google 安全提醒（24 封，跨 4.7 年） | 1 行 | **15 段** |
+| X 异常登录（11 封，跨 52 天） | 1 行 | **3 段** |
+| HSBC 扣款通知（5 封，跨 0.9 天） | 1 行 | **1 段** ✓ |
+
+全库 479 行里只有 **27 段**会发生合并 —— 启发式是保守的。
+
+- **迁移 v4 → v5**：新增 `subject_key` 列 + 索引，并在迁移时**只用行内数据**把它回填（不联网）——
+  subject、发件人、账号地址都在 `messages` 里。真机实测：`user_version 4 → 5`、`messages` 仍然 **490 行**（一封没丢）、
+  479/490 行拿到 `subject_key`（11 行按设计没有：自己发的 + 无主题的）。
+- **测试**：Rust 侧 `threads.rs` 4 条（前缀剥离与 JS 同一套用例、不参与的情形、大小写）、
+  `cache.rs` 2 条（启发式分组 + 会话窗）；JS 侧 `thread_key_test` 加了 6 条（合并、不同发件人不合并、
+  自己的邮件不参与、改主题不拆链、链吸收同主题的孤封、7 天窗与链式间隔）。**证伪过**：去掉"缓存优先"式的
+  必要分支？—— 本轮证伪的是实现 bug：union 边合并边建组会拆散会话（测试抓到，已改成"先合并完再分组"）。
+- **真机验证**（真实 QQ 账号）：那 4 封现在是**一行、带 4 的角标**，点开看到 **4 个气泡**、
+  "共 4 封　wangfang@example.com"、1 个 surface。列表行数与视图气泡数一致。
+
+**数字**：`check.ps1` **23 步全绿**；`cargo test --workspace` **328 通过 / 0 失败**（273 mail-core lib + 47 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri）。
+
+---
+
 ## 交接摘要（先读这里）
 
 **当前状态**：`tools/check.ps1` **23 步全绿**（离线；`-Network` 会多跑一步真实端点）；`cargo test --workspace`
-**322 通过、0 失败**（267 mail-core lib + 47 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri；
+**328 通过、0 失败**（273 mail-core lib + 47 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri；
 另有 **5** 条 ignored：3 条真实端点 + 2 条 doctest）；
 `python design/tools/audit.py` **0 失败**；应用启动冒烟通过。新增的 JS 门禁：
 `node tools/wizard_verdict_test.mjs`、`node tools/reply_test.mjs`、`node tools/history_test.mjs`、`node tools/payload_keys.mjs`（含 `EndpointOverride`）。

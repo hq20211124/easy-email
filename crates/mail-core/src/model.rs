@@ -295,6 +295,16 @@ pub struct MessageSummary {
     /// than it is fetched, and the headers are not kept.
     #[serde(default)]
     pub thread_key: Option<String>,
+    /// The **heuristic** conversation signal: normalised subject plus the sender
+    /// (`crate::threads::subject_key`), for mail that carries no `References` chain.
+    ///
+    /// Kept next to `thread_key` rather than folded into it because the two are unioned, not ranked:
+    /// the chain is a fact and the subject is a guess, and a message may be grouped by either. Only
+    /// mail the user received gets one (see the note on the function).
+    ///
+    /// `None` for rows written before this existed, and for the messages that must not participate.
+    #[serde(default)]
+    pub subject_key: Option<String>,
 }
 
 /// One message of a conversation, with the folder it lives in (`design/08` §4.2's `ThreadMessage`).

@@ -80,6 +80,9 @@
    * An empty subject is deliberately **not** grouped with other empty subjects: a subject-less
    * message (a bounce, a notification) has nothing to match on, and folding unrelated ones together
    * would hide mail. It gets a key of its own, derived from the message.
+   *
+   * This is one message's *identity*; the grouping itself is [`groupConversations`], which unions it
+   * with the second signal the backend stores.
    */
   function conversationKey(message) {
     // The exact key first: the backend computes it from the `References` chain when it parses the
@@ -91,6 +94,13 @@
       return exact;
     }
 
+    // The heuristic the backend also stores, for mail with no chain at all: sender plus normalised
+    // subject. Present only for mail the user received (`crate::threads::subject_key`).
+    const heuristic = message.subject_key;
+    if (typeof heuristic === 'string' && heuristic.length > 0) {
+      return heuristic;
+    }
+
     const subject = normaliseSubject(message.subject);
     if (!subject) {
       return `solo:${message.folder ?? ''}:${message.uid ?? ''}`;
@@ -99,26 +109,145 @@
   }
 
   /**
+   * The same window the backend uses to bound the heuristic (`THREAD_SESSION_GAP_SECS` in
+   * `cache.rs`): a week.
+   *
+   * A bound is not optional. The case that asked for the heuristic is four messages inside a day,
+   * while recurring notifications reuse one subject for years — Google's 安全提醒 arrived 24 times
+   * over 4.7 years. Without the window the list would fold all of those into one row.
+   */
+  const SESSION_GAP_SECONDS = 7 * 24 * 60 * 60;
+
+  /**
+   * The subject-and-sender signal, one per **session** of same-subject mail.
+   *
+   * Consecutive messages chain while the gap stays inside the window, which is what makes "a burst of
+   * mail under one subject" one conversation and "the same subject next month" another.
+   */
+  function sessionSignals(messages, baseKeyOf) {
+    const byKey = new Map();
+    for (const message of messages) {
+      const key = baseKeyOf(message);
+      if (!key) continue;
+      const rows = byKey.get(key);
+      if (rows) rows.push(message);
+      else byKey.set(key, [message]);
+    }
+
+    const signals = new Map();
+    for (const [key, rows] of byKey) {
+      const ordered = rows
+        .slice()
+        .sort((a, b) => (a.date ?? 0) - (b.date ?? 0) || (a.uid ?? 0) - (b.uid ?? 0));
+      let session = 0;
+      let previous = null;
+      for (const row of ordered) {
+        const date = row.date ?? 0;
+        if (previous !== null && date - previous > SESSION_GAP_SECONDS) session += 1;
+        previous = date;
+        signals.set(row, `s:${key}#${session}`);
+      }
+    }
+    return signals;
+  }
+
+  /**
    * The messages grouped into conversations, newest first, with the newest message of each group
    * first inside the group.
+   *
+   * **Two signals, unioned.** The `References` chain (`thread_key`) is a fact; the sender-and-subject
+   * key (`subject_key`, bounded to a week-long session) is a heuristic for mail that carries no chain —
+   * which is what folds the four separate messages a correspondent sent under one subject into one row
+   * (reported 2026-10-06). Union rather than "the exact key wins", because a thread whose subject was
+   * edited mid-way and a thread whose chain reaches further back than the cache both keep grouping:
+   * the heuristic can only ever add rows to a conversation, never take them away.
    *
    * The caller decides what to show; this only decides what belongs together. Order is preserved
    * rather than re-derived, because the list is already sorted the way the user expects and a second
    * sort here would fight it.
    */
   function groupConversations(messages) {
+    const list = messages ?? [];
+
+    /** The heuristic's base key for a row, or `null` when the row must not take part in it. */
+    const baseKeyOf = (message) => {
+      const stored = message.subject_key;
+      if (typeof stored === 'string' && stored.length > 0) return stored;
+      // A row that has an exact key but no stored heuristic key is one the backend deliberately left
+      // out (mail the user sent): it groups by its chain and nothing else.
+      if (typeof message.thread_key === 'string' && message.thread_key.length > 0) return null;
+      // Neither column existed when this row was written: the renderer's own guess, which is what the
+      // conversation view falls back to as well.
+      const subject = normaliseSubject(message.subject);
+      const who = counterpart(message);
+      return subject && who ? `${who}|${subject}` : null;
+    };
+    const sessions = sessionSignals(list, baseKeyOf);
+
+    /** Union-find over signal names; `parent.get(x) === x` marks a root. */
+    const parent = new Map();
+    const add = (key) => {
+      if (!parent.has(key)) parent.set(key, key);
+      return key;
+    };
+    const find = (key) => {
+      let root = key;
+      while (parent.get(root) !== root) root = parent.get(root);
+      let walk = key;
+      while (walk !== root) {
+        const next = parent.get(walk);
+        parent.set(walk, root);
+        walk = next;
+      }
+      return root;
+    };
+    const union = (a, b) => {
+      add(a);
+      add(b);
+      const rootA = find(a);
+      const rootB = find(b);
+      if (rootA !== rootB) parent.set(rootB, rootA);
+    };
+
+    // Two passes on purpose: union **all** the signals first, then group. Grouping while merging
+    // would key the earlier rows to a root that a later union moves, splitting one conversation into
+    // two — which is exactly what this did until the test for it failed.
+    const rows = [];
+    for (const message of list) {
+      const signals = [];
+      const exact = message.thread_key;
+      if (typeof exact === 'string' && exact.length > 0) signals.push(`t:${exact}`);
+      const session = sessions.get(message);
+      if (session) signals.push(session);
+      // A row with no signal at all keeps a group of its own, exactly as before: two bounces have
+      // nothing to match on, and folding them together would hide mail.
+      const own =
+        signals.length > 0 ? signals[0] : `solo:${message.folder ?? ''}:${message.uid ?? ''}`;
+      add(own);
+      for (const signal of signals) union(own, signal);
+      rows.push({ message, own });
+    }
+
     const groups = new Map();
-    for (const message of messages ?? []) {
-      const key = conversationKey(message);
-      const group = groups.get(key);
+    for (const { message, own } of rows) {
+      const root = find(own);
+      const group = groups.get(root);
       if (group) {
         group.messages.push(message);
       } else {
-        groups.set(key, { key, messages: [message] });
+        // The raw signal travels on as `key`: it is what the conversation view is opened with, and a
+        // chain key is always the right thing to hand it (the backend follows the chain, and expands
+        // to the session from there).
+        groups.set(root, { key: own.replace(/^[ts]:/, '').replace(/#\d+$/, ''), messages: [message] });
       }
     }
     return [...groups.values()];
   }
 
-  global.__easyEmailThreads = { conversationKey, groupConversations, normaliseSubject };
+  global.__easyEmailThreads = {
+    conversationKey,
+    groupConversations,
+    normaliseSubject,
+    sessionSignals,
+  };
 })(typeof window === 'undefined' ? globalThis : window);

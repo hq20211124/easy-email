@@ -26,7 +26,7 @@ use crate::error::{MailError, Result};
 use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Where a delivered message's Sent copy is (`design/07` §5.4).
 ///
@@ -314,6 +314,21 @@ impl Cache {
                 "create index if not exists messages_by_thread on messages(account_id, thread_key)",
                 [],
             )?;
+
+            // v5: the second, heuristic conversation signal (`threads::subject_key`), for mail with no
+            // `References` chain. Same column-not-in-create-table rule as above.
+            add_column_if_missing(conn, "messages", "subject_key", "text")?;
+            conn.execute(
+                "create index if not exists messages_by_subject_key
+                     on messages(account_id, subject_key)",
+                [],
+            )?;
+
+            // Fill it for the rows that already exist. **From the rows themselves** — subject, sender
+            // and the account's address are all in `messages`, so this migration needs no network: an
+            // upgrade that quietly required a sync before old mail could be grouped would leave the
+            // user looking at rows that never merge.
+            backfill_subject_keys(conn)?;
             Ok(())
 
         })
@@ -508,11 +523,19 @@ impl Cache {
         let summaries = summaries.to_vec();
         self.db.write_blocking(move |conn: &Connection| {
             for summary in summaries {
+                // Computed here rather than in the parser: the heuristic key needs to know whether the
+                // sender is the account itself, and that fact lives with the account, not the headers.
+                let subject_key = crate::threads::subject_key(
+                    &summary.subject,
+                    summary.from_addr.as_deref().unwrap_or_default(),
+                    &account_id,
+                );
+                let subject_key = (!subject_key.is_empty()).then_some(subject_key);
                 conn.execute(
                     "insert into messages
                          (account_id, folder, uid, subject, from_name, from_addr, date, size, seen,
-                          flagged, thread_key)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                          flagged, thread_key, subject_key)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      on conflict(account_id, folder, uid) do update set
                          subject   = excluded.subject,
                          from_name = excluded.from_name,
@@ -521,7 +544,8 @@ impl Cache {
                          size      = excluded.size,
                          seen      = excluded.seen,
                          flagged   = excluded.flagged,
-                         thread_key = excluded.thread_key",
+                         thread_key = excluded.thread_key,
+                         subject_key = excluded.subject_key",
                     params![
                         account_id,
                         folder,
@@ -534,6 +558,7 @@ impl Cache {
                         i64::from(summary.seen),
                         i64::from(summary.flagged),
                         summary.thread_key,
+                        subject_key,
                     ],
                 )?;
                 Self::refresh_search_row(conn, &account_id, &folder, summary.uid)?;
@@ -554,7 +579,8 @@ impl Cache {
         let conn: &Connection = &guard;
 
         let mut stmt = conn.prepare(
-            "select uid, subject, from_name, from_addr, date, size, seen, flagged, thread_key
+            "select uid, subject, from_name, from_addr, date, size, seen, flagged, thread_key,
+                    subject_key
              from messages
              where account_id = ?1 and folder = ?2
              order by date desc, uid desc
@@ -575,6 +601,7 @@ impl Cache {
                     // `None` for rows written before the column existed: the renderer falls back to
                     // grouping by subject and sender, which is a guess but a visible one.
                     thread_key: row.get(8)?,
+                    subject_key: row.get(9)?,
                 })
             },
         )?;
@@ -593,6 +620,13 @@ impl Cache {
     /// counterpart). That is a guess, and it is deliberately not made here, where guessing wrong would
     /// silently merge two unrelated conversations.
     ///
+    /// The two conversation signals are **unioned**, not ranked (see [`crate::threads`]): the
+    /// `References` chain is a fact, and the subject-and-sender key is a heuristic for mail that has
+    /// no chain at all. Starting from whichever key the caller has in hand, each round adds the
+    /// signals of everything found so far, so a heuristic group that contains a chain (or a chain
+    /// whose root shares a subject with unrelated mail) comes back whole. The loop is bounded: it
+    /// stops as soon as a round adds nothing, and four rounds is more than any real group needs.
+    ///
     /// Local only — no network — so opening a conversation is a disk read (`design/08` §8). `limit`
     /// exists because "a conversation" has no upper bound in the data, and the caller is a UI.
     pub fn thread_summaries(
@@ -604,16 +638,126 @@ impl Cache {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
 
+        let mut members: Vec<ThreadMember> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+        // Each signal is followed once, which is also what makes the loop terminate: a round that
+        // finds no *new* signal is the end of the group.
+        let mut tried: std::collections::HashSet<Signal> = std::collections::HashSet::new();
+        tried.insert(Signal::Chain(thread_key.to_string()));
+        let mut pending: Vec<Signal> = vec![Signal::Chain(thread_key.to_string())];
+
+        for _ in 0..4 {
+            let mut next: Vec<Signal> = Vec::new();
+            for signal in &pending {
+                let found = match signal {
+                    Signal::Chain(key) => Self::chain_members(conn, account_id, key, limit)?,
+                    // The heuristic is bounded in time: only the session that already contains one of
+                    // our messages joins, not every message that ever used this subject.
+                    Signal::Subject(key) => {
+                        Self::subject_session(conn, account_id, key, limit, &seen)?
+                    }
+                };
+                for member in found {
+                    let id = (member.folder.clone(), member.summary.uid);
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    for candidate in [
+                        member.summary.thread_key.clone().map(Signal::Chain),
+                        member.summary.subject_key.clone().map(Signal::Subject),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if !candidate.is_empty() && tried.insert(candidate.clone()) {
+                            next.push(candidate);
+                        }
+                    }
+                    members.push(member);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            pending = next;
+        }
+
         // Oldest first: a conversation is read in the order it happened. The UI is what decides which
         // end to focus, and it needs the whole thing either way.
-        let mut stmt = conn.prepare(
-            "select folder, uid, subject, from_name, from_addr, date, size, seen, flagged, thread_key
+        members.sort_by_key(|member| (member.summary.date.unwrap_or(0), member.summary.uid));
+        members.truncate(limit as usize);
+        Ok(members)
+    }
+
+    /// Every cached row sharing one `References` root: the exact half of the grouping.
+    fn chain_members(
+        conn: &Connection,
+        account_id: &str,
+        thread_key: &str,
+        limit: u32,
+    ) -> Result<Vec<ThreadMember>> {
+        Self::query_members(
+            conn,
+            "select folder, uid, subject, from_name, from_addr, date, size, seen, flagged,
+                    thread_key, subject_key
              from messages
              where account_id = ?1 and thread_key = ?2
              order by date asc, uid asc
              limit ?3",
+            params![account_id, thread_key, i64::from(limit)],
+        )
+    }
+
+    /// The **session** of mail that used one `subject_key` — the heuristic half of the grouping.
+    ///
+    /// Split by [`THREAD_SESSION_GAP_SECS`]: consecutive messages chain while the gap stays inside the
+    /// window, and only the session that already contains one of `seen` is returned (that is how the
+    /// caller learned the key, so this is "the conversation this message is part of" rather than
+    /// "everything that ever had this subject").
+    fn subject_session(
+        conn: &Connection,
+        account_id: &str,
+        subject_key: &str,
+        limit: u32,
+        seen: &std::collections::HashSet<(String, u32)>,
+    ) -> Result<Vec<ThreadMember>> {
+        let rows = Self::query_members(
+            conn,
+            "select folder, uid, subject, from_name, from_addr, date, size, seen, flagged,
+                    thread_key, subject_key
+             from messages
+             where account_id = ?1 and subject_key = ?2
+             order by date asc, uid asc
+             limit ?3",
+            params![account_id, subject_key, i64::from(limit)],
         )?;
-        let rows = stmt.query_map(params![account_id, thread_key, i64::from(limit)], |row| {
+
+        let mut out: Vec<ThreadMember> = Vec::new();
+        let mut session: Vec<ThreadMember> = Vec::new();
+        let mut previous: Option<i64> = None;
+        for member in rows {
+            let date = member.summary.date.unwrap_or(0);
+            if let Some(last) = previous
+                && date.saturating_sub(last) > THREAD_SESSION_GAP_SECS
+            {
+                flush_session(&mut session, &mut out, seen);
+            }
+            previous = Some(date);
+            session.push(member);
+        }
+        flush_session(&mut session, &mut out, seen);
+        Ok(out)
+    }
+
+    /// Read `ThreadMember`s with one prepared query. Shared so the two searches above cannot drift in
+    /// the columns they read.
+    fn query_members(
+        conn: &Connection,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<ThreadMember>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |row| {
             Ok(ThreadMember {
                 folder: row.get(0)?,
                 summary: MessageSummary {
@@ -626,6 +770,7 @@ impl Cache {
                     seen: row.get::<_, i64>(7)? != 0,
                     flagged: row.get::<_, i64>(8)? != 0,
                     thread_key: row.get(9)?,
+                    subject_key: row.get(10)?,
                 },
             })
         })?;
@@ -958,6 +1103,98 @@ impl Cache {
 
 /// Add a column to an existing table, once.
 ///
+/// How far apart two messages under the same subject may be and still read as one conversation.
+///
+/// The heuristic needs a bound, and a real mailbox says why: the case that asked for it is four
+/// messages inside one day, while recurring notifications reuse one subject for years — Google's
+/// 安全提醒 appeared 24 times over **4.7 years**, an "unusual sign-in" alert 11 times over 52 days.
+/// Unbounded, the guess folds all of those into single rows.
+///
+/// A week is the threshold mail clients converge on for subject-based threading: long enough for a
+/// real burst of mail (four messages over two days, a bank's five transaction notices inside a day),
+/// short enough that "the same subject next month" is a new conversation.
+pub const THREAD_SESSION_GAP_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// One of the two things that can join two messages into one conversation.
+///
+/// A type rather than a string with a prefix, because the two are followed by **different rules**: a
+/// chain is followed to the end, a subject is followed only inside its session. Keeping them apart is
+/// also what stops a chain key and a subject key from ever being compared to each other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Signal {
+    Chain(String),
+    Subject(String),
+}
+
+impl Signal {
+    fn is_empty(&self) -> bool {
+        match self {
+            Signal::Chain(key) | Signal::Subject(key) => key.is_empty(),
+        }
+    }
+}
+
+/// Keep a finished session only if it holds a message we already have.
+///
+/// That is the whole "which session is mine" rule: the caller learned the subject key *from* a message
+/// it had already found, so the session containing that message is the one the user opened, and a
+/// session months earlier that happens to share the subject is a different conversation.
+fn flush_session(
+    session: &mut Vec<ThreadMember>,
+    out: &mut Vec<ThreadMember>,
+    seen: &std::collections::HashSet<(String, u32)>,
+) {
+    if session
+        .iter()
+        .any(|member| seen.contains(&(member.folder.clone(), member.summary.uid)))
+    {
+        out.append(session);
+    }
+    session.clear();
+}
+
+/// Fill `subject_key` for every row that has none, reading nothing but the row itself.
+///
+/// The v5 migration's one-time pass. It is deliberately not a sync: subject, sender and the account's
+/// address are all in `messages`, so already-downloaded mail becomes groupable immediately. Rows that
+/// legitimately get no key (the user's own mail, a subject-less message) stay `NULL` and simply do not
+/// participate in the heuristic.
+fn backfill_subject_keys(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String, i64, String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "select account_id, folder, uid, subject, from_addr
+             from messages where subject_key is null",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (account_id, folder, uid, subject, from_addr) in rows {
+        let key = crate::threads::subject_key(
+            &subject,
+            from_addr.as_deref().unwrap_or_default(),
+            &account_id,
+        );
+        if key.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "update messages set subject_key = ?4
+             where account_id = ?1 and folder = ?2 and uid = ?3",
+            params![account_id, folder, uid, key],
+        )?;
+    }
+    Ok(())
+}
+
 /// SQLite has no `alter table ... add column if not exists`, so the check has to be made explicitly.
 /// Doing it by asking the schema rather than by trusting the recorded version is deliberate: the two
 /// can disagree (an interrupted migration, a file copied between versions), and the schema is what
@@ -990,6 +1227,7 @@ mod tests {
             seen: false,
             flagged: false,
             thread_key: None,
+            subject_key: None,
         }
     }
 
@@ -1467,6 +1705,113 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The heuristic half of the grouping, on real rows: mail with **no** `References` chain that came
+    /// from the same person with the same subject is one conversation.
+    ///
+    /// The reported case (2026-10-06): four separate messages from one correspondent, one subject,
+    /// none of them a reply to anything — four rows in the list. They are grouped now, and the reply
+    /// that *does* carry a chain still joins its own thread.
+    #[test]
+    fn mail_with_no_chain_is_grouped_by_sender_and_subject() {
+        let cache = Cache::open_in_memory().unwrap();
+        let me = "acc";
+
+        // Four independent messages, each its own root, all from the same person with one subject.
+        let mut first = summary(1, "王芳 您好", "wangfang@example.com", 1_000);
+        first.thread_key = Some("<a@outlook>".to_string());
+        let mut second = summary(2, "王芳 您好", "wangfang@example.com", 2_000);
+        second.thread_key = Some("<b@outlook>".to_string());
+        // A reply-shaped subject is the same conversation.
+        let mut third = summary(3, "Re: 王芳 您好", "wangfang@example.com", 3_000);
+        third.thread_key = Some("<c@outlook>".to_string());
+        // Same subject, a different person: a different conversation.
+        let mut stranger = summary(4, "王芳 您好", "someone@else.com", 4_000);
+        stranger.thread_key = Some("<d@else>".to_string());
+        // The user's own mail never joins by subject, even with the same subject and no chain.
+        let mut mine = summary(5, "王芳 您好", me, 5_000);
+        mine.thread_key = Some("<e@qq>".to_string());
+
+        cache
+            .upsert_summaries(me, "INBOX", &[first, second, third, stranger, mine])
+            .expect("write");
+
+        let members = cache
+            .thread_summaries(me, "<a@outlook>", 100)
+            .expect("read");
+        assert_eq!(
+            members.iter().map(|m| m.summary.uid).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the three from that sender are one conversation, oldest first: {members:?}"
+        );
+
+        assert_eq!(
+            cache
+                .thread_summaries(me, "<d@else>", 100)
+                .expect("read")
+                .len(),
+            1,
+            "a different sender is a different conversation"
+        );
+        assert_eq!(
+            cache
+                .thread_summaries(me, "<e@qq>", 100)
+                .expect("read")
+                .len(),
+            1,
+            "the user's own mail is not folded in by subject"
+        );
+
+        // And the write path stores the signal, so the renderer can group the same way it does here.
+        let listed = cache.list_summaries(me, "INBOX", 10, 0).expect("read");
+        let stored: Vec<Option<String>> = listed
+            .iter()
+            .map(|summary| summary.subject_key.clone())
+            .collect();
+        assert!(
+            stored.iter().filter(|key| key.is_some()).count() == 4,
+            "four rows carry the heuristic key, the user's own does not: {stored:?}"
+        );
+    }
+
+    /// The heuristic is bounded in time, and a real mailbox is why: recurring notifications reuse one
+    /// subject for years (Google's 安全提醒, 24 times over 4.7 years). Only a burst counts.
+    #[test]
+    fn the_subject_heuristic_stops_at_the_session_gap() {
+        let cache = Cache::open_in_memory().unwrap();
+        let day = 86_400;
+        let mut burst_a = summary(1, "发票", "billing@example.com", day * 10);
+        burst_a.thread_key = Some("<a@x>".to_string());
+        let mut burst_b = summary(2, "发票", "billing@example.com", day * 10 + 3_600);
+        burst_b.thread_key = Some("<b@x>".to_string());
+        // Two days later: still the same session.
+        let mut burst_c = summary(3, "发票", "billing@example.com", day * 12);
+        burst_c.thread_key = Some("<c@x>".to_string());
+        // More than a week after that: the same subject, a different conversation.
+        let mut much_later = summary(4, "发票", "billing@example.com", day * 40);
+        much_later.thread_key = Some("<d@x>".to_string());
+
+        cache
+            .upsert_summaries("acc", "INBOX", &[burst_a, burst_b, burst_c, much_later])
+            .expect("write");
+
+        let members = cache.thread_summaries("acc", "<a@x>", 100).expect("read");
+        assert_eq!(
+            members.iter().map(|m| m.summary.uid).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the burst is one conversation: {members:?}"
+        );
+        assert_eq!(
+            cache
+                .thread_summaries("acc", "<d@x>", 100)
+                .expect("read")
+                .iter()
+                .map(|m| m.summary.uid)
+                .collect::<Vec<_>>(),
+            vec![4],
+            "mail six weeks later shares the subject but not the conversation"
+        );
+    }
+
     /// The upgrade path for databases created before M0-7: the pragma cannot be enabled in place,
     /// so the only correct answer is a full rebuild — and the helper must be idempotent.
     #[test]
@@ -1540,6 +1885,7 @@ mod tests {
             seen: false,
             flagged: false,
             thread_key: None,
+            subject_key: None,
         }
     }
 

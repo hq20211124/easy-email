@@ -1013,6 +1013,9 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         date,
         size: fetch.size,
         thread_key,
+        // Computed by the cache, which is the layer that knows whose account this is: the key is only
+        // for mail the user received, and "is this sender me?" cannot be answered from the headers.
+        subject_key: None,
         seen,
         flagged,
     }
@@ -1416,6 +1419,7 @@ mod tests {
             size: Some(100),
             seen: false,
             flagged: false,
+            subject_key: None,
             thread_key: None,
         }
     }
