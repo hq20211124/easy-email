@@ -2497,6 +2497,10 @@ XOAUTH2、队列发信全部就绪），这一轮做的是**真实登录会踩�
   `probe-outbox.mjs`（入队 → 撤销）与 Rust loopback 测试覆盖。
 
 **数字**：`check.ps1` **22 步全绿**；`cargo test --workspace` **322 通过 / 0 失败**（无 Rust 改动）。
+**收尾**：release 便携包重打（`桌面\easy-email-latest\easy-email.exe`，10.10 MB）—— 包里实测启动 15 秒存活、
+真实账号同步正常、**9222 不可达**；另用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 临时开一次调试端口，
+确认**包内就是新界面**（按钮 `✉ 普通模式`、`#thread-reply-text` 与 `reply.js` 都在、1 个 surface / 1 个 iframe），
+验完即关掉，`tauri.conf.json` 里没有任何调试端口。
 
 ---
 
