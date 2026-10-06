@@ -2584,6 +2584,9 @@ QQ INBOX 缓存里 **192 封、UID 5662..5856、日期 2026-09-02 .. 2026-10-06*
   "共 4 封　wangfang@example.com"、1 个 surface。列表行数与视图气泡数一致。
 
 **数字**：`check.ps1` **23 步全绿**；`cargo test --workspace` **328 通过 / 0 失败**（273 mail-core lib + 47 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri）。
+**收尾**：release 便携包重打（**10.14 MB**），并用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 临时开端口
+**在包内实测**：那 4 封是**一行、角标 4**，点开 **4 个气泡**、"共 4 封　wangfang@example.com"、1 个 surface；
+按钮显示 `💬 对话模式`。验完端口已关掉。
 
 ---
 
