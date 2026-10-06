@@ -2853,6 +2853,44 @@ function openAccountWizard() {
         <span class="hint">国内邮箱几乎都需要「授权码」，不是登录密码 —— 见上方说明。</span>
       </div>
     </div>
+
+    <!--
+      Only for a provider whose servers are the user's to fill in (the manual_endpoints flag from the
+      provider table — never an id comparison here). The defaults come from the backend, not from this
+      file. Avoid interpolation syntax in this comment: it lives inside a template literal.
+    -->
+    <div id="wiz-endpoints" hidden>
+      <p class="hint">这个服务商的服务器地址不内置，需要你按服务商文档填写。</p>
+      <div class="grid-2">
+        <div class="field">
+          <label>IMAP 主机</label>
+          <input id="wiz-imap-host" placeholder="imap.example.com" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label>IMAP 端口</label>
+          <input id="wiz-imap-port" type="number" min="1" max="65535" />
+        </div>
+      </div>
+      <div class="field">
+        <label>IMAP 加密</label>
+        <select id="wiz-imap-security"></select>
+      </div>
+      <div class="grid-2">
+        <div class="field">
+          <label>SMTP 主机</label>
+          <input id="wiz-smtp-host" placeholder="smtp.example.com" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label>SMTP 端口</label>
+          <input id="wiz-smtp-port" type="number" min="1" max="65535" />
+        </div>
+      </div>
+      <div class="field">
+        <label>SMTP 加密</label>
+        <select id="wiz-smtp-security"></select>
+      </div>
+      <div id="wiz-endpoint-note" class="hint"></div>
+    </div>
     <div id="wiz-report"></div>`;
 
   openModal({
@@ -2865,6 +2903,23 @@ function openAccountWizard() {
       const displayName = modal.querySelector('#wiz-name').value.trim();
       const username = modal.querySelector('#wiz-username').value.trim();
       const password = modal.querySelector('#wiz-password').value;
+      const chosenProvider = state.providers.find((p) => p.id === providerId);
+      // Only a provider whose servers are the user's to fill in carries endpoints; everything else
+      // sends `null` and the backend builds the account from the table. `endpointOverride` keeps the
+      // wire names in one place (src/payload.js), which is what the contract gate compares against
+      // the Rust struct. There is deliberately **no** validation here: the rules live in Rust
+      // (`normalise_host` / `validate_endpoint`), and a second copy is a second place to be wrong.
+      const endpoints =
+        chosenProvider?.manual_endpoints === true
+          ? window.__easyEmailPayload.endpointOverride({
+              imapHost: modal.querySelector('#wiz-imap-host').value,
+              imapPort: Number(modal.querySelector('#wiz-imap-port').value),
+              imapSecurity: modal.querySelector('#wiz-imap-security').value,
+              smtpHost: modal.querySelector('#wiz-smtp-host').value,
+              smtpPort: Number(modal.querySelector('#wiz-smtp-port').value),
+              smtpSecurity: modal.querySelector('#wiz-smtp-security').value,
+            })
+          : null;
 
       if (!email.includes('@')) {
         toast('请填写完整的邮箱地址。', 'err');
@@ -2912,6 +2967,8 @@ function openAccountWizard() {
           password,
           // null lets the backend fall back to the address.
           username: username || null,
+          // null for every provider whose servers come from the table.
+          endpoints,
         });
 
         result = await invoke('verify_account', { accountId });
@@ -2921,14 +2978,43 @@ function openAccountWizard() {
         report.innerHTML = `<div class="report bad">${escapeHtml(errText(error))}</div>`;
       }
 
+      // What a failed probe means is decided by a pure function with a test beside it
+      // (`src/wizard.js`, `tools/wizard_verdict_test.mjs`), because this spot collected three bugs
+      // one at a time and the order of the checks *is* the decision. The cases:
+      //
+      // - a **rejection** is not the same failure as silence, and for OAuth it is the one case that
+      //   must not be saved: the credential was refused, so the account can never work, and every
+      //   later message about it ("网络恢复后会自动开始收信") would be false. Nothing used to compare
+      //   the address typed here with the account the browser authorized.
+      // - an OAuth account that was authorized is **kept** when the probe simply got no answer: the
+      //   authorization is a real, stored, revocable thing the user just did in a browser, while
+      //   "IMAP did not answer" is often just the network (measured: Gmail's 993 answers about two
+      //   times in five from this network). Throwing the account away would make them redo the
+      //   browser dance for nothing.
+      // - IMAP answering while **SMTP** refuses is the Microsoft 365 shape (a tenant with SMTP AUTH
+      //   switched off): receiving already works, so "网络恢复后" is the wrong sentence, and the
+      //   account is worth keeping while the user is told an administrator has to change a setting.
+      const verdict = window.__easyEmailWizard.verificationVerdict({
+        oauthAuthorized: Boolean(oauthAccount) && modal.dataset.oauthAuthorized === '1',
+        imapOk: result?.imap_ok === true,
+        smtpOk: result?.smtp_ok === true,
+        imapAuthRejected: result?.imap_auth_rejected === true,
+        smtpAuthRejected: result?.smtp_auth_rejected === true,
+      });
+
+      if (verdict === 'accept-receive-only') {
+        pendingWizardAccountId = null;
+        toast(
+          `已保存 ${email}：可以收信，但服务器拒绝了发信 —— ${result.smtp_detail}`,
+          'info',
+          20000
+        );
+        await refreshAccounts();
+        return true;
+      }
+
       if (!verified) {
-        // A **rejection** is not the same failure as silence, and for OAuth it is the one case that
-        // must not be saved: the credential was refused, so the account can never work, and every
-        // later message about it ("网络恢复后会自动开始收信") would be false. Nothing used to compare
-        // the address typed here with the account the browser authorized, so the trap is easy to walk
-        // into: the browser signs in as A, the field says B, and the result is an account that is
-        // rejected forever, retried on every startup.
-        if (oauthAccount && modal.dataset.oauthAuthorized === '1' && result?.imap_auth_rejected) {
+        if (verdict === 'reject-address') {
           pendingWizardAccountId = accountId;
           report.innerHTML =
             '<div class="report bad"><strong>服务器拒绝了这次登录</strong><br>' +
@@ -2942,12 +3028,7 @@ function openAccountWizard() {
           return false;
         }
 
-        // An OAuth account that has already been authorized is **kept** when the probe simply got no
-        // answer, because the two failures are not alike: the authorization is a real, stored,
-        // revocable thing the user just did in a browser, while "IMAP did not answer" is often just the
-        // network (measured: Gmail's 993 answers about two times in five from this network).
-        // Throwing the account away here would make the user redo the browser dance for nothing.
-        if (oauthAccount && modal.dataset.oauthAuthorized === '1') {
+        if (verdict === 'accept-offline') {
           pendingWizardAccountId = null;
           toast(
             `已保存 ${email}：浏览器授权成功，但这次没连上服务器。网络恢复后会自动开始收信。`,
@@ -2958,6 +3039,7 @@ function openAccountWizard() {
           return true;
         }
 
+        // 'retry': a password account, where a failure is usually a wrong authorization code.
         pendingWizardAccountId = accountId;
         const retry = modal.querySelector('[data-role="confirm"]');
         if (retry) retry.textContent = '重试';
@@ -2977,7 +3059,63 @@ function openAccountWizard() {
   const usernameInput = modal.querySelector('#wiz-username');
   const providerSelect = modal.querySelector('#wiz-provider');
 
-  const updateDetected = () => {
+  // The manual-endpoint block and its fields. Resolved once, here, because `updateDetected` runs on
+  // every keystroke and a query per field per keystroke is pure waste.
+  const endpointsBlock = modal.querySelector('#wiz-endpoints');
+  const imapHostInput = modal.querySelector('#wiz-imap-host');
+  const imapPortInput = modal.querySelector('#wiz-imap-port');
+  const imapSecuritySelect = modal.querySelector('#wiz-imap-security');
+  const smtpHostInput = modal.querySelector('#wiz-smtp-host');
+  const smtpPortInput = modal.querySelector('#wiz-smtp-port');
+  const smtpSecuritySelect = modal.querySelector('#wiz-smtp-security');
+  const endpointNote = modal.querySelector('#wiz-endpoint-note');
+
+  /**
+   * Fill the manual endpoint block for a provider whose servers are the user's to supply.
+   *
+   * The one-time part (the security choices and the defaults) comes from `endpoint_choices`, which
+   * reads `Security::ALL` and the `custom` row of the provider table — the wire spells of the
+   * security values are serde's, and a copy of them here would keep looking right after a rename.
+   *
+   * The per-address part only touches a host box the user has not edited: guessing `mail.example.com`
+   * is helpful while the address is being typed and destructive a second later.
+   */
+  const fillEndpointForm = async (provider, email) => {
+    if (endpointsBlock.dataset.ready !== '1') {
+      endpointsBlock.dataset.ready = '1';
+      try {
+        const choices = await invoke('endpoint_choices');
+        for (const select of [imapSecuritySelect, smtpSecuritySelect]) {
+          select.innerHTML = '';
+          for (const choice of choices.securities) {
+            const option = document.createElement('option');
+            option.value = choice.value;
+            option.textContent = `${choice.label} —— ${choice.hint}`;
+            select.appendChild(option);
+          }
+        }
+        imapPortInput.value = String(choices.default_imap_port);
+        imapSecuritySelect.value = choices.default_imap_security;
+        smtpPortInput.value = String(choices.default_smtp_port);
+        smtpSecuritySelect.value = choices.default_smtp_security;
+      } catch (error) {
+        // Falling back to an empty dropdown is honest: the user can still type the ports, and the
+        // error is right under the fields rather than in a toast they might miss.
+        endpointNote.textContent = `无法读取加密方式选项：${errText(error)}`;
+      }
+    }
+
+    const domain = email.includes('@') ? email.split('@')[1] : '';
+    for (const input of [imapHostInput, smtpHostInput]) {
+      if (input.dataset.touched === '1') continue;
+      input.value = domain ? `mail.${domain}` : '';
+    }
+    endpointNote.textContent = domain
+      ? `已按域名预填 mail.${domain}，请按服务商文档核对或改写。`
+      : '填好邮箱地址后这里会自动预填一个猜测值，可以随时改。';
+  };
+
+  const updateDetected = async () => {
     const email = emailInput.value.trim();
     const provider = state.providers.find((p) => p.id === providerSelect.value);
     if (!provider) return;
@@ -3030,6 +3168,14 @@ function openAccountWizard() {
       choice.querySelector('input[value="oauth"]').checked = true;
     }
     applyPath();
+
+    // The manual endpoint block: shown from the provider table's flag, never from an id here.
+    if (provider.manual_endpoints === true) {
+      endpointsBlock.hidden = false;
+      await fillEndpointForm(provider, email);
+    } else {
+      endpointsBlock.hidden = true;
+    }
 
     {
       // Asked for **every** provider, not only the ones already known to offer OAuth: the answer is
@@ -3146,13 +3292,23 @@ function openAccountWizard() {
     }
 
     detected.hidden = false;
+    // A manual provider has no hosts to show — the table's blanks are deliberate (see `custom`), and
+    // rendering them would put ":993" on screen as if it were an answer.
+    const endpointCell = (host, port, security) =>
+      provider.manual_endpoints
+        ? '<span class="muted">由你在下方填写</span>'
+        : `<span class="mono">${escapeHtml(host)}:${port} (${security})</span>`;
     detected.innerHTML = `
-      <div><span class="k">IMAP</span><span class="mono">${escapeHtml(provider.imap_host)}:${
-        provider.imap_port
-      } (${provider.imap_security})</span></div>
-      <div><span class="k">SMTP</span><span class="mono">${escapeHtml(provider.smtp_host)}:${
-        provider.smtp_port
-      } (${provider.smtp_security})</span></div>
+      <div><span class="k">IMAP</span>${endpointCell(
+        provider.imap_host,
+        provider.imap_port,
+        provider.imap_security
+      )}</div>
+      <div><span class="k">SMTP</span>${endpointCell(
+        provider.smtp_host,
+        provider.smtp_port,
+        provider.smtp_security
+      )}</div>
       <div><span class="k">认证</span>${
         provider.auth === 'oauth2'
           ? '<strong>需要 OAuth2</strong>（用下面的按钮登录，或填应用专用密码）'
@@ -3161,7 +3317,11 @@ function openAccountWizard() {
             : '邮箱登录密码'
       }${provider.quirks.needs_id ? '　·　该服务商要求发送 IMAP ID 命令（已内置处理）' : ''}</div>
       <div><span class="k">状态</span>${
-        provider.verified ? '✅ 服务器地址已实测可用' : '⚠️ 尚未实测验证'
+        provider.manual_endpoints
+          ? '由你填写（不适用内置地址验证）'
+          : provider.verified
+            ? '✅ 服务器地址已实测可用'
+            : '⚠️ 尚未实测验证'
       }</div>
       <div><span class="k">登录名</span><span class="mono">${escapeHtml(effectiveLogin)}</span>${
         effectiveLogin.toLowerCase() === email.toLowerCase()
@@ -3207,6 +3367,13 @@ function openAccountWizard() {
   });
   providerSelect.addEventListener('change', updateDetected);
   usernameInput.addEventListener('input', updateDetected);
+  // "Has the user edited this?" is marked once, here, and never inside `updateDetected` — a listener
+  // attached there would be attached again on every keystroke, and the N-th one would win.
+  [imapHostInput, smtpHostInput].forEach((input) => {
+    input.addEventListener('input', () => {
+      input.dataset.touched = '1';
+    });
+  });
   updateDetected();
   // The detected box and the setup note are added above the password field, so the body grew
   // after the dialog opened. Put the scroll position back at the top.

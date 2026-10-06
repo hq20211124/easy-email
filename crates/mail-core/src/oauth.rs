@@ -169,6 +169,13 @@ pub struct OAuthProvider {
     pub auth_endpoint: &'static str,
     pub token_endpoint: &'static str,
     pub scope: &'static str,
+    /// The host to **advertise** in the redirect URI.
+    ///
+    /// Not always the address we bind: Azure's desktop platform accepts `http://localhost` and rejects
+    /// `http://127.0.0.1` (measured 2026-10-04), while Google has been verified against `127.0.0.1`.
+    /// This is only the string the provider is told to send the browser back to — the listening side is
+    /// decided by [`Loopback::bind`], which binds **both** loopback families whenever this is a name.
+    pub redirect_host: &'static str,
     /// Whether Google-style extra parameters should be sent (`access_type=offline`, `prompt=consent`).
     ///
     /// Without them Google hands back an access token and **no** refresh token, and the account works
@@ -186,6 +193,8 @@ pub const GOOGLE: OAuthProvider = OAuthProvider {
     auth_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
     token_endpoint: "https://oauth2.googleapis.com/token",
     scope: "https://mail.google.com/ openid email",
+    // Verified against this literal address (2026-10-04): Google accepts it, so it does not change.
+    redirect_host: "127.0.0.1",
     needs_offline_params: true,
 };
 
@@ -198,6 +207,10 @@ pub const MICROSOFT: OAuthProvider = OAuthProvider {
     auth_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
     token_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
     scope: "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send openid email offline_access",
+    // Azure's desktop platform ignores the port but **refuses `127.0.0.1`** (measured 2026-10-04), so
+    // the registered redirect is `http://localhost`; `Loopback::bind` therefore listens on both
+    // loopback families, because `localhost` can resolve to either one.
+    redirect_host: "localhost",
     needs_offline_params: false,
 };
 
@@ -364,7 +377,7 @@ pub async fn sign_in_as<T: TokenTransport, B: BrowserLauncher>(
         ));
     }
 
-    let loopback = Loopback::bind().await?;
+    let loopback = Loopback::bind(provider.redirect_host).await?;
     let redirect_uri = loopback.redirect_uri.clone();
     let pkce = Pkce::generate()?;
     let state = state()?;
@@ -734,8 +747,9 @@ impl BrowserLauncher for SystemBrowser {
 ///
 /// RFC 8252 (A1-F32/F36) and nothing invented here:
 ///
-/// * **`127.0.0.1`, never `0.0.0.0`.** A wildcard bind would accept the authorization code from the
-///   local network, and the code is a bearer credential for the account.
+/// * **Loopback, never wildcard.** A wildcard bind would accept the authorization code from the
+///   local network, and the code is a bearer credential for the account. Which loopback addresses are
+///   bound is decided by [`Loopback::bind`] from the host the provider was told to use.
 /// * **An ephemeral port**, announced to the provider as part of the redirect URI. There is nothing
 ///   to register per installation, and no fixed port for another local process to sit on first.
 /// * **The `state` is checked before the code is accepted.** A request with the wrong state is
@@ -745,22 +759,38 @@ impl BrowserLauncher for SystemBrowser {
 /// Everything here is synchronous with the browser: the caller opens the browser, then awaits
 /// [`Loopback::wait_for_code`].
 pub struct Loopback {
-    listener: TcpListener,
+    /// One listener per bound address. Two when the advertised host is a name (`localhost`) that can
+    /// resolve to either family: a browser that picks `::1` first must not get "connection refused",
+    /// because that reaches the user as "点了没反应" with nothing on screen to explain it.
+    listeners: Vec<TcpListener>,
     /// Exactly the string to hand the provider, including the trailing slash.
     pub redirect_uri: String,
 }
 
-/// Bind the loopback listener with `SO_EXCLUSIVEADDRUSE`.
+/// The address the redirect listener always binds.
 ///
-/// A1-F36 asks for this one specifically, and it is not the same as `SO_REUSEADDR`: on Windows,
+/// `127.0.0.1`, never `0.0.0.0` — a wildcard bind would accept the authorization code from the local
+/// network, and the code is a bearer credential for the account (A1-F36).
+const PRIMARY_LOOPBACK: &str = "127.0.0.1";
+
+/// Bind one loopback address exclusively.
+///
+/// `SO_EXCLUSIVEADDRUSE` has to be set **before** `bind` (A1-F36), so the socket is built by hand and
+/// converted to a tokio listener afterwards — and that is true for both families, which is why this
+/// takes the address rather than hard-coding one. It is not the same as `SO_REUSEADDR`: on Windows,
 /// `SO_REUSEADDR` **lets** another process bind the same address, which is exactly the race worth
 /// closing — a local process that grabs the port between our bind and the browser's redirect would
-/// receive the authorization code. The option has to be set **before** `bind`, so the socket is built
-/// by hand and converted to a tokio listener afterwards.
-fn bind_exclusive_loopback() -> Result<TcpListener> {
+/// receive the authorization code.
+fn bind_exclusive_loopback_at(address: std::net::SocketAddr) -> Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .map_err(|error| MailError::Config(format!("无法创建监听套接字：{error}")))?;
 
     #[cfg(windows)]
@@ -785,7 +815,6 @@ fn bind_exclusive_loopback() -> Result<TcpListener> {
         }
     }
 
-    let address: std::net::SocketAddr = "127.0.0.1:0".parse().expect("literal address");
     socket
         .bind(&address.into())
         .map_err(|error| MailError::Config(format!("无法监听本机端口：{error}")))?;
@@ -802,19 +831,19 @@ fn bind_exclusive_loopback() -> Result<TcpListener> {
 }
 
 impl Loopback {
-    /// Bind an ephemeral port on loopback and work out the redirect URI.
-    pub async fn bind() -> Result<Loopback> {
-        let listener = bind_exclusive_loopback()?;
-        let port = listener
-            .local_addr()
-            .map_err(|error| MailError::Config(format!("无法读取监听端口：{error}")))?
-            .port();
-        Ok(Loopback {
-            listener,
-            // Google and Microsoft both require the path to be part of the registered URI; `/` is the
-            // one form that works without a custom scheme.
-            redirect_uri: format!("http://127.0.0.1:{port}/"),
-        })
+    /// Bind the redirect listener(s) for a provider whose redirect host is `redirect_host`.
+    ///
+    /// A literal IP is taken at its word: we listen on exactly that address and advertise it.
+    /// A **name** (`localhost`) can resolve to either family, so both loopback addresses are bound on the
+    /// same port. `::1` failing to bind is not an error — a machine with IPv6 loopback disabled still has
+    /// a working IPv4 one — but `127.0.0.1` failing is.
+    pub async fn bind(redirect_host: &str) -> Result<Loopback> {
+        let extra: &[&str] = if redirect_host.parse::<std::net::IpAddr>().is_ok() {
+            &[]
+        } else {
+            &["::1"]
+        };
+        bind_loopback(redirect_host, extra).await
     }
 
     /// Wait for the browser to come back with a code, up to `timeout`.
@@ -824,15 +853,32 @@ impl Loopback {
     pub async fn wait_for_code(self, expected_state: &str, timeout: Duration) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
 
+        // One accept loop per listener, funnelled into a channel: whichever family the browser picks,
+        // the same code path handles it. The loops end by themselves — when this function returns, `rx`
+        // is dropped, the sends fail, and the listeners go with them.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        for listener in self.listeners {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    if tx.send(stream).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(MailError::Timeout(timeout.as_secs()));
             }
 
-            let accepted = tokio::time::timeout(remaining, self.listener.accept()).await;
-            let Ok(Ok((mut stream, _peer))) = accepted else {
-                // The timeout above is the only way this ends without a browser.
+            let accepted = tokio::time::timeout(remaining, rx.recv()).await;
+            let Ok(Some(mut stream)) = accepted else {
+                // `None` means every accept loop ended (no listeners left), which is the same dead end as
+                // the timeout: nothing is coming.
                 return Err(MailError::Timeout(timeout.as_secs()));
             };
 
@@ -879,6 +925,45 @@ impl Loopback {
             let _ = respond(&mut stream, 400, "回调里既没有 code 也没有 error。").await;
         }
     }
+}
+
+/// As [`Loopback::bind`], with extra addresses to *try*.
+///
+/// Private and separate so the tests can exercise the second listener **deterministically** — with
+/// `127.0.0.2`, which is loopback on Windows and needs no IPv6 — instead of a test that quietly does
+/// nothing on a machine where `::1` is unavailable.
+async fn bind_loopback(redirect_host: &str, extra: &[&str]) -> Result<Loopback> {
+    let primary = bind_exclusive_loopback_at(
+        format!("{PRIMARY_LOOPBACK}:0")
+            .parse()
+            .expect("literal address"),
+    )?;
+    let port = primary
+        .local_addr()
+        .map_err(|error| MailError::Config(format!("无法读取监听端口：{error}")))?
+        .port();
+
+    let mut listeners = vec![primary];
+    for address in extra {
+        // Parsed as an IpAddr first, then paired with the port: `SocketAddr`'s Display adds the
+        // brackets IPv6 needs, so `[::1]:port` cannot be assembled by hand and get it wrong.
+        let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let addr = std::net::SocketAddr::new(ip, port);
+        // Not an error: a machine with IPv6 loopback turned off is a normal machine, and the IPv4
+        // listener above already covers the callback.
+        if let Ok(listener) = bind_exclusive_loopback_at(addr) {
+            listeners.push(listener);
+        }
+    }
+
+    Ok(Loopback {
+        listeners,
+        // Google and Microsoft both require the path to be part of the registered URI; `/` is the
+        // one form that works without a custom scheme.
+        redirect_uri: format!("http://{redirect_host}:{port}/"),
+    })
 }
 
 /// The query string of a request line like `GET /?code=x HTTP/1.1`.
@@ -1258,6 +1343,149 @@ mod tests {
         );
     }
 
+    /// The Microsoft contract, checked sentence by sentence against the pages that define it.
+    ///
+    /// This exists because the one thing this path cannot have in CI is a real sign-in. Sources (read
+    /// 2026-10-06):
+    ///
+    /// * [Authenticate an IMAP, POP or SMTP connection using OAuth](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)
+    ///   — the three resource scopes, `offline_access` for a refresh token, and the XOAUTH2 string
+    ///   (including a worked example whose base64 is asserted below, byte for byte).
+    /// * [Microsoft identity platform and OAuth 2.0 authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow)
+    ///   — `common`, PKCE, "**public clients … must not use secrets**", `http://localhost` as the
+    ///   recommended redirect for apps that use the system browser, and `scope` being *optional* on
+    ///   both the redeem and the refresh leg.
+    /// * [Redirect URI restrictions](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)
+    ///   — the port is ignored when matching a localhost redirect (so `http://localhost` registered
+    ///   matches `http://localhost:<ephemeral>/`), and the IPv6 literal is **not** supported, which is
+    ///   why the advertised host is the *name* and why both loopback families are bound.
+    ///
+    /// A real sign-in is still the only thing that can prove the tenant side (consent, SMTP AUTH, the
+    /// account itself). What this pins is that nothing on **our** side of the wire is the reason it
+    /// would fail.
+    #[tokio::test]
+    async fn the_microsoft_flow_matches_the_published_imap_smtp_oauth_contract() {
+        // 1. Authority: the v2 endpoints under `common`, so a personal account and a work account
+        //    reach the same app registration without a per-tenant URL.
+        assert!(
+            MICROSOFT
+                .auth_endpoint
+                .starts_with("https://login.microsoftonline.com/common/oauth2/v2.0/authorize"),
+            "{}",
+            MICROSOFT.auth_endpoint
+        );
+        assert!(
+            MICROSOFT
+                .token_endpoint
+                .starts_with("https://login.microsoftonline.com/common/oauth2/v2.0/token"),
+            "{}",
+            MICROSOFT.token_endpoint
+        );
+
+        // 2. Scope: exactly the documented set. `offline_access` is what makes a refresh token appear
+        //    at all, and the two OIDC scopes are what make the response name the account.
+        for required in [
+            "https://outlook.office.com/IMAP.AccessAsUser.All",
+            "https://outlook.office.com/SMTP.Send",
+            "offline_access",
+            "openid",
+            "email",
+        ] {
+            assert!(
+                MICROSOFT.scope.split_whitespace().any(|s| s == required),
+                "{required} is missing from `{}`",
+                MICROSOFT.scope
+            );
+        }
+
+        // 3. The advertised redirect host is the *name*: the portal refuses `http://127.0.0.1`, and
+        //    the reply-URL page says the `[::1]` literal is not supported.
+        assert_eq!(MICROSOFT.redirect_host, "localhost");
+
+        // 4. The authorization request.
+        let pkce = Pkce::generate().expect("entropy");
+        let redirect = format!("http://{}:51234/", MICROSOFT.redirect_host);
+        let url = authorization_url(MICROSOFT, "client", &redirect, &pkce, "the-state");
+        for expected in [
+            "response_type=code",
+            "code_challenge_method=S256",
+            "client_id=client",
+            "state=the-state",
+            "redirect_uri=http%3A%2F%2Flocalhost%3A51234%2F",
+        ] {
+            assert!(url.contains(expected), "{expected} is missing: {url}");
+        }
+        assert!(
+            !url.contains("prompt=none"),
+            "prompt=none turns a missing session into interaction_required: {url}"
+        );
+        assert!(
+            !url.contains("access_type="),
+            "that is Google's parameter, not Microsoft's: {url}"
+        );
+
+        // 5. Redeeming the code as a public client: the verifier PKCE needs, the same redirect URI,
+        //    and no secret ("public clients must not use secrets or certificates").
+        let fake = Fake::replying(r#"{"access_token":"at","refresh_token":"rt"}"#);
+        exchange_code(
+            &fake,
+            MICROSOFT,
+            "client",
+            None,
+            "the-code",
+            &pkce.verifier,
+            &redirect,
+        )
+        .await
+        .expect("redeem");
+        let form = fake.form(0);
+        assert!(has(&form, "grant_type", "authorization_code"));
+        assert!(has(&form, "code_verifier", &pkce.verifier));
+        assert!(
+            has(&form, "redirect_uri", &redirect),
+            "the token leg must repeat the authorize leg's URI exactly"
+        );
+        assert!(
+            !form.iter().any(|(k, _)| k == "client_secret"),
+            "a public client must not send one: {form:?}"
+        );
+
+        // 6. Refreshing: the documented minimum — and no secret either. `scope` is optional here, so
+        //    its absence is correct rather than an omission.
+        let fake = Fake::replying(r#"{"access_token":"at2","refresh_token":"rt2"}"#);
+        refresh(&fake, MICROSOFT, "client", None, "rt1")
+            .await
+            .expect("refresh");
+        let form = fake.form(0);
+        assert!(has(&form, "grant_type", "refresh_token"));
+        assert!(has(&form, "refresh_token", "rt1"));
+        assert!(has(&form, "client_id", "client"));
+        assert!(
+            !form.iter().any(|(k, _)| k == "client_secret"),
+            "a public client must not send one: {form:?}"
+        );
+
+        // 7. XOAUTH2, against **Microsoft's own worked example** rather than against ourselves: the
+        //    base64 below is the string printed in the IMAP/POP/SMTP OAuth page, and decoding it has
+        //    to give exactly what `imap.rs` puts on the wire.
+        {
+            use base64::Engine as _;
+            let documented = "dXNlcj10ZXN0QGNvbnRvc28ub25taWNyb3NvZnQuY29tAWF1dGg9QmVhcmVy\
+                              IEV3QkFBbDNCQUFVRkZwVUFvN0ozVmUwYmpMQldaV0NjbFJDM0VvQUEBAQ==";
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(documented)
+                .expect("the documentation's own example decodes");
+            assert_eq!(
+                String::from_utf8(decoded).expect("ASCII"),
+                crate::imap::xoauth2_response(
+                    "test@contoso.onmicrosoft.com",
+                    "EwBAAl3BAAUFFpUAo7J3Ve0bjLBWZWCclRC3EoAA"
+                ),
+                "our XOAUTH2 string must be the documented one, byte for byte"
+            );
+        }
+    }
+
     /// A JWT-shaped string with the given claims, and a signature nobody looks at.
     fn id_token_with(claims: &str) -> String {
         use base64::Engine as _;
@@ -1577,7 +1805,7 @@ mod tests {
     #[test]
     fn the_redirect_uri_is_loopback_and_ephemeral() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let loopback = runtime.block_on(Loopback::bind()).expect("bind");
+        let loopback = runtime.block_on(Loopback::bind("127.0.0.1")).expect("bind");
         assert!(
             loopback.redirect_uri.starts_with("http://127.0.0.1:"),
             "never a wildcard bind: the code is a bearer credential ({})",
@@ -1593,7 +1821,7 @@ mod tests {
         // `SO_EXCLUSIVEADDRUSE` is what refuses it. Asserted the only way it can be: try to take it.
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let loopback = Loopback::bind().await.expect("bind");
+            let loopback = Loopback::bind("127.0.0.1").await.expect("bind");
             let port = loopback
                 .redirect_uri
                 .trim_start_matches("http://127.0.0.1:")
@@ -1613,7 +1841,7 @@ mod tests {
     fn a_matching_state_yields_the_code_and_a_stray_request_does_not_cancel_it() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let loopback = Loopback::bind().await.expect("bind");
+            let loopback = Loopback::bind("127.0.0.1").await.expect("bind");
             let redirect = loopback.redirect_uri.clone();
             let waiting =
                 tokio::spawn(
@@ -1644,7 +1872,7 @@ mod tests {
     fn a_code_with_escaped_characters_survives_the_callback() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let loopback = Loopback::bind().await.expect("bind");
+            let loopback = Loopback::bind("127.0.0.1").await.expect("bind");
             let redirect = loopback.redirect_uri.clone();
             let waiting =
                 tokio::spawn(async move { loopback.wait_for_code("s", TEST_TIMEOUT).await });
@@ -1660,7 +1888,7 @@ mod tests {
     fn the_user_pressing_cancel_is_reported_as_a_cancel_not_a_failure() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let loopback = Loopback::bind().await.expect("bind");
+            let loopback = Loopback::bind("127.0.0.1").await.expect("bind");
             let redirect = loopback.redirect_uri.clone();
             let waiting =
                 tokio::spawn(async move { loopback.wait_for_code("s", TEST_TIMEOUT).await });
@@ -1681,13 +1909,110 @@ mod tests {
     fn no_browser_at_all_times_out_instead_of_hanging_forever() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            let loopback = Loopback::bind().await.expect("bind");
+            let loopback = Loopback::bind("127.0.0.1").await.expect("bind");
             let error = loopback
                 .wait_for_code("s", Duration::from_millis(120))
                 .await
                 .expect_err("nobody connected");
             assert!(matches!(error, MailError::Timeout(_)), "{error:?}");
         });
+    }
+
+    // ---------------------------------------------------------------- which host, which family
+
+    /// Azure refuses `http://127.0.0.1` and Google was verified against it, so the host a provider is
+    /// *told* to use is per-provider data — this pins it, because a uniform "just use 127.0.0.1"
+    /// refactor would silently break the Microsoft sign-in at the last step, in the browser.
+    #[test]
+    fn the_redirect_host_is_what_each_provider_was_told_to_use() {
+        assert_eq!(GOOGLE.redirect_host, "127.0.0.1");
+        assert_eq!(MICROSOFT.redirect_host, "localhost");
+
+        // And the string that goes on the wire is the caller's, built from that host: the authorization
+        // URL does not rewrite it, so the host chosen here is the host the browser is sent back to.
+        let redirect_uri = format!("http://{}:51234/", MICROSOFT.redirect_host);
+        let pkce = Pkce::generate().expect("pkce");
+        let url = authorization_url(MICROSOFT, "client", &redirect_uri, &pkce, "state");
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A51234%2F"),
+            "the provider must be told the same host we listen on: {url}"
+        );
+    }
+
+    /// `localhost` can resolve to either family, and the IPv6-first failure mode has no symptom on
+    /// screen — the browser just gets "connection refused" and the user sees a wizard that does
+    /// nothing. So both are bound wherever both exist.
+    ///
+    /// "Wherever both exist" is checked, not assumed: a machine with IPv6 loopback switched off is a
+    /// normal machine and must not fail this. The test asks the OS itself first (can a `::1` listener
+    /// be opened at all?) and only then requires our listener to be on it, which is what makes the
+    /// dual-binding falsifiable here instead of decorative.
+    #[test]
+    fn a_name_host_binds_both_loopback_families() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            // Probed on its own ephemeral port and dropped: this only answers "does this machine have a
+            // working IPv6 loopback", which is exactly the precondition the assertion below needs.
+            let ipv6_available = tokio::net::TcpListener::bind("[::1]:0").await.is_ok();
+
+            let loopback = Loopback::bind("localhost").await.expect("bind");
+            let port = redirect_port(&loopback.redirect_uri);
+
+            let v4 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+            assert!(
+                v4.is_ok(),
+                "IPv4 loopback is mandatory — a machine may have no IPv6 at all"
+            );
+
+            if !ipv6_available {
+                println!("this machine has no IPv6 loopback; the ::1 listener is not required here");
+                return;
+            }
+            let v6 = tokio::net::TcpStream::connect(("::1", port)).await;
+            assert!(
+                v6.is_ok(),
+                "this machine does have IPv6 loopback, so a browser that resolves `localhost` to ::1 \
+                 must not be refused — that failure looks like the button doing nothing: {v6:?}"
+            );
+        });
+    }
+
+    /// The second listener is a real accept loop, not decoration.
+    ///
+    /// `127.0.0.2` rather than `::1` on purpose: the whole 127/8 block is loopback on Windows and
+    /// needs no IPv6, so this proves the fan-in works on every machine the suite runs on.
+    #[test]
+    fn the_second_listener_serves_the_same_callback() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let loopback = bind_loopback("localhost", &["127.0.0.2"])
+                .await
+                .expect("bind");
+            let port = redirect_port(&loopback.redirect_uri);
+            let waiting =
+                tokio::spawn(async move { loopback.wait_for_code("s", TEST_TIMEOUT).await });
+
+            // Only the *second* listener can answer this: nothing is listening on the primary address,
+            // and the browser is not using it.
+            let response = browser_gets(
+                &format!("http://127.0.0.2:{port}/"),
+                "/?state=s&code=second",
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert_eq!(waiting.await.expect("join").expect("code"), "second");
+        });
+    }
+
+    /// The ephemeral port out of a redirect URI the way the tests above need it.
+    fn redirect_port(redirect_uri: &str) -> u16 {
+        redirect_uri
+            .rsplit_once(':')
+            .expect("a redirect URI carries a port")
+            .1
+            .trim_end_matches('/')
+            .parse()
+            .expect("port")
     }
 
     // ---------------------------------------------------------------- the real transport

@@ -85,6 +85,12 @@ pub struct Provider {
     pub setup_note: &'static str,
     /// Deep link to the page where the credential is generated.
     pub enable_url: &'static str,
+    /// True when the servers are the user's to fill in rather than ours to know.
+    ///
+    /// The renderer shows the manual endpoint block from **this flag**, never from a provider id:
+    /// a list of ids in the renderer is what `design/05` §10.1 exists to prevent, and "which
+    /// providers need hand-entered servers" is exactly the kind of fact that belongs next to the table.
+    pub manual_endpoints: bool,
     /// Whether the endpoint data has been confirmed against the live service.
     ///
     /// Confirmed means: TCP connect succeeded, the TLS mode matched, and the server greeted us
@@ -206,6 +212,7 @@ pub const PROVIDERS: &[Provider] = &[
                      解决：在下方「登录用户名」里填你的 QQ 号邮箱（例如 123456@qq.com），\
                      「邮箱地址」一栏仍然填别名。这样用 QQ 号登录，发信身份还是别名。",
         enable_url: "https://service.mail.qq.com/detail/0/75",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -226,6 +233,7 @@ pub const PROVIDERS: &[Provider] = &[
                      然后设置「客户端授权密码」。请把授权密码填到本应用的密码框里。\
                      网易邮箱要求客户端先发送 IMAP ID 命令，本应用已自动处理。",
         enable_url: "https://mail.163.com/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -245,6 +253,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "与 163 邮箱相同：在网页版「设置 → POP3/SMTP/IMAP」开启服务并设置\
                      「客户端授权密码」，然后填入本应用的密码框。",
         enable_url: "https://mail.126.com/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -263,6 +272,7 @@ pub const PROVIDERS: &[Provider] = &[
         quirks: Quirks::NETEASE,
         setup_note: "与 163 邮箱相同：开启 IMAP/SMTP 服务并设置客户端授权密码。",
         enable_url: "https://mail.yeah.net/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -283,6 +293,7 @@ pub const PROVIDERS: &[Provider] = &[
                      密码通常就是邮箱登录密码；若管理员开启了安全策略，\
                      请在网页版「设置 → 客户端」中生成专用密码。",
         enable_url: "https://exmail.qq.com/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -303,6 +314,7 @@ pub const PROVIDERS: &[Provider] = &[
                      管理员需在后台为账号开启 IMAP/SMTP，密码为邮箱登录密码。\
                      本应用会自动发送网易要求的 ID 命令。",
         enable_url: "https://qiye.163.com/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -322,6 +334,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "在阿里邮箱网页版「设置 → 账户」中确认已开启 IMAP/SMTP 服务，\
                      密码为邮箱登录密码。",
         enable_url: "https://mail.aliyun.com/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -341,6 +354,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "阿里企业邮使用自有域名，服务器地址固定为 imap/smtp.qiye.aliyun.com。\
                      密码为邮箱登录密码。",
         enable_url: "https://qiye.aliyun.com/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -360,6 +374,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "在新浪邮箱网页版「设置 → 客户端 POP/IMAP/SMTP」中开启 IMAP/SMTP 服务，\
                      密码为邮箱登录密码。",
         enable_url: "https://mail.sina.com.cn/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -379,6 +394,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "139 邮箱使用手机号加 @139.com 作为地址。\
                      请在网页版「设置 → 账户」中开启 IMAP/SMTP，密码为邮箱登录密码。",
         enable_url: "https://mail.10086.cn/",
+        manual_endpoints: false,
         verified: true,
     },
     // ---------------------------------------------------------------- 国际
@@ -400,6 +416,7 @@ pub const PROVIDERS: &[Provider] = &[
                      再到「应用专用密码」页面生成一个 16 位密码，填到本应用的密码框。\
                      直接使用 Google 账号密码会认证失败。",
         enable_url: "https://myaccount.google.com/apppasswords",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -425,10 +442,17 @@ pub const PROVIDERS: &[Provider] = &[
         quirks: Quirks::STANDARD,
         setup_note: "微软已于 2024 年 9 月彻底关闭个人账号的基本认证，IMAP/SMTP 现在只能使用 \
                      OAuth2 授权登录。本程序支持这条路：微软没有公开可借的应用注册，需要你先到 \
-                     Azure 门户注册一个应用（类型选「移动和桌面应用程序」），把它下载到的客户端 \
-                     ID 填进向导「高级」里，再点「打开浏览器登录」。\
+                     Azure 门户（portal.azure.com → Microsoft Entra ID → 应用注册 → 新注册）\
+                     注册一个应用：名称随意（会显示在授权页上）；「受支持的帐户类型」选 \
+                     「任何组织目录中的帐户和个人 Microsoft 帐户」（个人 outlook.com 和单位 \
+                     M365 都要能登）；「重定向 URI」平台选「移动和桌面应用程序」，地址填 \
+                     http://localhost（端口不用写，Azure 对桌面平台忽略端口，而且它不接受 \
+                     http://127.0.0.1）。**不需要客户端密码** —— 桌面应用是公共客户端，用的是 \
+                     PKCE。注册完把「应用程序(客户端) ID」填进向导「高级」里，密钥留空，\
+                     再点「打开浏览器登录」。\
                      这条路尚未在真实 Outlook 账号上走通过 —— 如果卡住，请把浏览器里的原文发来。",
         enable_url: "https://support.microsoft.com/account-billing",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -448,6 +472,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "Yahoo 要求使用「应用密码」：登录 Yahoo 账号安全设置，生成应用密码后\
                      填到本应用的密码框。",
         enable_url: "https://login.yahoo.com/account/security",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -467,6 +492,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "Apple 要求使用「App 专用密码」：在 Apple 账户的「登录与安全」中生成，\
                      然后填到本应用的密码框。请使用 @icloud.com 主地址登录。",
         enable_url: "https://account.apple.com/account/manage",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -485,6 +511,7 @@ pub const PROVIDERS: &[Provider] = &[
         quirks: Quirks::STANDARD,
         setup_note: "Zoho 建议使用「应用专用密码」：账号设置 → 安全 → App Passwords 中生成。",
         enable_url: "https://accounts.zoho.com/home#security/app_passwords",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -504,6 +531,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "在 Yandex ID 的「安全 → 应用密码」中生成专用密码，\
                      并确认邮箱设置中已开启 IMAP。",
         enable_url: "https://id.yandex.com/security/app-passwords",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -522,6 +550,7 @@ pub const PROVIDERS: &[Provider] = &[
         quirks: Quirks::STANDARD,
         setup_note: "与 Yahoo 同属一家，同样要求生成「应用密码」后使用。",
         enable_url: "https://login.aol.com/account/security",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -540,6 +569,7 @@ pub const PROVIDERS: &[Provider] = &[
         quirks: Quirks::STANDARD,
         setup_note: "在 GMX 网页版「设置 → POP3/IMAP」中开启 IMAP 访问，密码为登录密码。",
         enable_url: "https://www.gmx.com/",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -559,6 +589,7 @@ pub const PROVIDERS: &[Provider] = &[
         setup_note: "Fastmail 必须使用「App Password」：设置 → 隐私与安全 → App Passwords，\
                      生成时勾选 IMAP 与 SMTP 权限。",
         enable_url: "https://app.fastmail.com/settings/security/apppasswords",
+        manual_endpoints: false,
         verified: true,
     },
     Provider {
@@ -580,6 +611,7 @@ pub const PROVIDERS: &[Provider] = &[
                      密码请使用 Bridge 界面中显示的专用密码（不是 Proton 账号密码）。",
         enable_url: "https://proton.me/mail/bridge",
         // Localhost, so it cannot be checked from CI or from a machine without Bridge running.
+        manual_endpoints: false,
         verified: false,
     },
     Provider {
@@ -600,6 +632,33 @@ pub const PROVIDERS: &[Provider] = &[
                      因此任何第三方邮件客户端都无法连接它。",
         enable_url: "https://tuta.com/",
         // No IMAP endpoint exists, so there is nothing to verify.
+        manual_endpoints: false,
+        verified: false,
+    },
+    Provider {
+        id: "custom",
+        display_name: "自定义 / 自建服务器",
+        // No domains: a custom server is never auto-detected, and pretending to guess one would
+        // silently pick the wrong provider for every unknown address.
+        domains: &[],
+        region: Region::Global,
+        imap_host: "",
+        // The defaults the wizard prefills: what nearly every server uses. They are not a claim about
+        // any particular server — the user is expected to change them.
+        imap_port: 993,
+        imap_security: Ssl,
+        smtp_host: "",
+        smtp_port: 465,
+        smtp_security: Ssl,
+        auth: Password,
+        supports_imap: true,
+        quirks: Quirks::STANDARD,
+        setup_note: "自建或表外的服务器：请按服务商文档填写 IMAP/SMTP 主机、端口与加密方式。\
+                     绝大多数服务器 IMAP 用 993(SSL)，SMTP 用 465(SSL) 或 587(STARTTLS)。\
+                     地址填错会连不上，报告里会给出服务器原话。",
+        // Unused by the renderer today; empty rather than a dead link.
+        enable_url: "",
+        manual_endpoints: true,
         verified: false,
     },
 ];
@@ -717,6 +776,9 @@ mod tests {
             ("fastmail", AuthKind::AppPassword),
             ("proton", AuthKind::Password),
             ("tutanota", AuthKind::OAuth2),
+            // The manual layer's row (`design/05` §1.4): a password account with no endpoints of its
+            // own, so it is last and it never wins the auto-detection.
+            ("custom", AuthKind::Password),
         ];
 
         let actual: Vec<(&str, AuthKind)> = all()
@@ -726,6 +788,30 @@ mod tests {
         assert_eq!(
             actual, expected,
             "the auth dispatch changed; update this snapshot deliberately"
+        );
+    }
+
+    #[test]
+    fn only_the_custom_provider_takes_hand_entered_servers() {
+        let manual: Vec<&str> = all()
+            .iter()
+            .filter(|p| p.manual_endpoints)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(
+            manual,
+            ["custom"],
+            "exactly one row may ask the user for its servers — the renderer shows the manual block \
+             from this flag, and a second one would change the wizard without changing this list"
+        );
+
+        // And it must stay at the end of the table, because the wizard's provider dropdown is built
+        // in table order and the first entry is what an unknown address falls back to: a blank row
+        // must never be the default choice.
+        assert_eq!(
+            all().last().expect("a table").id,
+            "custom",
+            "the manual row belongs last, so it is never the default selection"
         );
     }
 
@@ -843,7 +929,10 @@ mod tests {
                 "{} needs a real setup note, not a placeholder",
                 p.id
             );
-            if p.supports_imap {
+            // `custom` is the one row whose hosts are deliberately blank: they are the user's to
+            // fill in, and the wizard pre-fills 993/465 with something to overwrite. Requiring a host
+            // here would mean inventing one.
+            if p.supports_imap && !p.manual_endpoints {
                 assert!(!p.imap_host.is_empty(), "{} has no IMAP host", p.id);
                 assert!(p.imap_port != 0, "{} has no IMAP port", p.id);
                 assert!(!p.smtp_host.is_empty(), "{} has no SMTP host", p.id);

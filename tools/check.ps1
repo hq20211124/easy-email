@@ -273,6 +273,25 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'the wizard decides what a failed connection test means' {
+        # The verdict on a failed probe used to live inside `openAccountWizard`'s closure, where three
+        # separate bugs were fixed one at a time (M1a-69 "network silence is not a failure", M1a-82
+        # "an OAuth address that was never authorized must not be saved", and the Microsoft 365
+        # "receiving works, sending is refused" case) with no way to test the order of the checks
+        # except by clicking through the dialog. It is a pure function now, and this pins it.
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/wizard_verdict_test.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'the wizard would save or refuse an account for the wrong reason' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'every id the stylesheet styles still exists' {
         # A layout broke exactly here (M1a-67): the three-column grid moved back to `#app`, the wrapper
         # element was deleted, and `#shell { grid-template-columns: … }` stayed behind. CSS happily

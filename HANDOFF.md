@@ -21,10 +21,12 @@
 
 前端语法（`src/*.js` + `tools/*.mjs`）→ index.html 引用的资源是否真的存在 → 前端 id 引用 → 正文默认仍然拦截远程图片
 → 正文的宽度规则仍然放过百分比布局 → 本地搜索仍然用能搜中文的分词器 → **前端调的每个命令都已定义且已注册**
-→ `fmt` → `clippy -D warnings` → `cargo build`（抓 linker 警告，clippy 看不到）→ `cargo test`
-→ **exe 的 PE 头 Subsystem 必须是 2**（GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**
-（CDP 探针要用，但留下等于把 webview 交给任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
-目前 **19 步全绿**、**297 passed**（+4 ignored，见 `tools/check.ps1`）。
+→ **会话分组** → **向导对"验证没过"的判决**（`tools/wizard_verdict_test.mjs`）→ 样式表的 id 必须存在
+→ auth 轴三条承诺 → 安装包配置 → `fmt` → `clippy -D warnings` → `cargo build`（抓 linker 警告，clippy 看不到）
+→ `cargo test` → **负载契约**（`payload_keys.mjs`，含 `EndpointOverride`）→ **exe 的 PE 头 Subsystem 必须是 2**
+（GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**（CDP 探针要用，但留下等于把 webview 交给
+任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
+目前 **21 步全绿**（离线）、**321 passed**（+5 ignored，见 `tools/check.ps1`）。
 加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。
 
 改任何东西后跑它。加新 crate 依赖后也要跑，因为 `cargo build` 那一步会抓 MSVC linker 警告
@@ -112,6 +114,12 @@
   应用自己的 JS 碰不到它，只有 CDP 不受同源策略限制。
   **用之前要临时把 `--remote-debugging-port=9222` 加回 `additionalBrowserArgs` 并重新构建，
   验完必须删掉**（那个端口任何本机进程都能驱动 webview）。
+  **加的位置有讲究（这次踩了一次）**：`additionalBrowserArgs` 是**空格分隔**的命令行串，
+  而 `--disable-features` 的**值**才是逗号分隔的。把 `,--remote-debugging-port=9222` 接在那个值的末尾，
+  等于把它塞进了特性列表：构建成功、应用照常启动、端口**不开**，而且没有任何报错。
+  正确写法（也是历史提交里的写法）：
+  `"--remote-debugging-port=9222 --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication"`。
+  另外**先 `Stop-Process easy-email` 再启动**：正在跑的旧进程没有这个端口，而且看起来"应用明明是开着的"。
 
 ## 4. 工作方式（用户明确表达过）
 
@@ -201,10 +209,24 @@
 - **`cache.db` 的索引必须建在 `add_column_if_missing` 之后。** v2 老库到达迁移时 `messages` 表根本没有
   `thread_key` 列，把索引写进同一个 schema 批次会让 `Cache::open` 直接失败（`no such column`），
   连带两条迁移测试一起红 —— 已证伪过，别"整理"成一批。
+- **Microsoft 的回调主机名固定 `localhost`，监听端**两个族都绑**（`127.0.0.1` + `::1`）。**
+  用户 2026-10-04 实测 **Azure 拒绝 `http://127.0.0.1`**，所以回调主机名只能是 `localhost`；
+  而 `localhost` 在 Windows 上可能先解析到 `::1`，只绑 IPv4 时"浏览器会不会回退"不是我们能保证的事，
+  它失败的样子正好是"点了没反应"。**不要**为了"简化"退回单个 listener，也**不要**改成 `0.0.0.0`/`::`
+  —— 通配绑定会让同网段的机器把授权码送到我们手上（A1-F36）。`SO_EXCLUSIVEADDRUSE` 两个族都设。
+- **自定义服务器只做"手动"这一层，自动发现不做。** 域名 autoconfig / ISPDB / DNS SRV / Autodiscover
+  都要向第三方发出**用户的域名**（`design/05` §11 反驳 5），而且需要网络层的额外工作；手动层就能覆盖
+  自建邮局与表外服务商。要加的时候，入口是 `providers.rs` 里那一行与 `EndpointOverride`。
+- **端点规则（清洗、端口、加密）的唯一出处是 Rust**（`normalise_host` / `validate_endpoint` /
+  `endpoint_advisory`），前端**刻意不抄一份**：`save_account` 在本地、往返是毫秒级，
+  抄一份就是第二个会写错的地方。加密选项列表也由 `endpoint_choices` 命令下发（线格式是 serde 的拼写），
+  渲染层不硬编码 `ssl`/`start_tls`/`plain`。
+- **校验必须在 `save_account` 里最先做**（写凭据与写 `accounts.json` 之前）。这不是风格：
+  半创建的账号要靠"关掉对话框"来清理，而一个改了字段再重试的用户**本来就不该创建过它**。
 
 ## 6. 已经验到什么程度
 
-**已验证**：**297 个测试**（+4 ignored）；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
+**已验证**：**321 个测试**（+5 ignored）；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
 
 **Gmail（2026-10-04）：认证轴第一次在真实 Google 端点上跑通，而且收信也通了。**
 `realuser@gmail.com` —— OAuth 授权 → 刷新令牌 DPAPI 落盘 → **INBOX 实收 289 封**
@@ -269,16 +291,41 @@ surface 回到原位。`cache.db` v3 → v4 的迁移**在真实库上实做过*
    —— `needs_id_command` 目前只有 loopback 假服务器验过，没对着真网易服务器验过。
    服务商表里的 `verified: true` 指的是**服务器地址**实测过（40 个端点的 TCP+TLS+问候语），
    **不是**"登录实测过"；这两个差别很大，别把前者当成后者。
-2. **Outlook / Microsoft 365 的 OAuth 路径没走过**：代码就绪（Microsoft 端点、scope、XOAUTH2 都在），
-   `setup_note` 已改成指向它，但没有真实 Outlook 账号试过；用它还需要用户自己在 Azure 注册一个应用。
+2. **Outlook / Microsoft 365 的 OAuth 路径没走过**：代码与三个缺口都补齐了（M365 关 SMTP AUTH 的专门文案、
+   `smtp_auth_rejected`、`localhost` 双绑定回环、Azure 步骤写进 `setup_note`），Microsoft 令牌端点也实测可达
+   （`--ignored` 测试 3.7 秒拿到服务商答复），**2026-10-06 又按官方文档逐条核对了整条契约并钉进测试**
+   （`the_microsoft_flow_matches_the_published_imap_smtp_oauth_contract`：三个资源 scope、`offline_access`、
+   `common` + v2 端点、PKCE S256、公共客户端不带 secret、`http://localhost` 与"忽略端口"、
+   以及**用微软文档里那个 XOAUTH2 示例的 base64 做逐字节比对**），但**仍然没有真实 Outlook 账号走完过一遍**。
+   **卡在哪（别再重新诊断一遍）**：用户 2026-10-06 去注册应用时被 **Azure 门户自己的登录**挡住，报
+   `AADSTS16000 … 用户帐户在租户"Microsoft Services"中不存在 … 应用 74658136-14ec-4630-ad9b-26e160ff0fc6`。
+   那个 GUID 是 **`ADIbizaUX` = Azure 门户自己**的客户端（Ibiza 是门户的内部代号），报错来自**门户的登录层**，
+   **与 Easy Email 无关**：含义是"登录用的账号不是该目录的成员 / 目录选错了 / 会话里是别的账号"。
+   修法：用创建该目录的那个账号登录、门户右上角切对目录、或用 InPrivate 重登。**它不需要改我们任何代码。**
+   步骤与预期输出见 README 的「真实账号手工验证」。
 3. **`tauri build` 打成 NSIS 安装包没验过**，只验了 `cargo build` + 直接运行 exe。
 4. **`@foxmail.com` 别名**：QQ 号地址能登录，同一授权码下 foxmail 别名被拒。
    已加了「登录用户名」覆盖字段来应对，但**没有实测确认**哪种填法能通。
    如果以后能拿到一个 foxmail 别名账号，这是第一件该验的事。
-5. **没有"自定义服务器"入口**：向导只能从服务商表里选，自建邮局（Postfix/Dovecot）现在还连不上。
-   `design/05` 里有这个东西，属于没做，不是做不了。
+5. ~~**没有"自定义服务器"入口**~~ **已做**（M1a-87）：向导里可选「自定义 / 自建服务器」，
+   主机/端口/加密方式手填，规则全在 Rust（`normalise_host` / `validate_endpoint`），
+   真机探针四件事全过（`tools/probe-custom-server.mjs`）。**但没对着真实自建服务器登录过一次** ——
+   `127.0.0.1` 与假地址验证的是"错的输入被正确拒绝"，不是"对的输入能连上"。
 
-## 7. 下一步（用户已选定三件，①② 已完成）
+## 7. 下一步（用户已选定三件，①②③ 已完成）
+
+### ④ 真实账号验证的三件小事 —— 都在等外部条件
+按"成本最低 × 唯一未被真实服务商检验过"排序：
+
+1. **Outlook 真机登录**（M1a-88 把代码与三个缺口补齐了）：需要用户自己在 Azure 注册一个应用，
+   步骤与预期输出逐条写在 README 的「真实账号手工验证」。**这是唯一还没被真实服务商检验过的认证分支。**
+2. **163/126 的真实登录**（`ID` 命令那条路）：成本极低，只需要一个网易授权码。
+3. **自建服务器真机登录**（M1a-87 做了入口）：需要一个真实的 Postfix/Dovecot 之类。
+
+### ⑤ 明确不做 / 留给下一轮
+自动发现（autoconfig / ISPDB / SRV / Autodiscover）；"这个服务器不提供 SMTP"的开关
+（只收信的自建账号现在还加不进来）；自定义账号的配额与大小上限（表里没有数）；
+M365 的**管理员同意**（企业租户可能需要 `prompt=admin_consent` 或租户专属端点）。
 
 ### ① SQLite 本地缓存 + FTS5 全文搜索 —— ✅ 已完成（2026-10-02）
 `cache.rs` / `sync.rs` / `imap.rs` 的三个取件原语 / Tauri 命令 / 前端搜索框，真实账号验过。

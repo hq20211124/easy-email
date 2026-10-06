@@ -24,7 +24,7 @@ use mail_core::{
     ConnectionReport, DraftMirrorReport, FilingReport, FilingRun, MailError, MailboxInfo,
     MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun, OutgoingAttachment,
     OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit, SentCopy, Spool,
-    SyncDriver, SyncOutcome, SyncWindow, account_with_login, backfill_older, ensure_sent_copy,
+    SyncDriver, SyncOutcome, SyncWindow, account_with_endpoints, backfill_older, ensure_sent_copy,
     file_sent_copies, file_sha256, fill_thread_keys, prepare_attachments, recover_in_flight,
     run_due, secret, smtp,
     userdb::{Draft, DraftMirror, UserStore},
@@ -222,10 +222,63 @@ fn build_account(
     display_name: String,
     username: Option<String>,
 ) -> Result<AccountConfig, String> {
-    account_with_login(&provider_id, &email, &display_name, username.as_deref()).map_err(describe)
+    // No endpoints: this only ever previews a provider whose servers the table knows. A `custom`
+    // account has nothing to preview until the user has typed something, and `account_with_endpoints`
+    // says so instead of guessing.
+    account_with_endpoints(
+        &provider_id,
+        &email,
+        &display_name,
+        username.as_deref(),
+        None,
+    )
+    .map_err(describe)
 }
 
 // ---------------------------------------------------------------- accounts
+
+/// The security choices the wizard offers, and the defaults for a new custom account.
+///
+/// A command rather than three constants in the renderer: the value that travels the wire is serde's
+/// spelling of `Security`, and a second copy of it in JavaScript would keep looking right after a
+/// rename and fail only at the moment a user picked that option.
+#[derive(serde::Serialize)]
+struct EndpointChoices {
+    securities: Vec<SecurityChoice>,
+    /// `custom`'s own row: the ports/security a new account starts from, so the defaults live in the
+    /// provider table and not in a second place.
+    default_imap_port: u16,
+    default_imap_security: mail_core::Security,
+    default_smtp_port: u16,
+    default_smtp_security: mail_core::Security,
+}
+
+#[derive(serde::Serialize)]
+struct SecurityChoice {
+    value: mail_core::Security,
+    label: &'static str,
+    hint: &'static str,
+}
+
+#[tauri::command]
+fn endpoint_choices() -> Result<EndpointChoices, String> {
+    let custom = mail_core::providers::by_id("custom")
+        .ok_or_else(|| "服务商表里没有 custom 这一项".to_string())?;
+    Ok(EndpointChoices {
+        securities: mail_core::Security::ALL
+            .iter()
+            .map(|s| SecurityChoice {
+                value: *s,
+                label: s.label(),
+                hint: s.hint(),
+            })
+            .collect(),
+        default_imap_port: custom.imap_port,
+        default_imap_security: custom.imap_security,
+        default_smtp_port: custom.smtp_port,
+        default_smtp_security: custom.smtp_security,
+    })
+}
 
 #[tauri::command]
 fn list_accounts(state: State<'_, AppState>) -> Vec<AccountConfig> {
@@ -233,6 +286,10 @@ fn list_accounts(state: State<'_, AppState>) -> Vec<AccountConfig> {
 }
 
 /// Add or update an account and stash the credential in the Windows Credential Manager.
+// Every parameter is one field of the wizard and one argument name on the wire (Tauri maps them
+// straight through), so bundling them into a struct would only rename the contract the renderer
+// sends — and `endpoints` is the one that is genuinely optional.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn save_account(
     state: State<'_, AppState>,
@@ -242,9 +299,19 @@ async fn save_account(
     display_name: String,
     password: String,
     username: Option<String>,
+    endpoints: Option<mail_core::model::EndpointOverride>,
 ) -> Result<AccountConfig, String> {
-    let mut cfg = account_with_login(&provider_id, &email, &display_name, username.as_deref())
-        .map_err(describe)?;
+    // FIRST, before the credential is written and before the account file is touched: a bad host must
+    // not leave a half-created account behind. (`closeModal` would delete it, but only if the dialog
+    // is closed — a user who fixes the field and retries should never have created one.)
+    let mut cfg = account_with_endpoints(
+        &provider_id,
+        &email,
+        &display_name,
+        username.as_deref(),
+        endpoints.as_ref(),
+    )
+    .map_err(describe)?;
 
     // An account whose registration is already stored was signed in with OAuth a moment ago (the
     // wizard does that before saving). Marking it here — rather than asking the frontend to say so —
@@ -2531,6 +2598,7 @@ pub fn run() {
             list_providers,
             suggest_provider,
             build_account,
+            endpoint_choices,
             list_accounts,
             save_account,
             delete_account,

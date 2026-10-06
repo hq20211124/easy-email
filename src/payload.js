@@ -124,10 +124,23 @@
     return `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   }
 
+  /** `EndpointOverride` — crates/mail-core/src/model.rs. Hand-entered servers for a custom account. */
+  function endpointOverride(fields) {
+    return {
+      imap_host: fields.imapHost ?? '',
+      imap_port: fields.imapPort ?? 0,
+      imap_security: fields.imapSecurity ?? 'ssl',
+      smtp_host: fields.smtpHost ?? '',
+      smtp_port: fields.smtpPort ?? 0,
+      smtp_security: fields.smtpSecurity ?? 'ssl',
+    };
+  }
+
   global.__easyEmailPayload = {
     attachment,
     outgoingMail,
     draft,
+    endpointOverride,
     serializeAttachments,
     parseAttachments,
     newDraftId,

@@ -115,6 +115,8 @@ pub enum AuthHint {
     NeteaseNeedsId,
     /// QQ / Foxmail rejects the login and lists its own possible causes, including rate limiting.
     QqLoginRejected,
+    /// The tenant turned SMTP AUTH off. Receiving works; sending cannot, until an admin changes it.
+    SmtpAuthDisabled,
     Unknown,
 }
 
@@ -149,6 +151,11 @@ impl AuthHint {
                  ③ 如果刚才已经连续失败了好几次，QQ 会临时限制登录 —— 等 10~15 分钟再试，\
                  这期间反复重试只会延长限制。\n\
                  QQ 的帮助页地址在上面的服务器原文里。"
+            }
+            AuthHint::SmtpAuthDisabled => {
+                "这个账号所在的 Microsoft 365 组织关闭了 SMTP AUTH，所以只能收信、不能发信。\
+                 需要在 Microsoft 365 管理中心为这个账号（或整个组织）开启 SMTP AUTH，\
+                 或者改用别的发信方式。收信不受影响。"
             }
             AuthHint::Unknown => {
                 "认证被拒绝。请确认：1) 账号填写的是完整邮箱地址；\
@@ -269,6 +276,22 @@ impl MailError {
             || lower.contains("username and password not accepted")
             || lower.contains("invalid credentials")
             || lower.contains("5.7.8");
+
+        // Before the generic authentication branch: this is also a 535, and the advice for it is the
+        // opposite of "generate an app password" — a Microsoft 365 tenant has no such thing, and telling
+        // the user to look for one sends them after a setting that does not exist (design/01 P2b).
+        if lower.contains("smtpclientauthentication is disabled")
+            || lower.contains("5.7.139")
+            // 5.7.60: the mailbox may not send as this sender — the same family of tenant policy.
+            || lower.contains("does not have permissions to send as this sender")
+            || (lower.contains("smtp auth") && lower.contains("disabled"))
+        {
+            return MailError::Auth {
+                server: "SMTP".to_string(),
+                raw,
+                hint: AuthHint::SmtpAuthDisabled,
+            };
+        }
 
         if auth_related {
             return MailError::Auth {
@@ -398,6 +421,44 @@ mod tests {
             panic!("expected auth error");
         };
         assert_eq!(*hint, AuthHint::NeteaseNeedsId);
+    }
+
+    #[test]
+    fn a_tenant_that_disabled_smtp_auth_is_told_so_not_told_to_find_an_app_password() {
+        // Microsoft 365's real sentence. It is a 535, so the generic authentication branch would
+        // otherwise catch it and send the user looking for an app password that does not exist.
+        let error = MailError::classify_smtp(
+            "535 5.7.139 Authentication unsuccessful, SmtpClientAuthentication is disabled for the Tenant.",
+        );
+        let MailError::Auth { hint, .. } = &error else {
+            panic!("expected an auth error");
+        };
+        assert_eq!(*hint, AuthHint::SmtpAuthDisabled);
+        // The regression this test exists to prevent:
+        assert_ne!(*hint, AuthHint::UseAppPassword);
+        let text = error.user_hint().expect("hint");
+        assert!(text.contains("SMTP AUTH"), "got: {text}");
+        assert!(!text.contains("授权码"), "got: {text}");
+    }
+
+    #[test]
+    fn sending_as_another_sender_also_points_at_the_tenant_policy() {
+        let error = MailError::classify_smtp(
+            "550 5.7.60 SMTP; Client does not have permissions to send as this sender",
+        );
+        let MailError::Auth { hint, .. } = &error else {
+            panic!("expected an auth error");
+        };
+        assert_eq!(*hint, AuthHint::SmtpAuthDisabled);
+    }
+
+    #[test]
+    fn an_ordinary_smtp_auth_failure_still_points_at_the_app_password() {
+        let error = MailError::classify_smtp("535 5.7.8 Username and Password not accepted");
+        let MailError::Auth { hint, .. } = &error else {
+            panic!("expected an auth error");
+        };
+        assert_eq!(*hint, AuthHint::UseAppPassword);
     }
 
     #[test]

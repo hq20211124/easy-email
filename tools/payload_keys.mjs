@@ -30,6 +30,9 @@ const CONTRACTS = [
   { builder: 'outgoingMail', struct: 'OutgoingMail', file: 'crates/mail-core/src/model.rs' },
   { builder: 'attachment', struct: 'OutgoingAttachment', file: 'crates/mail-core/src/model.rs' },
   { builder: 'draft', struct: 'Draft', file: 'crates/mail-core/src/userdb.rs' },
+  // The manual-endpoint block's shape: `save_account` takes it as an optional struct, so a key that
+  // drifted would reach serde as the same "missing field" the others did.
+  { builder: 'endpointOverride', struct: 'EndpointOverride', file: 'crates/mail-core/src/model.rs' },
 ];
 
 /** Load the renderer's builders without a browser: the file assigns to `globalThis`. */

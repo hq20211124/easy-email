@@ -2345,11 +2345,133 @@ padding 容忍、**4 种"没有可用地址"与 5 种垃圾输入都返回 `None
 
 ---
 
+### M1a-87 自定义服务器（手动端点）：`custom` 这一行 + 三个纯校验函数 ✅（第 93 轮）
+
+`design/05` §1.4 的自动发现层**不做**（要向第三方发出用户域名的请求，`design/05` §11 反驳 5），
+这一轮只做**最后一层：手动**——它就能覆盖自建邮局与表外服务商，正是用户要的。
+
+- **`Provider.manual_endpoints`** 进服务商表（21 处既有字面量补 `false`），`custom` 是表里**最后一行**、
+  也是唯一 `true` 的一行。渲染层显示手动区块看的是**这个标志，不是 id 比较**（`design/05` §10.1 要防的正是界面里列 id）。
+  快照测试同时钉住"只有 custom 是 true"与"custom 在末尾"（下拉框第一项就是默认项，空行不能当默认）。
+- **三个纯函数**（`model.rs`）：`normalise_host`（粘贴 `imaps://IMAP.Example.com/` ⇒ `imap.example.com`；
+  带端口的 `imap.example.com:993`、带路径、带空格、带 `@` 一律拒绝，IPv6 写成 `[::1]`）、
+  `validate_endpoint`（端口 0 拒绝；`不加密` **只允许本机地址**——它的文档就写着 Localhost only，
+  而它意味着密码明文上线）、`endpoint_advisory`（465+STARTTLS 这类"不常见但不错"的组合只提示不拦截）。
+  `EndpointProblem` 是枚举不是字符串，所以测试钉的是**原因**而不是文案。
+- **`account_with_endpoints()` 是唯一组装账号的地方**，`account_with_login()` 变成它的薄包装
+  （既有调用点与测试一处都没改，它们验的正是"表驱动"那条路）。**校验在任何东西被建出来之前**，
+  而且**给表内服务商传 override 会被拒绝**而不是被忽略——忽略的样子是"我填的主机被悄悄丢了"，
+  这种 bug 报告没人能处理。
+- **命令**：`save_account` 多一个 `endpoints` 参数（校验放在写凭据与写 `accounts.json` **之前**）；
+  新命令 `endpoint_choices`（把 `Security::ALL`、`label()`、`hint()` 与 `custom` 行的默认值送给渲染层，
+  前端不抄第二份加密方式）。
+- **契约**：`src/payload.js` 加 `endpointOverride()`，`tools/payload_keys.mjs` 的 `CONTRACTS` 加
+  `EndpointOverride`，比对 6 个字段（线格式已核实是 serde 的 `ssl` / `start_tls` / `plain`）。
+
+**证伪（三条，逐条做过）**：去掉 `(false, Some(_)) => Err` 那一支 ⇒ `a_table_provider_refuses_an_override_instead_of_ignoring_it` 红；
+去掉 `validate_endpoint` 的 `Plain` 检查 ⇒ `plain_security_is_refused_off_the_local_machine` 红；
+删掉 `normalise_host` 的 `:` 检查 ⇒ `a_host_that_carries_its_own_port_is_refused` 红。
+
+**真机探针**（`tools/probe-custom-server.mjs`，CDP 驱动真实窗口，全程只填 `127.0.0.1` 与假地址）四件事全过：
+① 选 `custom` ⇒ 区块可见、主机预填 `mail.example.com`、端口取后端默认 993/465、加密选项是 `ssl/start_tls/plain`；
+② 主机改成 `imap.example.com:993` ⇒ 报告区逐字出现"端口请填到右边的「端口」框里…"；
+③ **`accounts.json` 与探针前逐字节相同**（这条才是关键：校验必须在写任何东西之前，纯函数测试看不见调用点在哪）；
+④ 主机 `127.0.0.1`、端口 9 ⇒ 报告"无法连接 … (os error 10061)"，关掉对话框后账号被删（`closeModal` 的既有行为）。
+`BUG_IF_TRUE: false`。
+
+**未验证 / 未做（如实说）**：自动发现（autoconfig / ISPDB / SRV / Autodiscover）；
+"这个服务器不提供 SMTP"的开关（只收信的自建账号现在还加不进来——密码账号两腿都过才自动保存）；
+自定义账号不参与服务商表的 `daily_download_budget()` / `append_limit_bytes()` / `smtp_max_message_bytes()`，
+三者对它都返回 `None`（"未知"），所以配额节流与大小预检对它不生效。**没有对着真实自建服务器跑过一次**。
+
+---
+
+### M1a-88 给 Outlook 真实登录补上三个缺口 + 回环双绑定 ✅（第 94 轮）
+
+Outlook 的代码路径本来就是齐的（服务商行、`oauth_available`、Microsoft 端点与 scope、刷新令牌落盘、
+XOAUTH2、队列发信全部就绪），这一轮做的是**真实登录会踩到的三件事**：
+
+- **M365 关掉 SMTP AUTH 时不再给错建议**。`535 5.7.139 … SmtpClientAuthentication is disabled for the Tenant`
+  也是 535，会被通用的"授权码"分支接住，于是界面告诉用户"去网页版生成授权码"——**M365 没有这个东西**。
+  新增 `AuthHint::SmtpAuthDisabled`（含 `5.7.60` "无权以此发件人发送"），匹配放在通用分支**之前**。
+  两条测试：真实那句话 ⇒ `SmtpAuthDisabled` 且 **断言它不等于 `UseAppPassword`**（要防的回归）、
+  普通 `535 5.7.8` ⇒ 仍然是 `UseAppPassword`（新分支没把普通情况吃掉）。**证伪过**：删掉新分支 ⇒ 第一条红。
+- **`ConnectionReport.smtp_auth_rejected`**：M1a-82 只分开了 IMAP 的"被拒绝 / 没应答"，
+  而 Outlook 的典型失败是 **IMAP 成功、SMTP 被拒** —— 今天会走到"网络恢复后会自动开始收信"，
+  可**收信现在就能用**，那句话是假的。loopback 加一条（好 IMAP + 拒绝 AUTH 的假 SMTP ⇒ 标志为真、IMAP 仍算成功），
+  并把内联的那个假 SMTP 服务器抽成 `spawn_smtp_rejecting_auth()` 供两条测试共用。
+- **`src/wizard.js`：把"验证没过之后怎么办"变成可测的纯函数**。这个判断原来住在 `openAccountWizard` 的闭包里，
+  是 M1a-69 / M1a-82 / 这一轮三处 bug 的交汇点，而且**没有任何自动化测试**。现在 `verificationVerdict()`
+  的五个结局与**检查顺序本身**由 `tools/wizard_verdict_test.mjs` 钉住（门禁新增一步）：
+  两腿都好 ⇒ `accept`；密码账号失败 ⇒ `retry`（**断言它不是 `accept-offline`**：没授权过的账号绝不能被"网络不通"放行）；
+  OAuth + IMAP 被拒 ⇒ `reject-address`；OAuth + IMAP 好 + SMTP 被拒 ⇒ `accept-receive-only`；
+  OAuth 都没应答 ⇒ `accept-offline`。另加两条**顺序断言**（IMAP 被拒且 SMTP 被拒 ⇒ 仍判地址错；
+  密码账号 + SMTP 被拒 ⇒ 仍 `retry`）。
+- **`A3`：Microsoft 的回调主机名固定 `localhost`，回环监听**双绑定 `127.0.0.1` 与 `::1`**。**
+  用户 2026-10-04 实测 **Azure 拒绝 `http://127.0.0.1`**，所以回调主机名只能是 `localhost`；
+  而 `localhost` 在 Windows 上可能先解析到 `::1`，只绑 IPv4 时"浏览器是否回退"不是我们能保证的事，
+  它失败的样子正好是"点了没反应"。所以不赌：`OAuthProvider.redirect_host`（Google 仍是已验过的 `127.0.0.1`）
+  + `bind_exclusive_loopback_at(address)`（把写死 IPv4 的旧函数参数化，`SO_EXCLUSIVEADDRUSE` 原样保留）
+  + `Loopback.listeners: Vec<TcpListener>` + `wait_for_code` 里每个 listener 一个 accept 循环、经 mpsc 汇入同一条路径。
+  **安全边界一个字都没放宽**：绑的仍是回环，`0.0.0.0` / `::` 永远不绑。
+- 三条新测试：`the_redirect_host_is_what_each_provider_was_told_to_use`、
+  `a_name_host_binds_both_loopback_families`、`the_second_listener_serves_the_same_callback`（用 `127.0.0.2`，
+  不依赖 IPv6，证明 mpsc 那条路真的能从第二个监听器收到 code）。7 处 `Loopback::bind()` 全部带参数。
+  **两条证伪都做过**：把 `extra` 循环删掉 ⇒ 第二条监听器测试红；`Loopback::bind` 的 `extra` 恒空 ⇒ 双族测试
+  **在本机红**（本机有 IPv6 回环：先探测 `TcpListener::bind("[::1]:0")` 成功才断言，所以这条在没 IPv6 的机器上会跳过而不是假绿）。
+  **顺带更正计划里的一处**：`tests/oauth_flow.rs` 的测试字面量用的是 `..GOOGLE`，加字段**没让它编译失败**，所以那处没改。
+- **网络**：新增 `--ignored` 测试 `the_oauth_http_client_reaches_the_microsoft_token_endpoint`，
+  本机实测 **3.67 秒拿到服务商答复**（`AADSTS9002313: Invalid request`，服务商原话 —— 拒绝就是通过）。
+- `outlook` 的 `setup_note` 写成了可以照着做的 Azure 步骤（名称随意、帐户类型必须选"任何组织目录中的帐户和个人
+  Microsoft 帐户"、重定向 URI 平台选"移动和桌面应用程序"且填 `http://localhost`（端口不用写）、**不需要客户端密码**）。
+
+**验证边界（如实说）：A4 没有做成，而且是 Azure 侧挡住的路，不是我们的代码。**
+用户去注册应用时被 **Azure 门户自己的登录**拦下，报
+`AADSTS16000 … 用户帐户在租户"Microsoft Services"中不存在，且无法访问该租户中的应用程序
+74658136-14ec-4630-ad9b-26e160ff0fc6`。查清了：那个 GUID 是 **`ADIbizaUX`** —— **Azure 门户自己**的客户端
+（Ibiza 是 Azure 门户的内部代号），"Microsoft Services" 是微软自己的租户。也就是说这条报错来自**门户的登录层**，
+与 Easy Email 无关：它意味着"用来注册应用的账号不是该目录的成员 / 目录选错了 / 会话里是另一个账号"。
+（修法：用创建该目录的那个账号登录；门户右上角把目录切对；或用 InPrivate 重新登录。）
+用户据此决定这一轮不做真实账号验证，改为要求**用公开信息与逻辑推演**尽量保证微软邮箱能登。
+
+于是把"公开契约"逐条核对并**钉进测试**：`the_microsoft_flow_matches_the_published_imap_smtp_oauth_contract`
+（`oauth.rs`），每条断言都对应文档里的一句话，注释里带三份文档的链接：
+
+- 三个资源 scope 必须是完整 URL（`https://outlook.office.com/IMAP.AccessAsUser.All` / `SMTP.Send`）、
+  外加 `offline_access`（**没有它就没有刷新令牌**）与 `openid email`（地址核对要用）；
+- 端点必须是 `login.microsoftonline.com/common/oauth2/v2.0/…`（`common` 才能同时覆盖个人账号与工作账号）；
+- 授权请求带 `response_type=code` + `code_challenge_method=S256`，**不带** `prompt=none`
+  （那会把"会话里没有用户"变成 `interaction_required`），也不带 Google 的 `access_type`；
+- 兑换授权码时**不得**带 `client_secret`（文档原话：公共客户端"must not use secrets"），且必须重复
+  与授权腿**完全相同**的 `redirect_uri`；
+- 刷新时 `scope` 是**可选**的（所以我们的"不发 scope"是正确而不是漏了），同样不得带 secret；
+- 回调主机名只能是**名字** `localhost`：门户拒绝 `http://127.0.0.1`，而文档明说 `[::1]` 字面量**不受支持**，
+  且 localhost 匹配时**忽略端口**（所以注册 `http://localhost` 能匹配 `http://localhost:<临时端口>/`）——
+  这正是 A3 那条双绑定的依据。
+
+**最强的一条断言**：文档里给了一个算好的 XOAUTH2 例子（`test@contoso.onmicrosoft.com` + 一个示例令牌
++ 它的 base64）。测试把这个 base64 **解码**，断言逐字节等于 `imap.rs` 生成的字符串 —— 等于拿微软自己的字节
+当标准答案。**证伪过**：把结尾两个 `\x01` 去掉一个 ⇒ 立刻红（`left` 有两个 `\u{1}`、`right` 一个）。
+
+**仍未验证（静态核对一条都替代不了）**：真实账号的同意页、M365 租户的 SMTP AUTH 开关、
+个人账号是否真的返回可用于 IMAP/SMTP 的令牌。所以 `setup_note` 里
+"这条路尚未在真实 Outlook 账号上走通过"这句**继续留着**。
+
+**收尾**：`check.ps1` **21 步全绿**；`cargo test --workspace` **322 通过 / 0 失败**（+5 ignored）；
+`python design/tools/audit.py` **0 失败**；release 便携包重打
+（`C:\Users\72492\Desktop\easy-email-latest\easy-email.exe`，**10.10 MB**），
+**包内实测**：启动 14 秒存活、日志显示真实账号同步正常（QQ 新增 6 封）、
+**`http://127.0.0.1:9222/json/version` 不可达**（调试端口确实不在包里）。
+
+---
+
 ## 交接摘要（先读这里）
 
-**当前状态**：`tools/check.ps1` **19 步全绿**；`cargo test --workspace` **300 通过、0 失败**
-（246 mail-core lib + 46 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri；另有 4 条 ignored）；
-`python design/tools/audit.py` **0 失败**；应用启动冒烟通过。
+**当前状态**：`tools/check.ps1` **21 步全绿**（离线；`-Network` 会多跑一步真实端点）；`cargo test --workspace`
+**322 通过、0 失败**（267 mail-core lib + 47 loopback + 1 oauth_flow + 4 reachability + 3 src-tauri；
+另有 **5** 条 ignored：3 条真实端点 + 2 条 doctest）；
+`python design/tools/audit.py` **0 失败**；应用启动冒烟通过。新增的两条 JS 门禁：
+`node tools/wizard_verdict_test.mjs`、`node tools/payload_keys.mjs`（含 `EndpointOverride`）。
 **认证轴已在真实 Google 端点上跑通并完成闭环**（M1a-81）：`realuser@gmail.com` 的刷新令牌已落盘（DPAPI），
 **Gmail INBOX 实收 289 封**（`last_uid=289`、`synced=0h ago`，全部带 `thread_key`），`[Gmail]/` 文件夹列表也拿到了。
 **用户已确认**：真机发出去的信收到了（他自己试的）——发件箱全链在真实账号上的第一次人证。
@@ -2398,11 +2520,13 @@ padding 容忍、**4 种"没有可用地址"与 5 种垃圾输入都返回 `None
 | **M1a-15** | **`sent_index`（cache.db v2）：归档时记录副本的 folder/UID（UID 可空）、发件箱「查看副本」按钮、三种诚实降级** | **cache 三条（含 v1 老库打开即获新表）+ worker 断言索引里确有链接；真机 cache.db v1→v2、`messages` 仍 158 行；探针：查不到的 `Message-ID` 返回诚实的 `null`** |
 | **M1a-16** | **服务器草稿镜像：`draft_mirrors`（user.db）、`mirror_draft`（不带 `\Seen`、**先写新的再删旧的**、无 Drafts 文件夹 ⇒ `None`）、`draft_to_mail`、丢弃草稿时一并删服务器副本、关窗后 best-effort 镜像** | **loopback：APPEND 到 Drafts 且没有 `\SEEN`、第二次镜像用 `UID STORE 4242` 标删旧副本、无文件夹 ⇒ `None`；真机 `user.db` 出现 `draft_mirrors` 且其余行数不变** |
 | **M1a-17** | **`user.db` 的"更新版本拒绝打开"守卫**（与 cache.db 对齐）：拒绝的代价是"请升级程序"，误读的代价是用户的草稿 | **测试把 `user_version` 改成 `SCHEMA_VERSION + 1` ⇒ `open` 失败且消息可行动；回退日志明说本次运行不读写草稿/发件箱** |
-**最近六十一轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
+| **M1a-87** | **自定义服务器（手动端点）：`Provider.manual_endpoints` + `custom` 行（表末）、`EndpointOverride`、三个纯校验函数、`account_with_endpoints()`、`save_account` 的 `endpoints` 参数、`endpoint_choices` 命令、向导手动区块 + 预填 + 保存路径、契约补 `EndpointOverride`** | **四条待证伪点里三条已证伪（见该节）；真机探针 `probe-custom-server.mjs` 四件事全过：区块可见/预填、`imap.example.com:993` 报"端口请填到右边"、**`accounts.json` 逐字节不变**、连不上时账号被删** |
+| **M1a-88** | **Outlook 真实登录的三个缺口：`AuthHint::SmtpAuthDisabled`（M365 关 SMTP AUTH 不给"找授权码"的错建议）、`ConnectionReport.smtp_auth_rejected` + 向导第五种结局、`src/wizard.js` 的判决纯函数 + node 测试 + 门禁、Microsoft 回调主机名 `localhost` + 回环**双绑定** `127.0.0.1`/`::1`（mpsc 汇入同一路径）** | **两条证伪都做过（删新分支 ⇒ 红的；`extra` 恒空 ⇒ 双族测试在本机红）；Microsoft 令牌端点 `--ignored` 测试 3.67 秒拿到服务商答复；OAuth 路径回归探针 `probe-oauth-wizard.mjs` 仍过** |
+**最近六十三轮一句话索引**（完整叙述在各节，这里只是为了不用往上翻）：
 M1a-18 第 (5) 件现状盘点（哪些已在、哪些被外部卡住）· M1a-19 网易系"只让读最近 30 天"的可操作提示 ·
 M1a-20 清掉没有对应草稿的服务器副本 · M1a-21/22 草稿镜像每 30 秒 + 失焦 · M1a-23 SMTP 上限预检
 （只写核实的数 + 本地 25 MB）· M1a-24 添加附件当时就挡住超限 · M1a-25 **更正**：通知点击跳转属 M0-6 ·
-M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮）** · **M1a-46 XOAUTH2 的四步计划** · **M1a-47 更新状态（成功/没生效各说一次）** · **M1a-48 XOAUTH2 发送半边** · **M1a-49 XOAUTH2 接收半边** · **M1a-50 连接前刷新令牌（轮换先落盘）** · **M1a-51 OAuth 设置进 user.db + Credential 类型** · **M1a-52 账号自带 auth** · **M1a-53 `secret_for`：OAuth 账号连接前刷新令牌** · **M1a-54 OAuth 账号能被创建** · **M1a-55 OAuth 发信（队列）也走 XOAUTH2 + 测试** · **M1a-56 重新登录入口（`oauth_relogin` + 账号行 ↻）** · **M1a-58 真机验证①崩溃恢复** · **M1a-59 真机验证②附件改动（入队拦住 + 实收 31 字节证明冻结）** · **M1a-60 真机验证③抓到真 bug（草稿镜像缺 account_id 迁移，已修）** · **M1a-61 真机验证④查看副本——四件真机验证全部通过** · **M1a-62 本地库错误文案修正 + 测试信删除** · **M1a-63 预填 Mozilla 公开注册** · **M1a-64 读用户自己的 Google 注册** · **M1a-65 自绘顶栏 + release 便携包** · **M1a-66 添加账号两条路径分开、修掉"点旁边就关窗"** · **M1a-67 去掉整条顶栏，窗口按钮浮在右上角** · **M1a-68 Web 类型客户端当场拒绝** · **M1a-69 OAuth 已授权时网络不通也保存账号** · **M1a-70 OAuth 失败写日志 + 测试模式 7 天过期提醒** · **M1a-71 目标五项逐条对账** · **M1a-72 接缝测试（真实 transport + 真实回环）** · **M1a-73 采用注册文件里的端点** · **M1a-74 补 design/05 §10 三条门禁 + auth 快照** · **M1a-75 §10.1 向导改由服务商表决定** · **M1a-76 刷新令牌并发单飞** · **M1a-77 令牌库"损坏"一例** · **M1a-78 修好被我改坏的布局（截图发现）+ 新门禁：样式表的 id 必须存在** · **M1a-79「打开浏览器登录」没反应 = 两个 bug（按钮没绑事件 + `cmd` 把授权 URL 从第一个 `&` 截断，含 `cmd` 引号条款的实测与证伪）** · **M1a-80 应用完全不使用系统代理（`default-features=false` 丢掉 `system-proxy`）——"浏览器成功、应用超时"的真因，双向验证** · **M1a-81 真实 Google 端点登录跑通 + Gmail 实收 289 封（认证轴闭环）** · **M1a-82 填的地址 ≠ 浏览器授权的账号（永久认证失败 + 误导文案）→ 区分"被拒绝"与"没应答"** · **M1a-83 Outlook 两处过期文案（`design/05` §7 的遗留项）** · **M1a-84 对话模式：跨文件夹会话 + 气泡视图（`cache.db` v4 + `messages_by_thread` 索引 + `list_thread` + 全局模式开关；真机 20 封会话、跨文件夹、全场仅 1 个沙箱 iframe；抓到并修掉"聚焦气泡被压成 1px"）** · **M1a-85 收尾：调试端口门禁（18 → 19 步）+ release 便携包，包内实测 9222 不可达** · **M1a-86 让应用真的知道浏览器授权的是哪个账号（`openid email` + 解 `id_token`，签名不验是有意的；`None` 一律表示"服务商没说"而非"不匹配"）**。
+M1a-26 按账号开关通知 · M1a-27 副本超过 append 上限就不写 · M1a-28 副本缺失文案如实说两种可能 · **M1a-29 会话串（近似键）+ 新门禁第 8 步** · **M1a-30 会话串精确键（References 根 + cache v3 列迁移，真机 160 行无损）** · **M1a-31 给老缓存补键（真机 0/50 → 50/0）** · **M1a-32 会话展开/折叠（真机：6 封会话展开露出 5 行、收起回到 43 行）** · **M1a-33 配额账本露到界面** · **M1a-34 侧栏同步状态一行 + 修掉探针把用户设置留在中途值的问题（真机已改回 years:2）** · **M1a-35 服务端下界（观测即记录，QQ 上不触发）** · **M1a-36 安装包配置补齐 + hooks.nsh（release exe 8.32 MB；安装包未测）** · **M1a-37 会话键补到更早的缓存行（有界 5 页）** · **M1a-38 OAuth 环境可行（reqwest 0.12 + rustls 可离线构建）+ 修掉一个会无故变红的 db 测试** · **M1a-39 OAuth 协议层（PKCE/授权 URL/交换与刷新）** · **M1a-40 OAuth 回环回调（state 校验 + 真开端口测试；SO_EXCLUSIVEADDRUSE 仍差）** · **M1a-41 刷新令牌 DPAPI 落盘** · **M1a-42 真实 reqwest transport** · **M1a-43 认证轴整条流程 + 系统浏览器** · **M1a-44 SO_EXCLUSIVEADDRUSE（A1-F36 收尾）** · **M1a-45 OAuth 接上界面（命令 + 向导按钮）** · **M1a-46 XOAUTH2 的四步计划** · **M1a-47 更新状态（成功/没生效各说一次）** · **M1a-48 XOAUTH2 发送半边** · **M1a-49 XOAUTH2 接收半边** · **M1a-50 连接前刷新令牌（轮换先落盘）** · **M1a-51 OAuth 设置进 user.db + Credential 类型** · **M1a-52 账号自带 auth** · **M1a-53 `secret_for`：OAuth 账号连接前刷新令牌** · **M1a-54 OAuth 账号能被创建** · **M1a-55 OAuth 发信（队列）也走 XOAUTH2 + 测试** · **M1a-56 重新登录入口（`oauth_relogin` + 账号行 ↻）** · **M1a-58 真机验证①崩溃恢复** · **M1a-59 真机验证②附件改动（入队拦住 + 实收 31 字节证明冻结）** · **M1a-60 真机验证③抓到真 bug（草稿镜像缺 account_id 迁移，已修）** · **M1a-61 真机验证④查看副本——四件真机验证全部通过** · **M1a-62 本地库错误文案修正 + 测试信删除** · **M1a-63 预填 Mozilla 公开注册** · **M1a-64 读用户自己的 Google 注册** · **M1a-65 自绘顶栏 + release 便携包** · **M1a-66 添加账号两条路径分开、修掉"点旁边就关窗"** · **M1a-67 去掉整条顶栏，窗口按钮浮在右上角** · **M1a-68 Web 类型客户端当场拒绝** · **M1a-69 OAuth 已授权时网络不通也保存账号** · **M1a-70 OAuth 失败写日志 + 测试模式 7 天过期提醒** · **M1a-71 目标五项逐条对账** · **M1a-72 接缝测试（真实 transport + 真实回环）** · **M1a-73 采用注册文件里的端点** · **M1a-74 补 design/05 §10 三条门禁 + auth 快照** · **M1a-75 §10.1 向导改由服务商表决定** · **M1a-76 刷新令牌并发单飞** · **M1a-77 令牌库"损坏"一例** · **M1a-78 修好被我改坏的布局（截图发现）+ 新门禁：样式表的 id 必须存在** · **M1a-79「打开浏览器登录」没反应 = 两个 bug（按钮没绑事件 + `cmd` 把授权 URL 从第一个 `&` 截断，含 `cmd` 引号条款的实测与证伪）** · **M1a-80 应用完全不使用系统代理（`default-features=false` 丢掉 `system-proxy`）——"浏览器成功、应用超时"的真因，双向验证** · **M1a-81 真实 Google 端点登录跑通 + Gmail 实收 289 封（认证轴闭环）** · **M1a-82 填的地址 ≠ 浏览器授权的账号（永久认证失败 + 误导文案）→ 区分"被拒绝"与"没应答"** · **M1a-83 Outlook 两处过期文案（`design/05` §7 的遗留项）** · **M1a-84 对话模式：跨文件夹会话 + 气泡视图（`cache.db` v4 + `messages_by_thread` 索引 + `list_thread` + 全局模式开关；真机 20 封会话、跨文件夹、全场仅 1 个沙箱 iframe；抓到并修掉"聚焦气泡被压成 1px"）** · **M1a-85 收尾：调试端口门禁（18 → 19 步）+ release 便携包，包内实测 9222 不可达** · **M1a-86 让应用真的知道浏览器授权的是哪个账号（`openid email` + 解 `id_token`，签名不验是有意的；`None` 一律表示"服务商没说"而非"不匹配"）** · **M1a-87 自定义服务器（手动端点）：`custom` 行 + 表末 + `manual_endpoints` 标志 + 三个纯校验函数 + `account_with_endpoints` + `endpoint_choices` 命令 + 向导区块；真机探针证明"拒绝时 `accounts.json` 逐字节不变"** · **M1a-88 Outlook 三个缺口：M365 关 SMTP AUTH 的专门文案（不再让人去找不存在的授权码）、`smtp_auth_rejected` + 向导第五种结局（`src/wizard.js` 纯函数 + node 门禁）、Microsoft 回调固定 `localhost` 且回环双绑定 `127.0.0.1`/`::1`**。
 
 **若继续，从这里开始**（按性价比）：
 ① **说准"副本太大"**（`ensure_sent_copy` 返回三态 + outbox 行记标记，见 M1a-28）——最小、已诊断清楚；

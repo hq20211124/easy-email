@@ -2376,6 +2376,33 @@ async fn verify_account_does_probe_smtp_when_imap_authentication_succeeds() {
     );
 }
 
+/// The third outcome the wizard has to tell apart: IMAP fine, SMTP answered and refused.
+///
+/// This is the Microsoft 365 shape (a tenant with SMTP AUTH switched off): receiving works, so
+/// "网络恢复后会自动开始收信" would be false, and the account is still worth saving — but the user has
+/// to be told that an administrator, not the network, is what stands between them and sending.
+#[tokio::test]
+async fn verify_account_reports_an_smtp_rejection_without_calling_imap_broken() {
+    let (imap, _log) = spawn_imap(true).await;
+    let smtp = spawn_smtp_rejecting_auth().await;
+    let cfg = account(imap, smtp);
+
+    let report = within(mail_core::verify_account(&cfg, "app-password")).await;
+
+    assert!(report.imap_ok, "{}", report.imap_detail);
+    assert!(!report.imap_auth_rejected);
+    assert!(!report.smtp_ok, "the fixture refuses AUTH");
+    assert!(
+        report.smtp_auth_rejected,
+        "SMTP answered and refused, so this is a rejection and not silence: {}",
+        report.smtp_detail
+    );
+    assert_ne!(
+        report.smtp_detail, "",
+        "the server's own sentence must reach the user"
+    );
+}
+
 /// The other half of the distinction the wizard depends on.
 ///
 /// `verify_account` answers two different questions with the same `imap_ok: false`, and the advice for
@@ -2421,6 +2448,24 @@ async fn smtp_test_connection_authenticates_without_sending() {
 #[tokio::test]
 async fn a_bad_smtp_password_returns_an_actionable_error() {
     // A server that rejects AUTH, to prove the SMTP error path is classified too.
+    let addr = spawn_smtp_rejecting_auth().await;
+
+    let cfg = account(addr, addr);
+    let error = within(smtp::test_connection(&cfg, "wrong"))
+        .await
+        .expect_err("AUTH must fail");
+
+    assert!(
+        error.user_hint().is_some(),
+        "an SMTP auth rejection must carry a hint too, got: {error}"
+    );
+}
+
+/// A minimal SMTP server that advertises AUTH and answers `535` to every attempt.
+///
+/// Used both for the lone error-path test and for [`verify_account`]'s SMTP-leg outcome, so the two
+/// cannot drift apart: the point of the second one is precisely *which* error this server produces.
+async fn spawn_smtp_rejecting_auth() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
@@ -2456,16 +2501,7 @@ async fn a_bad_smtp_password_returns_an_actionable_error() {
             });
         }
     });
-
-    let cfg = account(addr, addr);
-    let error = within(smtp::test_connection(&cfg, "wrong"))
-        .await
-        .expect_err("AUTH must fail");
-
-    assert!(
-        error.user_hint().is_some(),
-        "an SMTP auth rejection must carry a hint too, got: {error}"
-    );
+    addr
 }
 
 // ===================================================================== local cache + sync

@@ -142,6 +142,10 @@ async fn every_verified_provider_really_answers() {
         if provider.imap_host == "127.0.0.1" {
             continue;
         }
+        // `custom` has no endpoint of its own to probe — the user supplies one.
+        if provider.manual_endpoints {
+            continue;
+        }
 
         for (kind, host, port, security) in [
             (
@@ -212,6 +216,10 @@ async fn every_verified_provider_really_answers() {
 fn every_endpoint_is_well_formed() {
     for provider in providers::all() {
         if !provider.supports_imap {
+            continue;
+        }
+        // The `custom` row has no endpoints of its own to check: the user types them in.
+        if provider.manual_endpoints {
             continue;
         }
         for (kind, host, port, security) in [
@@ -337,4 +345,34 @@ async fn the_oauth_http_client_reaches_the_token_endpoint() {
         "no round trip happened — the system proxy is probably not being used: {error}"
     );
     println!("token endpoint answered (a rejection is the point): {error}");
+}
+
+/// The same question for Microsoft, whose token endpoint is a different host and tenant path.
+///
+/// Kept separate from the Google one rather than parameterised: `login.microsoftonline.com` can be
+/// blocked or proxied differently from `oauth2.googleapis.com`, and the user is expected to run this
+/// before blaming the app for an Outlook login that never gets an answer. A **provider answer** is
+/// the proof — a rejection is a pass, a transport error is the finding.
+#[tokio::test]
+#[ignore = "requires public internet access (and, on some networks, a system proxy)"]
+async fn the_oauth_http_client_reaches_the_microsoft_token_endpoint() {
+    use mail_core::MailError;
+    use mail_core::oauth::{HttpTokens, MICROSOFT, refresh};
+
+    let transport = HttpTokens::new().expect("an HTTP client");
+    let error = refresh(
+        &transport,
+        MICROSOFT,
+        "not-a-real-client-id",
+        None,
+        "not-a-real-refresh-token",
+    )
+    .await
+    .expect_err("a bogus refresh token cannot be exchanged");
+
+    assert!(
+        !matches!(error, MailError::Timeout(_) | MailError::Connect { .. }),
+        "no round trip happened — the system proxy is probably not being used, or the host is blocked: {error}"
+    );
+    println!("microsoft token endpoint answered (a rejection is the point): {error}");
 }
