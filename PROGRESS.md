@@ -2542,6 +2542,9 @@ QQ INBOX 缓存里 **192 封、UID 5662..5856、日期 2026-09-02 .. 2026-10-06*
 
 **数字**：`check.ps1` **23 步全绿**；`cargo test --workspace` **322 通过 / 0 失败**（无 Rust 改动）；
 新增门禁测试文件 `tools/history_test.mjs`、常驻诊断工具 `tools/inspect-cache-detail.py`。
+**收尾**：release 便携包重打（10.11 MB），并用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 临时开端口
+**在包内实测这两件事**：`加载更多` 22 行/10-2 → 70 行/9-22 → 120 行/9-14 → **162 行/9-2** → 再点才说"没有更早的邮件了"；
+单封邮件进对话模式 ⇒ `#thread-view` 可见、恰好 1 个气泡、回复框在、1 个 surface。验完端口已关掉。
 
 ---
 
