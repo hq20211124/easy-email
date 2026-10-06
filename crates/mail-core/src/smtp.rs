@@ -52,6 +52,11 @@ fn attachment_part(meta: &OutgoingAttachment) -> Result<SinglePart> {
 /// and nothing for crash recovery to compare before re-sending (§5.3.1).
 ///
 /// The domain is the sender's rather than `localhost`, so the id looks like every other client's.
+///
+/// The random component is new (2026-10-06): time + PID + a counter is guessable by anyone who knows
+/// roughly when the mail was sent, and crash recovery **trusts** a matching `Message-ID` to mean "this
+/// already went out" (`design/07` §5.3.1). Guessing it would mean a message that is silently never
+/// sent. Eight random bytes from the OS cost nothing and remove the question.
 fn make_message_id(email: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -61,13 +66,25 @@ fn make_message_id(email: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut random_bytes = [0u8; 8];
+    let random = match getrandom::fill(&mut random_bytes) {
+        Ok(()) => u64::from_le_bytes(random_bytes),
+        // The OS source failing is not a reason to refuse to send mail; the id is still unique
+        // within this process, which is what the Sent-folder search and recovery need.
+        Err(_) => sequence,
+    };
+
     let domain = email
         .rsplit('@')
         .next()
         .filter(|d| d.contains('.'))
         .unwrap_or("localhost");
 
-    format!("<{nanos:x}.{sequence:x}.{}@{domain}>", std::process::id())
+    format!(
+        "<{nanos:x}.{random:016x}.{sequence:x}.{}@{domain}>",
+        std::process::id()
+    )
 }
 
 /// Build the RFC 5322 message, including the threading headers that keep replies grouped

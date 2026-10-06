@@ -161,7 +161,11 @@ function escapeHtml(value) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    // The single quote as well. Every interpolation today sits in a double-quoted attribute, so this
+    // is latent rather than a live hole — but the next person who writes title='${escapeHtml(x)}'
+    // should not be the one who finds out.
+    .replace(/'/g, '&#39;');
 }
 
 function toast(message, kind = 'info', ttl = 5000, action = null) {
@@ -2280,8 +2284,24 @@ function applyBodyMode() {
 
 /** Remote images in the body, i.e. the ones that would phone home when rendered. */
 function countRemoteImages(html) {
-  const matches = html.match(/<img\b[^>]*\bsrc\s*=\s*["']?\s*https?:/gi);
-  return matches ? matches.length : 0;
+  const remote = /https?:\/\//i;
+  let count = 0;
+
+  // `srcset` is a second way to name a URL on the same element, and the engine picks whichever
+  // candidate it likes — counting only `src` reported "0 blocked" for a body that had a tracking
+  // pixel in `srcset`, which took away the warning bar and with it the opt-in affordance.
+  for (const tag of html.match(/<img\b[^>]*>/gi) || []) {
+    const src = tag.match(/\bsrc\s*=\s*["']?\s*([^"'\s>]+)/i);
+    if (src && remote.test(src[1])) count += 1;
+    const srcset = tag.match(/\bsrcset\s*=\s*["']([^"']*)["']/i);
+    if (srcset && remote.test(srcset[1])) count += 1;
+  }
+
+  // CSS-referenced images (`background: url(https://…)`) are blocked by the same `img-src` and are
+  // just as good a beacon, so they belong in the number the user is shown.
+  count += (html.match(/url\(\s*["']?\s*https?:\/\//gi) || []).length;
+
+  return count;
 }
 
 function updateRemoteImageBar(html) {
@@ -2906,9 +2926,14 @@ function quoteOriginal(detail) {
 }
 
 function stripTags(html) {
-  const div = document.createElement('div');
-  div.innerHTML = html;
-  return div.textContent || '';
+  // `DOMParser` rather than `innerHTML` on a detached element. Both are inert as far as *scripts*
+  // go — the shell CSP has `script-src 'self'` with no `unsafe-inline` — but a detached `innerHTML`
+  // is parsed by the document the app lives in, whose CSP deliberately allows `img-src https:` so
+  // that the per-message "显示图片" opt-in can work. A `<img src="https://tracker/…">` in the body
+  // therefore became a parse-time request that no opt-in ever authorised. A `DOMParser` document has
+  // no browsing context, so images in it are never fetched.
+  const parsed = new DOMParser().parseFromString(String(html ?? ''), 'text/html');
+  return parsed.body ? parsed.body.textContent || '' : '';
 }
 
 /**

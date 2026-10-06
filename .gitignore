@@ -14,6 +14,13 @@ oauth-client.json
 # `tools/screenshot.mjs` writes this where it is run from. The *tool* is committed (it is how M1a-78's
 # broken layout was found); the picture of the moment is not.
 /screenshot.png
+# Screenshots of a real mailbox. They were untracked but *not* ignored, i.e. one `git add -A` away
+# from publishing someone's actual mail to the world.
+/shot-*.png
+
+# Audit output. The security and licence reports describe live weaknesses and quote the values that
+# had to be removed from the tree, so they are working documents for the maintainer, not source.
+/reports/
 
 # Sahara / editor noise
 .DS_Store

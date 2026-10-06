@@ -10,6 +10,41 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, MailError>;
 
+/// Remove a secret from text that came back from a server, before it is stored or logged.
+///
+/// Deliberately conservative: a secret shorter than six characters is left alone, because replacing
+/// every occurrence of a two-character string would garble the message the user has to read, and no
+/// authorization code or OAuth token is that short. Both the raw form and the percent-encoded form
+/// are scrubbed — a gateway that puts the credential in a URL echoes the encoded one.
+pub fn scrub_secret(text: &str, secret: &str) -> String {
+    if secret.len() < 6 {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    if out.contains(secret) {
+        out = out.replace(secret, "…（凭据已隐去）");
+    }
+    let encoded = percent_encode(secret);
+    if encoded != secret && out.contains(&encoded) {
+        out = out.replace(&encoded, "…（凭据已隐去）");
+    }
+    out
+}
+
+/// The handful of characters a credential realistically contains, percent-encoded.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Error)]
 pub enum MailError {
     #[error("无法连接 {host}:{port} — {source}")]
@@ -221,6 +256,22 @@ impl MailError {
         }
     }
 
+    /// [`classify_login`](Self::classify_login), with the submitted secret scrubbed first.
+    ///
+    /// A hostile or merely chatty server can echo the submitted credential back inside its rejection
+    /// text — `NO [AUTHENTICATIONFAILED] invalid password xYzQ…` is a shape that exists in the wild
+    /// for proxies and gateways. That text is then stored verbatim in `outbox.last_error` and in
+    /// `startup-error.log`, so an echo becomes a plaintext credential at rest. Scrubbing at the
+    /// boundary is the only place the secret and the server's sentence are both available.
+    pub fn classify_login_scrubbed(
+        server: &str,
+        raw: impl Into<String>,
+        needs_id: bool,
+        secret: &str,
+    ) -> Self {
+        Self::classify_login(server, scrub_secret(&raw.into(), secret), needs_id)
+    }
+
     /// Turn a raw IMAP LOGIN failure into a classified, actionable error.
     ///
     /// The heuristics here are deliberately fuzzy: providers return wildly different text
@@ -392,6 +443,49 @@ mod tests {
             panic!("expected an auth error");
         };
         assert!(raw.starts_with("Login fail."), "got: {raw}");
+    }
+
+    #[test]
+    fn a_credential_echoed_by_the_server_never_reaches_the_stored_text() {
+        // The concrete attack: a gateway answers `NO ... bad password <the password we sent>`.
+        let secret = "abcdef123456";
+        let error = MailError::classify_login_scrubbed(
+            "imap.example.com",
+            format!("NO [AUTHENTICATIONFAILED] invalid credentials: {secret}"),
+            false,
+            secret,
+        );
+        let MailError::Auth { raw, .. } = &error else {
+            panic!("expected an auth error");
+        };
+        assert!(!raw.contains(secret), "the secret survived: {raw}");
+        assert!(
+            raw.contains("invalid credentials"),
+            "the reason must survive"
+        );
+        // The classification still works on the scrubbed text.
+        assert_eq!(error.user_hint(), Some(AuthHint::UseAppPassword.as_str()));
+
+        // The percent-encoded form is scrubbed too, because a gateway that puts the credential in a
+        // URL echoes that one instead.
+        let secret = "abc/def+ghi=";
+        let error = MailError::classify_login_scrubbed(
+            "imap.example.com",
+            "NO auth failed: abc%2Fdef%2Bghi%3D",
+            false,
+            secret,
+        );
+        let MailError::Auth { raw, .. } = &error else {
+            panic!("expected an auth error");
+        };
+        assert!(
+            !raw.contains("abc%2Fdef"),
+            "the encoded secret survived: {raw}"
+        );
+
+        // A very short secret is left alone: masking it would garble the sentence the user reads,
+        // and no authorization code is two characters long.
+        assert_eq!(scrub_secret("login fail", "il"), "login fail");
     }
 
     #[test]

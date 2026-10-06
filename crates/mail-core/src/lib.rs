@@ -30,6 +30,7 @@ pub mod oauthclient;
 pub mod outbox;
 pub mod pool;
 pub mod providers;
+pub mod sanitize;
 pub mod secret;
 pub mod sentcopy;
 pub mod smtp;

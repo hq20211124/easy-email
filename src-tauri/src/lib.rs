@@ -2264,6 +2264,12 @@ fn safe_file_name(raw: &str, part: u32) -> String {
         .trim()
         .trim_matches('.');
 
+    // Bidirectional overrides and zero-width characters come out **first**, before the replacement
+    // table below. They are `Cf`, not `Cc`, so `is_control()` does not see them — and they are how a
+    // file called `invoice\u{202E}gnp.exe` displays as `invoiceexe.png`. Deleting them is the only
+    // honest fix: there is no legitimate reason for a filename to contain one.
+    let leaf = mail_core::sanitize::strip_invisible_controls(leaf);
+
     let mut cleaned: String = leaf
         .chars()
         .map(|c| {
@@ -2278,17 +2284,34 @@ fn safe_file_name(raw: &str, part: u32) -> String {
     // Long names are a real hazard on Windows, and the extension is the part worth keeping.
     const MAX: usize = 120;
     if cleaned.chars().count() > MAX {
-        let keep: String = cleaned.chars().take(MAX).collect();
-        cleaned = keep;
+        // Truncating the whole string would drop the `.pdf` and leave a file nothing will open —
+        // which is what the line above always promised and the code never did. The extension is
+        // preserved when it is short enough to be a real one.
+        let extension = Path::new(&cleaned)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .filter(|e| e.chars().count() < 16);
+        let budget = MAX - extension.as_ref().map_or(0, |e| e.chars().count());
+        let stem: String = cleaned.chars().take(budget).collect();
+        cleaned = match extension {
+            Some(extension) => format!("{stem}{extension}"),
+            None => stem,
+        };
     }
 
     let upper = cleaned.to_ascii_uppercase();
+    // The full Windows set, not just the first few: `COM5` and `LPT3` fail exactly like `COM1`, and
+    // `CONIN$`/`CONOUT$`/`CLOCK$` are device names that look like ordinary files. Missing entries
+    // here do not produce a security hole — they produce a save that fails with a bewildering error.
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2",
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$", "COM1", "COM2", "COM3", "COM4",
+        "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+        "LPT7", "LPT8", "LPT9",
     ];
     // Compare the stem, since `NUL.txt` is just as unusable as `NUL`.
     let stem = upper.split('.').next().unwrap_or("");
-    if reserved.contains(&stem) {
+    if reserved.contains(&stem) || upper.contains('$') {
         cleaned = format!("file-{cleaned}");
     }
 
@@ -2644,4 +2667,63 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Easy Email 启动失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_file_name;
+
+    /// Hostile attachment names, table-driven.
+    ///
+    /// This function had no test at all, in a crate that otherwise has almost none, while `README`
+    /// describes filenames as the hostile input it defends against. Every row here is a name a
+    /// sender can put in `Content-Disposition` (`design/14` §9).
+    #[test]
+    fn hostile_attachment_names_are_neutralised() {
+        let cases: &[(&str, &str)] = &[
+            // Path traversal, both separators and a drive-qualified path.
+            ("../../evil.exe", "evil.exe"),
+            (r"..\..\evil.exe", "evil.exe"),
+            (r"C:\Windows\System32\calc.exe", "calc.exe"),
+            ("/etc/passwd", "passwd"),
+            // A trailing dot or space is dropped by Windows and can defeat an extension check.
+            ("evil.exe.", "evil.exe"),
+            ("evil.exe   ", "evil.exe"),
+            // Reserved device names, including the ones the old list missed.
+            ("CON", "file-CON"),
+            ("nul.txt", "file-nul.txt"),
+            ("COM5", "file-COM5"),
+            ("LPT9.log", "file-LPT9.log"),
+            ("CONIN$", "file-CONIN$"),
+            // Characters that cannot appear in a Windows name.
+            (r#"a<b>c:d"e.txt"#, "a_b_c_d_e.txt"),
+            // A bidi override that makes `invoicegnp.exe` *display* as `invoiceexe.png`.
+            ("invoice\u{202E}gnp.exe", "invoicegnp.exe"),
+            ("a\u{200B}b.txt", "ab.txt"),
+            // Nothing usable left.
+            ("", "attachment-3"),
+            ("...", "attachment-3"),
+            ("///", "attachment-3"),
+            // Ordinary names are not mangled.
+            ("report.pdf", "report.pdf"),
+            ("年度报表 2026.xlsx", "年度报表 2026.xlsx"),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(&safe_file_name(raw, 3), expected, "raw name: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_name_keeps_its_extension() {
+        let long = format!("{}.pdf", "a".repeat(300));
+        let name = safe_file_name(&long, 1);
+        assert_eq!(name.chars().count(), 120);
+        assert!(name.ends_with(".pdf"), "the extension must survive: {name}");
+
+        // A name with no extension is simply cut.
+        let long = "b".repeat(300);
+        let name = safe_file_name(&long, 1);
+        assert_eq!(name.chars().count(), 120);
+    }
 }

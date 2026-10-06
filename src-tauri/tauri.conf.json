@@ -18,7 +18,7 @@
         "minHeight": 460,
         "resizable": true,
         "decorations": false,
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication"
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,AutofillServerCommunication"
       }
     ],
     "security": {
@@ -30,7 +30,7 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "windows": {
-      "webviewInstallMode": { "type": "embedBootstrapper", "silent": true },
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
       "digestAlgorithm": "sha256",
       "timestampUrl": "http://timestamp.digicert.com",
       "nsis": {

@@ -68,29 +68,35 @@ pub struct ClientChoice {
     pub auth_endpoint: Option<String>,
     #[serde(default)]
     pub token_endpoint: Option<String>,
-    /// `own` when the user brought their own registration; `public_test` when it is borrowed.
+    /// `own` when the user brought their own registration; `missing` when we have nothing to offer.
     pub source: String,
     /// Empty for one's own registration; the notice to show for a borrowed one.
     #[serde(default)]
     pub notice: String,
 }
 
-/// The published Thunderbird registration, and the notice that has to travel with it.
+/// There is **no** built-in OAuth client registration, on purpose.
 ///
-/// It is in Mozilla's source because a desktop client cannot keep a secret (A1-F32), and the comment
-/// above it there says "Don't copy these values for your own application--register it yourself." That
-/// is why using it is a **fallback with a notice**, never a default: the consent screen says "Mozilla
-/// Thunderbird", Mozilla can revoke it whenever they like, and a release build must ship its own
-/// registration (A1-F37).
-pub const PUBLIC_TEST_CLIENT: (&str, &str) = (
-    "REMOVED-BORROWED-CLIENT-ID",
-    "REMOVED-BORROWED-CLIENT-SECRET",
-);
-
-/// The notice shown whenever a borrowed registration is used.
-pub const PUBLIC_TEST_NOTICE: &str = "预填的是 Mozilla 公开在源码里的注册（Thunderbird 用的），仅供试用：授权页会显示 \
-     \"Mozilla Thunderbird\"，且 Mozilla 可随时撤销。正式使用请换成你自己注册的客户端 ID\
-     （把 Google Cloud 下载的 JSON 放进应用数据目录即可）。";
+/// An earlier revision shipped Mozilla's published Thunderbird registration as a Gmail fallback, on
+/// the reasoning that it is in Mozilla's source and comes with a notice. The 2026-10-06 licence audit
+/// reversed that, and the reversal is the right call:
+///
+/// * the comment above those values in Mozilla's own tree says **"Don't copy these values for your
+///   own application--register it yourself"**, so shipping them is contrary to the terms the values
+///   were published under;
+/// * the consent screen the user sees says "Mozilla Thunderbird", which is a false statement about
+///   who is asking for access to their mail, and Mozilla may revoke the registration at any moment —
+///   which would break Gmail sign-in for every user of a released build, with no fix available
+///   except a new release;
+/// * a `client_secret` that is published in a git repository is not a secret, and baking a
+///   third party's credential into a binary makes that credential *this* project's problem.
+///
+/// So every provider that needs a registration asks for one. The user brings their own
+/// (`oauthclient.rs` reads it out of the app data directory), and `design/05` §11 documents the
+/// three available routes: own client ID, own client ID with a secret, or an app-specific password.
+pub const NO_BUILT_IN_REGISTRATION: &str = "这个服务商需要 OAuth 客户端 ID。请把你自己的注册填进来\
+     （Google Cloud / Azure 门户里建一个「桌面应用」类型，把下载的 JSON 放进应用数据目录），\
+     或者改用应用专用密码。本应用不内置任何第三方注册。";
 
 impl OAuthProvider {
     /// This provider's endpoints, overridden by the ones the client registration names.
@@ -124,7 +130,11 @@ impl OAuthProvider {
 }
 
 /// Decide what to offer for one provider.
-pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -> ClientChoice {
+///
+/// `_provider_id` is kept in the signature because the answer used to depend on it (Gmail got the
+/// borrowed registration). It is now the same for every provider — ask the user — and the parameter
+/// stays so the call sites and the tests keep naming the provider they are asking about.
+pub fn client_choice(_provider_id: &str, own: crate::oauthclient::Registration) -> ClientChoice {
     if let crate::oauthclient::Registration::Own { registration } = own {
         return ClientChoice {
             // Filled in by the command layer, which has the provider table at hand.
@@ -138,28 +148,16 @@ pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -
         };
     }
 
-    // No registration of our own. Gmail gets the borrowed one with its notice; Microsoft has no
-    // published equivalent, and inventing one would be worse than asking.
-    if provider_id == "gmail" {
-        ClientChoice {
-            oauth_available: false,
-            client_id: PUBLIC_TEST_CLIENT.0.to_string(),
-            client_secret: Some(PUBLIC_TEST_CLIENT.1.to_string()),
-            auth_endpoint: None,
-            token_endpoint: None,
-            source: "public_test".to_string(),
-            notice: PUBLIC_TEST_NOTICE.to_string(),
-        }
-    } else {
-        ClientChoice {
-            oauth_available: false,
-            client_id: String::new(),
-            client_secret: None,
-            auth_endpoint: None,
-            token_endpoint: None,
-            source: "missing".to_string(),
-            notice: "这个服务商需要 OAuth 客户端 ID。请把你自己的注册填进来。".to_string(),
-        }
+    // No registration of the user's. Every provider is asked the same way — Gmail included, since
+    // 2026-10-06: the borrowed Thunderbird registration is gone (see `NO_BUILT_IN_REGISTRATION`).
+    ClientChoice {
+        oauth_available: false,
+        client_id: String::new(),
+        client_secret: None,
+        auth_endpoint: None,
+        token_endpoint: None,
+        source: "missing".to_string(),
+        notice: NO_BUILT_IN_REGISTRATION.to_string(),
     }
 }
 
@@ -713,7 +711,16 @@ pub trait BrowserLauncher {
 /// out an embedded webview and any hardcoded browser).
 #[cfg(windows)]
 fn browser_command(url: &str) -> std::process::Command {
-    let mut command = std::process::Command::new("rundll32.exe");
+    // The **full path**, not a bare name.
+    //
+    // `Command::new("rundll32.exe")` resolves against the current directory before `PATH` on
+    // Windows, so a `rundll32.exe` planted next to any file the user happened to open would run
+    // instead. `%SystemRoot%\System32` is not user-writable. The URL still goes through argv, never
+    // a shell, so this remains an argument and not a command.
+    let system32 = std::env::var("SystemRoot")
+        .map(|root| format!("{root}\\System32\\rundll32.exe"))
+        .unwrap_or_else(|_| r"C:\Windows\System32\rundll32.exe".to_string());
+    let mut command = std::process::Command::new(system32);
     command.args(["url.dll,FileProtocolHandler", url]);
     command
 }
@@ -1757,19 +1764,27 @@ mod tests {
     }
 
     #[test]
-    fn without_one_gmail_borrows_thunderbirds_registration_and_says_so() {
-        let choice = client_choice("gmail", crate::oauthclient::Registration::Missing);
-        assert_eq!(choice.client_id, PUBLIC_TEST_CLIENT.0);
-        assert_eq!(choice.source, "public_test");
-        assert!(
-            choice.notice.contains("Mozilla"),
-            "the notice has to name whose registration it is: {}",
-            choice.notice
-        );
-        assert!(
-            choice.notice.contains("撤销"),
-            "and that it can be taken away"
-        );
+    fn no_provider_gets_a_registration_we_do_not_own() {
+        // This test used to assert the opposite: that Gmail fell back to Mozilla's published
+        // Thunderbird registration. That fallback is gone (see `NO_BUILT_IN_REGISTRATION`), and the
+        // assertion is inverted rather than deleted so the decision cannot be quietly undone.
+        for provider in ["gmail", "outlook", "qq", "163"] {
+            let choice = client_choice(provider, crate::oauthclient::Registration::Missing);
+            assert!(
+                choice.client_id.is_empty(),
+                "{provider} must not ship a client_id it does not own"
+            );
+            assert!(
+                choice.client_secret.is_none(),
+                "{provider} must ship no secret"
+            );
+            assert_eq!(choice.source, "missing");
+            assert!(
+                choice.notice.contains("你自己的注册"),
+                "{provider} must tell the user to register their own: {}",
+                choice.notice
+            );
+        }
     }
 
     #[test]

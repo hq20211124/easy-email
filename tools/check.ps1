@@ -167,6 +167,52 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'mail HTML is sanitised before it can reach the renderer' {
+        # The gap this pins was found by an audit on 2026-10-06 and it was the serious kind: the
+        # renderer had no sanitiser at all. The whole defence was the sandbox plus the per-message
+        # CSP, and a CSP has no opinion about navigation — `<meta http-equiv="refresh" content=
+        # "0;url=https://tracker.example/px">` produced an unsolicited request when the message was
+        # merely opened, ignoring the "显示图片" opt-in entirely.
+        #
+        # The behaviour is covered by unit tests in `crates/mail-core/src/sanitize.rs`; this step
+        # exists for the *wiring*, which no unit test can see: a sanitiser that is not called is
+        # exactly as good as no sanitiser, and that is how this bug existed in the first place.
+        $sanitize = Get-Content 'crates/mail-core/src/sanitize.rs' -Raw
+        $imap = Get-Content 'crates/mail-core/src/imap.rs' -Raw
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw
+        $js = Get-Content 'src/app.js' -Raw
+        $problems = @()
+
+        foreach ($tag in @('script', 'iframe', 'object', 'meta', 'embed')) {
+            if ($sanitize -notmatch """$tag""") {
+                $problems += "sanitize.rs: '$tag' is no longer in the drop list"
+            }
+        }
+        if ($sanitize -notmatch 'http-equiv' -and $sanitize -notmatch 'DROP_TAG') {
+            $problems += 'sanitize.rs: the meta/refresh rule has gone'
+        }
+        if ($imap -notmatch 'sanitize_mail_html') {
+            $problems += 'imap.rs: a fetched body is stored without being sanitised'
+        }
+        if ($cache -notmatch 'sanitize_mail_html') {
+            $problems += 'cache.rs: bodies cached before the sanitiser existed are served unsanitised'
+        }
+        if ($js -match 'div\.innerHTML = html') {
+            $problems += 'app.js: the HTML-to-text helper is parsing in the privileged shell again'
+        }
+        if ($js -notmatch 'new DOMParser\(\)') {
+            $problems += 'app.js: the inert HTML-to-text helper (DOMParser) has gone'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'sanitiser present and called on both sides; no raw-HTML parse in the shell'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'mail body layout rules stay safe for percentage layouts' {
         # The rules that make a fixed-width newsletter fit the reading pane have to neutralise pixel
         # widths (inline style="width:720px"), and the only way to beat an inline style is
@@ -387,15 +433,23 @@ try {
           } else if (!fs.existsSync('src-tauri/' + nsis.installerHooks)) {
             problems.push('nsis.installerHooks points at a file that does not exist: ' + nsis.installerHooks);
           }
-          if (win.webviewInstallMode?.type !== 'embedBootstrapper') {
-            problems.push('webviewInstallMode should be embedBootstrapper + silent (design/17 §2)');
+          // `downloadBootstrapper`, not `embedBootstrapper`, as of 2026-10-06: embedding Microsoft's
+          // bootstrapper means redistributing a Microsoft binary, which drags in their runtime
+          // licence's EULA pass-through and SmartScreen-notice obligations and fails the SignPath
+          // criterion "no proprietary components" (design/17 §6.2). The trade-off is real and was
+          // taken deliberately: the installer now needs a network connection to fetch the runtime.
+          if (win.webviewInstallMode?.type !== 'downloadBootstrapper') {
+            problems.push('webviewInstallMode must stay downloadBootstrapper: embedding Microsoft\\'s bootstrapper redistributes it (reports/open-source-readiness.md 2.2)');
+          }
+          if (win.webviewInstallMode?.silent !== true) {
+            problems.push('webviewInstallMode should stay silent (design/17 §2)');
           }
           for (const icon of [conf.bundle?.icon ?? [], nsis.installerIcon ? [nsis.installerIcon] : []].flat()) {
             if (!fs.existsSync('src-tauri/' + icon)) problems.push('icon missing: ' + icon);
           }
           problems.forEach((p) => console.error('- ' + p));
           if (problems.length > 0) process.exit(1);
-          console.log('installer: currentUser + hooks (' + nsis.installerHooks + ') + embedBootstrapper, all files present');
+          console.log('installer: currentUser + hooks (' + nsis.installerHooks + ') + downloadBootstrapper, all files present');
         " 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Host 'the installer configuration would not produce what design/17 describes' -ForegroundColor Red

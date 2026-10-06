@@ -342,10 +342,14 @@ impl ImapClient {
                 let needs_id = cfg.needs_id_command;
 
                 timed(async move {
-                    client
-                        .login(&username, &password)
-                        .await
-                        .map_err(|(e, _)| MailError::classify_login(&host, e.to_string(), needs_id))
+                    client.login(&username, &password).await.map_err(|(e, _)| {
+                        MailError::classify_login_scrubbed(
+                            &host,
+                            e.to_string(),
+                            needs_id,
+                            &password,
+                        )
+                    })
                 })
                 .await?
             }
@@ -358,7 +362,11 @@ impl ImapClient {
                     client
                         .authenticate("XOAUTH2", auth)
                         .await
-                        .map_err(|(e, _)| MailError::classify_login(&host, e.to_string(), false))
+                        .map_err(|(e, _)| {
+                            // The access token is scrubbed the same way as a password: it is a
+                            // credential, and the server has just been shown it.
+                            MailError::classify_login_scrubbed(&host, e.to_string(), false, &token)
+                        })
                 })
                 .await?
             }
@@ -725,6 +733,12 @@ impl ImapClient {
     }
 
     /// Fetch a message's raw bytes.
+    ///
+    /// The size is checked against [`MAX_FETCH_BYTES`] **before** the bytes are copied: `async-imap`
+    /// will happily buffer a literal up to its own 512 MiB ceiling, and `fetch.body()` hands back a
+    /// buffer this code then copies wholesale. A server (or a sender) that answers with a 500 MiB
+    /// literal would otherwise take the process out — and a mail client that dies on one message is
+    /// a mail client that cannot show the user the other nine hundred.
     async fn fetch_raw(&mut self, uid: u32) -> Result<Vec<u8>> {
         timed(async {
             let mut stream = self
@@ -736,6 +750,13 @@ impl ImapClient {
             let mut body = None;
             while let Some(fetch) = stream.try_next().await.map_err(imap_err)? {
                 if let Some(bytes) = fetch.body() {
+                    if bytes.len() > MAX_FETCH_BYTES {
+                        return Err(MailError::Parse(format!(
+                            "邮件太大（{} MB），超过本应用能安全处理的 {} MB 上限。",
+                            bytes.len() / (1024 * 1024),
+                            MAX_FETCH_BYTES / (1024 * 1024)
+                        )));
+                    }
                     body = Some(bytes.to_vec());
                     break;
                 }
@@ -884,6 +905,13 @@ impl ImapClient {
         message_id: &str,
     ) -> Result<Option<u32>> {
         let id = normalise_msg_id(message_id);
+        // The `Message-ID` reaches `uid_search` as an IMAP search key, and `async-imap` does **not**
+        // run its own CRLF/quote validation on `uid_search` (it does for `select`/`copy`/`append`).
+        // The value comes from this app's own `make_message_id`, which is built from the account's
+        // address, so a malformed address is the only way in — but "only way in" is not a reason to
+        // build a protocol line out of unvalidated text, and the fix is two bytes wide.
+        let id = id.replace(['"', '\\'], "");
+        let id: String = id.chars().filter(|c| !c.is_control()).collect();
         timed(async {
             self.session.select(mailbox).await.map_err(imap_err)?;
             let query = format!("HEADER Message-ID \"{id}\"");
@@ -1146,7 +1174,13 @@ fn parse_detail(uid: u32, raw: &[u8]) -> Result<MessageDetail> {
             .map(|r| r.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
         body_text: msg.body_text(0).map(|c| c.into_owned()),
-        body_html: msg.body_html(0).map(|c| c.into_owned()),
+        // Sanitised **here**, where the HTML enters the application, so what is written to the cache
+        // is already safe and every later reader inherits that (see `sanitize`'s module comment for
+        // the `meta http-equiv="refresh"` hole this closes). `Cache::get_detail` runs it again on the
+        // way out for the rows that were stored before this existed.
+        body_html: msg
+            .body_html(0)
+            .map(|c| crate::sanitize::sanitize_mail_html(&c)),
         attachments,
         inline_images,
     })
@@ -1158,6 +1192,14 @@ fn parse_detail(uid: u32, raw: &[u8]) -> Result<MessageDetail> {
 /// turn into an oversized string and a stalled UI. Anything above this stays visible in the
 /// attachment list, where it can be fetched deliberately instead.
 const MAX_INLINE_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Largest message this app will buffer in memory.
+///
+/// Deliberately generous — mail with a 100 MB video attachment is real, and refusing it would be a
+/// worse bug than the one this guards. The point is that the ceiling is *ours* and produces a
+/// readable error, rather than being `async-imap`'s 512 MiB `Buffer::MAX_CAPACITY` arriving as an
+/// out-of-memory kill on a machine that is also running the user's browser.
+const MAX_FETCH_BYTES: usize = 128 * 1024 * 1024;
 
 /// Collect the images that HTML refers to by `cid:`.
 fn collect_inline_images(

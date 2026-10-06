@@ -26,7 +26,7 @@ use crate::error::{MailError, Result};
 use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Where a delivered message's Sent copy is (`design/07` §5.4).
 ///
@@ -233,6 +233,9 @@ impl Cache {
                     "缓存数据库版本 {version} 比程序支持的 {SCHEMA_VERSION} 更新，请升级程序"
                 )));
             }
+            // Some steps below are only needed for databases that predate a version, and they cannot
+            // be inferred from the schema after the fact.
+            let previous_version = version;
 
             conn.execute_batch(
                 "create table if not exists folders (
@@ -328,6 +331,25 @@ impl Cache {
             // and the account's address are all in `messages`, so this migration needs no network: an
             // upgrade that quietly required a sync before old mail could be grouped would leave the
             // user looking at rows that never merge.
+            // v6: the FTS row that belongs to this message, so the index can be addressed by rowid.
+            // Before this the delete scanned the entire index on every single message — see the
+            // comment in `refresh_search_row`; the benchmark measured the difference.
+            add_column_if_missing(conn, "messages", "search_rowid", "integer")?;
+            // The search query joins `messages.search_rowid` to the FTS rowid, and without this index
+            // that join is a scan of `messages` per match — which is the second half of the same
+            // performance bug and was measured at 769 ms P50 on a 20 000-message fixture.
+            conn.execute(
+                "create index if not exists messages_by_search_rowid
+                     on messages(search_rowid)",
+                [],
+            )?;
+            if previous_version < 6 {
+                // Nothing else can fix rows indexed under the old scheme: their rowids are unrelated
+                // to their messages, so there is no way to find them except by scanning. Rebuilding
+                // is cheap (it is derived data) and this is the only moment it can be done in one
+                // pass.
+                rebuild_search_index(conn)?;
+            }
             backfill_subject_keys(conn)?;
             Ok(())
 
@@ -915,16 +937,21 @@ impl Cache {
         let account_id = account_id.to_string();
         let folder = folder.to_string();
         self.db.write_blocking(move |conn: &Connection| {
+            // The index row goes **first**, while its id is still readable from `messages`: once the
+            // message row is gone there is nothing left to look the index row up by, and finding it
+            // any other way means scanning the index (which is the bug this ordering exists to avoid).
+            conn.execute(
+                "delete from search where rowid =
+                     (select search_rowid from messages
+                       where account_id = ?1 and folder = ?2 and uid = ?3)",
+                params![account_id, folder, i64::from(uid)],
+            )?;
             conn.execute(
                 "delete from messages where account_id = ?1 and folder = ?2 and uid = ?3",
                 params![account_id, folder, i64::from(uid)],
             )?;
             conn.execute(
                 "delete from bodies where account_id = ?1 and folder = ?2 and uid = ?3",
-                params![account_id, folder, i64::from(uid)],
-            )?;
-            conn.execute(
-                "delete from search where account_id = ?1 and folder = ?2 and uid = ?3",
                 params![account_id, folder, i64::from(uid)],
             )?;
             Ok(())
@@ -989,9 +1016,17 @@ impl Cache {
             .optional()?;
 
         match raw {
-            Some(json) => serde_json::from_str(&json)
-                .map(Some)
-                .map_err(|e| MailError::Cache(format!("缓存里的正文已损坏：{e}"))),
+            Some(json) => {
+                let mut detail: MessageDetail = serde_json::from_str(&json)
+                    .map_err(|e| MailError::Cache(format!("缓存里的正文已损坏：{e}")))?;
+                // Rows written before the sanitiser existed still hold the sender's raw HTML, so the
+                // guard runs on the way out as well as on the way in. It is idempotent, which is what
+                // makes doing it in both places safe (`crate::sanitize`).
+                if let Some(html) = detail.body_html.take() {
+                    detail.body_html = Some(crate::sanitize::sanitize_mail_html(&html));
+                }
+                Ok(Some(detail))
+            }
             None => Ok(None),
         }
     }
@@ -999,6 +1034,14 @@ impl Cache {
     // ------------------------------------------------------------------ search
 
     /// Local full-text search over headers (always) and bodies (for messages already read).
+    ///
+    /// **Driven from the index, joined by rowid.** The obvious shape — `from search join messages m
+    /// using (account_id, folder, uid) where search match ?` — is the one that was here, and it is
+    /// quadratic: the three join columns are `unindexed` in the FTS5 table, so the planner cannot use
+    /// them for a join and the whole thing degrades into a scan. Measured on the 20 000-message
+    /// fixture: P50 769 ms, P95 2 380 ms, against a `design/15` budget of 100 ms at P95 on ten times
+    /// that data. The subquery takes the matching FTS rowids first (an index lookup) and
+    /// `messages_by_search_rowid` turns each into the message row.
     pub fn search(&self, account_id: &str, query: &str, limit: u32) -> Result<Vec<SearchHit>> {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
@@ -1010,9 +1053,9 @@ impl Cache {
 
         let mut stmt = conn.prepare(
             "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
-             from search
-             join messages m using (account_id, folder, uid)
-             where search match ?1 and search.account_id = ?2
+             from (select rowid from search where search match ?1) f
+             join messages m on m.search_rowid = f.rowid
+             where m.account_id = ?2
              order by m.date desc, m.uid desc
              limit ?3",
         )?;
@@ -1045,33 +1088,58 @@ impl Cache {
         folder: &str,
         uid: u32,
     ) -> Result<()> {
-        let row: Option<IndexSource> = conn
+        // `m.rowid` and `m.search_rowid` come back too: the index is keyed **by rowid** now.
+        //
+        // This is the fix for a real performance bug, found on 2026-10-06 by the fixture benchmark.
+        // The delete used to be `delete from search where account_id = ? and folder = ? and uid = ?`,
+        // and those three columns are `unindexed` in the FTS5 table — `unindexed` means "not
+        // searchable", not "cheap to filter", so every delete scanned the whole index. A sync of N
+        // messages therefore did O(N²) row visits: measured 1.4 s for 2 000 messages and, by that
+        // curve, about an hour for 100 000. `design/A2` §2.1 had already flagged the risk ("987 ms
+        // per row on delete"); the implementation had kept the slow form, and nothing measured it
+        // until the fixture existed.
+        let row: Option<(Option<i64>, IndexSource)> = conn
             .query_row(
-                "select m.subject, m.from_name, m.from_addr, m.to_addrs, b.detail
+                "select m.search_rowid, m.subject, m.from_name, m.from_addr, m.to_addrs, b.detail
                      from messages m
                      left join bodies b
                        on b.account_id = m.account_id and b.folder = m.folder and b.uid = m.uid
                      where m.account_id = ?1 and m.folder = ?2 and m.uid = ?3",
                 params![account_id, folder, i64::from(uid)],
                 |row| {
-                    Ok(IndexSource {
-                        subject: row.get(0)?,
-                        from_name: row.get(1)?,
-                        from_addr: row.get(2)?,
-                        to_addrs: row.get(3)?,
-                        detail_json: row.get(4)?,
-                    })
+                    Ok((
+                        row.get(0)?,
+                        IndexSource {
+                            subject: row.get(1)?,
+                            from_name: row.get(2)?,
+                            from_addr: row.get(3)?,
+                            to_addrs: row.get(4)?,
+                            detail_json: row.get(5)?,
+                        },
+                    ))
                 },
             )
             .optional()?;
 
-        conn.execute(
-            "delete from search where account_id = ?1 and folder = ?2 and uid = ?3",
-            params![account_id, folder, i64::from(uid)],
-        )?;
-
-        let Some(source) = row else {
+        // A row with no `messages` entry never reaches here: the callers that delete a message
+        // (`delete_message`, `invalidate_folder`, `forget_account`) remove the index row in the same
+        // transaction, and they do it first, while the `search_rowid` is still readable.
+        let Some((existing_rowid, source)) = row else {
             return Ok(());
+        };
+
+        if let Some(existing) = existing_rowid {
+            conn.execute("delete from search where rowid = ?1", params![existing])?;
+        }
+
+        // Reuse the row's own id when it has one, so the index stays stable across re-indexing
+        // (a body arriving later re-runs this whole function). A brand new row takes the next free
+        // id: `max(rowid)` is a b-tree lookup, not a scan.
+        let rowid: i64 = match existing_rowid {
+            Some(existing) => existing,
+            None => conn.query_row("select ifnull(max(rowid), 0) + 1 from search", [], |row| {
+                row.get(0)
+            })?,
         };
 
         // The body lives inside the serialised detail; pull just the text out of it.
@@ -1084,9 +1152,10 @@ impl Cache {
 
         conn.execute(
             "insert into search
-                 (subject, from_name, from_addr, to_addrs, body, account_id, folder, uid)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (rowid, subject, from_name, from_addr, to_addrs, body, account_id, folder, uid)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
+                rowid,
                 to_tokens(&source.subject),
                 to_tokens(source.from_name.as_deref().unwrap_or_default()),
                 to_tokens(source.from_addr.as_deref().unwrap_or_default()),
@@ -1097,8 +1166,43 @@ impl Cache {
                 i64::from(uid),
             ],
         )?;
+
+        // Remember which index row belongs to this message, so the *next* refresh (and every
+        // deletion) can address it by rowid instead of scanning the index.
+        conn.execute(
+            "update messages set search_rowid = ?4
+             where account_id = ?1 and folder = ?2 and uid = ?3",
+            params![account_id, folder, i64::from(uid), rowid],
+        )?;
         Ok(())
     }
+}
+
+/// Throw the index away and build it again from `messages` (and `bodies`).
+///
+/// Used by the v6 migration, whose whole point is that old rows had no `search_rowid` to delete by.
+/// One pass, one transaction: the identities are collected first because the loop writes to
+/// `messages` while a statement over it would still be open.
+fn rebuild_search_index(conn: &Connection) -> Result<()> {
+    conn.execute("delete from search", [])?;
+    conn.execute("update messages set search_rowid = null", [])?;
+
+    let rows: Vec<(String, String, u32)> = {
+        let mut stmt = conn.prepare("select account_id, folder, uid from messages")?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u32,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (account_id, folder, uid) in rows {
+        Cache::refresh_search_row(conn, &account_id, &folder, uid)?;
+    }
+    Ok(())
 }
 
 /// Add a column to an existing table, once.
