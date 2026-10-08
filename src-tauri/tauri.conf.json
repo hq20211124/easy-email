@@ -17,8 +17,7 @@
         "minWidth": 640,
         "minHeight": 460,
         "resizable": true,
-        "decorations": false,
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,AutofillServerCommunication"
+        "decorations": false
       }
     ],
     "security": {
@@ -27,22 +26,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.ico"],
-    "windows": {
-      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
-      "digestAlgorithm": "sha256",
-      "timestampUrl": "http://timestamp.digicert.com",
-      "nsis": {
-        "installMode": "currentUser",
-        "displayLanguageSelector": false,
-        "languages": ["SimpChinese", "English"],
-        "installerIcon": "icons/icon.ico",
-        "installerHooks": "installer/hooks.nsh"
-      }
-    },
+    "targets": ["deb", "appimage", "rpm"],
+    "icon": ["icons/icon.ico", "icons/icon.png"],
     "publisher": "Easy Email",
-    "shortDescription": "轻量 Windows 邮件桌面客户端",
-    "longDescription": "内置主流国内外邮箱配置，开箱即用的 Windows 邮件桌面客户端。"
+    "shortDescription": "轻量邮件桌面客户端",
+    "longDescription": "内置主流国内外邮箱配置，开箱即用的邮件桌面客户端。"
   }
 }

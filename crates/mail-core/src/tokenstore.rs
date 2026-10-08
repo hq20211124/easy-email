@@ -3,7 +3,13 @@
 //! A1-F35 settled this, and it is worth restating because the obvious answer is wrong: the **Windows
 //! credential manager cannot hold a refresh token**. `CRED_MAX_CREDENTIAL_BLOB_SIZE` is 2,560 bytes
 //! and Entra's refresh tokens are commonly 1-4 KB, so storing one there fails or, worse, truncates.
-//! The design's answer is a **DPAPI-encrypted file** (`CryptProtectData`, user scope).
+//!
+//! Windows uses a **DPAPI-encrypted file** (`CryptProtectData`, user scope). Linux/macOS has no DPAPI,
+//! so the file is instead encrypted with a key derived from the machine's own id (`/etc/machine-id`)
+//! and the caller's entropy (the account id), written with `0600` permissions inside a `0700`
+//! directory. The honest limitation is the same on both platforms — this does not stop malware
+//! running **as the same user**; it stops the file being useful to another account on the same
+//! machine or anywhere else.
 //!
 //! Three details that are easy to get wrong and are therefore spelled out here:
 //!
@@ -43,6 +49,7 @@ impl TokenStore {
     pub fn save(&self, account_id: &str, refresh_token: &str) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|error| MailError::Config(format!("无法创建令牌目录：{error}")))?;
+        restrict_dir(&self.dir);
         let sealed = protect(refresh_token.as_bytes(), account_id.as_bytes())?;
         let path = self.path_for(account_id);
         // Write to a temporary file and rename: a crash halfway through must not leave a truncated
@@ -52,6 +59,7 @@ impl TokenStore {
             .map_err(|error| MailError::Config(format!("无法写入令牌：{error}")))?;
         std::fs::rename(&temporary, &path)
             .map_err(|error| MailError::Config(format!("无法替换令牌文件：{error}")))?;
+        restrict_file(&path);
         Ok(())
     }
 
@@ -96,9 +104,10 @@ impl TokenStore {
     }
 }
 
-/// Whether this build can protect tokens at all.
+/// Whether this build can protect tokens at all. Both supported platforms have a real
+/// implementation now (DPAPI on Windows, machine-id-keyed file encryption elsewhere).
 pub fn available() -> bool {
-    cfg!(windows)
+    true
 }
 
 #[cfg(windows)]
@@ -195,16 +204,135 @@ fn free_local(pointer: *mut u8) {
     }
 }
 
+#[cfg(windows)]
+fn restrict_dir(_dir: &std::path::Path) {}
+
+#[cfg(windows)]
+fn restrict_file(_path: &std::path::Path) {}
+
 #[cfg(not(windows))]
-fn protect(_plain: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
-    Err(MailError::Config(
-        "这个版本只在 Windows 上提供 DPAPI 保护的令牌存储".into(),
-    ))
+fn restrict_dir(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
 }
 
 #[cfg(not(windows))]
-fn unprotect(_sealed: &[u8], _entropy: &[u8]) -> std::result::Result<Vec<u8>, String> {
-    Err("这个平台没有 DPAPI".into())
+fn restrict_file(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(windows))]
+fn protect(plain: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
+    let key = derive_key(entropy)?;
+    let mut out = Vec::with_capacity(MAGIC.len() + TAG_LEN + plain.len());
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&tag(&key, plain));
+    out.extend(xor_keystream(&key, plain));
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+fn unprotect(sealed: &[u8], entropy: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let key = derive_key(entropy).map_err(|error| error.to_string())?;
+    if sealed.len() < MAGIC.len() + TAG_LEN + 1 || &sealed[..MAGIC.len()] != MAGIC {
+        return Err("不是有效的令牌文件".into());
+    }
+    let expected = &sealed[MAGIC.len()..MAGIC.len() + TAG_LEN];
+    let body = &sealed[MAGIC.len() + TAG_LEN..];
+    let plain = xor_keystream(&key, body);
+    if tag(&key, &plain).as_slice() != expected {
+        return Err("完整性校验失败".into());
+    }
+    Ok(plain)
+}
+
+/// Four bytes of magic so a non-token file is rejected rather than producing garbage.
+#[cfg(not(windows))]
+const MAGIC: &[u8; 4] = b"EEET";
+
+#[cfg(not(windows))]
+const TAG_LEN: usize = 8;
+
+/// Key = SHA-256(domain || machine secret || caller entropy). The machine secret binds the
+/// file to this machine; the entropy (the account id) binds it to this account.
+#[cfg(not(windows))]
+fn derive_key(entropy: &[u8]) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"easy-email/tokenstore/v1");
+    hasher.update(machine_secret()?);
+    hasher.update(entropy);
+    Ok(hasher.finalize().into())
+}
+
+#[cfg(not(windows))]
+fn tag(key: &[u8; 32], plain: &[u8]) -> [u8; TAG_LEN] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.update(plain);
+    let digest = hasher.finalize();
+    let mut out = [0u8; TAG_LEN];
+    out.copy_from_slice(&digest[..TAG_LEN]);
+    out
+}
+
+/// SHA-256 in counter mode as a keystream: a stand-in stream cipher that keeps the token
+/// out of the file (and fails an integrity check under the wrong key) without a new
+/// dependency. **Not** a substitute for a real AEAD in new code; chosen because it needs
+/// no new crate and the threat model is file-on-wrong-machine.
+#[cfg(not(windows))]
+fn xor_keystream(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::with_capacity(data.len());
+    for (counter, chunk) in data.chunks(32).enumerate() {
+        let mut hasher = Sha256::new();
+        hasher.update(key);
+        hasher.update((counter as u64).to_be_bytes());
+        let block = hasher.finalize();
+        for (byte, key) in chunk.iter().zip(block.iter()) {
+            out.push(byte ^ key);
+        }
+    }
+    out
+}
+
+/// The machine's own identity: `/etc/machine-id`, falling back to a per-user random file
+/// persisted next to the app config. Either is enough to keep the file from being useful
+/// on another machine.
+#[cfg(not(windows))]
+fn machine_secret() -> Result<Vec<u8>> {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(id) = std::fs::read_to_string(path) {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.as_bytes().to_vec());
+            }
+        }
+    }
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })
+        .ok_or_else(|| MailError::Config("无法确定配置目录，无法读取机器标识".into()))?
+        .join("easy-email");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| MailError::Config(format!("无法创建配置目录：{error}")))?;
+    let path = dir.join("machine-key");
+    match std::fs::read(&path) {
+        Ok(bytes) if bytes.len() >= 16 => Ok(bytes),
+        _ => {
+            let mut bytes = vec![0u8; 32];
+            getrandom::fill(&mut bytes)
+                .map_err(|error| MailError::Config(format!("系统随机源不可用：{error}")))?;
+            std::fs::write(&path, &bytes)
+                .map_err(|error| MailError::Config(format!("无法写入机器标识：{error}")))?;
+            restrict_file(&path);
+            Ok(bytes)
+        }
+    }
 }
 
 /// A directory that is removed when the test ends, so a failing test leaves nothing behind.
@@ -297,8 +425,8 @@ mod tests {
         assert_eq!(files.len(), 1, "one file per account");
         let raw = std::fs::read(&files[0]).expect("read");
 
-        // The assertion this whole module exists for: if DPAPI silently did nothing, the secret would
-        // be sitting in the file and this would catch it.
+        // The assertion this whole module exists for: if the protection silently did nothing,
+        // the secret would be sitting in the file and this would catch it.
         assert!(
             !raw.windows("SUPERSECRET-REFRESH-TOKEN".len())
                 .any(|window| window == b"SUPERSECRET-REFRESH-TOKEN"),
@@ -306,7 +434,7 @@ mod tests {
         );
         assert!(
             raw.len() > 20,
-            "DPAPI output carries a header: {} bytes",
+            "sealed output carries a header: {} bytes",
             raw.len()
         );
     }
@@ -316,7 +444,7 @@ mod tests {
         if !available() {
             return;
         }
-        // The account id is the DPAPI entropy, so this is what stops one account's token from being
+        // The account id is the entropy, so this is what stops one account's token from being
         // handed to another — and what a "copy the file next to another account" attempt looks like.
         let dir = TempDir::new("entropy");
         let store = TokenStore::new(dir.path());

@@ -1,0 +1,35 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Easy Email — 邮件客户端",
+        "width": 1200,
+        "height": 780,
+        "minWidth": 640,
+        "minHeight": 460,
+        "resizable": true,
+        "decorations": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,AutofillServerCommunication"
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "languages": ["SimpChinese", "English"],
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "installer/hooks.nsh"
+      }
+    },
+    "shortDescription": "轻量 Windows 邮件桌面客户端",
+    "longDescription": "内置主流国内外邮箱配置，开箱即用的 Windows 邮件桌面客户端。"
+  }
+}

@@ -743,10 +743,21 @@ impl BrowserLauncher for SystemBrowser {
     }
 
     #[cfg(not(windows))]
-    fn open(&self, _url: &str) -> Result<()> {
-        Err(MailError::Config(
-            "这个版本只在 Windows 上打开系统浏览器".into(),
-        ))
+    fn open(&self, url: &str) -> Result<()> {
+        // Same guarantee as the Windows branch: the URL arrives as ONE argv element, never
+        // through a shell. `xdg-open` is the freedesktop default handler.
+        let status = std::process::Command::new("xdg-open")
+            .arg(url)
+            .status()
+            .map_err(|error| {
+                MailError::Config(format!("无法打开浏览器（xdg-open 不可用）：{error}"))
+            })?;
+        if !status.success() {
+            return Err(MailError::Config(
+                "系统没有打开浏览器，请手动复制授权链接".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

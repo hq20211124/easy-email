@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "targets": ["deb", "appimage", "rpm"],
+    "linux": {
+      "deb": {
+        "depends": ["librsvg2-2", "xdg-utils"]
+      }
+    }
+  }
+}

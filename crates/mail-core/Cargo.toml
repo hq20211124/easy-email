@@ -22,7 +22,11 @@ lettre = { version = "0.11", default-features = false, features = [
 # of real mail in this market.
 mail-parser = { version = "0.11", features = ["full_encoding"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-keyring = { version = "3", default-features = false, features = ["windows-native"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Inline (`cid:`) images are handed to the webview as `data:` URIs, which requires base64.
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Attachment identity: a draft records each file's hash when it is added, and the send path compares
@@ -60,12 +64,13 @@ url = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Networking_WinSock"] }
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Non-Windows platforms store secrets through the D-Bus Secret Service
+# (libsecret/gnome-keyring/KWallet). `crypto-rust` keeps the transfer encryption
+# pure-Rust so openSSL dev headers are not needed at build time.
+[target.'cfg(not(windows))'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }

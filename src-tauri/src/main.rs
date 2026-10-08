@@ -8,7 +8,7 @@
 //   * `easy-email.exe > log.txt 2>&1` — a GUI-subsystem process inherits handles it was handed,
 //     so redirection works with no console at all
 // Panics additionally go to `startup-error.log`; see `log_line` in lib.rs.
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 /// Console plumbing for `--console`.
 ///
@@ -89,6 +89,15 @@ fn main() {
     {
         if std::env::args().any(|arg| arg == "--console") {
             console::attach_to_parent();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Console semantics on Linux/macOS: the process owns its terminal anyway, so this is
+        // a no-op that still prints the two stream markers the runbook greps for.
+        if std::env::args().any(|arg| arg == "--console") {
+            println!("[easy-email] --console: stdout 已就绪");
+            eprintln!("[easy-email] --console: stderr 已就绪");
         }
     }
 

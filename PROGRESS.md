@@ -34,6 +34,38 @@
 
 ---
 
+### M2-1 Linux（WSL）可编译、可测试、可运行；Windows 行为不变 ✅（第 62 轮）
+
+目标从一开始定的是"**优先 Windows 可用，同时别把 Linux 写死**"。这一轮把之前散落的
+`cfg(windows)` 假设补齐成平台分支：
+
+| 原来 | 现在 |
+|---|---|
+| `keyring` 写死 `windows-native` | Windows `windows-native` 保持；其余平台 `sync-secret-service`+`crypto-rust`（D-Bus/libsecret） |
+| `rusqlite/serde/serde_json/thiserror/tokio` 只在 `cfg(windows)` 里声明，但 `cache.rs`/`userdb.rs` 无条件引用 | 移回公共段（这是 Linux 编译不过的直接原因） |
+| `tokenstore` 非 Windows 恒 Err、`available()` 恒 false | 非 Windows 改为"机器标识派生密钥加密 + 0600 文件 + 0700 目录"，五个原测试从"恒跳过"变成真跑真绿 |
+| `SystemBrowser::open` 非 Windows 恒 Err | Linux 用 `xdg-open`（argv 直传，不经 shell；Windows 的 `rundll32` 路径不动） |
+| `main.rs` 的 `#![windows_subsystem]` 不 cfg | 改成 `cfg_attr(windows, …)`；非 Windows 的 `--console` 只打印两行标记 |
+
+打包配置按平台拆：`tauri.conf.json` 留跨平台字段（targets/deb/appimage/rpm、png 图标），
+新增 `tauri.windows.conf.json`（nsis、webviewInstallMode、`additionalBrowserArgs`）和
+`tauri.linux.conf.json`（deb depends、运行时库），Tauri v2 自动合并，**Windows 打包产物与
+原来一致**。
+
+**两平台都在本机真跑过**：
+- WSL：fmt / clippy `-D warnings` / 292 测试通过；装了 systemd 用户 dbus socket 后
+  keyring 的"真实 vault 往返"用例也过；deb / AppImage / rpm 三件套产出并验证（解包运行、
+  rpm 依赖、桌面文件）。
+- Windows：用本机 Windows cargo（1.98.1，MSVC）跑了 **293 个测试**（比 Linux 多一个
+  `cfg(windows)` 用例）+ clippy + fmt + `cargo tauri build` 出 nsis，PE 仍是 GUI subsystem。
+
+**License 影响**：新增的 30 来个 crate（`dbus-secret-service`/`secret-service`/`zbus` 家族/
+RustCrypto 的 aes/hkdf/hmac/nix/rand/num…）逐个查过 crates.io 的 license 字段，全是
+MIT 或 MIT-OR-Apache-2.0，且只在 `cfg(not(windows))` 边进入图，**不进 Windows 二进制**。
+详见 `reports/licensing.md` §1.7。
+
+---
+
 ### M1a-24 添加附件时就把超限挡住（`design/15` §4 的验收项）✅（第 30 轮）
 
 M1a-23 把上限拦在**点发送**时，但设计要的是"添加附件/点发送时**就**被拦住"——用户在还没写正文之前

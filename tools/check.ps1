@@ -438,7 +438,9 @@ try {
         }
         node -e "
           const fs = require('fs');
-          const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          // Windows packaging invariants live in the platform override; the base config
+          // carries the cross-platform bundle fields.
+          const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.windows.conf.json', 'utf8'));
           const win = conf.bundle?.windows ?? {};
           const nsis = win.nsis ?? {};
           const problems = [];
@@ -608,6 +610,11 @@ try {
     }
 
     Step 'desktop binary is a GUI subsystem (no console window)' {
+        if (-not $IsWindows) {
+            Write-Host 'non-Windows host: PE subsystem check skipped (main.rs uses cfg_attr instead)' -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
         # Regression guard. The Tauri template ships
         # `cfg_attr(not(debug_assertions), windows_subsystem = "windows")`, which left every debug
         # build as a console binary, so launching the exe from Explorer opened a cmd window behind

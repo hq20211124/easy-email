@@ -1,6 +1,6 @@
 # Easy Email
 
-轻量级 Windows 邮件桌面客户端。**用户只需要填邮箱地址和授权码 —— 服务器地址、端口、加密方式全部内置。**
+轻量级**跨平台**邮件桌面客户端，主要目标是 Windows，Linux 亦可编译与运行。**用户只需要填邮箱地址和授权码 —— 服务器地址、端口、加密方式全部内置。**
 
 技术栈：Tauri v2 + Rust。没有 Node 构建步骤，前端是静态 HTML/JS，整个项目一次 `cargo build` 搞定。
 
@@ -44,6 +44,15 @@
 
 ```powershell
 cargo run -p easy-email
+```
+
+**Linux**（含 WSL）：除 Rust 工具链外需要 `build-essential pkg-config libwebkit2gtk-4.1-dev
+libsoup-3.0-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libdbus-1-dev`。
+凭据走 D-Bus Secret Service（gnome-keyring / KWallet），没有密钥守护进程时应用会明确报错而不是
+硬崩；刷新令牌存为机器标识派生密钥加密的 0600 文件。打包：
+
+```bash
+cargo tauri build    # deb / AppImage / rpm；Windows 上为 nsis
 ```
 
 **没有控制台窗口。** exe 现在是 GUI 子系统的（Tauri 模板默认只有 release 才是，于是每次双击 debug
