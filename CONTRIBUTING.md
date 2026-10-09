@@ -39,6 +39,20 @@ stylesheet styles must exist, a command the UI calls must exist in Rust, the san
 applied on both fetch and cache, the CSP intersection rule, and the installer configuration.
 Please do not weaken a gate to make a change pass.
 
+## Releasing (maintainers)
+
+A `v*` tag builds the four installers and uploads them to the Release
+(`.github/workflows/release.yml`), but CI does **not** bump the version for you: the version in
+the artifact names comes from `src-tauri/tauri.conf.json` and the workspace `Cargo.toml`, which
+have nothing to do with the tag. Skip that step and every release ships files called
+`Easy Email_0.1.0_…` that users cannot tell apart — that is exactly how v0.1.1 was mis-released.
+
+```bash
+# 1. bump the version in BOTH files, then commit and push
+# 2. git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z
+# 3. gh release create vX.Y.Z --title "…" --notes-file notes.md --latest
+```
+
 ## Pull Requests
 
 - Keep the change focused. One behaviour per PR, and say in the description *what it fixes for

@@ -133,6 +133,32 @@ python tools/make_icon.py
 
 ---
 
+## 发版（维护者）
+
+打 tag 会自动构建四类安装包并上传到 Release（`.github/workflows/release.yml`），但 CI **不会**替你
+改版本号——产物文件名里的版本来自 `src-tauri/tauri.conf.json` 的 `version` 和 workspace `Cargo.toml`，
+与 git tag 无关。忘了改的后果是每个版本都产出 `Easy Email_0.1.0_…`，Release 页上无法区分（v0.1.1
+第一次就是这么发错的）。
+
+```bash
+# 1. 升版本号（两处保持一致）
+sed -i 's/^version = .*/version = "X.Y.Z"/' Cargo.toml
+sed -i 's/"version": ".*"/"version": "X.Y.Z"/' src-tauri/tauri.conf.json
+
+# 2. 提交并推送
+git commit -am "发布 X.Y.Z" && git push
+
+# 3. 打 tag 并推送（触发 CI 构建与上传）
+git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z
+
+# 4. 写发布说明并置为 latest
+gh release create vX.Y.Z --title "Easy Email X.Y.Z（主题）" --notes-file notes.md --latest
+```
+
+产物带 `SHA256SUMS`；deb/rpm 的运行时依赖声明在 `src-tauri/tauri.linux.conf.json`。
+
+---
+
 ## 目录结构
 
 ```
