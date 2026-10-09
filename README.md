@@ -1,5 +1,11 @@
 # Easy Email
 
+[![Release](https://img.shields.io/github/v/release/hq20211124/easy-email?style=flat-square)](https://github.com/hq20211124/easy-email/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/hq20211124/easy-email/release.yml?style=flat-square&label=build)](https://github.com/hq20211124/easy-email/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](#安装)
+[![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black)](#安装)
+
 轻量级**跨平台**邮件桌面客户端，主要目标是 Windows，Linux 亦可编译与运行。**用户只需要填邮箱地址和授权码 —— 服务器地址、端口、加密方式全部内置。**
 
 技术栈：Tauri v2 + Rust。没有 Node 构建步骤，前端是静态 HTML/JS，整个项目一次 `cargo build` 搞定。
@@ -38,18 +44,42 @@
 
 ---
 
-## 跑起来
+## 安装
 
-需要 Rust 1.88+（本项目使用 edition 2024）、VS 2022 Build Tools、WebView2 Runtime。
+装好的包在 [Releases](https://github.com/hq20211124/easy-email/releases/latest) 页面，
+四类产物由 CI 自动构建并附带 `SHA256SUMS`。
 
-```powershell
-cargo run -p easy-email
+| 平台 | 下载 | 安装 |
+|---|---|---|
+| Windows | `Easy Email_x64-setup.exe` | 双击安装（需要系统有 WebView2 运行时，Win10/11 一般自带；安装时按需联网下载） |
+| Debian / Ubuntu | `Easy Email_0.1.0_amd64.deb` | `sudo dpkg -i Easy\ Email_0.1.0_amd64.deb`（依赖会自动提示） |
+| Fedora / RHEL | `Easy Email-0.1.0-1.x86_64.rpm` | `sudo dnf install ./Easy\ Email-0.1.0-1.x86_64.rpm` |
+| 任意 Linux（免安装） | `Easy Email_0.1.0_amd64.AppImage` | `chmod +x Easy\ Email_0.1.0_amd64.AppImage && ./Easy\ Email_0.1.0_amd64.AppImage` |
+
+Linux 版凭据走 D-Bus Secret Service（gnome-keyring / KWallet）；没有密钥守护进程时应用会明确
+报错而不是硬崩，刷新令牌以"机器标识派生密钥加密 + `0600` 权限"的本地文件存放。
+
+首次添加账号：填邮箱地址 → 服务商与服务器自动识别 → 填**授权码**（不是登录密码）→ 应用先做一次
+真实连接验证再保存。Gmail 与 Outlook/Microsoft 365 只支持 OAuth2，需要在向导里填**你自己注册的**
+客户端 ID（微软没有授权码这东西）。
+
+---
+
+## 从源码构建
+
+需要 Rust 1.88+（本项目使用 edition 2024）。前端是静态 HTML/JS，没有 Node 构建步骤。
+
+**Windows**：装 VS 2022 Build Tools + WebView2 Runtime，然后 `cargo run -p easy-email`。
+
+**Linux**（含 WSL）：除 Rust 工具链外还需要
+
+```bash
+sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+  libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libdbus-1-dev
 ```
 
-**Linux**（含 WSL）：除 Rust 工具链外需要 `build-essential pkg-config libwebkit2gtk-4.1-dev
-libsoup-3.0-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libdbus-1-dev`。
-凭据走 D-Bus Secret Service（gnome-keyring / KWallet），没有密钥守护进程时应用会明确报错而不是
-硬崩；刷新令牌存为机器标识派生密钥加密的 0600 文件。打包：
+没有图形会话时（例如 WSL 默认会话）用 `dbus-run-session -- ./target/debug/easy-email` 起
+桌面总线和托盘，否则托盘/密钥环会报告"没有 session bus"。Linux 打包：
 
 ```bash
 cargo tauri build    # deb / AppImage / rpm；Windows 上为 nsis
@@ -597,6 +627,11 @@ back=40000 written=40000 identical=true
   否则正文策略再宽松也没用（这就是上面第 8 条那个 bug）。
   真正的把关点在 `buildSandboxedDocument()` 的默认分支，`check.ps1` 有一项专门盯着它别被改坏。
 - **CSP 锁死渲染进程**：脚本只能来自本地，`connect-src` 只留 IPC。
+- **凭据按平台分离保存**：Windows 走凭据管理器（密码）+ DPAPI 用户态加密文件（刷新令牌）；
+  Linux 走 D-Bus Secret Service（密码）+ 机器标识派生密钥加密的 `0600` 文件（刷新令牌）。
+  日志里永远不出现令牌或密码（`tools/check.ps1` 有一项专门拦这个）。
+- 报告安全问题见 [SECURITY.md](SECURITY.md)，第三方组件许可清单见
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ---
 
@@ -651,3 +686,14 @@ back=40000 written=40000 identical=true
 - **自定义账号不参与服务商表的所有策略**：`daily_download_budget()`、`append_limit_bytes()`、
   `smtp_max_message_bytes()` 对它都返回 `None`（"未知"），所以配额节流与发送前的大小预检对它不生效。
   这是如实表示未知，不是漏洞。
+
+---
+
+## 许可与致谢
+
+本项目以 [MIT](LICENSE) 发布。第三方组件与各自许可的完整清单见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)；安全相关问题见 [SECURITY.md](SECURITY.md)；
+想参与开发见 [CONTRIBUTING.md](CONTRIBUTING.md)（一句话：**修了行为就要有能抓住那个 bug 的测试**）。
+
+内置的 21 个服务商配置来自各服务商公开文档与登录帮助页的表述，不含任何商标图形；
+OAuth 路径不内置任何第三方客户端注册——Gmail 与 Microsoft 365 都要求用户使用自己注册的应用。
