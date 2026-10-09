@@ -32,7 +32,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "stable"
-          targets: x86_64-unknown-linux-gnu
+          target: x86_64-unknown-linux-gnu
       - name: cargo tauri build
         run: cargo install tauri-cli --version "^2" && cargo tauri build
       - name: checksums
@@ -57,7 +57,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "stable"
-          targets: x86_64-pc-windows-msvc
+          target: x86_64-pc-windows-msvc
       - name: cargo tauri build
         run: cargo install tauri-cli --version "^2" && cargo tauri build
       - name: checksums
