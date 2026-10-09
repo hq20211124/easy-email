@@ -88,6 +88,15 @@ const state = {
   sendCap: null,
   /** Decoded mailbox name for display; `mailbox` stays in wire form for commands. */
   mailboxLabel: null,
+  /**
+   * Unread message count per folder (wire name -> count), from the cache.
+   *
+   * A folder with nothing unread is absent rather than zero, so a badge only ever appears when it
+   * carries information — a row of zeroes is decoration, and a badge that is always there stops
+   * being read. Absent for a folder that has never been synced, which is why an account added five
+   * seconds ago shows no badges at all.
+   */
+  unreadCounts: {},
   messages: [],
   limit: PAGE_SIZE,
   /**
@@ -198,6 +207,11 @@ function errText(error) {
   if (typeof error === 'string') return error;
   if (error && typeof error.message === 'string') return error.message;
   return String(error);
+}
+
+/** 99+ once a folder is deep enough that the exact number stops being useful. */
+function formatUnread(count) {
+  return count > 99 ? '99+' : String(count);
 }
 
 function formatDate(unixSeconds) {
@@ -596,6 +610,10 @@ async function loadMailboxes() {
   state.mailboxes = (mailboxes ?? []).filter((box) => box.selectable);
   renderMailboxes();
 
+  // Badges come from the cache, so an offline start still shows what was unread when the app was
+  // last online. Best effort: a failure here must not stop the folder list from rendering.
+  await loadUnreadCounts();
+
   if (state.mailboxes.length === 0) {
     state.messages = [];
     renderMessages();
@@ -716,6 +734,16 @@ async function openHit(hit) {
   });
 }
 
+/** Refresh the sidebar badges. Failures leave the previous counts on screen rather than blanking them. */
+async function loadUnreadCounts() {
+  if (!state.accountId) return;
+  const counts = await run('读取未读数', () =>
+    invoke('folder_unread_counts', { accountId: state.accountId })
+  );
+  state.unreadCounts = counts ?? {};
+  renderMailboxes();
+}
+
 function renderMailboxes() {
   const list = $('mailbox-list');
   list.innerHTML = '';
@@ -731,7 +759,14 @@ function renderMailboxes() {
     // The wire name, not the display name: two folders can share a decoded label, and the
     // highlight must follow the one the commands are actually pointed at.
     button.dataset.mailbox = box.name;
-    button.innerHTML = `<span class="label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>`;
+    const unread = state.unreadCounts[box.name] ?? 0;
+    button.innerHTML = `<span class="label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>${
+      unread > 0
+        ? `<span class="unread-badge" title="${escapeHtml(label)}：${unread} 封未读">${escapeHtml(
+            formatUnread(unread)
+          )}</span>`
+        : ''
+    }`;
     button.addEventListener('click', () => {
       // Choosing a folder is what leaves the drafts list; `selectMailbox` itself is also called
       // while loading an account, where jumping out of drafts would be exactly wrong.
@@ -1061,6 +1096,7 @@ function renderDrafts(list) {
     row.tabIndex = 0;
     row.innerHTML = `
       <div class="msg-top">
+        <span class="unread-dot read" aria-hidden="true"></span>
         <span class="msg-from">${escapeHtml(draft.to_addrs || '(未填收件人)')}</span>
         <span class="msg-date">${escapeHtml(formatDate(draft.updated_at))}</span>
       </div>
@@ -1182,6 +1218,7 @@ function renderOutbox(list) {
     const undo = undoCountdown(item);
     row.innerHTML = `
       <div class="msg-top">
+        <span class="unread-dot read" aria-hidden="true"></span>
         <span class="msg-from">${escapeHtml(preview.destinations)}</span>
         <span class="msg-date">${escapeHtml(formatDate(item.created_at))}</span>
       </div>
@@ -1513,6 +1550,9 @@ async function loadMessages({ reset = false } = {}) {
   // Newest first: the server returns ascending UIDs and people want the latest on top.
   state.messages = messages.slice().sort((a, b) => b.uid - a.uid);
   renderMessages();
+  // The badges count the cache, and this listing just changed it. Not awaited: the list on screen
+  // is the thing the user asked for, and a slow badge must not hold it up.
+  void loadUnreadCounts();
 }
 
 function renderMessages() {
@@ -1566,6 +1606,11 @@ function renderMessages() {
     button.className = 'msg' + (unread ? ' unread' : '') + (selected ? ' selected' : '');
     button.innerHTML = `
       <div class="msg-top">
+        ${
+          unread
+            ? '<span class="unread-dot" role="img" aria-label="未读" title="此会话有未读邮件"></span>'
+            : '<span class="unread-dot read" aria-hidden="true"></span>'
+        }
         <span class="msg-from">${
           extra > 0
             ? `<span class="msg-caret" role="button" title="${
@@ -1599,6 +1644,11 @@ function renderMessages() {
         child.className = 'msg thread-child' + (entry.seen ? '' : ' unread');
         child.innerHTML = `
           <div class="msg-top">
+            ${
+              entry.seen
+                ? '<span class="unread-dot read" aria-hidden="true"></span>'
+                : '<span class="unread-dot" role="img" aria-label="未读" title="未读"></span>'
+            }
             <span class="msg-from">${escapeHtml(senderLabel(entry))}</span>
             <span class="msg-date">${escapeHtml(formatDate(entry.date))}</span>
           </div>
@@ -1635,6 +1685,11 @@ function renderSearchHits(list) {
     const button = document.createElement('button');
     const selected = hit.uid === state.selectedUid && hit.folder === state.selectedFolder;
     button.className = 'msg' + (hit.seen ? '' : ' unread') + (selected ? ' selected' : '');
+    // The same marker the folder list uses: a search hit is mail, and unread mail has to look
+    // unread wherever it appears. The `seen: hit.seen` line two branches below reads it too.
+    const dot = hit.seen
+      ? '<span class="unread-dot read" aria-hidden="true"></span>'
+      : '<span class="unread-dot" role="img" aria-label="未读" title="未读"></span>';
     // Tag only the hits that come from somewhere other than the folder on screen — the tag exists to
     // answer "why is this here?", and while everything is in the current folder that is noise.
     const tag =
@@ -1643,6 +1698,7 @@ function renderSearchHits(list) {
         : `<span class="msg-folder">${escapeHtml(folderLabel(hit.folder))}</span>`;
     button.innerHTML = `
       <div class="msg-top">
+        ${dot}
         <span class="msg-from">${tag}${escapeHtml(senderLabel(hit))}</span>
         <span class="msg-date">${escapeHtml(formatDate(hit.date))}</span>
       </div>
@@ -1783,6 +1839,9 @@ function markSeen(summary, folder) {
   if (!summary || summary.seen) return;
   summary.seen = true;
   renderMessages();
+  // One fewer unread in this folder. Re-read rather than decrement: the same message could be open
+  // from a conversation that spans folders, and the count belongs to the folder it was fetched in.
+  void loadUnreadCounts();
   run('标记已读', () =>
     invoke('mark_seen', {
       accountId: state.accountId,

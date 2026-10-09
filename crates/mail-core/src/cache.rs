@@ -957,6 +957,43 @@ impl Cache {
         Ok(count as u32)
     }
 
+    /// Unread messages **per folder**, for the sidebar badges.
+    ///
+    /// A folder with no unread mail is absent from the map rather than present with `0`: the renderer
+    /// shows nothing for it, which is the difference between a badge that carries information and one
+    /// that is decoration. Read from the cache for the same reason [`Cache::unread_count`] is — the
+    /// badges must appear on an offline start, where there is no server to ask.
+    ///
+    /// Folders the cache has never synced are absent too, so a freshly added account shows no badges
+    /// instead of a row of zeroes.
+    pub fn unread_counts(
+        &self,
+        account_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+
+        let mut statement = conn.prepare(
+            "select folder, count(*) from messages
+              where account_id = ?1 and seen = 0
+              group by folder",
+        )?;
+        let rows = statement.query_map(params![account_id], |row| {
+            let folder: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((folder, count as u32))
+        })?;
+
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let (folder, count) = row?;
+            if count > 0 {
+                counts.insert(folder, count);
+            }
+        }
+        Ok(counts)
+    }
+
     // ------------------------------------------------------------------ sent copies
 
     /// Schema version recorded in the file.
@@ -1569,6 +1606,55 @@ mod tests {
 
         // A term whose characters are not all ASCII keeps the phrase form, character by character.
         assert_eq!(to_query("账单-发票"), "\"账 单\" AND \"发 票\"");
+    }
+
+    #[test]
+    fn the_sidebar_badges_count_unread_per_folder() {
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "one", "a@example.com", 1),
+                    summary(2, "two", "b@example.com", 2),
+                ],
+            )
+            .unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "[Gmail]/Spam",
+                &[summary(3, "spam", "c@example.com", 3)],
+            )
+            .unwrap();
+
+        // Everything starts unread (the schema default), and the folder with two leads.
+        let counts = cache.unread_counts("acc").unwrap();
+        assert_eq!(counts.get("INBOX").copied(), Some(2));
+        assert_eq!(counts.get("[Gmail]/Spam").copied(), Some(1));
+
+        // Reading one drops that folder's badge one step at a time — this is what a badge that
+        // lies looks like, so it is asserted rather than assumed.
+        cache.set_seen("acc", "INBOX", 1, true).unwrap();
+        assert_eq!(
+            cache.unread_counts("acc").unwrap().get("INBOX").copied(),
+            Some(1)
+        );
+        cache.set_seen("acc", "INBOX", 2, true).unwrap();
+        assert_eq!(cache.unread_counts("acc").unwrap().get("INBOX"), None);
+        // ...and the other folder's badge is untouched by it.
+        assert_eq!(
+            cache
+                .unread_counts("acc")
+                .unwrap()
+                .get("[Gmail]/Spam")
+                .copied(),
+            Some(1)
+        );
+
+        // A folder with no unread mail is absent, not zero: the renderer draws nothing for it.
+        assert_eq!(cache.unread_count("acc").unwrap(), 1);
     }
 
     #[test]

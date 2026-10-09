@@ -521,6 +521,40 @@ textarea {
   box-shadow: inset 3px 0 0 var(--unread);
 }
 
+/* The unread marker itself. A filled dot, with an empty one for read rows so the subject keeps one
+   baseline across the list: a marker that only exists on unread rows shifts every subject to the
+   left when a row turns read, which is visible as the list jumping. Sized to the font, not fixed
+   pixels, so it sits on the sender's baseline rather than next to it. */
+.unread-dot {
+  flex: none;
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--unread);
+}
+
+.unread-dot.read {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+/* Sidebar badge: how many messages in this folder are unread. `99+` past a hundred, because an
+   exact number stops being readable at that width and the distinction stops mattering. */
+.unread-badge {
+  flex: none;
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--unread);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 16px;
+}
+
 /* The draft rows reuse the message layout (`.msg`), so a drafts list reads like the mail lists
    beside it. This is the one part that has no message equivalent: the per-row action. */
 .draft-actions {

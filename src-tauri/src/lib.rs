@@ -1106,6 +1106,24 @@ async fn refresh_thread_keys(
     ));
     Ok(filled)
 }
+/// Unread messages per folder, for the sidebar badges.
+///
+/// Read from the cache, not the server: the badges have to be there on an offline start (the same
+/// reason the list itself is served from the cache), and a `LIST` round trip per refresh would make
+/// them lag the very event they are reporting. A folder with nothing unread is absent, so the
+/// renderer shows nothing for it instead of a row of zeroes.
+#[tauri::command]
+async fn folder_unread_counts(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<std::collections::HashMap<String, u32>, String> {
+    state
+        .cache
+        .clone()
+        .unread_counts(&account_id)
+        .map_err(describe)
+}
+
 /// Whether new mail for this account shows a system notification.
 #[tauri::command]
 async fn get_notify_enabled(
@@ -2688,6 +2706,7 @@ pub fn run() {
             load_more_messages,
             fetch_message,
             mark_seen,
+            folder_unread_counts,
             delete_message,
             move_message,
             search_messages,
