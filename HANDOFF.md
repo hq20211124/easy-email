@@ -5,6 +5,76 @@
 
 ---
 
+## 0. 交接快照（2026-10-09，交接前必读这一节）
+
+### 0.1 仓库与发布状态
+
+- 公开仓库：**https://github.com/hq20211124/easy-email**（MIT）。本地 `/home/myroot/my-projects/easy-email`
+  就是它（同一份历史，`origin` 已指向，WSL 全局配了 Linux gh 的凭证助手）。
+- 历史**清洗过**：`bestbychinas@gmail.com`、`facai2411923@126.com`、`forwork8888@foxmail.com`、公网 IP
+  `111.55.214.44` 在全部提交里都已被 filter-repo 替换为占位符。**别再把这些串写回任何文件**。
+- 已发布：**v0.1.0**（首发）、**v0.1.1**（已读未读标识）。Release 资产由 CI 自动构建：
+  `Easy Email_<ver>_x64-setup.exe`（Windows/nsis）+ deb / AppImage / rpm（Linux）+ `SHA256SUMS`。
+- **版本号必须手动升**（`Cargo.toml` 与 `src-tauri/tauri.conf.json` 两处），CI 不碰它。
+  忘了升 = 产物还叫上一个版本（v0.1.1 第一次就是这么发错的，已作废重发）。流程写在 README「发版（维护者）」。
+- 打 tag 后要 `gh release create vX.Y.Z --title … --notes-file … --latest`，否则只有 tag 没有 Release 页。
+
+### 0.2 本次（相对上一版交接）新增/改动的平台层
+
+Windows 行为**没有**任何退化，全部改动都在 `cfg` 分支后面：
+
+- `crates/mail-core/Cargo.toml`：`rusqlite/serde/serde_json/thiserror/tokio` 从 `cfg(windows)` 移回公共段
+  （原先只声明在 Windows 段却无条件引用，Linux 编译不过）；`keyring` 按 target 拆 ——
+  Windows `windows-native`，其余 `sync-secret-service` + `crypto-rust`（D-Bus/libsecret）。
+- `tokenstore.rs`：非 Windows 不再是"必失败"。改为机器标识（`/etc/machine-id`，回退
+  `~/.config/easy-email/machine-key`）派生 SHA-256 流密钥 + 8 字节完整性 tag 的文件加密，
+  目录 `0700`、文件 `0600`、tmp+rename 保留；`available()` 恒真，五个用例全平台真跑。
+- `oauth.rs`：`SystemBrowser::open` 非 Windows 用 `xdg-open`（argv 直传，不经 shell）。
+  `SO_EXCLUSIVEADDRUSE` 仍是 `cfg(windows)` 分支，**没有**为 Linux 加等价 socket 选项（不需要：
+  未设 `SO_REUSEADDR` 的 socket 在 Linux 上同样拒绝二次绑定，测试 `another_process_cannot_take_the_port…` 已覆盖）。
+- `main.rs`：`#![windows_subsystem]` → `#![cfg_attr(windows, windows_subsystem = "windows")]`；
+  非 Windows 的 `--console` 只打印两行标记。
+- Tauri 配置按平台拆（Tauri v2 自动合并，数组整体覆盖）：`tauri.conf.json` 放跨平台字段，
+  `tauri.windows.conf.json`（nsis、webviewInstallMode、`additionalBrowserArgs`）与
+  `tauri.linux.conf.json`（deb depends）为 override。
+- `tools/check.ps1`：nsis 不变量改读 `tauri.windows.conf.json`；PE subsystem 检查在非 Windows 主机跳过。
+
+### 0.3 最近两个功能块
+
+1. **公开化**（`22812e7`、`b0a42aa`）：Linux 支持 + 历史清洗；门面补齐（badge、安装矩阵、
+   `SECURITY.md`、`CONTRIBUTING.md`、自动生成的 `THIRD-PARTY-NOTICES.md` —— 439 个 crate 全量清单，
+   含 MPL-2.0 / `self_cell` 双许可选边 / ring 的 NOTICE 传播）。
+   注意 `reports/` **在 .gitignore 里**（许可审计是给维护者的工作文档，不随仓库发）。
+2. **已读未读标识**（`59c6232`）：`Cache::unread_counts`（按文件夹，0 的不出现）+
+   `folder_unread_counts` 命令 + 侧栏徽标（99+）+ 列表/会话/搜索行圆点（已读行保留隐形占位点防跳动）。
+   刷新点是"重算"而不是"减一"：会话跨文件夹时，数属于当初取回它的那个文件夹。
+
+### 0.4 两台机器的用法（按两台电脑思考，别跨文件系统编译）
+
+- **WSL（Linux）**：rustup 装在 `~/.cargo`，工具链 stable（1.99），crates 走 tuna 镜像
+  （`~/.cargo/config.toml`）。系统依赖已 apt 装好（webkit2gtk-4.1、gtk3、soup3、libdbus、rsvg、
+  appindicator、build-essential、gcc-mingw 用于 windows-gnu 交叉 check）。
+  GUI 跑：先 `systemctl --user start dbus.socket`（已建 default.target.wants 符号链接，重启仍在），
+  然后 `./target/debug/easy-email`。**截图抓不动**（WSLg weston 不支持 wlr-screencopy，import -window root 也失败）——
+  要视觉证据只能让用户在 Windows 桌面侧看，或用 Win+Shift+S。
+- **Windows**：`/mnt/c/Users/72492/.cargo/bin`（rustc 1.98 MSVC）可用，但从 WSL 编译
+  `/home/myroot/...` 下的源码**必失败**（9p 文件系统 + rustc 增量锁）。历史上是在
+  `C:\Users\72492\easy-email-win` 同步一份副本编译测试的 —— **这已被用户明确否决**：
+  约定改为「先在 WSL 提交并推送，Windows 侧自己 pull 后编译」。
+- **gh 用 Linux 那个**：`/home/myroot/gh/bin/gh`（token 带 `workflow` scope，能推 workflow 文件）。
+  `/mnt/c/Program Files\GitHub CLI/gh.exe` 是另一个 token（没有 workflow scope，推 `.github/workflows/` 会被拒）。
+
+### 0.5 下一步（用户已有完整路线图，见 `design/19-roadmap.md`）
+
+阶段表：M0 ✅ / M1a 大部分 ✅（差 Outlook 真机验证、自动更新、代码签名）/ M1b ⏳ 基本未开始 /
+M2、M3 ❌。README「已知限制」是 Issue 级清单。候选里最小最独立的是**离线提示**
+（`sync_status` 命令已存在但界面从未调用）；最值钱的是**正文全文索引**（现在搜索只覆盖已打开的正文）。
+
+**用户的工作方式**：先要一份可照做的 PLAN.md 再动手；在意 token 成本；不要重新读已注释过的库源码。
+**未验证的事不要写"完成"**；测试必须能抓住它修的那个 bug。
+
+---
+
 ## 1. 关于库 API：不要重新探测
 
 `async-imap` / `async-native-tls` / `mail-parser` / `lettre` 的坑**已经全部写进代码注释和 Cargo.toml 注释了**。
@@ -26,7 +96,7 @@
 → `cargo test` → **负载契约**（`payload_keys.mjs`，含 `EndpointOverride`）→ **exe 的 PE 头 Subsystem 必须是 2**
 （GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**（CDP 探针要用，但留下等于把 webview 交给
 任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
-目前 **21 步全绿**（离线）、**321 passed**（+5 ignored，见 `tools/check.ps1`）。
+目前 **24 步全绿**（离线）、**351 passed**（+7 ignored，见 `tools/check.ps1`）。
 加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。
 
 改任何东西后跑它。加新 crate 依赖后也要跑，因为 `cargo build` 那一步会抓 MSVC linker 警告

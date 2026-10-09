@@ -34,6 +34,29 @@
 
 ---
 
+### M2-2 公开仓库与发布链路打通 + 已读未读标识 ✅（第 63 轮）
+
+**公开化**（`22812e7`、`b0a42aa`、`f2a8634`）：仓库 <https://github.com/hq20211124/easy-email>，
+MIT，历史经 `git filter-repo` 清洗（真实邮箱与公网 IP 全部替换为占位符；licensing.md §5.1 关于
+Mozilla client_secret 的结论是**误报**——最早引入 `PUBLIC_TEST_CLIENT` 的提交里就已是占位符）。
+门面补齐：README 徽章与安装矩阵、`SECURITY.md`、`CONTRIBUTING.md`、
+`THIRD-PARTY-NOTICES.md`（439 个 crate 全量清单 + MPL-2.0/双许可选边/NOTICE 传播说明）。
+
+**发布链路**（`.github/workflows/release.yml`）：打 tag 自动出四类包 + SHA256SUMS。
+踩过三个坑并全部修掉：`dtolnay/rust-action` 已归档 → `actions-rust-lang/setup-rust-toolchain`；
+tauri-cli 2.12 要求 rustc ≥1.90 → 工具链改 stable；**产物版本号来自源码而非 tag**，
+忘了升 `Cargo.toml`/`tauri.conf.json` 就会发出 `Easy Email_0.1.0_…`（v0.1.1 因此作废重发过一次）。
+发版流程已写进 README 与 CONTRIBUTING。
+
+**已读未读标识**（`59c6232`）：v0.1.1 的主题。之前只有"加粗 + 3px 蓝条"，弱到看不出来，
+且左侧文件夹列表一个未读标识都没有。新增 `Cache::unread_counts`（按文件夹分组，0 的文件夹**不出现**——
+全零的徽标是装饰不是信息）、`folder_unread_counts` 命令（读缓存，离线启动也有）、
+侧栏徽标（99+ 截断）、列表/会话子行/搜索行圆点（已读行保留隐形占位点，否则主题会随状态左右跳）。
+刷新用"重算"而非"减一"：会话跨文件夹时，未读数属于当初取回它的那个文件夹。
+测试 `the_sidebar_badges_count_unread_per_folder` 钉住"读一封掉一个数、别的文件夹不受影响"。
+
+---
+
 ### M2-1 Linux（WSL）可编译、可测试、可运行；Windows 行为不变 ✅（第 62 轮）
 
 目标从一开始定的是"**优先 Windows 可用，同时别把 Linux 写死**"。这一轮把之前散落的
