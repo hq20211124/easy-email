@@ -219,7 +219,7 @@ qiye163   IMAP imap.qiye.163.com:993      OK  * OK IMAP4 ready
 aliyun    IMAP imap.aliyun.com:993        OK  * OK AliYun IMAP Server Ready
 sina      IMAP imap.sina.com:993          OK  * OK [CAPABILITY IMAP4rev1 ID] sina imap server ready
 139       IMAP imap.139.com:993           OK  * OK RICHINFO System IMap Server Ready
-gmail     IMAP imap.gmail.com:993         OK  * OK Gimap ready for requests from 203.0.113.9
+gmail     IMAP imap.gmail.com:993         OK  * OK Gimap ready for requests from 203.0.113.9（我方公网 IP，已脱敏）
 outlook   IMAP outlook.office365.com:993  OK  * OK Microsoft Exchange IMAP4 service ready
 yahoo     IMAP imap.mail.yahoo.com:993    OK  * OK Welcome! IMAP Server up and ready
 icloud    IMAP imap.mail.me.com:993       OK
