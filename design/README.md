@@ -62,6 +62,7 @@
 | [17-distribution.md](17-distribution.md) | 安装包、签名、自动更新与通道、winget/Store、WebView2、关联注册、许可 | DIST-01…09 | ✅ |
 | [18-protocols-extensions.md](18-protocols-extensions.md) | `MailBackend` 抽象、POP3/JMAP/Graph、EWS 死期、CalDAV/CardDAV、邀请与 RSVP | PROTO-01…09, CAL-01…05 | ✅ |
 | [19-roadmap.md](19-roadmap.md) | 里程碑、依赖图、完成定义、风险登记册、起步顺序、演进/替换清单 | 全局 | ✅ |
+| [20-v0.2-plan.md](20-v0.2-plan.md) | **v0.2 的计划 → 反向找茬 → 修正稿**：以代码为准的现状盘点、10 条红队（含对文档/代码的交叉核对）、修正后的块清单与"人的动作"清单 | 全局 | 🚧 v0.2 进行中 |
 | [A1-research-findings.md](A1-research-findings.md) | **外部事实与库能力**（46 条，带来源与"未核实"标记，含一条推翻既有结论的更正） | 全局 | ✅（索引研究待并入） |
 | [A2-final-review.md](A2-final-review.md) | **红队评审记录**：第一轮自查 + **第二轮三个独立子代理评审**（3 个 BLOCKER、40+ 条待办）、已修/未修清单、诚实更正 | 全局 | ✅（§2.2 待办未清零，故"定稿"暂缓） |
 | [`tools/audit.py`](tools/audit.py) | **设计阶段的门禁**：对**活文件**跑 6 类检查（结构完整性 / 被推翻的说法不得复活 / 跨文档常量一致 / 不做清单 / 全部 DDL 真的建库 / 原型语法与令牌保真）。用法 `python design/tools/audit.py`，退出码 = 失败项数。**任何"设计一致"的结论都要由它的输出支撑** | 全局 | ✅ 当前 0 失败 |
