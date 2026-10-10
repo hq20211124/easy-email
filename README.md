@@ -160,6 +160,18 @@ gh release create vX.Y.Z --title "Easy Email X.Y.Z（主题）" --notes-file not
 
 产物带 `SHA256SUMS`；deb/rpm 的运行时依赖声明在 `src-tauri/tauri.linux.conf.json`。
 
+### 签名与更新的现状（发版前必读）
+
+- **安装包未签名**（Authenticode）。后果：Windows 首次运行会弹 SmartScreen
+  "Windows 保护了你的电脑"——点「更多信息 → 仍要运行」即可。这不影响自动更新的安全性：
+  更新包的完整性由 minisign 签名保证，与 Authenticode 是两件事（`design/17` §6）。
+- **自动更新只覆盖 Windows**。deb / rpm / AppImage 三类包**没有**更新机制——
+  AppImage 的更新模型是"整份替换"，把它默认接到 deb 安装上会把安装的包换成便携文件，
+  所以 `latest.json` 里只写 `windows-x86_64`。Linux 用户请重新下载安装。
+- 更新清单 `latest.json` 由 CI 在同一 tag 上生成并上传，内容只有
+  `version` / `pub_date` / `platforms.windows-x86_64.{url,signature}`。
+  **清单缺失时更新检查静默失败**（离线或墙内都不打扰，连续失败 3 次才在关于面板里提一句）。
+
 ---
 
 ## 目录结构
