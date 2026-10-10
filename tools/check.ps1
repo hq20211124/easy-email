@@ -589,6 +589,40 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the performance budget table lists all sixteen items, measured or not' {
+        # `design/19` §4 makes this a hard requirement for the performance block, and names the
+        # failure it exists to prevent: a benchmark script that claims a count the budget table does
+        # not have, leaving four budgets silently untested. The script asserts its own count at run
+        # time; this step makes sure nobody deletes an item (or the assertion) to silence it.
+        $bench = Get-Content 'tools/bench.ps1' -Raw -Encoding UTF8
+        $problems = @()
+
+        $ids = [regex]::Matches($bench, "Id\s*=\s*'P(\d+)'") | ForEach-Object { [int]$_.Groups[1].Value }
+        $missing = @(1..16 | Where-Object { $ids -notcontains $_ })
+        if ($ids.Count -ne 16 -or $missing.Count -gt 0) {
+            $problems += "tools/bench.ps1 lists $($ids.Count) budgets (P1-P16 expected); missing P$($missing -join ', P')"
+        }
+        if ($bench -notmatch 'function Assert-BudgetCoverage') {
+            $problems += 'bench.ps1 must assert its own coverage (Assert-BudgetCoverage), not leave sixteen to be counted by eye'
+        }
+        if ($bench -notmatch 'throw') {
+            $problems += 'the coverage assertion must fail the run (throw), so a dropped item cannot pass quietly'
+        }
+        foreach ($test in @('bench_storage_path', 'bench_message_build')) {
+            if ($bench -notmatch [regex]::Escape($test)) {
+                $problems += "bench.ps1 never runs $test — a budget whose measurement exists but is not invoked is not measured (P10 was exactly this)"
+            }
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'sixteen budgets listed, asserted by the script itself, both fixture tests invoked'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {
@@ -954,12 +988,27 @@ try {
             $problems += "$($badReads.Count) read(s) without an explicit -Encoding UTF8: $($badReads -join ' | ')"
         }
 
+        # 3) A .ps1 that contains Chinese must carry a UTF-8 BOM. Same trap, one level down: Windows
+        #    PowerShell 5.1 reads a BOM-less script as ANSI, and the mojibake can swallow the closing
+        #    quote of a Chinese string — `bench.ps1` had 31 parse errors on a real Windows run and
+        #    could not start at all (round 73). This file passes only because its own string literals
+        #    are ASCII; that is luck, not a rule, so the rule is checked here.
+        foreach ($script in Get-ChildItem 'tools/*.ps1') {
+            $bytes = [System.IO.File]::ReadAllBytes($script.FullName)
+            $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+            $text = [System.IO.File]::ReadAllText($script.FullName, [System.Text.Encoding]::UTF8)
+            $hasCjk = $text -match '[一-鿿]'
+            if ($hasCjk -and -not $hasBom) {
+                $problems += "$($script.Name) contains Chinese but has no UTF-8 BOM: Windows PowerShell 5.1 would read it as ANSI and fail to parse it"
+            }
+        }
+
         if ($problems.Count -gt 0) {
             $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
             $global:LASTEXITCODE = 1
             return
         }
-        Write-Host 'host detection runs on 5.1; every read is explicit UTF-8'
+        Write-Host 'host detection runs on 5.1; every read is explicit UTF-8; Chinese scripts carry a BOM'
         $global:LASTEXITCODE = 0
     }
 
