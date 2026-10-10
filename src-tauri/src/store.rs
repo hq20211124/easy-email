@@ -82,6 +82,7 @@ mod tests {
             needs_id_command: false,
             max_connections: 2,
             auth: mail_core::AuthMethod::Password,
+            smtp_none: false,
         }
     }
 

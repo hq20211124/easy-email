@@ -135,6 +135,72 @@ check(
   'accept-offline'
 );
 
+// **V2-D / C8.** The receive-only flag opens the one hole in "an account must be complete", so the
+// hole has to be exactly as wide as the user's statement and no wider.
+check(
+  'a stated absence of SMTP saves the account',
+  verificationVerdict({ ...base, imapOk: true, smtpOk: false, smtpNone: true }),
+  'accept-receive-only'
+);
+// The guard that makes the flag safe: the same failed probe, without the statement, is still refused.
+// Without this the checkbox would become "save anyway" for every typo. Both halves matter: a
+// password account says "retry", and an already-authorized OAuth account keeps its own outcome
+// rather than being handed a free pass by a box nobody ticked.
+check(
+  'an unflagged SMTP failure is still refused (password account)',
+  verificationVerdict({
+    oauthAuthorized: false,
+    imapOk: true,
+    smtpOk: false,
+    smtpNone: false,
+  }),
+  'retry'
+);
+check(
+  'an unflagged SMTP failure is not rescued for an OAuth account either',
+  verificationVerdict({
+    oauthAuthorized: true,
+    imapOk: true,
+    smtpOk: false,
+    imapAuthRejected: false,
+    smtpAuthRejected: true,
+    smtpNone: false,
+  }),
+  'accept-receive-only'
+);
+// The flag is not a way out of a *credential* failure. With IMAP answering and refusing, the
+// password account path must still say "retry" — and the flag must not appear anywhere in that
+// sentence. (An OAuth account whose IMAP was refused keeps its own outcome, `reject-address`: the
+// statement about SMTP says nothing about whether the credential works.)
+check(
+  'a rejected IMAP leg is not rescued by the SMTP flag',
+  verificationVerdict({
+    oauthAuthorized: false,
+    imapOk: false,
+    smtpOk: false,
+    imapAuthRejected: true,
+    smtpNone: true,
+  }),
+  'retry'
+);
+check(
+  'the OAuth address mismatch still outranks the SMTP flag',
+  verificationVerdict({
+    oauthAuthorized: true,
+    imapOk: false,
+    smtpOk: false,
+    imapAuthRejected: true,
+    smtpNone: true,
+  }),
+  'reject-address'
+);
+// A missing flag behaves as false: every account written before this field existed.
+check(
+  'the flag defaults to off',
+  verificationVerdict({ oauthAuthorized: true, imapOk: true, smtpOk: false }),
+  'accept-offline'
+);
+
 if (failures.length > 0) {
   for (const failure of failures) console.error(`- ${failure}`);
   console.error('\nthe wizard would save or refuse an account for the wrong reason');
@@ -148,5 +214,6 @@ console.log(
     'a mismatched OAuth address refused',
     'receive-only distinguished from offline',
     'rejections outrank silence',
+    'the receive-only flag is exactly as wide as the statement',
   ].join(' / ')}`
 );

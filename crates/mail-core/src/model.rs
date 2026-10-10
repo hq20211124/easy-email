@@ -232,6 +232,16 @@ pub struct AccountConfig {
     /// every existing installation — keeps loading as what it is: a password account.
     #[serde(default)]
     pub auth: AuthMethod,
+    /// The user has said this server does not offer SMTP at all.
+    ///
+    /// Why this is a flag on the account rather than a consequence of a failed probe: refusing to
+    /// *save* an account whose SMTP leg failed is the protection that keeps a half-created account
+    /// out of the list (`HANDOFF.md` §5), and a receive-only server is the one case where that
+    /// protection is wrong. The user has to say so out loud — an unset flag keeps the old
+    /// behaviour exactly, so a typo in a host still produces no account (`design/20-v0.2-plan.md`
+    /// C8). `#[serde(default)]` because every existing account has both legs.
+    #[serde(default)]
+    pub smtp_none: bool,
 }
 
 /// The two ways an account can authenticate (`design/05` §3.2).

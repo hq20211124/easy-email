@@ -307,6 +307,9 @@ async fn save_account(
     password: String,
     username: Option<String>,
     endpoints: Option<mail_core::model::EndpointOverride>,
+    // The user stated this server offers no SMTP. Off means "both legs are expected", which is
+    // every existing account (design/20-v0.2-plan.md, C8).
+    smtp_none: bool,
 ) -> Result<AccountConfig, String> {
     // FIRST, before the credential is written and before the account file is touched: a bad host must
     // not leave a half-created account behind. (`closeModal` would delete it, but only if the dialog
@@ -319,6 +322,8 @@ async fn save_account(
         endpoints.as_ref(),
     )
     .map_err(describe)?;
+
+    cfg.smtp_none = smtp_none;
 
     // An account whose registration is already stored was signed in with OAuth a moment ago (the
     // wizard does that before saving). Marking it here — rather than asking the frontend to say so —
@@ -976,6 +981,16 @@ async fn enqueue_send(
 
     if mail.to.is_empty() && mail.cc.is_empty() && mail.bcc.is_empty() {
         return Err("请至少填写一个收件人。".to_string());
+    }
+
+    // A receive-only account has no SMTP to talk to, by the user's own statement. Refusing here
+    // rather than letting the worker discover it per attempt is the difference between one clear
+    // sentence and a queue full of failures that all say the same thing.
+    if cfg.smtp_none {
+        return Err(
+            "这个账号绑定的是只收信的服务器（添加时你标注了「不提供 SMTP」），因此不能从这里发信。"
+                .to_string(),
+        );
     }
 
     // Attachments are paths, so the file can have been edited or deleted since it was chosen, and

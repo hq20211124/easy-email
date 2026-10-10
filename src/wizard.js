@@ -31,6 +31,15 @@
    * `oauthAuthorized` is what keeps an ordinary password account from being waved through as
    * "offline": without a stored authorization there is nothing to save, and a typo in the password
    * would be recorded as a working account.
+   *
+   * 6. the user said this server has no SMTP → 'accept-receive-only'  (a receive-only mail store is
+   *    not a broken account, and refusing to save it would be the protection misfiring —
+   *    `design/20-v0.2-plan.md` C8. The flag has to come from the user: without it a mistyped host
+   *    still yields no account.)
+   *
+   * `smtpNone` is checked before the `oauthAuthorized` gate and only for password accounts, because
+   * that combination is the one with something worth saving: a working IMAP login plus an explicit
+   * statement that there is nothing to send to.
    */
   function verificationVerdict({
     oauthAuthorized,
@@ -38,8 +47,11 @@
     smtpOk,
     imapAuthRejected,
     smtpAuthRejected,
+    smtpNone = false,
   }) {
     if (imapOk && smtpOk) return 'accept';
+    // A stated absence is not a failure to retry: the account is exactly as the user described it.
+    if (imapOk && smtpNone) return 'accept-receive-only';
     if (!oauthAuthorized) return 'retry';
     if (imapAuthRejected) return 'reject-address';
     if (imapOk && smtpAuthRejected) return 'accept-receive-only';

@@ -1223,6 +1223,7 @@ fn bench_message_build() {
         needs_id_command: false,
         max_connections: 2,
         auth: mail_core::AuthMethod::Password,
+        smtp_none: false,
     };
     let mail = OutgoingMail {
         to: vec!["alice@example.com".into()],

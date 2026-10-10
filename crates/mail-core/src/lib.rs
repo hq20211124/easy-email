@@ -177,6 +177,7 @@ pub fn account_with_endpoints(
         // The password path; the wizard switches this to `OAuth2` when the user signs in with a
         // provider that requires it.
         auth: AuthMethod::Password,
+        smtp_none: false,
     })
 }
 

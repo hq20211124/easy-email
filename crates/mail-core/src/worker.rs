@@ -491,6 +491,7 @@ mod tests {
             needs_id_command: false,
             max_connections: 4,
             auth: crate::model::AuthMethod::Password,
+            smtp_none: false,
         }
     }
 

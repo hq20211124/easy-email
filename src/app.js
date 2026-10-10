@@ -3417,6 +3417,16 @@ function openAccountWizard() {
     -->
     <div id="wiz-endpoints" hidden>
       <p class="hint">这个服务商的服务器地址不内置，需要你按服务商文档填写。</p>
+      <!--
+        A receive-only mail store is not a broken account. Refusing to save one because its SMTP leg
+        could not be probed is the "must be complete" protection misfiring, and the only way out is
+        for the user to say so out loud: with this unchecked, a mistyped host still produces no
+        account (design/20-v0.2-plan.md, C8). No backticks here: this is inside a template literal.
+      -->
+      <label class="check">
+        <input id="wiz-smtp-none" type="checkbox" />
+        <span>这个服务器不提供 SMTP（只收信，不发信）</span>
+      </label>
       <div class="grid-2">
         <div class="field">
           <label>IMAP 主机</label>
@@ -3525,6 +3535,9 @@ function openAccountWizard() {
           username: username || null,
           // null for every provider whose servers come from the table.
           endpoints,
+          // The one case where an account is allowed to exist without a working SMTP leg; false
+          // for everything else, which keeps the "must be complete" rule intact.
+          smtpNone: modal.querySelector('#wiz-smtp-none')?.checked === true,
         });
 
         result = await invoke('verify_account', { accountId });
@@ -3556,15 +3569,18 @@ function openAccountWizard() {
         smtpOk: result?.smtp_ok === true,
         imapAuthRejected: result?.imap_auth_rejected === true,
         smtpAuthRejected: result?.smtp_auth_rejected === true,
+        smtpNone: modal.querySelector('#wiz-smtp-none')?.checked === true,
       });
 
       if (verdict === 'accept-receive-only') {
         pendingWizardAccountId = null;
-        toast(
-          `已保存 ${email}：可以收信，但服务器拒绝了发信 —— ${result.smtp_detail}`,
-          'info',
-          20000
-        );
+        // Two roads to the same verdict, and they are not the same sentence: one is the user telling
+        // us there is nothing to send to, the other is a server refusing to let us.
+        const because =
+          modal.querySelector('#wiz-smtp-none')?.checked === true
+            ? '你说过这个服务器不提供 SMTP，因此只能收信。要发信需要另配一个账号。'
+            : `可以收信，但服务器拒绝了发信 —— ${result.smtp_detail}`;
+        toast(`已保存 ${email}：${because}`, 'info', 20000);
         await refreshAccounts();
         return true;
       }

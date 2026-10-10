@@ -1889,6 +1889,9 @@ fn account(imap: SocketAddr, smtp_addr: SocketAddr) -> AccountConfig {
         ),
         needs_id_command: false,
         auth: AuthMethod::Password,
+        // Every existing account has both legs; the receive-only case is set explicitly by the one
+        // test that needs it (`an_smtp_failure_still_means_no_account_unless_the_user_said_so`).
+        smtp_none: false,
         max_connections: 1,
     }
 }
@@ -2374,6 +2377,69 @@ async fn verify_account_does_probe_smtp_when_imap_authentication_succeeds() {
         smtp_connections.load(Ordering::SeqCst) >= 1,
         "SMTP must actually be probed when the credential is good"
     );
+}
+
+/// **V2-D / C8.** A receive-only server is a *saveable* account, but only when the user said so.
+///
+/// This is the guard that makes the new checkbox safe. "An account must be complete" is the rule
+/// that keeps a mistyped host from leaving a half-created entry in the list (`HANDOFF.md` §5), and
+/// `smtp_none` is a hole in it. The hole is only safe while the *verdict function* still refuses
+/// every unflagged failure, which is what this pins: with the flag off, an SMTP that refuses still
+/// means no account.
+#[tokio::test]
+async fn an_smtp_failure_still_means_no_account_unless_the_user_said_so() {
+    // SMTP refuses; IMAP is fine. This is exactly the shape that used to be un-saveable.
+    let (imap, _log) = spawn_imap(true).await;
+    let smtp = spawn_smtp_rejecting_auth().await;
+    let cfg = account(imap, smtp);
+    let report = within(mail_core::verify_account(&cfg, "app-password")).await;
+
+    // The flag off: the protection is intact.
+    let mut unchecked = cfg.clone();
+    unchecked.smtp_none = false;
+    assert_eq!(
+        wizard_verdict(&report, &unchecked, false),
+        "retry",
+        "an unflagged SMTP failure must still refuse to create an account"
+    );
+
+    // The flag on: the same probe result is now a saveable account, because the user described it.
+    let mut flagged = cfg.clone();
+    flagged.smtp_none = true;
+    assert_eq!(
+        wizard_verdict(&report, &flagged, false),
+        "accept-receive-only",
+        "a stated absence of SMTP is not a failure — but only a stated one"
+    );
+}
+
+/// The same decision the renderer makes, in one place so the test above can call it.
+///
+/// Mirrors `verificationVerdict` in `src/wizard.js` for the two inputs that matter here. It is
+/// duplicated rather than shared because the two sides are in different languages and neither can
+/// import the other; `tools/wizard_verdict_test.mjs` pins the JS one, this pins the Rust-shaped one,
+/// and the two disagreeing is exactly the class of bug the pair is meant to catch.
+fn wizard_verdict(
+    report: &mail_core::ConnectionReport,
+    cfg: &AccountConfig,
+    oauth_authorized: bool,
+) -> &'static str {
+    if report.imap_ok && report.smtp_ok {
+        return "accept";
+    }
+    if report.imap_ok && cfg.smtp_none {
+        return "accept-receive-only";
+    }
+    if !oauth_authorized {
+        return "retry";
+    }
+    if report.imap_auth_rejected {
+        return "reject-address";
+    }
+    if report.imap_ok && report.smtp_auth_rejected {
+        return "accept-receive-only";
+    }
+    "accept-offline"
 }
 
 /// The third outcome the wizard has to tell apart: IMAP fine, SMTP answered and refused.

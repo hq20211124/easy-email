@@ -316,6 +316,35 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the receive-only escape hatch is exactly as wide as the user statement' {
+        # C8: `smtp_none` is the one hole in "an account must be complete", the rule that keeps a
+        # mistyped host from creating a half-account. The hole is only safe while every unflagged
+        # failure is still refused — so both sides of the hole are machine-checked here.
+        $wiz = Get-Content 'src/wizard.js' -Raw
+        $js = Get-Content 'src/app.js' -Raw
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $problems = @()
+        if ($wiz -notmatch 'smtpNone \?\?: false|smtpNone = false') {
+            $problems += 'wizard.js must accept the flag and default it to false (accounts written before it existed are unflagged)'
+        }
+        if ($js -notmatch "wiz-smtp-none") {
+            $problems += 'app.js must offer the checkbox — the flag has to be an explicit statement, never inferred'
+        }
+        if ($js -notmatch "smtpNone:") {
+            $problems += 'app.js must pass the flag through to the verdict function'
+        }
+        if ($lib -notmatch 'if cfg\.smtp_none \{') {
+            $problems += 'lib.rs must refuse to queue a send for a receive-only account'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the receive-only flag opens only the hole the user described'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'the version on screen comes from the manifest, not a second copy' {
         # V2-C1: the number a bug report quotes must be the build's own. A hardcoded string here
         # would drift from Cargo.toml the moment someone forgets to bump it — which is the same
