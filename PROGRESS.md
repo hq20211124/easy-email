@@ -45,6 +45,33 @@ HANDOFF 的 351 与 PROGRESS 里 29x 的"矛盾"由此解释——后者只数 m
 
 ---
 
+### V2-B 失败可见性：横幅按失败类型说不同的出路 ✅（第 65 轮）
+
+红队 C3 抓到的真问题：`sync_status.offline` 的语义是**"上次同步失败"**，而失败可能是
+授权码过期、配额到顶、本地数据库错误、网络断开。把它们一律显示成"离线"，
+等于在该换授权码的时候劝用户检查网线。所以判据不能来自错误文本——文本被 `describe()`
+拍成句子之后就没人能再分类了。
+
+**做法**：`refresh_folder` 的返回类型从 `Result<_, String>` 改成 `Result<_, SyncFailure>`，
+在 `MailError` 还活着的唯一位置（这个函数的边界）就按变体归类成
+`network / auth / quota / server / local / busy`，句子照旧走 `describe`（日志和界面同一份）。
+`SyncStatus` 多一个 `failure_kind`；前端横幅按类型给文案 + 「重试」，
+刷新成功即消失。`SyncFailure` 实现 `Display`（只打印句子，**kind 不进人读的文本**）。
+
+**两个刻意的选择**：① `Tls` 那条没写进测试——`async_native_tls::Error` 没有公开构造器，
+造一个得真做一次握手；映射就在同一个 match 臂上，注释写明了原因。
+② `quota` 枚举值定义了但当前没有产生点（配额账本在 mail-core 侧，刷新路径还没接它）——
+**这是预留不是已完成**，README 没把它算进功能。
+
+**测试**：+2（每个 `MailError` 变体各归一类；`Connect ≠ Auth` 这条反向断言；
+`Display` 只出句子）→ **362 passed / 7 ignored**，clippy/fmt 干净。
+**门禁**：+1 项（27 步）：前端必须分支 `failure_kind`，`SyncStatus` 必须带 kind。
+
+**未验**：真机上断开网络看横幅（需要你在 Windows 上拔一次网线/关一次 Wi-Fi）。
+`last_sync_error` 是内存态，重启即丢——这是特性：重启后不该显示上次的失败。
+
+---
+
 ## 提交记录
 共 **22 个提交**，从基线到最新（`git log --oneline` 看全量；下表只列里程碑）：
 

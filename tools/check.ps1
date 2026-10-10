@@ -316,6 +316,32 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the offline notice names the failure, not just "offline"' {
+        # C3: `sync_status.offline` means "the last refresh failed", which is true of a dead network,
+        # an expired 授权码 and a provider quota alike. Showing all three as "离线" is the failure this
+        # step prevents: the user is told the wrong remedy at the moment they need the right one. The
+        # renderer must branch on `failure_kind`.
+        $js = Get-Content 'src/app.js' -Raw
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $problems = @()
+        if ($js -notmatch 'failure_kind') {
+            $problems += 'app.js must branch on failure_kind — a bare offline flag cannot tell an auth failure from a dead network'
+        }
+        if ($lib -notmatch 'fn failure_kind\(') {
+            $problems += 'lib.rs must classify the MailError while it is still structured'
+        }
+        if ($lib -notmatch 'failure_kind: Option<FailureKind>') {
+            $problems += 'SyncStatus must carry the kind, not only the sentence'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the sync banner says which kind of failure it was'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'search reports body coverage from the backend, not a hardcoded sentence' {
         # The status line used to say "正文只搜已打开过的邮件" as a fixed sentence, which was both
         # stale the moment a body was indexed and unable to say *how much* is indexed. The number

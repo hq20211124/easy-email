@@ -56,7 +56,14 @@ struct AppState {
     ///
     /// Exists so the UI can say "showing cached mail" instead of silently presenting data of
     /// unknown age as if it were fresh.
-    last_sync_error: Mutex<Option<String>>,
+    ///
+    /// A **kind** alongside the text, because "the refresh failed" and "you are offline" are
+    /// different situations with different remedies, and the raw error text cannot be told apart by
+    /// anyone reading it: an expired authorization code and a dead Wi-Fi both arrive as a connect or
+    /// authentication error, and only the `MailError` variant that was still in hand at the capture
+    /// point knows which one it was (`design/20-v0.2-plan.md` C3). Once it has been flattened into
+    /// a sentence for the user, that knowledge is gone.
+    last_sync_error: Mutex<Option<SyncFailure>>,
     /// Reused IMAP connections.
     ///
     /// In an `Arc` because the IDLE watcher holds one for the whole life of the app: it reconnects
@@ -445,42 +452,130 @@ struct HistoryPage {
     done: bool,
 }
 
+/// Which kind of thing went wrong the last time we tried to talk to the server.
+///
+/// The categories are the ones the user can act on: being offline and having an expired
+/// authorization code both stop a refresh, but telling someone to check their network when their
+/// credential needs regenerating sends them to the wrong place (`design/20-v0.2-plan.md` C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// The server could not be reached at all: no network, or a dead route.
+    Network,
+    /// The server was reached and refused the credential: an expired authorization code, a revoked
+    /// app password, an OAuth token that needs another sign-in.
+    Auth,
+    /// The provider's own daily cap was hit. Time-limited, so retrying today cannot help.
+    Quota,
+    /// Anything the server said that is neither of the above: a protocol error, a closed SMTP AUTH,
+    /// a folder that vanished.
+    Server,
+    /// A local problem: the cache or the user database. The server is fine.
+    Local,
+    /// A transient condition worth retrying: the database was locked, an operation timed out.
+    Busy,
+}
+
+/// One refresh that did not make it, kept for the status line.
+#[derive(Debug, Clone)]
+pub struct SyncFailure {
+    pub kind: FailureKind,
+    /// The sentence the user reads, produced once so the log and the UI cannot disagree.
+    pub detail: String,
+}
+
+/// The sentence, so every log line that used to print the error string still prints it.
+///
+/// The kind is deliberately *not* in here: it is for the machine-readable half of the contract, and
+/// mixing it into the prose is how a user ends up reading "failure_kind: auth" in a message.
+impl std::fmt::Display for SyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// Classify a refresh failure while the structured error is still in hand.
+///
+/// This is the whole point of the type: the same `MailError` becomes "授权码可能过期" or
+/// "现在连不上服务器" depending on its variant, and by the time it has been flattened into a
+/// sentence nobody can tell them apart again.
+pub fn failure_kind(error: &mail_core::error::MailError) -> FailureKind {
+    use mail_core::error::MailError;
+    match error {
+        MailError::Connect { .. } | MailError::Tls { .. } => FailureKind::Network,
+        MailError::Auth { .. } => FailureKind::Auth,
+        MailError::Busy(_) | MailError::Timeout(_) => FailureKind::Busy,
+        MailError::Cache(_) | MailError::LocalDb(_) => FailureKind::Local,
+        MailError::Imap(_)
+        | MailError::Smtp(_)
+        | MailError::Config(_)
+        | MailError::Credential(_)
+        | MailError::Parse(_) => FailureKind::Server,
+    }
+}
+
+/// Turn a protocol error into a classified failure, keeping the sentence the user reads.
+///
+/// The sentence goes through `describe` so the shape the user sees is the same one the log gets;
+/// what this adds is the kind, which cannot be recovered from it afterwards.
+fn failed(error: mail_core::error::MailError) -> SyncFailure {
+    SyncFailure {
+        kind: failure_kind(&error),
+        detail: describe(error),
+    }
+}
+
 /// Refresh one folder from the server into the cache.
 ///
 /// Best effort by design: a mail client that shows nothing when the network is down is worse than
 /// one showing slightly stale mail, which is the whole reason the cache exists. Callers fall back to
 /// whatever is on disk and surface [`AppState::last_sync_error`] when it fails.
+///
+/// The error carries a **[`FailureKind`] next to the sentence** rather than a bare string. This is
+/// the one place where that is still possible: the `MailError` is alive here, and past this function
+/// it has been flattened by `describe` into prose that no reader can classify again. Everything that
+/// wants to *say* something different for an offline account versus an expired authorization code
+/// needs the kind, and it can only come from inside (`design/20-v0.2-plan.md` C3).
 async fn refresh_folder(
     state: &AppState,
     pool: &ConnectionPool,
     cache: &Cache,
     cfg: &AccountConfig,
     mailbox: &str,
-) -> Result<SyncOutcome, String> {
+) -> std::result::Result<SyncOutcome, SyncFailure> {
     // Reuse the display name and delimiter we already know; only ask the server for `LIST` when
     // this folder has never been seen, so a normal refresh costs no extra round trip.
-    let known = cache.get_folder(&cfg.id, mailbox).map_err(describe)?;
+    let known = cache.get_folder(&cfg.id, mailbox).map_err(failed)?;
 
     let info = match known {
         Some(info) => info,
         None => {
-            let password = secret_for(state, cfg).await?;
+            let password = secret_for(state, cfg).await.map_err(|detail| SyncFailure {
+                kind: FailureKind::Auth,
+                detail,
+            })?;
             let all = pool_op!(pool, cfg, &password, |client| {
                 client.list_mailboxes().await
             })
-            .map_err(describe)?;
+            .map_err(failed)?;
 
             let found = all
                 .into_iter()
                 .find(|m| m.name == mailbox)
-                .ok_or_else(|| format!("服务器上找不到文件夹「{mailbox}」"))?;
+                .ok_or_else(|| SyncFailure {
+                    kind: FailureKind::Server,
+                    detail: format!("服务器上找不到文件夹「{mailbox}」"),
+                })?;
             // Record it with a zero generation; the sync below reports the real one.
-            cache.upsert_folder(&cfg.id, &found, 0).map_err(describe)?;
+            cache.upsert_folder(&cfg.id, &found, 0).map_err(failed)?;
             found
         }
     };
 
-    let password = secret_for(state, cfg).await?;
+    let password = secret_for(state, cfg).await.map_err(|detail| SyncFailure {
+        kind: FailureKind::Auth,
+        detail,
+    })?;
 
     // The driver is built *inside* the block, which matters twice over: the block runs more than
     // once for the pool's retry, and rebuilding the driver is what makes a retry safe —
@@ -496,7 +591,7 @@ async fn refresh_folder(
             // A generation change: the folder was discarded and the driver wants a fresh window.
         }
     })
-    .map_err(describe)?;
+    .map_err(failed)?;
 
     log_line(&format!(
         "[easy-email] 同步 {}：新增 {} 封，缓存共 {} 封{}",
@@ -574,6 +669,8 @@ async fn list_messages(
     let sync_failure = refresh_folder(&state, &state.pool, &state.cache, &cfg, &mailbox)
         .await
         .err();
+    // The classification happens inside `refresh_folder`, on the `MailError`, because this is the
+    // last moment it exists.
     *state.last_sync_error.lock().expect("sync error mutex") = sync_failure.clone();
 
     let cached = state
@@ -587,7 +684,7 @@ async fn list_messages(
         (false, _) => Ok(cached),
         // Nothing on disk and the refresh failed: there is genuinely nothing to show, so report why
         // rather than rendering an empty inbox as if the folder were empty.
-        (true, Some(error)) => Err(error),
+        (true, Some(failure)) => Err(failure.detail),
         (true, None) => Ok(cached),
     }
 }
@@ -1822,10 +1919,14 @@ async fn set_sync_window(state: State<'_, AppState>, window: SyncWindow) -> Resu
     Ok(())
 }
 
-/// Why the last server refresh failed, and how much is cached. Drives the "offline" notice.
+/// Why the last server refresh failed, and how much is cached. Drives the status line.
+///
+/// `failure_kind` is what makes the notice actionable: "cannot reach the server" and "the server
+/// refused the credential" need different responses from the user, and the text alone cannot be
+/// classified by anyone reading it (`design/20-v0.2-plan.md` C3).
 #[tauri::command]
 async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<SyncStatus, String> {
-    let last_error = state
+    let failure = state
         .last_sync_error
         .lock()
         .expect("sync error mutex")
@@ -1848,8 +1949,9 @@ async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<S
     let pending = user.pending_op_count().map_err(describe)?;
 
     Ok(SyncStatus {
-        offline: last_error.is_some(),
-        last_error,
+        offline: failure.is_some(),
+        failure_kind: failure.as_ref().map(|f| f.kind),
+        last_error: failure.map(|f| f.detail),
         cached_total,
         drafts,
         pending_ops: pending,
@@ -1985,6 +2087,8 @@ async fn search_messages(
 #[derive(serde::Serialize)]
 struct SyncStatus {
     offline: bool,
+    /// Which kind of failure, when there is one. `None` means the last refresh worked.
+    failure_kind: Option<FailureKind>,
     last_error: Option<String>,
     cached_total: u32,
     /// Drafts on disk (they are the reason the user database exists).
@@ -2825,7 +2929,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_file_name;
+    use super::{FailureKind, SyncFailure, failure_kind, safe_file_name};
 
     /// Hostile attachment names, table-driven.
     ///
@@ -2879,5 +2983,89 @@ mod tests {
         let long = "b".repeat(300);
         let name = safe_file_name(&long, 1);
         assert_eq!(name.chars().count(), 120);
+    }
+
+    /// **V2-B.** A refresh failure is classified by what the user can do about it.
+    ///
+    /// The whole point of `FailureKind` is that "cannot connect" and "credential refused" are
+    /// different situations, and a sentence cannot be classified by anyone reading it. This pins each
+    /// `MailError` variant to the one remedy it deserves — including the pair that is easiest to get
+    /// backwards: an auth failure arrives as an `Auth`, not as a `Connect`, and telling that user to
+    /// check their network sends them to the wrong place.
+    #[test]
+    fn every_failure_kind_points_at_a_different_remedy() {
+        use mail_core::error::{AuthHint, MailError};
+
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "no route");
+        let auth = MailError::Auth {
+            server: "imap.qq.com".into(),
+            raw: "Invalid credentials".into(),
+            hint: AuthHint::Unknown,
+        };
+
+        assert_eq!(
+            failure_kind(&MailError::Connect {
+                host: "imap.qq.com".into(),
+                port: 993,
+                source: io
+            }),
+            FailureKind::Network
+        );
+        // `Tls` maps to `Network` too. It is not constructed here: the error type wraps a
+        // `native_tls::Error` with no public constructor, and building one would mean performing a
+        // handshake against something. The mapping is one line of the same match arm, and
+        // `describe()` already covers the wording.
+        assert_eq!(failure_kind(&auth), FailureKind::Auth);
+        assert_eq!(
+            failure_kind(&MailError::Busy("database is locked".into())),
+            FailureKind::Busy
+        );
+        assert_eq!(failure_kind(&MailError::Timeout(30)), FailureKind::Busy);
+        assert_eq!(
+            failure_kind(&MailError::LocalDb("user.db 打不开".into())),
+            FailureKind::Local
+        );
+        assert_eq!(
+            failure_kind(&MailError::Cache("cache.db 打不开".into())),
+            FailureKind::Local
+        );
+        assert_eq!(
+            failure_kind(&MailError::Imap("命令被拒".into())),
+            FailureKind::Server
+        );
+        assert_eq!(
+            failure_kind(&MailError::Smtp("550 拒收".into())),
+            FailureKind::Server
+        );
+        assert_eq!(
+            failure_kind(&MailError::Config("端口写错".into())),
+            FailureKind::Server
+        );
+
+        // And the two that must never collapse into each other.
+        assert_ne!(
+            failure_kind(&MailError::Connect {
+                host: "h".into(),
+                port: 993,
+                source: std::io::Error::new(std::io::ErrorKind::TimedOut, "x")
+            }),
+            FailureKind::Auth,
+            "a dead network is not a bad credential"
+        );
+    }
+
+    /// A `SyncFailure` prints the sentence and nothing else: the kind is for the machine half of the
+    /// contract, and putting it in the prose is how a user ends up reading "auth" in a message.
+    #[test]
+    fn a_sync_failure_prints_only_the_sentence() {
+        let failure = SyncFailure {
+            kind: FailureKind::Auth,
+            detail: "imap.qq.com 认证失败".into(),
+        };
+        assert_eq!(failure.to_string(), "imap.qq.com 认证失败");
+        assert!(
+            !failure.to_string().contains("auth"),
+            "the kind must stay out of the text"
+        );
     }
 }

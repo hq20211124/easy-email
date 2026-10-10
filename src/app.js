@@ -1588,9 +1588,58 @@ async function loadMessages({ reset = false } = {}) {
   // Newest first: the server returns ascending UIDs and people want the latest on top.
   state.messages = messages.slice().sort((a, b) => b.uid - a.uid);
   renderMessages();
+  // Tell the user whether this list is fresh or cached, and why. The refresh just ran, so this is
+  // the one moment the answer is current; doing it before the list would paint a stale banner over
+  // a fresh one.
+  void refreshSyncBanner();
   // The badges count the cache, and this listing just changed it. Not awaited: the list on screen
   // is the thing the user asked for, and a slow badge must not hold it up.
   void loadUnreadCounts();
+}
+
+/**
+ * Show (or hide) "this is cached data" and say why, in the words that fit the failure.
+ *
+ * The wording comes from the backend's `failure_kind`, not from the error text: an expired
+ * authorization code and a dead network both stop a refresh, but "check your network" is useless
+ * advice to someone whose 授权码 needs regenerating (`design/20-v0.2-plan.md` C3). It disappears on
+ * the next successful refresh rather than lingering, because a banner that never clears teaches
+ * people to ignore it.
+ */
+async function refreshSyncBanner() {
+  const banner = $('sync-banner');
+  const status = await invoke('sync_status', { accountId: state.accountId }).catch(() => null);
+  if (!status) {
+    banner.hidden = true;
+    return;
+  }
+  state.syncStatus = status;
+
+  if (!status.offline) {
+    banner.hidden = true;
+    banner.replaceChildren();
+    return;
+  }
+
+  const words = {
+    network: '现在连不上服务器，下面显示的是上次同步的内容。',
+    auth: '服务器拒绝了登录凭据（授权码可能已过期），点「重试」或重新添加账号。',
+    quota: '服务商的当日用量到顶了，今天不再同步，下面的内容是最近一次取回的。',
+    server: '同步没成功，下面的内容是上次同步的。',
+    local: '本地数据库出错，收发已暂停；邮件本身没有丢。',
+    busy: '本地数据库正忙，稍等一下会自动重试。',
+  };
+  banner.replaceChildren(document.createTextNode(words[status.failure_kind] || status.last_error || '同步未成功。'));
+
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'btn ghost small';
+  retry.textContent = '重试';
+  retry.addEventListener('click', () => loadMessages({ reset: true }));
+
+  banner.className = 'sync-banner' + (status.failure_kind === 'auth' ? ' auth' : '');
+  banner.append(retry);
+  banner.hidden = false;
 }
 
 function renderMessages() {

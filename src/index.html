@@ -87,6 +87,13 @@
           </div>
         </header>
         <!--
+          Says out loud that what is on screen came from the cache, not from the server, and why.
+          Without it a stale inbox reads as an up-to-date one, which is the failure this whole cache
+          exists to avoid (`design/20-v0.2-plan.md` V2-B). The wording comes from the backend's
+          failure kind: "cannot reach the server" and "credential refused" need different remedies.
+        -->
+        <div id="sync-banner" class="sync-banner" hidden></div>
+        <!--
           Search runs entirely against the local cache, so it keeps working offline and never waits
           on the server. The placeholder says so, because "no results" here can mean "not cached
           yet" rather than "not in your mailbox".

@@ -428,6 +428,31 @@ textarea {
   color: var(--text-muted);
 }
 
+/* "This is cached data, and here is why." Deliberately quieter than a toast: it stays until the
+   next successful refresh, so it must not shout, and it must not look like an error the user
+   caused. Only the auth wording gets the danger colour, because that one is actionable. */
+.sync-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 10px 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  background: var(--surface-2, var(--bg-soft));
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.sync-banner.auth {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  color: var(--danger);
+}
+
+.sync-banner .btn.small {
+  margin-left: auto;
+}
+
 /* Which folder a search hit came from, shown only while searching. */
 .msg-folder {
   font-size: 10px;
