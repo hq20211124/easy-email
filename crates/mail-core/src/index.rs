@@ -22,7 +22,8 @@ pub const DEFAULT_PASS_LIMIT: usize = 20;
 /// matters for is Chinese — a byte cap would cut the last character of nearly every message.
 pub const DEFAULT_BODY_INDEX_CHARS: usize = 64 * 1024;
 
-/// One message that has no body in the cache yet.
+/// One message whose body is not searchable yet — for one of two reasons, told apart by
+/// [`Self::has_body`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingBody {
     pub folder: String,
@@ -30,10 +31,12 @@ pub struct PendingBody {
     /// The body **is** in the cache; only its index row predates the current shape
     /// ([`crate::cache::INDEX_VERSION`]). Such a row is re-indexed locally — `bodies.detail` holds
     /// the whole message, so the pass must not spend a connection (or a quota) fetching it again.
+    /// `false` means there is no body at all and the message has to be opened, which costs what
+    /// opening costs and is the reason the pass is bounded.
     pub has_body: bool,
 }
 
-/// Which messages the next pass should fetch.
+/// Which messages the next pass should work on.
 ///
 /// Pure so the cap and the ordering can be pinned without a database: the caller hands over what is
 /// pending (newest first, from `Cache::bodies_pending`) and this decides how much of it one pass may
