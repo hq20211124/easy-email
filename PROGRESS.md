@@ -11,7 +11,76 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
-### V2-0/V2-A v0.2 计划三段 + 基线实测 + 正文索引 ✅（第 64 轮）
+### 跨系统首跑：check.ps1 在真 Windows 上，抓到最 Windows 的那一步在假睡 ✅（第 70 轮）
+
+> 用户 2026-10-10 晚授权"你自己跨系统做吧"。本轮只做一件事：把 HANDOFF §2 挂了很久的那句
+> "`check.ps1` 仍未在 Windows 上真跑过" 补上，并处理由此暴露的问题。**没动任何功能代码。**
+
+**怎么跑的（可复现配方，写在这是为了下次不用重新摸索）**：WSL 里 `git clone --no-hardlinks`
+仓库到 `C:\Users\72492\ee-wincheck`（一次性副本，**不是**恢复被否决的第二副本工作流，跑完即删），
+写一个 `.cmd`：`cd /d` 到 Windows 目录（UNC 起始目录那句警告无害）→ `chcp 65001` →
+`vcvars64.bat`（VS2022 BuildTools，在 `Program Files (x86)` 下，不是 `Program Files`）→
+`powershell -File run-check.ps1`（先把 `[Console]::OutputEncoding` 设成 UTF8）→ 全程重定向日志。
+显式 `set TEMP/TMP` 到 Windows 目录，否则 WSL 的 `/tmp` 会泄漏进 Windows 进程。
+环境：Windows PowerShell **5.1**（不是 7！`pwsh` 在本机不存在，`powershell.exe` 走 WSL interop）、
+MSVC 1.98.1、Windows node 24.21.0（`C:\nvm4w\nodejs`）、python 3.12.14（uv 托管）。
+
+**第一遍就抓到一个真 bug，而且它在最要害的位置**：
+
+```
+=== desktop binary is a GUI subsystem (no console window) ===
+non-Windows host: PE subsystem check skipped (main.rs uses cfg_attr instead)
+ok: desktop binary is a GUI subsystem (no console window)
+```
+
+——在**真正的 Windows 上**，整个门禁里唯一为 Windows 存在的那一步自报"非 Windows 主机"跳过，
+然后打 `ok:`。根因：`if (-not $IsWindows)`，而 `$IsWindows` 是 PowerShell (Core) **7+** 的自动
+变量，5.1 里是 `$null`，`-not $null` 恒真。exe 明明构建成功了（33 MB）。**一条打印 ok 的跳过，
+比没有这条检查更糟：它会得到信任。**（与"三个只在 CI 里现形的 bug"同一族：跑的人不会遇到，
+遇到的人不在场 —— 只不过这次"不在场"的是平台。）
+
+**第二个缺陷同源：`Get-Content` 默认按 ANSI 代码页解码**（本机 GBK），所以任何匹配中文的判据
+打在乱码上，**永远不可能命中**。实测阳性对照（同一文件、同一字符串）：
+
+| 字符串 | GBK 隐式读 | UTF8 显式读 |
+|---|---|---|
+| `对话模式` / `同步窗口` / `当前版本` | False | True |
+
+受影响的是两处 CJK 判据：`当前版本.*0\.1\.1`（版本硬编码检查）与 `正文只搜已打开过的邮件`
+（陈旧文案检查）——**它们此前都是哑的**，有人把版本号写死进 app.js，这道门禁会发现不了。
+
+**修法（全在 `tools/check.ps1`，三处）**：
+1. 主机检测改 `[Environment]::OSVersion.Platform -eq 'Win32NT' -or $env:OS -eq 'Windows_NT'`
+   （5.1 与 7+ 都有定义；问的是"将要读 PE 头的那个 OS"，不是 shell 自己的版本）；
+2. **29 处** `Get-Content … -Raw` 全部显式 `-Encoding UTF8`（仓库文件本来全是 UTF-8）；
+3. **新增第 31 步**「the gate itself keeps working on Windows PowerShell 5.1」把上面两条钉死：
+   文件里不得出现那个 PS Core 专有变量（模式用 `'$' + 'IsWindows'` 拼出来，**让文件本身不含
+   这个字面量**，否则这步会匹配到自己）、必须含 Win32NT 判据、每个读取必须带 UTF8。
+   自引用是这步最大的坑：读检查写成逐行判断而不是单条正则，否则正则自身的源码行会误伤自己
+   （第一版就是会被自己flag，改成了逐行）。
+
+**验证（Windows 上第二遍，`CHECK_EXIT=0`，All checks passed）**：
+先用 `[System.Management.Automation.Language.Parser]::ParseFile` 在 5.1 的解析器上确认语法 0 错误，
+再整门禁重跑：`PE subsystem = 2 (Windows GUI)`（真的检查了）、新步骤
+`host detection runs on 5.1; every read is explicit UTF-8`、**31 步全 ok**。
+
+**口径（两平台实测，同一份源码 ff3692f + 本轮门禁修改）**：
+
+| 平台 | 通过/忽略 | 构成 |
+|---|---|---|
+| Windows MSVC 1.98.1 | **366 / 7** | tauri lib 8 + mail-core lib **302** + loopback **50** + oauth 1 + bench 1 + reachability 4 |
+| WSL stable 1.99 | **365 / 7** | 同上但 mail-core lib **301**（loopback 两平台都是 50） |
+
+两平台只差**一个 `cfg(windows)` 单测**。HANDOFF §2 原记的"mail-core lib 300 + loopback 49"是旧数，
+实际 WSL 是 301/50 —— 本轮一并更正（这正是 C6"所有数字带口径"要防的事）。
+
+**未做/未验（如实记）**：`-Network`（40 个真实端点）没有在 Windows 上跑，WSL 侧早前验过；
+`check.ps1` 在 PowerShell 7+ 下未跑（本机没有 7），但三处改动用的都是 5.1/7 通用 API；
+README 顺带修了四处漂移（命令数 44→55、loopback 8→**50**、Rust 1.88+→1.90+、安装表 0.1.0→0.1.2 文件名）
+与 `design/20` §1 的复盘注记；**这些都不是本轮目标，是 C5"文档当场改"的顺带**。
+Windows 侧的一次性副本与两个 `.cmd`/`.ps1`、两份日志在证据摘录后已删除。
+
+---
 
 **计划**（`design/20-v0.2-plan.md`，留在 git 里）：初稿 5 块 → 10 条反向找茬 → 修正稿。
 v0.2 = 把 M1a 收口成能发出去的版本：**断网时界面自己说、正文搜得到、Windows 上能自己更新**。

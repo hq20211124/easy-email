@@ -65,7 +65,7 @@ try {
         # A renamed or mistyped <script src> / <link href> fails silently at runtime: the page just
         # boots without that file. theme.js is load-bearing — without it
         # `window.__easyEmailTheme` is undefined and the theme button throws the moment it is used.
-        $html = Get-Content 'src/index.html' -Raw
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
         $refs = [regex]::Matches($html, '(?:src|href)="([^"]+)"') |
             ForEach-Object { $_.Groups[1].Value } |
             Where-Object { $_ -notmatch '^(https?:|data:|#)' } |
@@ -87,8 +87,8 @@ try {
         #   $('id')                  -> static markup in index.html
         #   querySelector('#id')     -> either static markup or a dialog built in app.js
         # The dialog fields are template strings in app.js, so both files count as definitions.
-        $html = Get-Content 'src/index.html' -Raw
-        $js = Get-Content 'src/app.js' -Raw
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
         $defined = "$html`n$js"
 
         $staticIds = [regex]::Matches($js, "\`$\('([a-z0-9-]+)'\)") |
@@ -125,9 +125,9 @@ try {
         #     still failed with naturalWidth = 0)
         #   * the inner DEFAULT must not allow https/http, and that is what actually blocks
         #     tracking pixels without the user's consent
-        $html = Get-Content 'src/index.html' -Raw
-        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw
-        $js = Get-Content 'src/app.js' -Raw
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
         $problems = @()
 
         foreach ($pair in @(@('src/index.html', $html), @('src-tauri/tauri.conf.json', $conf))) {
@@ -177,10 +177,10 @@ try {
         # The behaviour is covered by unit tests in `crates/mail-core/src/sanitize.rs`; this step
         # exists for the *wiring*, which no unit test can see: a sanitiser that is not called is
         # exactly as good as no sanitiser, and that is how this bug existed in the first place.
-        $sanitize = Get-Content 'crates/mail-core/src/sanitize.rs' -Raw
-        $imap = Get-Content 'crates/mail-core/src/imap.rs' -Raw
-        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw
-        $js = Get-Content 'src/app.js' -Raw
+        $sanitize = Get-Content 'crates/mail-core/src/sanitize.rs' -Raw -Encoding UTF8
+        $imap = Get-Content 'crates/mail-core/src/imap.rs' -Raw -Encoding UTF8
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
         $problems = @()
 
         foreach ($tag in @('script', 'iframe', 'object', 'meta', 'embed')) {
@@ -236,7 +236,7 @@ try {
         # !important. That is precisely where the danger is: applying width:auto broadly collapses
         # a table with width="100%" to 6% of the pane, which would wreck ordinary mail in a way no
         # offline test can see. The exclusion of the percentage forms is the load-bearing part.
-        $js = Get-Content 'src/app.js' -Raw
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
         $problems = @()
 
         if ($js -notmatch 'img \{ max-width: 100% !important') {
@@ -267,7 +267,7 @@ try {
         # This step exists for the *intent*: the FTS5 `trigram` tokenizer is the one every guide
         # recommends for substring matching, and it is wrong here — it needs three characters, and
         # most Chinese words are two. A future session reaching for it should see why not.
-        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
         $problems = @()
         if ($cache -notmatch "tokenize = 'unicode61'") {
             $problems += 'cache.rs: FTS5 tokenizer must stay unicode61 — trigram cannot match 2-character Chinese words such as 账单'
@@ -289,8 +289,8 @@ try {
         # fails only when that button is clicked, and the name also has to appear in
         # `generate_handler!` or Tauri rejects the call at runtime. Neither is covered by any test,
         # so the contract is checked here instead.
-        $js = Get-Content 'src/app.js' -Raw
-        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
 
         $called = [regex]::Matches($js, "invoke\('([a-z_]+)'") |
             ForEach-Object { $_.Groups[1].Value } |
@@ -325,9 +325,9 @@ try {
         #     nothing, which is the kind of silent hole a gate exists for;
         #   * the endpoint must be https. Tauri enforces this in release builds, but a config that
         #     only works in debug is a config that gets tested in debug and shipped in release.
-        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw
-        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
-        $cap = Get-Content 'src-tauri/capabilities/default.json' -Raw
+        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $cap = Get-Content 'src-tauri/capabilities/default.json' -Raw -Encoding UTF8
         $problems = @()
         if ($conf -notmatch '"createUpdaterArtifacts"\s*:\s*true') {
             $problems += 'tauri.conf.json: createUpdaterArtifacts must be true, or no .sig is produced and the check has nothing to verify'
@@ -363,9 +363,9 @@ try {
         # C8: `smtp_none` is the one hole in "an account must be complete", the rule that keeps a
         # mistyped host from creating a half-account. The hole is only safe while every unflagged
         # failure is still refused — so both sides of the hole are machine-checked here.
-        $wiz = Get-Content 'src/wizard.js' -Raw
-        $js = Get-Content 'src/app.js' -Raw
-        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $wiz = Get-Content 'src/wizard.js' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
         $problems = @()
         if ($wiz -notmatch 'smtpNone \?\?: false|smtpNone = false') {
             $problems += 'wizard.js must accept the flag and default it to false (accounts written before it existed are unflagged)'
@@ -392,8 +392,8 @@ try {
         # V2-C1: the number a bug report quotes must be the build's own. A hardcoded string here
         # would drift from Cargo.toml the moment someone forgets to bump it — which is the same
         # failure that produced Easy Email_0.1.0_... artifacts long after 0.1.1 shipped.
-        $js = Get-Content 'src/app.js' -Raw
-        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
         $problems = @()
         if ($lib -notmatch 'fn app_version\(\) -> String') {
             $problems += 'lib.rs must expose app_version()'
@@ -421,8 +421,8 @@ try {
         # an expired 授权码 and a provider quota alike. Showing all three as "离线" is the failure this
         # step prevents: the user is told the wrong remedy at the moment they need the right one. The
         # renderer must branch on `failure_kind`.
-        $js = Get-Content 'src/app.js' -Raw
-        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
         $problems = @()
         if ($js -notmatch 'failure_kind') {
             $problems += 'app.js must branch on failure_kind — a bare offline flag cannot tell an auth failure from a dead network'
@@ -446,7 +446,7 @@ try {
         # The status line used to say "正文只搜已打开过的邮件" as a fixed sentence, which was both
         # stale the moment a body was indexed and unable to say *how much* is indexed. The number
         # must come from `index_coverage`: a hardcoded one is the exact lie this step exists to catch.
-        $js = Get-Content 'src/app.js' -Raw
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
         $problems = @()
         if ($js -notmatch "invoke\('index_coverage'") {
             $problems += 'app.js must ask index_coverage for the coverage numbers'
@@ -469,7 +469,7 @@ try {
     Step 'body truncation touches the index only, never what the user reads' {
         # C9: cutting the stored body would silently lose mail. The truncation belongs to the FTS
         # row, so `bodies.detail` (the copy the reader shows) must stay whole.
-        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
         $problems = @()
         if ($cache -notmatch 'fn truncate_chars\(') {
             $problems += 'cache.rs: truncation helper is gone — the index needs it'
@@ -658,7 +658,7 @@ try {
         # back when you are done". It was left in and committed anyway — and that port lets *any* local
         # process drive the webview, which is a bigger hole than the probes are worth. Making the rule
         # mechanical is the only version of it that holds.
-        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw
+        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw -Encoding UTF8
         if ($conf -match 'remote-debugging-port') {
             Write-Host 'src-tauri/tauri.conf.json: remove --remote-debugging-port before shipping' -ForegroundColor Red
             $global:LASTEXITCODE = 1
@@ -696,7 +696,7 @@ try {
         # connection would silently undo that, so it is a gate rather than a convention.
         #
         # The one legitimate `Cache::open` is the startup call; everything else must clone.
-        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
         $opens = [regex]::Matches($lib, 'Cache::open\(')
         $clones = [regex]::Matches($lib, 'state\s*\.cache\s*\n?\s*\.clone\(\)')
         $problems = @()
@@ -722,7 +722,7 @@ try {
         # inside the incremental sync, where the driver has just stored what it is advancing past.
         # A backfill path that called `set_cursor` would push `last_uid` past messages that were never
         # stored, and `UID FETCH <last_uid+1>:*` would never ask for them again (design/04 §5.3).
-        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
         $problems = @()
 
         # The command's body, between its own signature and the next `#[tauri::command]`.
@@ -785,7 +785,14 @@ try {
     }
 
     Step 'desktop binary is a GUI subsystem (no console window)' {
-        if (-not $IsWindows) {
+        # Host detection must hold on Windows PowerShell 5.1, which is what a stock Windows box has.
+        # The `IsWindows` automatic variable exists only in PowerShell (Core) 7+ and is $null under
+        # 5.1, so `-not <that variable>` is ALWAYS true on the very platform this step protects: on
+        # the first real Windows run (2026-10-10, round 70) this step printed "non-Windows host …
+        # skipped" and then "ok:", verifying nothing at all. Platform, not $PSVersionTable, because
+        # the question is about the OS that will read the PE header, not the shell's own version.
+        $onWindows = [Environment]::OSVersion.Platform -eq 'Win32NT' -or $env:OS -eq 'Windows_NT'
+        if (-not $onWindows) {
             Write-Host 'non-Windows host: PE subsystem check skipped (main.rs uses cfg_attr instead)' -ForegroundColor Yellow
             $global:LASTEXITCODE = 0
             return
@@ -810,6 +817,51 @@ try {
             return
         }
         Write-Host "PE subsystem = 2 (Windows GUI)"
+        $global:LASTEXITCODE = 0
+    }
+
+    Step 'the gate itself keeps working on Windows PowerShell 5.1' {
+        # Round 70's two findings, pinned so neither can come back silently. Both are cases of a
+        # check that *looks* like it ran: the PE step printed "ok" after skipping itself on a real
+        # Windows box, and two Chinese patterns matched against GBK-mojibake bytes that can never
+        # match. A gate that cannot fail is worse than no gate — it is trusted.
+        #
+        # Self-reference note: the patterns below deliberately avoid containing their own literals
+        # (the host variable is assembled from parts, and the read check is per-line), otherwise
+        # this step would flag its own source text. Do not "simplify" it into a single regex.
+        $self = Get-Content $PSCommandPath -Raw -Encoding UTF8
+        $problems = @()
+
+        # 1) The PE host test must not use the PS Core-only automatic variable (assembled here so
+        #    this file never contains the literal): under 5.1 it is $null and the PE check that
+        #    exists for Windows skips itself on Windows.
+        $trap = '$' + 'IsWindows'
+        if ($self -match [regex]::Escape($trap)) {
+            $problems += 'check.ps1 tests the host with the PS Core automatic variable; under Windows PowerShell 5.1 that makes the PE check skip itself on real Windows. Use [Environment]::OSVersion.Platform -eq ''Win32NT'''
+        }
+        if ($self -notmatch "OSVersion\.Platform -eq 'Win32NT'") {
+            $problems += 'the PE host test must go through [Environment]::OSVersion.Platform (defined on 5.1 and 7+ alike)'
+        }
+
+        # 2) Every read must be explicit UTF-8. Without it, 5.1 decodes repo files with the ANSI
+        #    codepage (GBK here) and any Chinese pattern goes blind — both CJK checks in this file
+        #    were toothless for exactly that reason until round 70.
+        $badReads = @()
+        foreach ($line in ($self -split "`r?`n")) {
+            if ($line -match 'Get-Content' -and $line -match '-Raw' -and $line -notmatch '-Encoding UTF8') {
+                $badReads += $line.Trim()
+            }
+        }
+        if ($badReads.Count -gt 0) {
+            $problems += "$($badReads.Count) read(s) without an explicit -Encoding UTF8: $($badReads -join ' | ')"
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'host detection runs on 5.1; every read is explicit UTF-8'
         $global:LASTEXITCODE = 0
     }
 

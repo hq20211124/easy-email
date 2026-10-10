@@ -66,9 +66,14 @@ Windows 行为**没有**任何退化，全部改动都在 `cfg` 分支后面：
 
 ### 0.5 下一步（用户已有完整路线图，见 `design/19-roadmap.md`）
 
-阶段表：M0 ✅ / M1a 大部分 ✅（差 Outlook 真机验证、自动更新、代码签名）/ M1b ⏳ 基本未开始 /
-M2、M3 ❌。README「已知限制」是 Issue 级清单。候选里最小最独立的是**离线提示**
-（`sync_status` 命令已存在但界面从未调用）；最值钱的是**正文全文索引**（现在搜索只覆盖已打开的正文）。
+阶段表：M0 ✅ / M1a 大部分 ✅（差 Outlook 真机验证〔外部条件：Azure 账号〕、代码签名〔外部条件：
+证书费用〕；~~自动更新~~ 已在 v0.1.2 完成）/ **M1b ⏳ 基本未开始 —— 下一站** / M2、M3 ❌。
+README「已知限制」是 Issue 级清单。~~候选里最小最独立的是离线提示；最值钱的是正文全文索引~~
+——两者都已在 v0.1.2 做完（V2-B 失败可见性 / V2-A 后台正文索引），**不要再从这两件起步**。
+M1b 的入口候选（按"最小最独立"排序）：09 搜索与索引补齐（附件名索引、重建 UI）、
+15 性能与虚拟列表（10 万封，16 项 bench 预算）、04 离线队列完整化、16 诊断包；
+`design/19` §4 有各块验收。另有三件卡在外部条件的真机验证（Outlook / 163·126 / 自建服务器，
+清单见 §7 ④），不拦发版但每次接手时值得催一次。
 
 **用户的工作方式**：先要一份可照做的 PLAN.md 再动手；在意 token 成本；不要重新读已注释过的库源码。
 **未验证的事不要写"完成"**；测试必须能抓住它修的那个 bug。
@@ -96,13 +101,22 @@ M2、M3 ❌。README「已知限制」是 Issue 级清单。候选里最小最�
 → `cargo test` → **负载契约**（`payload_keys.mjs`，含 `EndpointOverride`）→ **exe 的 PE 头 Subsystem 必须是 2**
 （GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**（CDP 探针要用，但留下等于把 webview 交给
 任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
-目前 **31 步全绿**（离线）、**365 passed**（+7 ignored，见 `tools/check.ps1`）。
+目前 **32 步全绿**（31 离线 + 1 `-Network`）、**WSL 365 passed / 7 ignored，Windows 366 / 7**
+（同一份源码；Windows 多一个 `cfg(windows)` 单测，见 `tools/check.ps1` 与 PROGRESS 第 70 轮）。
 **v0.1.2 已发布**（2026-10-10）：三个 job 全绿，四个安装包 + `.sig` + `latest.json` 齐全，
-`releases/latest` 解析到 `0.1.2`。**`check.ps1` 仍未在 Windows 上真跑过**（WSL 无 pwsh，31 项
-都是用等价逻辑逐条验的）——这是下一次接手时第一件该补的事。
-**口径**（别再读成矛盾）：365 = 全 workspace（tauri lib 8 + mail-core lib 300 + loopback 49 +
-reachability 4 + oauth_flow 1 + bench_fixture 1）；PROGRESS 里某些轮次写的 29x 只数 mail-core 的 lib 单测。
-加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。
+`releases/latest` 解析到 `0.1.2`。
+**`check.ps1` 已在真 Windows 上跑过**（2026-10-10 晚，第 70 轮；Windows PowerShell **5.1** ——
+本机没有 `pwsh`，`powershell.exe` 从 WSL interop 调用即可；UNC 起始目录那句 CMD 警告无害）。
+**第一次真跑就抓到门禁自己的两个缺陷并已修**：① `$IsWindows` 是 PS 7+ 变量，5.1 下恒 `$null`，
+导致"PE subsystem = 2"那步在真 Windows 上自报非 Windows 跳过还打 `ok:`（改成
+`[Environment]::OSVersion.Platform -eq 'Win32NT'`）；② `Get-Content` 默认按 ANSI/GBK 解码，
+两处中文判据此前是哑的（29 处读取全部显式 `-Encoding UTF8`，并新增第 31 步把这两条钉死）。
+复跑配方（复用别重新摸索）：克隆到 Windows 原生路径的一次性副本 → `.cmd` 里 `chcp 65001` →
+`vcvars64.bat`（在 `Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`）→
+`[Console]::OutputEncoding=UTF8` 后跑门禁 → 全程重定向日志；`TEMP/TMP` 显式设成 Windows 目录。
+**口径**（别再读成矛盾）：365/366 = 全 workspace（tauri lib 8 + mail-core lib 301〔WSL〕/302〔Win〕
++ loopback 50 + reachability 4 + oauth_flow 1 + bench_fixture 1）；PROGRESS 里某些轮次写的 29x
+只数 mail-core 的 lib 单测。加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。
 
 改任何东西后跑它。加新 crate 依赖后也要跑，因为 `cargo build` 那一步会抓 MSVC linker 警告
 （Tauri 模板默认的 `crate-type = ["staticlib", "cdylib", "rlib"]` 会在每次构建时产生一条，
@@ -348,7 +362,8 @@ reachability 4 + oauth_flow 1 + bench_fixture 1）；PROGRESS 里某些轮次写
 
 ## 6. 已经验到什么程度
 
-**已验证**：**321 个测试**（+5 ignored）；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
+**已验证**：**365 passed（WSL）/ 366 passed（Windows）+ 7 ignored**（第 70 轮两平台实测，构成带口径
+见 §2）；`cargo build` 零警告；40 个真实服务器端点（TCP+TLS+协议问候语）。
 
 **Gmail（2026-10-04）：认证轴第一次在真实 Google 端点上跑通，而且收信也通了。**
 `realuser@gmail.com` —— OAuth 授权 → 刷新令牌 DPAPI 落盘 → **INBOX 实收 289 封**

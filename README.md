@@ -12,7 +12,9 @@
 
 ---
 
-## 当前进度（v0.2 进行中）
+## 当前进度（v0.1.2 已发布：内部计划“v0.2”的全部六块已交付）
+
+> 版本号口径：里程碑内部叫 v0.2， tag 是 `v0.1.2`（2026-10-10 发布，四类安装包 + 签名 + 更新清单齐全）。
 
 已完成：**单账号收发闭环** · 经过真实服务器验证的内置邮箱配置库 · **本地缓存与离线可读** · **本地全文搜索**。
 
@@ -56,9 +58,12 @@
 | 平台 | 下载 | 安装 |
 |---|---|---|
 | Windows | `Easy Email_x64-setup.exe` | 双击安装（需要系统有 WebView2 运行时，Win10/11 一般自带；安装时按需联网下载） |
-| Debian / Ubuntu | `Easy Email_0.1.0_amd64.deb` | `sudo dpkg -i Easy\ Email_0.1.0_amd64.deb`（依赖会自动提示） |
-| Fedora / RHEL | `Easy Email-0.1.0-1.x86_64.rpm` | `sudo dnf install ./Easy\ Email-0.1.0-1.x86_64.rpm` |
-| 任意 Linux（免安装） | `Easy Email_0.1.0_amd64.AppImage` | `chmod +x Easy\ Email_0.1.0_amd64.AppImage && ./Easy\ Email_0.1.0_amd64.AppImage` |
+| Debian / Ubuntu | `Easy Email_0.1.2_amd64.deb` | `sudo dpkg -i Easy\ Email_0.1.2_amd64.deb`（依赖会自动提示） |
+| Fedora / RHEL | `Easy Email-0.1.2-1.x86_64.rpm` | `sudo dnf install ./Easy\ Email-0.1.2-1.x86_64.rpm` |
+| 任意 Linux（免安装） | `Easy Email_0.1.2_amd64.AppImage` | `chmod +x Easy\ Email_0.1.2_amd64.AppImage && ./Easy\ Email_0.1.2_amd64.AppImage` |
+
+> 文件名里的版本号以 [Releases](https://github.com/hq20211124/easy-email/releases/latest) 页的实际资产为准；
+> 另外注意 CI 上传时空格会被换成点（`Easy Email` → `Easy.Email`），所以**资产名**可能和上面本地构建名不同。
 
 Linux 版凭据走 D-Bus Secret Service（gnome-keyring / KWallet）；没有密钥守护进程时应用会明确
 报错而不是硬崩，刷新令牌以"机器标识派生密钥加密 + `0600` 权限"的本地文件存放。
@@ -71,7 +76,8 @@ Linux 版凭据走 D-Bus Secret Service（gnome-keyring / KWallet）；没有密
 
 ## 从源码构建
 
-需要 Rust 1.88+（本项目使用 edition 2024）。前端是静态 HTML/JS，没有 Node 构建步骤。
+需要 Rust 1.90+（本项目使用 edition 2024；下限由自动更新插件 `tauri-plugin-updater` 的官方要求决定）。
+前端是静态 HTML/JS，没有 Node 构建步骤。
 
 **Windows**：装 VS 2022 Build Tools + WebView2 Runtime，然后 `cargo run -p easy-email`。
 
@@ -218,7 +224,7 @@ crates/mail-core/          协议层：不含任何 UI，可以单独测试
   tests/loopback.rs        进程内假 IMAP/SMTP 服务器，驱动真实客户端跑完整收发闭环
   tests/provider_reachability.rs   对着真实服务器验证配置库
 src-tauri/                 Tauri 外壳
-  src/lib.rs               44 个 Tauri 命令 + 状态管理 + 后台 worker
+  src/lib.rs               55 个 Tauri 命令（前端调用 49 个）+ 状态管理 + 后台 worker
   src/store.rs             账号持久化（原子写入 + 损坏文件自动备份）
 src/                       前端（静态 HTML/JS/CSS，无需打包）
 tools/make_icon.py         生成多分辨率 .ico
@@ -228,7 +234,7 @@ tools/make_icon.py         生成多分辨率 .ico
 
 | 测试 | 证明什么 | 需要凭据吗 |
 |---|---|---|
-| `tests/loopback.rs` | 客户端的协议交互是对的：问候语握手、`ID` 在 `LOGIN` 之前、`UID FETCH` 分帧、附件与 GB2312 解码、SMTP 认证与发信头。有 8 个用例，包括"服务器不支持 UIDPLUS"和"密码被拒"两条错误路径 | 不需要 |
+| `tests/loopback.rs` | 客户端的协议交互是对的：问候语握手、`ID` 在 `LOGIN` 之前、`UID FETCH` 分帧、附件与 GB2312 解码、SMTP 认证与发信头。有 50 个用例，包括"服务器不支持 UIDPLUS"和"密码被拒"两条错误路径 | 不需要 |
 | `tests/provider_reachability.rs` | 内置配置库指向的 40 个端点是真的存在、端口和加密方式没写错 | 不需要 |
 
 两层都不需要真实邮箱，所以 CI 里能全跑。`loopback` 用的是一个只实现必要协议子集的进程内服务器 ——
