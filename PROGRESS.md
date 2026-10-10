@@ -11,6 +11,56 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### V3-A 附件名进搜索索引：老缓存本地补齐，一次服务器都不碰 ✅（第 71 轮）
+
+**为什么是这块**：M1b 的第一站（`design/19` §4 的 09 树），也是 `design/09` §2 覆盖清单里
+**v0.1.2 之后唯一还欠的一项**：主题/发件人/收件人/正文都进索引了，**附件名还没有**。
+用户记得的是"那封带 报告.pdf 的信"，不是它正文里的词。按 §11/Q3 **附件文本**（PDF 里的字）
+默认关、是 M2 的开关，本块严格只做**名**。
+
+**实现（5 处，全在 mail-core）**：
+1. `refresh_search_row` 把 `detail.attachments` 的 `name` 追加入索引文本，**接在正文截断之后**。
+   顺序是载荷性的：一封 64K 长信不该把文件名挤出索引，而文件名恰是长会话里最可能被搜的字。
+   门禁按**字符位置**比较 `.attachments` 与 `truncate_chars` 的先后——编译器看不见顺序，只有位置能看见。
+2. `bodies` 表加 `index_version integer not null default 0`（新库 DDL 直接带，
+   老库走 `add_column_if_missing`，cache.rs 已有的列迁移模式）。
+3. `bodies_pending` / `bodies_pending_count` 的判据从"没有正文行"扩为"没有正文行 **或** 版本落后"，
+   `PendingBody` 多带 `has_body`。
+4. `Cache::reindex_row` + `index_bodies_pass` 分流：`has_body` 的行走**本地重索引**
+   （`bodies.detail` 里就有整封消息，一个写事务），没有正文的行照旧取件。**这就是升级路径**。
+5. **推翻了我自己先写的一个决定**：`body_coverage.indexed` 我一度改成"只数当前形状的行"，
+   写完立刻发现那是**把能力说小**：v0.1.2 用户升级后会看到"正文已索引 0/300"，
+   而那 300 封的正文其实照常能搜。已改回原语义并用测试钉住——**陈旧行仍算已索引**
+   （正文确实在索引里），它欠的只是附件名；"还有多少待办"才是诚实的地方，那正是
+   `bodies_pending_count`。
+
+**测试 +6**（cache 4 + index 2，全部钉的是"它该防住的那个错"）：
+附件名可搜（中文名 + `pdf` 扩展名）；老行被倒回版本 0 后 pending 且 `has_body`，
+`reindex_row` 后附件名可搜、期间覆盖率与正文搜索**不动**；超长正文里的"唯一标记"仍搜不到
+（截断没失效）而附件名仍可搜；无附件邮件行为不变；pass 的两个分支各一条——
+**陈旧行断言 `source.fetched == 0`**（这条才是"不联网"的证据），缺正文的行断言 `fetched == 1`。
+→ **WSL 371 passed / 7 ignored**（mail-core lib 301 → 307；tauri lib 8 / loopback 50 / oauth 1 /
+bench 1 / reachability 4 不变）。clippy `-D warnings` 干净，`fmt` 干净，`design/tools/audit.py` 0 失败。
+**Windows 未复测**（第 70 轮实测 366/7；按 +6 推断为 372——**这是推断不是实测**，
+下次真机/发版前在 Windows 上重跑一遍 `check.ps1` 即可）。
+
+**门禁 31 → 32 步（离线）**：新增「attachment names reach the index, and the body cap applies
+to the body alone」——四判据（函数里必须读 attachments、必须先截断后加名、pending 必须认
+`index_version`、必须带 `has_body`）。**本轮没有在 Windows 上重跑整门禁**（那是第 70 轮的证据），
+但新步骤在 Windows PowerShell 5.1 的解析器上**逐条实测过**：`parse_errors=0`、
+顺序判据 `trunc_pos=3964 < names_pos=4560`、`step_count=32`、第 31 步的自钉（无
+`$IsWindows` 字面量、全部读取显式 UTF8）仍然成立。
+
+**未做/未验**：附件文本抽取（Q3/M2）、`filename:` glob 表（Q8/M2）、`index_queue`、索引重建 UI、
+服务器端回退、查询语法（都还是 `design/09` 的纸面）；10 万封的 ≤100 ms 基准没有实测；
+**真机未验**（要一封带中文附件名的真实邮件，等用户在 QQ 邮箱里搜一个附件名）。
+
+**元教训**：索引**形状**变了，逐行就得能认出来——否则"已经索引过的邮件"永远停在旧形状，
+而这个毛病在单测里全绿（新邮件走新代码）。配套的一条：这类补齐必须**本地可做**，
+它决定升级是"几分钟安静补完"还是"重新下几百封"。
+
+---
+
 ### 跨系统首跑：check.ps1 在真 Windows 上，抓到最 Windows 的那一步在假睡 ✅（第 70 轮）
 
 > 用户 2026-10-10 晚授权"你自己跨系统做吧"。本轮只做一件事：把 HANDOFF §2 挂了很久的那句

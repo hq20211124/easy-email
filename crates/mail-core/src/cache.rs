@@ -29,6 +29,16 @@ use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
 pub const SCHEMA_VERSION: i64 = 7;
 
+/// Which index shape a `bodies` row was last written by.
+///
+/// The FTS row is derived from the stored message, so a change to what goes into it (attachment
+/// names arrived in round 71) has to be detectable per row. A row that predates the change reads
+/// back as `0`, which puts it in [`Cache::bodies_pending`] again — and because `bodies.detail`
+/// holds the whole message, the pass re-indexes those rows locally, with no connection. Without
+/// this marker, the already-indexed mail of an existing user would never learn about the newer
+/// index content at all.
+pub const INDEX_VERSION: i64 = 1;
+
 /// Where a delivered message's Sent copy is (`design/07` §5.4).
 ///
 /// Derived data: it lives in the rebuildable cache, and losing it costs the "查看已发送副本" link,
@@ -396,6 +406,7 @@ impl Cache {
                      uid        integer not null,
                      detail     text not null,
                      fetched_at integer not null,
+                     index_version integer not null default 0,
                      primary key (account_id, folder, uid)
                  );
 
@@ -465,6 +476,13 @@ impl Cache {
                      on messages(search_rowid)",
                 [],
             )?;
+
+            // v7: which index shape each stored body was last written by (`INDEX_VERSION`). Old rows
+            // default to 0, which is what puts them back into `bodies_pending` — the pass re-indexes
+            // them from `bodies.detail` itself, so no network and no rebuild at open time
+            // (`design/09` §5.4: rebuilding belongs in bounded background batches, never in the
+            // startup transaction).
+            add_column_if_missing(conn, "bodies", "index_version", "integer not null default 0")?;
             if previous_version < 7 {
                 // v7 changed the tokenisation (ASCII words are whole tokens now), so an index built
                 // by an older version is not just stale, it is built on different rules and can never
@@ -1141,19 +1159,21 @@ impl Cache {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
         let mut stmt = conn.prepare(
-            "select m.folder, m.uid
+            "select m.folder, m.uid, (b.uid is not null) as has_body
              from messages m
              left join bodies b
                on b.account_id = m.account_id and b.folder = m.folder and b.uid = m.uid
-             where m.account_id = ?1 and b.uid is null
+             where m.account_id = ?1
+               and (b.uid is null or b.index_version < ?3)
              order by m.date desc, m.uid desc
              limit ?2",
         )?;
         let cap = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![account_id, cap], |row| {
+        let rows = stmt.query_map(params![account_id, cap, INDEX_VERSION], |row| {
             Ok(crate::index::PendingBody {
                 folder: row.get(0)?,
                 uid: row.get::<_, i64>(1)? as u32,
+                has_body: row.get::<_, i64>(2)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1170,8 +1190,9 @@ impl Cache {
             "select count(*) from messages m
              left join bodies b
                on b.account_id = m.account_id and b.folder = m.folder and b.uid = m.uid
-             where m.account_id = ?1 and b.uid is null",
-            params![account_id],
+             where m.account_id = ?1
+               and (b.uid is null or b.index_version < ?2)",
+            params![account_id, INDEX_VERSION],
             |row| row.get::<_, i64>(0).map(|n| n as u32),
         )?)
     }
@@ -1180,6 +1201,13 @@ impl Cache {
     ///
     /// `indexed` counts bodies that still have a message row (`exists`, not a bare count): a body
     /// whose message was deleted is not searchable, and counting it would let the UI claim 105/100.
+    ///
+    /// **A row behind `INDEX_VERSION` still counts as indexed** — its body is searchable, it just
+    /// does not carry attachment names yet. It *is* pending work (`bodies_pending_count`), because
+    /// the pass still has to rebuild it, but subtracting it from this number would understate what
+    /// search can do: an upgrading user would see "已索引 0/300" while their 300 bodies answer
+    /// queries perfectly well. The honest place for that shortfall is the pending count, which is
+    /// what the index button works through.
     pub fn body_coverage(&self, account_id: &str) -> Result<BodyCoverage> {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
@@ -1275,6 +1303,51 @@ impl Cache {
             }
             None => Ok(None),
         }
+    }
+
+    /// Rebuild this message's index row from what is already stored — no network.
+    ///
+    /// What a row whose `index_version` is behind needs: `bodies.detail` holds the whole message,
+    /// so the only thing missing is the newer index shape (attachment names, in round 71). The
+    /// bounded pass calls this for such rows instead of fetching them again, which is what keeps
+    /// the upgrade free for the user. Goes through the write thread because
+    /// [`Self::refresh_search_row`] writes both FTS tables.
+    pub fn reindex_row(&self, account_id: &str, folder: &str, uid: u32) -> Result<()> {
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+            Self::refresh_search_row(
+                conn,
+                &account_id,
+                &folder,
+                uid,
+                crate::index::DEFAULT_BODY_INDEX_CHARS,
+            )
+        })
+    }
+
+    /// Test seam: put a row back to an older index shape, which is exactly what an upgrade looks
+    /// like from the database's side. `#[cfg(test)]` because no production path needs it — the
+    /// whole point of the tests that use it is that the normal code cannot produce a stale row by
+    /// accident, only the migration of an older file can.
+    #[cfg(test)]
+    pub fn force_index_version(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+        version: i64,
+    ) -> Result<()> {
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn: &Connection| {
+            conn.execute(
+                "update bodies set index_version = ?4
+                 where account_id = ?1 and folder = ?2 and uid = ?3",
+                params![account_id, folder, i64::from(uid), version],
+            )?;
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------------ search
@@ -1409,12 +1482,16 @@ impl Cache {
             })?,
         };
 
-        // The body lives inside the serialised detail; pull just the text out of it.
-        let body = source
+        // The body and the attachment names both live inside the serialised detail; one parse gives
+        // both. Names only, not the attachment contents: `design/09` §11/Q3 keeps text extraction
+        // off by default (M2), and the M1b slice is "search for 报告.pdf", not "search inside it".
+        let detail = source
             .detail_json
             .as_deref()
-            .and_then(|json| serde_json::from_str::<MessageDetail>(json).ok())
-            .and_then(|detail| detail.body_text)
+            .and_then(|json| serde_json::from_str::<MessageDetail>(json).ok());
+        let body = detail
+            .as_ref()
+            .and_then(|d| d.body_text.clone())
             .unwrap_or_default();
 
         // Only the *index copy* is truncated. `bodies.detail` keeps the whole message: that is what
@@ -1422,6 +1499,27 @@ impl Cache {
         // default is `design/09`'s 64 KB, and it is a setting on the roadmap so "I want everything
         // searchable" has somewhere to live.
         let body = truncate_chars(&body, body_limit);
+
+        // Attachment names are appended AFTER the truncation, never before it: the cap belongs to
+        // the body alone, and a 64 KB message would otherwise squeeze the filename out of the index
+        // — the name is short and is exactly what the user types on a long thread. `to_tokens` does
+        // the per-character spacing, so a Chinese filename matches the same way a Chinese body
+        // does; an ASCII extension like `pdf` is already a single token.
+        let names = detail
+            .as_ref()
+            .map(|d| {
+                d.attachments
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let indexed_body = if names.is_empty() {
+            to_tokens(body)
+        } else {
+            format!("{} {}", to_tokens(body), to_tokens(&names))
+        };
 
         conn.execute(
             "insert into search
@@ -1433,7 +1531,7 @@ impl Cache {
                 to_tokens(source.from_name.as_deref().unwrap_or_default()),
                 to_tokens(source.from_addr.as_deref().unwrap_or_default()),
                 to_tokens(source.to_addrs.as_deref().unwrap_or_default()),
-                to_tokens(body),
+                indexed_body,
                 account_id,
                 folder,
                 i64::from(uid),
@@ -1446,6 +1544,16 @@ impl Cache {
             "update messages set search_rowid = ?4
              where account_id = ?1 and folder = ?2 and uid = ?3",
             params![account_id, folder, i64::from(uid), rowid],
+        )?;
+
+        // Mark the body as carrying the current index shape. A row written before attachment names
+        // existed reads back as 0, which is what sends it through `bodies_pending` again — the pass
+        // re-indexes it locally (see `Cache::reindex_row`), so an existing user's already-indexed
+        // mail learns about attachment names without a single fetch.
+        conn.execute(
+            "update bodies set index_version = ?4
+             where account_id = ?1 and folder = ?2 and uid = ?3",
+            params![account_id, folder, i64::from(uid), INDEX_VERSION],
         )?;
         Ok(())
     }
@@ -1634,6 +1742,29 @@ mod tests {
         }
     }
 
+    /// Same message, with attachment names — the round-71 slice. Names only, no contents: the
+    /// point is that "报告.pdf" is searchable, not that the PDF is.
+    fn detail_with_attachments(
+        uid: u32,
+        subject: &str,
+        body_text: &str,
+        names: &[&str],
+    ) -> MessageDetail {
+        let mut d = detail(uid, subject, body_text);
+        d.attachments = names
+            .iter()
+            .map(|name| crate::model::AttachmentMeta {
+                name: (*name).to_string(),
+                mime: "application/octet-stream".to_string(),
+                size: 1024,
+                part: 1,
+                inline: false,
+                content_id: None,
+            })
+            .collect();
+        d
+    }
+
     #[test]
     fn schema_is_created_with_fts5_available() {
         // If FTS5 were missing from the bundled SQLite build, `migrate` would fail here rather than
@@ -1694,6 +1825,157 @@ mod tests {
         let both = cache.search("acc", "example.com", 10).unwrap();
         assert!(both.len() >= 2);
         assert!(both[0].date >= both[1].date, "newest first");
+    }
+
+    #[test]
+    fn attachment_names_are_searchable_after_put_detail() {
+        // `design/09` §2: the indexed row covers subject/sender/recipients + body + attachment
+        // *names* — names only, because text extraction is the M2 switch (§11/Q3). The user's
+        // query is "报告.pdf", not the body the file rode in; both the Chinese name and the ASCII
+        // extension have to find it.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "季度报表", "boss@example.com", 100)],
+            )
+            .unwrap();
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail_with_attachments(
+                    1,
+                    "季度报表",
+                    "正文里没有你要找的词",
+                    &["报告.pdf", "截图.png"],
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            cache.search("acc", "报告", 10).unwrap().len(),
+            1,
+            "Chinese name"
+        );
+        assert_eq!(
+            cache.search("acc", "pdf", 10).unwrap().len(),
+            1,
+            "extension"
+        );
+    }
+
+    #[test]
+    fn a_row_indexed_before_attachment_names_existed_is_reindexed_without_the_network() {
+        // What an upgrade looks like from the outside: the user read this mail, so the body is in
+        // the cache, but its index row predates attachment names. It must come back as pending
+        // *with the body in hand* (`has_body`) and be re-indexed by the local path. The coverage
+        // number deliberately does **not** move: see the assertion below.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "发票", "shop@example.com", 100)],
+            )
+            .unwrap();
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail_with_attachments(1, "发票", "正文", &["报告.pdf"]),
+            )
+            .unwrap();
+        cache
+            .force_index_version("acc", "INBOX", 1, 0)
+            .expect("rewind the row to the pre-attachment shape");
+
+        let pending = cache.bodies_pending("acc", 20).unwrap();
+        assert_eq!(pending.len(), 1, "a stale row is pending again");
+        assert!(
+            pending[0].has_body,
+            "…and the pass must know the body is already stored"
+        );
+        let coverage = cache.body_coverage("acc").unwrap();
+        assert_eq!(
+            (coverage.indexed, coverage.total),
+            (1, 1),
+            "pending work is not lost search: the body is indexed and answers queries today"
+        );
+        assert_eq!(
+            cache.search("acc", "正文", 10).unwrap().len(),
+            1,
+            "…and the rewind did not take the body with it"
+        );
+
+        cache
+            .reindex_row("acc", "INBOX", 1)
+            .expect("local re-index");
+        assert_eq!(cache.search("acc", "报告", 10).unwrap().len(), 1);
+        assert_eq!(cache.bodies_pending_count("acc").unwrap(), 0);
+        let coverage = cache.body_coverage("acc").unwrap();
+        assert_eq!((coverage.indexed, coverage.total), (1, 1));
+    }
+
+    #[test]
+    fn a_truncated_body_does_not_take_the_attachment_names_with_it() {
+        // The cap belongs to the body alone (C9: `bodies.detail` keeps the whole message; only the
+        // index copy is cut). Appending the names *after* the truncation is what keeps a 64 KB body
+        // from pushing the filename out of the index — the name is short and is the thing the user
+        // types on a long thread.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "大附件", "boss@example.com", 100)],
+            )
+            .unwrap();
+        let long_body = format!(
+            "{}唯一标记",
+            "长".repeat(crate::index::DEFAULT_BODY_INDEX_CHARS + 1024)
+        );
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail_with_attachments(1, "大附件", &long_body, &["年度总结.docx"]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            cache.search("acc", "唯一标记", 10).unwrap().len(),
+            0,
+            "the cap still applies to the body"
+        );
+        assert_eq!(
+            cache.search("acc", "年度总结", 10).unwrap().len(),
+            1,
+            "the name survives a body longer than the cap"
+        );
+    }
+
+    #[test]
+    fn a_message_without_attachments_indexes_unchanged() {
+        // Regression guard for the row-shape change: a body-only message searches exactly as
+        // before, and its row is current the moment it is written — no pending work, full coverage.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "对账单", "bank@example.com", 100)],
+            )
+            .unwrap();
+        cache
+            .put_detail("acc", "INBOX", &detail(1, "对账单", "流水号 8848"))
+            .unwrap();
+
+        assert_eq!(cache.bodies_pending_count("acc").unwrap(), 0);
+        let coverage = cache.body_coverage("acc").unwrap();
+        assert_eq!((coverage.indexed, coverage.total), (1, 1));
+        assert_eq!(cache.search("acc", "流水号", 10).unwrap().len(), 1);
     }
 
     #[test]

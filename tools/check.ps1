@@ -491,6 +491,50 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'attachment names reach the index, and the body cap applies to the body alone' {
+        # V3-A. Three properties, each of which fails in a way nothing else notices:
+        #   * the indexed text must include attachment **names** (`design/09` §2) — without them
+        #     "报告.pdf" finds nothing, and the only trace is the user reporting it;
+        #   * the 64 KB cap must not reach the names: it belongs to the body, and a long message
+        #     would otherwise push the filename out of the index;
+        #   * a row written by an older build must come back as pending, or the already-indexed mail
+        #     of every existing user would never learn about the newer index content at all.
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        $fn = [regex]::Match($cache, '(?s)fn refresh_search_row.*?\n    \}').Value
+        if ($fn.Length -eq 0) {
+            $problems += 'cache.rs: refresh_search_row is gone — the place where the index text is built'
+        } else {
+            if ($fn -notmatch '\.attachments') {
+                $problems += 'cache.rs: refresh_search_row no longer reads attachment names out of the stored detail'
+            }
+            # Order is load-bearing and invisible to the compiler: both happen in this one function,
+            # so the only way to see it is to compare positions.
+            $trunc = $fn.IndexOf('truncate_chars(&body, body_limit)')
+            $names = $fn.IndexOf('.attachments')
+            if ($trunc -lt 0) {
+                $problems += 'cache.rs: the body cap is gone from the index builder'
+            } elseif ($names -lt $trunc) {
+                $problems += 'cache.rs: attachment names are indexed BEFORE the body is truncated — a 64 KB body would crowd the filename out'
+            }
+        }
+        if ($cache -notmatch 'b\.index_version') {
+            $problems += 'cache.rs: nothing in the pending query knows which index shape a body row was written by'
+        }
+        if ($cache -notmatch 'has_body') {
+            $problems += 'cache.rs: bodies_pending must tell the pass whether the body is already stored, or stale rows get fetched again'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'names reach the index after the cap; stale rows are marked and come back as pending'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

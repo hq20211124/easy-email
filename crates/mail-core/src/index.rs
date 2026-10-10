@@ -27,6 +27,10 @@ pub const DEFAULT_BODY_INDEX_CHARS: usize = 64 * 1024;
 pub struct PendingBody {
     pub folder: String,
     pub uid: u32,
+    /// The body **is** in the cache; only its index row predates the current shape
+    /// ([`crate::cache::INDEX_VERSION`]). Such a row is re-indexed locally — `bodies.detail` holds
+    /// the whole message, so the pass must not spend a connection (or a quota) fetching it again.
+    pub has_body: bool,
 }
 
 /// Which messages the next pass should fetch.
@@ -102,6 +106,17 @@ pub async fn index_bodies_pass(
 
     let mut report = IndexReport::default();
     for item in &picked {
+        // Two kinds of pending work. A body that is already stored only needs its index row
+        // rebuilt — one write transaction, no connection — and that is the upgrade path for mail
+        // indexed before the current shape existed. A message with no body at all still has to be
+        // fetched, which is the expensive half and the reason the pass is bounded at all.
+        if item.has_body {
+            match run.cache.reindex_row(&run.cfg.id, &item.folder, item.uid) {
+                Ok(()) => report.indexed += 1,
+                Err(_) => report.failed += 1,
+            }
+            continue;
+        }
         match source.fetch_body(&item.folder, item.uid).await {
             Ok(detail) => {
                 run.cache.put_detail(&run.cfg.id, &item.folder, &detail)?;
@@ -127,6 +142,7 @@ mod tests {
             .map(|i| PendingBody {
                 folder: "INBOX".to_string(),
                 uid: 100 - i,
+                has_body: false,
             })
             .collect()
     }
@@ -151,5 +167,152 @@ mod tests {
     #[test]
     fn an_empty_pending_list_is_not_an_error() {
         assert!(pick_pending(Vec::new(), 20).is_empty());
+    }
+
+    // ---------------------------------------------------------- the two kinds of pending work
+
+    fn summary(
+        uid: u32,
+        subject: &str,
+        from_addr: &str,
+        date: i64,
+    ) -> crate::model::MessageSummary {
+        crate::model::MessageSummary {
+            uid,
+            subject: subject.to_string(),
+            from_name: Some("发件人".to_string()),
+            from_addr: Some(from_addr.to_string()),
+            date: Some(date),
+            size: Some(1024),
+            seen: false,
+            flagged: false,
+            thread_key: None,
+            subject_key: None,
+        }
+    }
+
+    fn detail(uid: u32, subject: &str, body_text: &str) -> MessageDetail {
+        MessageDetail {
+            uid,
+            subject: subject.to_string(),
+            from_name: Some("发件人".to_string()),
+            from_addr: Some("shop@example.com".to_string()),
+            to: vec!["me@example.com".to_string()],
+            cc: Vec::new(),
+            reply_to: None,
+            date: Some(1_700_000_000),
+            message_id: Some("m1@example.com".to_string()),
+            in_reply_to: None,
+            references: Vec::new(),
+            body_text: Some(body_text.to_string()),
+            body_html: Some("<p>html</p>".to_string()),
+            attachments: Vec::new(),
+            inline_images: Vec::new(),
+        }
+    }
+
+    fn test_config() -> crate::model::AccountConfig {
+        crate::model::AccountConfig {
+            id: "acc".to_string(),
+            email: "me@example.com".to_string(),
+            display_name: "我".to_string(),
+            username: "me@example.com".to_string(),
+            provider_id: "custom".to_string(),
+            imap: crate::model::Endpoint::new("127.0.0.1", 143, crate::model::Security::Plain),
+            smtp: crate::model::Endpoint::new("127.0.0.1", 25, crate::model::Security::Plain),
+            needs_id_command: false,
+            max_connections: 2,
+            auth: crate::model::AuthMethod::Password,
+            smtp_none: false,
+        }
+    }
+
+    /// A source that hands over one fixed message and counts the calls, so the two branches of the
+    /// pass can be told apart without a server: what matters is not *what* it would have returned,
+    /// but that it is never asked for a row we already hold.
+    struct OneMessage {
+        detail: MessageDetail,
+        fetched: std::cell::Cell<u32>,
+    }
+
+    impl BodySource for OneMessage {
+        async fn fetch_body(&mut self, _folder: &str, _uid: u32) -> Result<MessageDetail> {
+            self.fetched.set(self.fetched.get() + 1);
+            Ok(self.detail.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_indexed_before_attachment_names_existed_is_reindexed_locally_and_never_fetched()
+    {
+        // The upgrade path, end to end through the pass: the body is in the cache, only its index
+        // row is behind. Fetching it again would spend a connection (and quota) on data already
+        // stored — on a big mailbox that is the difference between an upgrade and a re-download.
+        let cache = crate::cache::Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "发票", "shop@example.com", 100)],
+            )
+            .unwrap();
+        cache
+            .put_detail("acc", "INBOX", &detail(1, "发票", "正文"))
+            .unwrap();
+        cache
+            .force_index_version("acc", "INBOX", 1, 0)
+            .expect("rewind the row to the pre-attachment shape");
+
+        let run = BodyIndexRun {
+            cache: &cache,
+            cfg: &test_config(),
+            limit: 20,
+        };
+        let mut source = OneMessage {
+            // Whatever the source would have produced must be irrelevant: it must not be called.
+            detail: detail(1, "不该被取", "不该被取"),
+            fetched: std::cell::Cell::new(0),
+        };
+        let report = index_bodies_pass(run, &mut source).await.expect("pass");
+
+        assert_eq!(report.indexed, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            source.fetched.get(),
+            0,
+            "a stale row is already stored — spending a connection on it is the bug"
+        );
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.bodies_pending_count("acc").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_message_with_no_body_is_fetched_and_then_indexed() {
+        // The other branch, and the reason the pass is bounded at all: no body stored means the
+        // message has to be opened, which costs what opening costs.
+        let cache = crate::cache::Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "发票", "shop@example.com", 100)],
+            )
+            .unwrap();
+
+        let run = BodyIndexRun {
+            cache: &cache,
+            cfg: &test_config(),
+            limit: 20,
+        };
+        let mut source = OneMessage {
+            detail: detail(1, "发票", "正文里的词"),
+            fetched: std::cell::Cell::new(0),
+        };
+        let report = index_bodies_pass(run, &mut source).await.expect("pass");
+
+        assert_eq!(report.indexed, 1);
+        assert_eq!(source.fetched.get(), 1, "a missing body has to be fetched");
+        assert_eq!(report.remaining, 0);
+        assert_eq!(cache.search("acc", "正文里的词", 5).unwrap().len(), 1);
     }
 }
