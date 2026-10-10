@@ -33,7 +33,10 @@
 进度「正在重建索引 done/total」+「停止」（停止 = 不进行下一批）；结束 toast 区分
 "完成"与"已停止 x/y，再点一次接着来"。
 
-**测试 +4**（cache）→ **WSL 375 passed / 7 ignored**（371+4）。载荷性那条是
+**测试 +4**（cache）→ **WSL 375 passed / 7 ignored**（371+4），**Windows 实测 376 / 7**
+（mail-core lib 312，比 WSL 恒多一个 `cfg(windows)` 单测）。整门禁在真 Windows 上跑完：
+33 步离线全 `ok`、`CHECK_EXIT=0`，新步骤输出
+`the index can be rebuilt in bounded, network-free steps`。载荷性那条是
 `a_rebuild_reproduces_the_incremental_index`：**重建后的答案必须与从未删过的增量索引一致**
 （5 组查询逐一比对，外加"查无此词必须 0 命中"的对照，否则"答案相同"是空话）；
 另有 分批+跨重启续跑（每步新开一次文件句柄，"重启"是结构性的）、`begin` 确实先清空、
