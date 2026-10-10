@@ -89,6 +89,19 @@ sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libsoup-3.0-de
 cargo tauri build    # deb / AppImage / rpm；Windows 上为 nsis
 ```
 
+> **打包需要签名私钥**（`createUpdaterArtifacts` 开启后 bundler 必须产出 `.sig`）。
+> 本地打包时把密钥指给它，否则会停在签名那一步：
+>
+> ```bash
+> export TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/easy-email.key"
+> export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='你生成密钥时设的密码'
+> cargo tauri build
+> ```
+>
+> `cargo build` / `cargo run` / `tools/check.ps1` **不受影响**（那只编译，不打安装包），
+> 只有走到 bundler 那一步才要密钥。真正的发布也不要本地打 —— CI 里有"密钥缺失就说人话"
+> 的前置检查和三个 job 的清单合并，本地没有这些。
+
 **没有控制台窗口。** exe 现在是 GUI 子系统的（Tauri 模板默认只有 release 才是，于是每次双击 debug
 exe 都会跟一个 cmd 窗口）。要看启动期的输出：
 
@@ -154,10 +167,21 @@ git commit -am "发布 X.Y.Z" && git push
 
 # 3. 打 tag 并推送（触发 CI 构建与上传）
 git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z
-
-# 4. 写发布说明并置为 latest
-gh release create vX.Y.Z --title "Easy Email X.Y.Z（主题）" --notes-file notes.md --latest
 ```
+
+**第 4 步不是 `gh release create`。** CI 的 `softprops/action-gh-release` 在上传资产时已经把
+release 建好了，再 `create` 会报 `release already exists`。release 建好之后只差标题、说明和
+latest 标记，用 `edit`：
+
+```bash
+# 4. 补标题与发布说明，并置为 latest
+gh release edit vX.Y.Z --title "Easy Email X.Y.Z（主题）" --notes-file notes.md --latest
+```
+
+> 想在打 tag **之前**就把说明写好也可以：先 `gh release create vX.Y.Z --draft …` 建一个草稿，
+> CI 会把资产传进去，最后 `gh release edit vX.Y.Z --draft=false --latest` 发布。
+> 但注意草稿 release 不会出现在 `releases/latest` 里，**自动更新会认为没有新版**
+> （插件的 `latest` 端点只解析非草稿、非预发布的 release）。
 
 产物带 `SHA256SUMS`；deb/rpm 的运行时依赖声明在 `src-tauri/tauri.linux.conf.json`。
 

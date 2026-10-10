@@ -36,14 +36,36 @@ jobs:
       # Fails *here*, with a sentence, rather than three steps later inside the bundler. Without the
       # private key `createUpdaterArtifacts` makes the build fail with a message about signing, and
       # the obvious reading of that is "the config is wrong" rather than "the secret is missing".
-      - name: signing key present
+      - name: signing key present and shaped like a private key
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+          set -euo pipefail
+          KEY="$TAURI_SIGNING_PRIVATE_KEY"
+          if [ -z "$KEY" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set. Every tag build signs its bundles, so a release cannot be built without it."
             exit 1
           fi
+          # A path is not the key: the field takes the file's *content*. This mistake builds fine
+          # until the bundler tries to read it.
+          if [ -e "$KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is a path. Paste the file's contents (the long base64 blob), not the path to it."
+            exit 1
+          fi
+          # The public key decodes to readable text that says so. Pasting it here is the easiest
+          # mistake to make — the two files sit next to each other — and it fails deep inside the
+          # bundler with a message about signing, which reads like "the config is wrong".
+          if printf '%s' "$KEY" | base64 -d 2>/dev/null | grep -q 'minisign public key'; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY holds the PUBLIC key. The private one is ~/.tauri/easy-email.key (the .pub next to it is what the app uses to verify)."
+            exit 1
+          fi
+          # The private key is a base64 blob of a few hundred bytes; anything much shorter is a
+          # truncated paste.
+          if [ ${#KEY} -lt 200 ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY looks truncated (${#KEY} characters). Copy the whole file."
+            exit 1
+          fi
+          echo "private key present and shaped like one"
       - name: cargo tauri build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -108,15 +130,30 @@ jobs:
         with:
           toolchain: "stable"
           target: x86_64-pc-windows-msvc
-      - name: signing key present
+      - name: signing key present and shaped like a private key
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         shell: bash
         run: |
-          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+          set -euo pipefail
+          KEY="$TAURI_SIGNING_PRIVATE_KEY"
+          if [ -z "$KEY" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set. Every tag build signs its bundles, so a release cannot be built without it."
             exit 1
           fi
+          if [ -e "$KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is a path. Paste the file's contents (the long base64 blob), not the path to it."
+            exit 1
+          fi
+          if printf '%s' "$KEY" | base64 -d 2>/dev/null | grep -q 'minisign public key'; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY holds the PUBLIC key. The private one is ~/.tauri/easy-email.key (the .pub next to it is what the app uses to verify)."
+            exit 1
+          fi
+          if [ ${#KEY} -lt 200 ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY looks truncated (${#KEY} characters). Copy the whole file."
+            exit 1
+          fi
+          echo "private key present and shaped like one"
       - name: cargo tauri build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
