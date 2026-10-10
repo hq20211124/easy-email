@@ -12,6 +12,7 @@
 //! - [`sync`] — incremental folder sync on top of the cache.
 //! - [pool] — reuse IMAP connections instead of handshaking per command.
 //! - [idle] — IMAP IDLE push, so new mail arrives without polling.
+//! - [index] — a bounded pass that fetches unread bodies so search can see them.
 //! - [`smtp`] — compose and send, including threading headers.
 //! - [`secret`] — Windows Credential Manager access.
 
@@ -23,6 +24,7 @@ pub mod error;
 pub mod folders;
 pub mod idle;
 pub mod imap;
+pub mod index;
 pub mod links;
 pub mod model;
 pub mod mutf7;
@@ -47,11 +49,12 @@ pub use attach::{AttachmentIssue, check_attachment, file_sha256, prepare_attachm
 pub use backfill::{
     BackfillBudget, BackfillReport, BackfillStop, backfill_older, fill_thread_keys,
 };
-pub use cache::{Cache, FolderState, SearchHit};
+pub use cache::{BodyCoverage, Cache, FolderState, SearchHit};
 pub use error::{AuthHint, MailError, Result};
 pub use idle::{PushEvent, watch, watch_every};
 pub use imap::Credential;
 pub use imap::{HeaderPage, ImapClient};
+pub use index::{BodyIndexRun, IndexReport, PendingBody, index_bodies_pass, pick_pending};
 pub use model::{
     AccountConfig, AttachmentMeta, AuthKind, AuthMethod, ConnectionReport, Endpoint,
     EndpointOverride, EndpointProblem, InlineImage, MailboxInfo, MessageDetail, MessageSummary,

@@ -25,7 +25,7 @@ use mail_core::{
     AccountConfig, Cache, ConnectionPool, Credential, Draft, DraftMirror, Endpoint, ImapClient,
     MailboxInfo, MessageSummary, NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent,
     RecoveryRun, Security, Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy,
-    mirror_draft, pool_op, recover_in_flight, run_due, watch_every,
+    index_bodies_pass, mirror_draft, pool_op, recover_in_flight, run_due, watch_every,
 };
 use mail_core::{
     AuthMethod, BackfillBudget, BackfillStop, SyncWindow, backfill_older, fill_thread_keys,
@@ -2536,6 +2536,137 @@ async fn sync_once(
             return outcome;
         }
     }
+}
+
+/// A body source that refuses one specific UID, so the pass's "one bad message" path is exercised
+/// against a real connection rather than a mock of one.
+struct UnreadableUid<'a> {
+    client: &'a mut ImapClient,
+    uid: u32,
+}
+
+impl mail_core::index::BodySource for UnreadableUid<'_> {
+    async fn fetch_body(
+        &mut self,
+        _folder: &str,
+        uid: u32,
+    ) -> mail_core::Result<mail_core::MessageDetail> {
+        if uid == self.uid {
+            return Err(mail_core::error::MailError::Imap("server said no".into()));
+        }
+        self.client.fetch_message(uid).await
+    }
+}
+
+/// **V2-A.** One bounded pass indexes what it is allowed to, and the next pass finishes the job.
+///
+/// The pass exists because a sync only stores headers: `bodies` — and therefore the FTS row — is
+/// written by `put_detail`, which the reading path calls. Without the pass, search would only ever
+/// see mail the user had already opened (`design/20-v0.2-plan.md` V2-A). The two assertions that
+/// matter are the cap (a pass must not turn into a whole-mailbox fetch) and the resume (the second
+/// pass picks up exactly what the first one left).
+#[tokio::test]
+async fn a_bounded_body_index_pass_resumes_until_nothing_is_pending() {
+    let (addr, _log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+    within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+
+    // A sync stores headers only, so nothing is searchable by body yet.
+    let coverage = cache.body_coverage(&cfg.id).expect("coverage");
+    assert_eq!(coverage.total, 4, "the fixture's INBOX");
+    assert_eq!(coverage.indexed, 0, "and a sync does not read bodies");
+    assert_eq!(cache.bodies_pending(&cfg.id, 10).expect("pending").len(), 4);
+
+    // First pass, capped at two: the cap is the whole point of the pass shape.
+    let first = within(index_bodies_pass(
+        mail_core::index::BodyIndexRun {
+            cache: &cache,
+            cfg: &cfg,
+            limit: 2,
+        },
+        &mut client,
+    ))
+    .await
+    .expect("first pass");
+    assert_eq!(first.indexed, 2, "one pass may not exceed its limit");
+    assert_eq!(first.failed, 0);
+    assert_eq!(
+        first.remaining, 2,
+        "and what is left is reported, not implied"
+    );
+    assert_eq!(cache.body_coverage(&cfg.id).expect("coverage").indexed, 2);
+
+    // Second pass: resumes at the same two it had not touched, not from the top again.
+    let second = within(index_bodies_pass(
+        mail_core::index::BodyIndexRun {
+            cache: &cache,
+            cfg: &cfg,
+            limit: 2,
+        },
+        &mut client,
+    ))
+    .await
+    .expect("second pass");
+    assert_eq!(second.indexed, 2);
+    assert_eq!(second.remaining, 0, "nothing left to index");
+    assert_eq!(
+        cache.body_coverage(&cfg.id).expect("coverage").indexed,
+        4,
+        "every message in the folder now has a body behind it"
+    );
+
+    // The point of the whole block: a word that only appears in a body is now findable. "Hello" is
+    // in message one's body and nowhere in any subject, so this fails if the pass did not index.
+    let hits = cache.search(&cfg.id, "Hello", 10).expect("search");
+    assert!(
+        hits.iter().any(|hit| hit.uid == 1),
+        "a body-only word must be searchable after the pass"
+    );
+}
+
+/// **V2-A, failure half.** One unreadable message must not abandon the rest of the pass.
+///
+/// The pass covers a mailbox, so stopping at the first failure would leave every message behind it
+/// un-indexed until the next pass — and the failure is usually one malformed message, not a dead
+/// connection (which fails the whole pass anyway). The failure is *counted and retried later*
+/// rather than hidden: `remaining` still includes it.
+#[tokio::test]
+async fn a_failing_message_does_not_stop_the_pass_and_stays_pending() {
+    let (addr, _log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+    within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+
+    let report = within(index_bodies_pass(
+        mail_core::index::BodyIndexRun {
+            cache: &cache,
+            cfg: &cfg,
+            limit: 4,
+        },
+        &mut UnreadableUid {
+            client: &mut client,
+            uid: 3,
+        },
+    ))
+    .await
+    .expect("pass");
+
+    assert_eq!(report.indexed, 3, "the other three still get indexed");
+    assert_eq!(
+        report.failed, 1,
+        "and the failure is visible, not swallowed"
+    );
+    assert_eq!(
+        report.remaining, 1,
+        "the failed one is still pending, so a later pass retries it"
+    );
 }
 
 #[tokio::test]

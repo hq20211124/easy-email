@@ -316,6 +316,55 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'search reports body coverage from the backend, not a hardcoded sentence' {
+        # The status line used to say "正文只搜已打开过的邮件" as a fixed sentence, which was both
+        # stale the moment a body was indexed and unable to say *how much* is indexed. The number
+        # must come from `index_coverage`: a hardcoded one is the exact lie this step exists to catch.
+        $js = Get-Content 'src/app.js' -Raw
+        $problems = @()
+        if ($js -notmatch "invoke\('index_coverage'") {
+            $problems += 'app.js must ask index_coverage for the coverage numbers'
+        }
+        if ($js -notmatch "invoke\('index_bodies'") {
+            $problems += 'app.js must offer the index_bodies pass, or coverage can never improve'
+        }
+        if ($js -match '正文只搜已打开过的邮件') {
+            $problems += 'app.js still carries the stale fixed sentence — coverage is a number now'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'search status line takes its coverage numbers from the cache'
+        $global:LASTEXITCODE = 0
+    }
+
+    Step 'body truncation touches the index only, never what the user reads' {
+        # C9: cutting the stored body would silently lose mail. The truncation belongs to the FTS
+        # row, so `bodies.detail` (the copy the reader shows) must stay whole.
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw
+        $problems = @()
+        if ($cache -notmatch 'fn truncate_chars\(') {
+            $problems += 'cache.rs: truncation helper is gone — the index needs it'
+        }
+        if ($cache -notmatch 'truncate_chars\(&body, body_limit\)') {
+            $problems += 'cache.rs: the body must be truncated only where the FTS row is written'
+        }
+        # `put_detail` writes the reader's copy; it must not mention the cap.
+        $putDetail = [regex]::Match($cache, '(?s)pub fn put_detail.*?\n    \}').Value
+        if ($putDetail -match 'body_limit|truncate_chars') {
+            $problems += 'put_detail must store the whole body — truncating it loses mail the user is reading'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'bodies.detail stays whole; only the index copy is capped'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

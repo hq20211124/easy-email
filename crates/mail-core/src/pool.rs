@@ -164,6 +164,16 @@ impl DerefMut for PooledClient<'_> {
     }
 }
 
+/// A checked-out connection *is* a body source: the pool hands the caller a `PooledClient`, and
+/// every method the trait needs is on the connection inside it. Implementing it here (rather than
+/// making call sites reach through the deref) keeps `pool_op!` blocks reading like the rest.
+#[allow(async_fn_in_trait)]
+impl crate::index::BodySource for PooledClient<'_> {
+    async fn fetch_body(&mut self, folder: &str, uid: u32) -> crate::Result<crate::MessageDetail> {
+        ImapClient::fetch_body(self, folder, uid).await
+    }
+}
+
 impl Drop for PooledClient<'_> {
     fn drop(&mut self) {
         if let (Some(client), false) = (self.client.take(), self.poisoned) {

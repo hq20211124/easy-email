@@ -282,6 +282,16 @@ textarea {
   background: transparent;
 }
 
+/* A button that lives inside a line of text (the search status line), so it must not push the line
+   taller than the 11px text it sits in. Same shape as the toast's action button. */
+.btn.small {
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  margin-left: 4px;
+  vertical-align: baseline;
+}
+
 /* ---------------------------------------------------------------- list rows */
 
 .row {

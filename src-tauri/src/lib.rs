@@ -1861,6 +1861,106 @@ async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<S
     })
 }
 
+/// How much of this account has an indexed body — what search can actually see.
+///
+/// The number the search box shows. It exists because "search only covers opened mail" was invisible
+/// on screen: the user typed a word, got nothing, and had no way to tell whether that meant "not
+/// there" or "not indexed yet" (`design/20-v0.2-plan.md` V2-A).
+#[tauri::command]
+async fn index_coverage(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<mail_core::BodyCoverage, String> {
+    let cache = state.cache.clone();
+    cache.body_coverage(&account_id).map_err(describe)
+}
+
+/// One bounded pass of body indexing, so mail the user never opened becomes searchable.
+///
+/// Bounded on purpose: reading a body costs what opening the message costs, so this must not turn
+/// into a whole-mailbox fetch that starves the user's own refresh. The desktop shell runs it on a
+/// 60 s tick; the button in the search box runs it on demand.
+#[tauri::command]
+async fn index_bodies(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<mail_core::index::IndexReport, String> {
+    body_index_pass(&state, &account_id).await
+}
+
+/// One pass for one account, shared by the command and the background tick.
+///
+/// Both callers need the same shape — claim a connection from the pool, walk the pending list, store
+/// what comes back — and the pool's retry macro expands its block twice, so this lives in one
+/// function rather than being written out at each call site.
+async fn body_index_pass(
+    state: &AppState,
+    account_id: &str,
+) -> Result<mail_core::index::IndexReport, String> {
+    let cfg = state.find(account_id)?;
+    let password = secret_for(state, &cfg).await?;
+    let cache = state.cache.clone();
+
+    let report = pool_op!(&state.pool, &cfg, &password, |client| {
+        mail_core::index::index_bodies_pass(
+            mail_core::index::BodyIndexRun {
+                cache: &cache,
+                cfg: &cfg,
+                limit: mail_core::index::DEFAULT_PASS_LIMIT,
+            },
+            &mut client,
+        )
+        .await
+    })
+    .map_err(describe)?;
+
+    if report.indexed > 0 {
+        log_line(&format!(
+            "[easy-email] 正文索引 {account_id}：新增 {} 封，还剩 {} 封",
+            report.indexed, report.remaining
+        ));
+    }
+    Ok(report)
+}
+
+/// Keep the body index moving on its own tick (`design/20-v0.2-plan.md` V2-A).
+///
+/// 60 s between passes because the per-message cost equals opening the message: slow and
+/// interruptible beats a burst that holds the account's connection budget while the user is trying
+/// to refresh. A pass that fails is simply not retried until the next tick — an offline account
+/// must not spin.
+fn start_body_index_worker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+            let accounts = app.state::<AppState>().snapshot();
+            for cfg in accounts {
+                // Ask the cache before claiming a connection: most ticks there is nothing to do, and
+                // a pass on an account with no pending bodies would still pay for the handshake.
+                let pending = match app.state::<AppState>().cache.bodies_pending_count(&cfg.id) {
+                    Ok(count) => count,
+                    Err(_) => continue,
+                };
+                if pending == 0 {
+                    continue;
+                }
+
+                match body_index_pass(&app.state::<AppState>(), &cfg.id).await {
+                    Ok(report) if report.indexed > 0 => {
+                        // So the search box's coverage line stays honest without polling.
+                        let _ = app.emit("body-index:changed", cfg.id.clone());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log_line(&format!("[easy-email] 正文索引 {} 失败：{error}", cfg.id));
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Search the local cache. Never touches the network, so it also works offline.
 #[tauri::command]
 async fn search_messages(
@@ -2606,6 +2706,7 @@ pub fn run() {
             // Start the outbox worker. Queued messages outlive the window, so this is what actually
             // sends them: the composer only commits them to `user.db`.
             start_outbox_worker(app.handle().clone());
+            start_body_index_worker(app.handle().clone());
 
             // The tray icon. Built here rather than in config so the menu can drive the app.
             let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
@@ -2675,6 +2776,8 @@ pub fn run() {
             delete_account,
             verify_account,
             list_mailboxes,
+            index_bodies,
+            index_coverage,
             list_messages,
             list_thread,
             get_sync_window,

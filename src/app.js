@@ -696,11 +696,49 @@ async function runSearch() {
 
   const status = $('search-status');
   status.hidden = false;
-  status.textContent = hits.length
-    ? `本地缓存命中 ${hits.length} 条 · 正文只搜已打开过的邮件`
-    : '本地缓存里没有匹配。搜索只覆盖已同步的邮件，正文只覆盖已打开过的。';
+  status.replaceChildren();
+
+  const coverage = await run('读取索引覆盖率', () =>
+    invoke('index_coverage', { accountId: state.accountId })
+  );
+  // The count is what turns "no results" from a dead end into a solvable one: without it, a user
+  // whose bodies were never fetched cannot tell "not in your mailbox" from "not indexed yet".
+  state.bodyCoverage = coverage;
+  const cover = coverage
+    ? `正文已索引 ${coverage.indexed}/${coverage.total} 封`
+    : '正文索引覆盖率未知';
+
+  if (hits.length) {
+    status.append(document.createTextNode(`本地缓存命中 ${hits.length} 条 · ${cover}`));
+  } else {
+    status.append(
+      document.createTextNode(`本地缓存里没有匹配。搜索只覆盖已同步的邮件，${cover}。`)
+    );
+  }
+
+  // Only offered while there is something to index: a button that does nothing is worse than none.
+  if (coverage && coverage.indexed < coverage.total) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn ghost small';
+    button.textContent = '现在索引';
+    button.title = '把已同步但还没读过的邮件正文加进搜索索引（每批 20 封）';
+    button.addEventListener('click', () => indexBodiesNow());
+    status.append(document.createTextNode(' '), button);
+  }
 
   renderMessages();
+}
+
+/** Read bodies the user has not opened, so search can see them. One bounded pass per press. */
+async function indexBodiesNow() {
+  const report = await run('索引正文', () =>
+    invoke('index_bodies', { accountId: state.accountId })
+  );
+  if (report === null) return;
+  // Re-run the search so the new coverage lands in the status line, and any hit that only exists
+  // in a body that was just fetched shows up.
+  await runSearch();
 }
 
 function exitSearchMode({ reload = true } = {}) {

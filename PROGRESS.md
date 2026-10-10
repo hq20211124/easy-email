@@ -11,6 +11,40 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### V2-0/V2-A v0.2 计划三段 + 基线实测 + 正文索引 ✅（第 64 轮）
+
+**计划**（`design/20-v0.2-plan.md`，留在 git 里）：初稿 5 块 → 10 条反向找茬 → 修正稿。
+v0.2 = 把 M1a 收口成能发出去的版本：**断网时界面自己说、正文搜得到、Windows 上能自己更新**。
+三项已拍板：五块全做顺序执行；minisign 密钥由用户生成；**tag 发 `v0.1.2` 而不是 0.2.0**
+（里程碑口径与 tag 编号不是一套，0.1.x 更诚实）。
+
+**基线是实测的，不是抄的**：`cargo test --workspace` = 351 passed / 7 ignored，分解写在设计文档 §0.1。
+HANDOFF 的 351 与 PROGRESS 里 29x 的"矛盾"由此解释——后者只数 mail-core 的 lib 单测。**以后所有数字带口径。**
+
+**正文索引（V2-A）**：核心决定是**不改同步路径**。红队 C2 指出：`imap.rs` 没有只取正文的原语，
+索引一封的代价等于打开它，写进同步路径会把 500 封头部的刷新变成几百次整封取件，还会和 IDLE、
+手动刷新抢同一个连接池。所以做成独立的后台遍（`crates/mail-core/src/index.rs`）：
+每 60 秒一遍、每遍 20 封、失败的留在 pending 里下遍重试、一遍失败不中断其余。
+搜索状态行显示「正文已索引 x/y 封」+「现在索引」按钮。
+
+**两个真 bug 是被新测试当场抓住的**：
+1. `remaining` 原本用 `bodies_pending(id, 1).len()` 探——那个查询最多返回一行，所以永远只能报 0 或 1。
+   改成 `bodies_pending_count()`（真 count）。**这是"报小数字"的活例：UI 会把它复述给用户。**
+2. `refresh_search_row` 加 `body_limit` 后，测试发现 FTS 列里存的是**分词后**的文本
+   （每个汉字之间都有空格），所以"截断到 64K"要在 token 化之后的字符数上比，不是 Rust 的 `len()`（字节）。
+
+**测试**：+9（index 单元 3、cache 单元 4、loopback 2）→ **360 passed / 7 ignored**，
+`clippy -D warnings` 干净，`fmt` 干净。
+**门禁**：+2 项（覆盖率数字必须来自后端、不得残留写死的旧文案；截断只允许发生在索引侧，
+`put_detail` 里出现 `truncate_chars`/`body_limit` 即失败）→ 26 步。
+
+**未做**（设计文档 §9 的验收清单里仍是 false 的）：`index_queue`、附件文本、索引重建 UI、
+服务器端搜索回退、把 64K 做成设置项、跨账号统一视图。
+**真机未验证**：需要你在 Windows 上启动 60 秒后搜一个只出现在正文里的词，
+并核对状态行数字与 `python tools/inspect-local-db.py` 数出来的 `bodies` 行数。
+
+---
+
 ## 提交记录
 共 **22 个提交**，从基线到最新（`git log --oneline` 看全量；下表只列里程碑）：
 

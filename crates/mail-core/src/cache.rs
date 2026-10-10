@@ -73,6 +73,21 @@ pub struct SearchHit {
     pub seen: bool,
 }
 
+/// How much of an account has a body behind it — what search can actually see.
+///
+/// Serialisable for the same reason [`SearchHit`] is. The two numbers exist so the UI can say
+/// "正文已索引 120/500" instead of implying that every cached message is searchable: before the
+/// backfill pass (`crate::index`), a body arrives only when the user opens the message, and the
+/// difference between those two facts is invisible on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BodyCoverage {
+    /// Messages whose body is in `bodies` (and therefore in the index) and still have a row in
+    /// `messages`.
+    pub indexed: u32,
+    /// Messages known to the cache at all.
+    pub total: u32,
+}
+
 /// The columns that feed one row of the search index.
 ///
 /// The body is not a column of its own: it lives inside the serialised `MessageDetail`, so it is
@@ -129,6 +144,17 @@ pub fn to_tokens(text: &str) -> String {
     }
 
     tokens.join(" ")
+}
+
+/// Cut to `limit` *characters*, never to bytes.
+///
+/// A byte cut would split a multi-byte character in half and panic on the slice boundary — and the
+/// mail this limit exists for is Chinese, where that is the normal case rather than the exception.
+fn truncate_chars(text: &str, limit: usize) -> &str {
+    match text.char_indices().nth(limit) {
+        Some((byte, _)) => &text[..byte],
+        None => text,
+    }
 }
 
 /// One clause of a `MATCH` expression: an ASCII word, or a run of characters that must be adjacent.
@@ -681,7 +707,13 @@ impl Cache {
                         subject_key,
                     ],
                 )?;
-                Self::refresh_search_row(conn, &account_id, &folder, summary.uid)?;
+                Self::refresh_search_row(
+                    conn,
+                    &account_id,
+                    &folder,
+                    summary.uid,
+                    crate::index::DEFAULT_BODY_INDEX_CHARS,
+                )?;
             }
             Ok(())
         })
@@ -1095,6 +1127,79 @@ impl Cache {
 
     // ------------------------------------------------------------------ bodies
 
+    /// Messages in this account that have no body in the cache yet, newest first.
+    ///
+    /// Driven from `messages` with a `left join`, not by pulling every uid into Rust and filtering:
+    /// at 100k rows the join is one query and the alternative is one query plus a filter over 100k
+    /// values. The `b.uid is null` side is what makes a message "not read yet" — `put_detail` is the
+    /// only writer of that table, so this is exactly "search cannot see this one yet".
+    pub fn bodies_pending(
+        &self,
+        account_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::index::PendingBody>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select m.folder, m.uid
+             from messages m
+             left join bodies b
+               on b.account_id = m.account_id and b.folder = m.folder and b.uid = m.uid
+             where m.account_id = ?1 and b.uid is null
+             order by m.date desc, m.uid desc
+             limit ?2",
+        )?;
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![account_id, cap], |row| {
+            Ok(crate::index::PendingBody {
+                folder: row.get(0)?,
+                uid: row.get::<_, i64>(1)? as u32,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many messages in this account have no body in the cache yet.
+    ///
+    /// A count rather than a `bodies_pending(…, 1).len()` probe: the probe can only answer "none" or
+    /// "one", so it would report the smaller number — and the UI repeats whatever it is told.
+    pub fn bodies_pending_count(&self, account_id: &str) -> Result<u32> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn.query_row(
+            "select count(*) from messages m
+             left join bodies b
+               on b.account_id = m.account_id and b.folder = m.folder and b.uid = m.uid
+             where m.account_id = ?1 and b.uid is null",
+            params![account_id],
+            |row| row.get::<_, i64>(0).map(|n| n as u32),
+        )?)
+    }
+
+    /// How much of this account has a body behind it — what search can actually see today.
+    ///
+    /// `indexed` counts bodies that still have a message row (`exists`, not a bare count): a body
+    /// whose message was deleted is not searchable, and counting it would let the UI claim 105/100.
+    pub fn body_coverage(&self, account_id: &str) -> Result<BodyCoverage> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let total: u32 = conn.query_row(
+            "select count(*) from messages where account_id = ?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0).map(|n| n as u32),
+        )?;
+        let indexed: u32 = conn.query_row(
+            "select count(*) from bodies b
+             where b.account_id = ?1
+               and exists (select 1 from messages m
+                           where m.account_id = b.account_id
+                             and m.folder = b.folder and m.uid = b.uid)",
+            params![account_id],
+            |row| row.get::<_, i64>(0).map(|n| n as u32),
+        )?;
+        Ok(BodyCoverage { indexed, total })
+    }
+
     /// Store a parsed message so it can be read again without touching the network.
     pub fn put_detail(&self, account_id: &str, folder: &str, detail: &MessageDetail) -> Result<()> {
         let account_id = account_id.to_string();
@@ -1128,7 +1233,13 @@ impl Cache {
                 )?;
             }
 
-            Self::refresh_search_row(conn, &account_id, &folder, detail.uid)?;
+            Self::refresh_search_row(
+                conn,
+                &account_id,
+                &folder,
+                detail.uid,
+                crate::index::DEFAULT_BODY_INDEX_CHARS,
+            )?;
             Ok(())
         })
     }
@@ -1242,6 +1353,7 @@ impl Cache {
         account_id: &str,
         folder: &str,
         uid: u32,
+        body_limit: usize,
     ) -> Result<()> {
         // `m.rowid` and `m.search_rowid` come back too: the index is keyed **by rowid** now.
         //
@@ -1305,6 +1417,12 @@ impl Cache {
             .and_then(|detail| detail.body_text)
             .unwrap_or_default();
 
+        // Only the *index copy* is truncated. `bodies.detail` keeps the whole message: that is what
+        // the user reads, and cutting it here would lose mail (`design/20-v0.2-plan.md` C9). The
+        // default is `design/09`'s 64 KB, and it is a setting on the roadmap so "I want everything
+        // searchable" has somewhere to live.
+        let body = truncate_chars(&body, body_limit);
+
         conn.execute(
             "insert into search
                  (rowid, subject, from_name, from_addr, to_addrs, body, account_id, folder, uid)
@@ -1315,7 +1433,7 @@ impl Cache {
                 to_tokens(source.from_name.as_deref().unwrap_or_default()),
                 to_tokens(source.from_addr.as_deref().unwrap_or_default()),
                 to_tokens(source.to_addrs.as_deref().unwrap_or_default()),
-                to_tokens(&body),
+                to_tokens(body),
                 account_id,
                 folder,
                 i64::from(uid),
@@ -1355,7 +1473,13 @@ fn rebuild_search_index(conn: &Connection) -> Result<()> {
     };
 
     for (account_id, folder, uid) in rows {
-        Cache::refresh_search_row(conn, &account_id, &folder, uid)?;
+        Cache::refresh_search_row(
+            conn,
+            &account_id,
+            &folder,
+            uid,
+            crate::index::DEFAULT_BODY_INDEX_CHARS,
+        )?;
     }
     Ok(())
 }
@@ -1606,6 +1730,140 @@ mod tests {
 
         // A term whose characters are not all ASCII keeps the phrase form, character by character.
         assert_eq!(to_query("账单-发票"), "\"账 单\" AND \"发 票\"");
+    }
+
+    #[test]
+    fn bodies_pending_returns_newest_first_and_respects_the_limit() {
+        // The index pass only ever sees this list, so its order *is* the order mail becomes
+        // searchable in — and the limit is what keeps one pass from becoming a whole-mailbox fetch.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(10, "old", "a@example.com", 100),
+                    summary(30, "new", "c@example.com", 300),
+                    summary(20, "mid", "b@example.com", 200),
+                ],
+            )
+            .unwrap();
+
+        let pending = cache.bodies_pending("acc", 2).unwrap();
+        assert_eq!(
+            pending.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            vec![30, 20],
+            "newest first, and no more than the limit"
+        );
+
+        // Reading one body removes it from the pending list: `put_detail` is the only writer.
+        cache
+            .put_detail("acc", "INBOX", &detail(30, "new", "正文"))
+            .unwrap();
+        let pending = cache.bodies_pending("acc", 10).unwrap();
+        assert_eq!(
+            pending.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            vec![20, 10]
+        );
+    }
+
+    #[test]
+    fn body_coverage_counts_only_messages_that_still_have_a_body() {
+        // The orphan case is the one that would make the UI lie: a body whose message row is gone
+        // is not searchable, so counting it would let the status line claim 105 out of 100.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "one", "a@example.com", 1),
+                    summary(2, "two", "b@example.com", 2),
+                    summary(3, "three", "c@example.com", 3),
+                ],
+            )
+            .unwrap();
+        cache
+            .put_detail("acc", "INBOX", &detail(1, "one", "正文一"))
+            .unwrap();
+        cache
+            .put_detail("acc", "INBOX", &detail(2, "two", "正文二"))
+            .unwrap();
+        cache.delete_message("acc", "INBOX", 2).unwrap();
+
+        let coverage = cache.body_coverage("acc").unwrap();
+        assert_eq!(
+            coverage.total, 2,
+            "the deleted message is gone from both counts"
+        );
+        assert_eq!(coverage.indexed, 1, "its body must not be counted either");
+    }
+
+    #[test]
+    fn a_long_body_is_truncated_for_the_index_but_kept_whole_for_reading() {
+        // C9: the truncation is the index's budget, not the user's copy. Cutting `bodies.detail`
+        // would silently lose mail, so this test pins which side the cut lands on.
+        let long: String = "账".repeat(crate::index::DEFAULT_BODY_INDEX_CHARS + 10);
+        assert!(
+            long.chars().count() > crate::index::DEFAULT_BODY_INDEX_CHARS,
+            "the fixture must be longer than the cap"
+        );
+
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries("acc", "INBOX", &[summary(1, "s", "a@example.com", 1)])
+            .unwrap();
+        cache
+            .put_detail("acc", "INBOX", &detail(1, "s", &long))
+            .unwrap();
+
+        // The FTS row is capped...
+        let indexed = cache
+            .db
+            .read_guard()
+            .query_row(
+                "select length(search.body) from search where folder = 'INBOX' and uid = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        // The column holds the *tokenised* copy (`to_tokens` separates every CJK character with a
+        // space), so the expected length is that of the truncated text, not of the raw one.
+        let expected = to_tokens(truncate_chars(
+            &long,
+            crate::index::DEFAULT_BODY_INDEX_CHARS,
+        ))
+        .chars()
+        .count();
+        assert_eq!(
+            indexed as usize, expected,
+            "the index copy stops at the cap"
+        );
+        assert!(
+            expected < to_tokens(&long).len(),
+            "the cap must actually bite on this fixture"
+        );
+
+        // ...while what the user reads is the whole message.
+        let stored = cache.get_detail("acc", "INBOX", 1).unwrap().unwrap();
+        assert_eq!(stored.body_text.as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn truncate_chars_cuts_on_character_boundaries_and_never_panics() {
+        // A byte cut on 账 would split it and panic on the slice; the mail this matters for is Chinese.
+        assert_eq!(truncate_chars("abc", 10), "abc");
+        assert_eq!(truncate_chars("abc", 2), "ab");
+        assert_eq!(truncate_chars("账abc", 1), "账");
+        assert_eq!(truncate_chars("账abc", 2), "账a");
+        // Every boundary the function produces must be a valid split point.
+        for text in ["账单", "a账b单", "𠮷野家"] {
+            for limit in 0..=text.chars().count() + 1 {
+                let cut = truncate_chars(text, limit);
+                assert!(cut.len() <= text.len());
+                assert!(text.starts_with(cut));
+            }
+        }
     }
 
     #[test]
