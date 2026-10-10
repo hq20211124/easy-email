@@ -71,10 +71,11 @@ Windows 行为**没有**任何退化，全部改动都在 `cfg` 分支后面：
 附件名索引第 71 轮；其余块未开始）/ M2、M3 ❌。
 README「已知限制」是 Issue 级清单。~~候选里最小最独立的是离线提示；最值钱的是正文全文索引~~
 ——两者都已在 v0.1.2 做完（V2-B 失败可见性 / V2-A 后台正文索引），**不要再从这两件起步**；
-**附件名索引也已完成（第 71 轮）**，09 树里剩下的是索引重建 UI、`index_queue`、查询语法、
-服务器回退（见 `design/09` 顶部那张实现状态表，它按目标逐条标了 ✅/❌）。
-下一批候选（按"最小最独立"排序）：09 的**索引重建 UI**（`design/09` §5.4，M1b 的验收项之一）、
-15 性能与虚拟列表（10 万封，16 项 bench 预算）、04 离线队列完整化、16 诊断包；
+**附件名索引（第 71 轮）与索引重建 UI（第 72 轮）也已完成**，09 树里剩下的是
+`index_queue` 队列、FTS 损坏的自动探测/heal、查询语法（`from:`/`has:attachment` 等）、服务器端回退
+（见 `design/09` 顶部那张实现状态表，它按目标逐条标了 ✅/❌，别再从已完成的那几项起步）。
+下一批候选（按"最小最独立"排序）：15 性能与虚拟列表（10 万封，16 项 bench 预算）、
+09 的查询语法、04 离线队列完整化、16 诊断包；
 `design/19` §4 有各块验收。另有三件卡在外部条件的真机验证（Outlook / 163·126 / 自建服务器，
 清单见 §7 ④），不拦发版但每次接手时值得催一次。
 
@@ -104,9 +105,8 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 → `cargo test` → **负载契约**（`payload_keys.mjs`，含 `EndpointOverride`）→ **exe 的 PE 头 Subsystem 必须是 2**
 （GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**（CDP 探针要用，但留下等于把 webview 交给
 任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
-目前 **33 步**（32 离线 + 1 `-Network`）、**WSL 371 passed / 7 ignored，Windows 372 / 7**
-（同一提交实测：mail-core lib 307〔WSL〕/308〔Windows〕，Windows 多一个 `cfg(windows)` 单测；
-loopback 50、tauri lib 8、reachability 4、oauth 1、bench 1）。
+目前 **34 步**（33 离线 + 1 `-Network`）、**WSL 375 passed / 7 ignored**（mail-core lib 311，
+第 72 轮 +4）。Windows 上次实测 372 / 7（第 71 轮；第 72 轮待复测）。
 **v0.1.2 已发布**（2026-10-10）：三个 job 全绿，四个安装包 + `.sig` + `latest.json` 齐全，
 `releases/latest` 解析到 `0.1.2`。
 **`check.ps1` 已在真 Windows 上跑过**（2026-10-10 晚，第 70 轮；Windows PowerShell **5.1** ——

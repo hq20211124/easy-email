@@ -736,7 +736,122 @@ async function runSearch() {
     status.append(document.createTextNode(' '), button);
   }
 
+  status.append(document.createTextNode(' '), rebuildIndexButton());
+
   renderMessages();
+}
+
+/** How many index rows one rebuild step rewrites. */
+const REBUILD_BATCH = 500;
+
+/**
+ * One rebuild at a time, as a module-level fact rather than a property of the button.
+ *
+ * The button lives in the search status line, which any new search re-renders — so "is a rebuild
+ * running?" cannot be answered by looking at it. And the answer has to exist: a second `begin`
+ * while the first loop is mid-way would clear the index the first loop is walking, and the two would
+ * interleave steps over the same rows. A lost button is recoverable; that is not.
+ */
+let rebuildInFlight = false;
+
+/**
+ * 「重建索引」 — throw the local search index away and build it again.
+ *
+ * Two clicks on purpose. The operation deletes the whole index before rebuilding it, so there is a
+ * window in which search answers *less* than before; a single click on a button whose label is two
+ * characters long is not enough consent for that. The confirm state lives in this button, so
+ * re-rendering the status line (which any search does) quietly cancels it.
+ *
+ * It also never touches the network: the rebuild re-derives what is already cached, so mail whose
+ * body was never fetched comes back searchable by subject only — and the pending body pass
+ * (`indexBodiesNow`) is what fills those in afterwards.
+ */
+function rebuildIndexButton() {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn ghost small';
+  button.textContent = '重建索引';
+  button.title = '丢掉并重建本地搜索索引（只重建本机已有的内容，不联网；随时可停）';
+  button.addEventListener('click', () => {
+    if (rebuildInFlight) {
+      toast('索引正在重建中，等它跑完（或点「停止」）再来。', 'info');
+      return;
+    }
+    if (button.dataset.armed === '1') {
+      button.removeAttribute('data-armed');
+      button.disabled = true;
+      rebuildSearchIndex(button);
+      return;
+    }
+    button.dataset.armed = '1';
+    button.textContent = '确认重建？';
+    button.title = '点一次确认：索引会先被清空，再分批重建。中途可以停，已重建的部分照常可搜。';
+  });
+  return button;
+}
+
+/** Drive the rebuild in bounded steps, showing progress, until it finishes or the user stops it. */
+async function rebuildSearchIndex(button) {
+  const status = $('search-status');
+  rebuildInFlight = true;
+  const started = await run('清空索引', () => invoke('rebuild_search_begin'));
+  if (started === null) {
+    rebuildInFlight = false;
+    button.disabled = false;
+    button.textContent = '重建索引';
+    return;
+  }
+
+  const note = document.createElement('span');
+  const stop = document.createElement('button');
+  stop.type = 'button';
+  stop.className = 'btn ghost small';
+  stop.textContent = '停止';
+  stop.title = '不再进行下一批。已重建的部分照常可搜，随时可以再点「重建索引」接着来。';
+  let stopped = false;
+  stop.addEventListener('click', () => {
+    stopped = true;
+  });
+  status.append(note, stop);
+
+  let done = 0;
+  let total = 0;
+  let remaining = 1;
+  let failed = false;
+  while (remaining > 0 && !stopped) {
+    // Yield between batches so the window keeps painting and the stop button stays clickable;
+    // a rebuild that freezes the UI cannot be cancelled by definition.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const progress = await run('重建索引', () =>
+      invoke('rebuild_search_step', { limit: REBUILD_BATCH })
+    );
+    if (progress === null) {
+      // `run` has already toasted the real message. The rebuild is left as it is: partially built,
+      // resumable, and not pretended to be finished.
+      failed = true;
+      break;
+    }
+    done = progress.done;
+    total = progress.total;
+    remaining = progress.remaining;
+    note.textContent = ` 正在重建索引 ${done}/${total}`;
+  }
+
+  note.remove();
+  stop.remove();
+  rebuildInFlight = false;
+  button.disabled = false;
+  button.textContent = '重建索引';
+  if (!failed) {
+    toast(
+      remaining > 0
+        ? `索引重建已停止（${done}/${total}），已重建的部分可以搜索；再点一次接着来。`
+        : `索引已重建完成（${done}/${total}）。`,
+      remaining > 0 ? 'info' : 'ok'
+    );
+  }
+  // The hits on screen came from the old index; re-run so what is shown matches what is stored.
+  await runSearch();
 }
 
 /** Read bodies the user has not opened, so search can see them. One bounded pass per press. */

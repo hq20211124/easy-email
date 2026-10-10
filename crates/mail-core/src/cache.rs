@@ -98,6 +98,23 @@ pub struct BodyCoverage {
     pub total: u32,
 }
 
+/// How far a rebuild of the search index has got.
+///
+/// The counters are **read back from the database** rather than accumulated. A rebuild is supposed
+/// to survive being interrupted — that is what makes it resumable and cancellable — so its progress
+/// cannot live in a variable somewhere; `done` is just the number of messages that have an index row
+/// again, which is the same set the next step walks over.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RebuildProgress {
+    /// Messages that have been rebuilt so far.
+    pub done: u32,
+    /// Messages known to the cache at all — the target, not an estimate.
+    pub total: u32,
+    /// `total - done`, reported as its own field because the UI shows it and arithmetic in two
+    /// places is how "0 remaining" appears while rows are still unindexed.
+    pub remaining: u32,
+}
+
 /// The columns that feed one row of the search index.
 ///
 /// The body is not a column of its own: it lives inside the serialised `MessageDetail`, so it is
@@ -1350,6 +1367,84 @@ impl Cache {
         })
     }
 
+    /// Throw the index away so it can be built again from what this machine already has.
+    ///
+    /// The FTS table holds tokenised text derived from `messages` and `bodies`, and both survive
+    /// untouched — this deletes **nothing the user owns**, which is what makes it safe to expose as
+    /// a button (`design/09` §5.4: the index is derived data, droppable and rebuildable).
+    ///
+    /// One transaction, and the rebuild itself then proceeds in bounded steps
+    /// ([`Self::rebuild_search_step`]). §5.4 forbids rebuilding inside a startup transaction, and for
+    /// the same reason it must not happen inside one long transaction here: every other command
+    /// would queue behind it on the single write thread.
+    ///
+    /// Not to be confused with the migration's own one-shot `rebuild_search_index`, which runs once
+    /// inside `migrate` for a v5 file that had no `search_rowid` to delete by. The two look alike and
+    /// are deliberately separate — do not "merge" them.
+    pub fn rebuild_search_begin(&self) -> Result<()> {
+        self.db.write_blocking(|conn: &Connection| {
+            conn.execute("delete from search", [])?;
+            conn.execute("update messages set search_rowid = null", [])?;
+            Ok(())
+        })
+    }
+
+    /// Rebuild up to `limit` messages' index rows. The next call continues where this one stopped.
+    ///
+    /// Ordered by `messages.rowid`: stable, so a resumed rebuild walks the same rows in the same
+    /// order. A message with no stored body is rebuilt as a **header-only** row — search has always
+    /// covered headers, and going to the network for bodies is the pending pass's job
+    /// ([`crate::index`]), not the rebuild's. That is also why the UI has to say so: a rebuilt
+    /// message the user never opened is searchable by subject but not by body, which is the truth
+    /// and not a fault.
+    pub fn rebuild_search_step(&self, limit: usize) -> Result<RebuildProgress> {
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.db.write_blocking(move |conn: &Connection| {
+            let rows: Vec<(String, String, u32)> = {
+                let mut stmt = conn.prepare(
+                    "select account_id, folder, uid from messages
+                     where search_rowid is null
+                     order by rowid
+                     limit ?1",
+                )?;
+                let mapped = stmt.query_map(params![cap], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as u32,
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            for (account_id, folder, uid) in rows {
+                Self::refresh_search_row(
+                    conn,
+                    &account_id,
+                    &folder,
+                    uid,
+                    crate::index::DEFAULT_BODY_INDEX_CHARS,
+                )?;
+            }
+            // Counted, never accumulated: a step cut short by a crash or a closed window still has
+            // to report the truth, and the caller drives its loop off these numbers. Accumulating
+            // would make the progress line the one thing a restart silently rewrites.
+            let total: i64 =
+                conn.query_row("select count(*) from messages", [], |row| row.get(0))?;
+            let done: i64 = conn.query_row(
+                "select count(*) from messages where search_rowid is not null",
+                [],
+                |row| row.get(0),
+            )?;
+            let done = done.clamp(0, total);
+            Ok(RebuildProgress {
+                done: done as u32,
+                total: total as u32,
+                remaining: (total - done) as u32,
+            })
+        })
+    }
+
     // ------------------------------------------------------------------ search
 
     /// Local full-text search over headers (always) and bodies (for messages already read).
@@ -1916,6 +2011,221 @@ mod tests {
         assert_eq!(cache.bodies_pending_count("acc").unwrap(), 0);
         let coverage = cache.body_coverage("acc").unwrap();
         assert_eq!((coverage.indexed, coverage.total), (1, 1));
+    }
+
+    // ---------------------------------------------------------------- rebuild
+
+    /// A temp file for the tests that need a second process-worth of state: "resume after a
+    /// restart" cannot be shown on an in-memory cache, because reopening one gives an empty database
+    /// rather than the file the first handle left behind.
+    fn temp_cache_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "easy-email-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    /// Three messages covering the three shapes search has to serve: headers only, a body, and a
+    /// body whose mail is found by its attachment name.
+    fn seed_rebuild_fixture(cache: &Cache) {
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "月度对账单", "bank@example.com", 100),
+                    summary(2, "开会通知", "boss@example.com", 200),
+                    summary(3, "发票已开具", "invoice@example.com", 300),
+                ],
+            )
+            .expect("summaries");
+        // 1 never gets a body: the rebuild must still make it searchable by subject, and must not
+        // invent a body for it.
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail_with_attachments(2, "开会通知", "记得带季度报表", &["议程.pdf"]),
+            )
+            .expect("body 2");
+        cache
+            .put_detail("acc", "INBOX", &detail(3, "发票已开具", "发票号 INV-8848"))
+            .expect("body 3");
+    }
+
+    fn uids(cache: &Cache, query: &str) -> Vec<u32> {
+        cache
+            .search("acc", query, 20)
+            .expect("search")
+            .iter()
+            .map(|hit| hit.uid)
+            .collect()
+    }
+
+    #[test]
+    fn a_rebuild_reproduces_the_incremental_index() {
+        // The load-bearing invariant of the whole block: a rebuilt index must answer **the same
+        // questions with the same answers** as one that was never deleted. If this fails, the button
+        // is not a repair — it is a second, subtly different search engine.
+        let cache = Cache::open_in_memory().unwrap();
+        seed_rebuild_fixture(&cache);
+
+        let queries = ["对账单", "季度报表", "议程", "INV-8848", "example.com"];
+        let before: Vec<Vec<u32>> = queries.iter().map(|q| uids(&cache, q)).collect::<Vec<_>>();
+
+        cache.rebuild_search_begin().expect("begin");
+        let mut progress = cache.rebuild_search_step(2).expect("step 1");
+        while progress.remaining > 0 {
+            progress = cache.rebuild_search_step(2).expect("step");
+        }
+
+        let after: Vec<Vec<u32>> = queries.iter().map(|q| uids(&cache, q)).collect();
+        for (i, query) in queries.iter().enumerate() {
+            assert_eq!(
+                before[i], after[i],
+                "rebuild changed the answer to {query:?}"
+            );
+        }
+        // Sanity: the fixture actually distinguishes the shapes, or the comparison above proves
+        // nothing. A term from nowhere must find nothing, or "the answers match" would be vacuous.
+        assert_eq!(uids(&cache, "对账单"), vec![1], "headers still searchable");
+        assert_eq!(
+            uids(&cache, "议程"),
+            vec![2],
+            "attachment name still searchable"
+        );
+        assert_eq!(uids(&cache, "INV-8848"), vec![3], "body still searchable");
+        assert!(
+            uids(&cache, "查无此词").is_empty(),
+            "control: nothing matches nothing"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_step_is_bounded_and_its_progress_survives_a_restart() {
+        // Two claims in one test because they are the same claim seen from two sides: the step does
+        // bounded work, and the progress that says so is **in the database**, not in a variable the
+        // process is carrying.
+        let path = temp_cache_path("rebuild-resume");
+        let cache = Cache::open(&path).expect("open");
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &(1..=5)
+                    .map(|uid| {
+                        summary(
+                            uid,
+                            &format!("主题{uid}"),
+                            "boss@example.com",
+                            i64::from(uid),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("summaries");
+        drop(cache);
+
+        let cache = Cache::open(&path).expect("reopen");
+        cache.rebuild_search_begin().expect("begin");
+        drop(cache);
+
+        // Every step opens the file, does bounded work and closes it again, so "the app was closed
+        // and reopened between steps" is structural here rather than a `drop` in the middle of a
+        // loop — and the numbers each step reports can only have come from the file.
+        let mut steps = Vec::new();
+        for _ in 0..10 {
+            let cache = Cache::open(&path).expect("open for one step");
+            let progress = cache.rebuild_search_step(2).expect("step");
+            steps.push(progress);
+            if progress.remaining == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            steps[0].done, 2,
+            "the first step did bounded work, not all five"
+        );
+        assert_eq!(steps[0].total, 5);
+        assert!(
+            steps[0].remaining > 0,
+            "there is more to do, and the UI is told so"
+        );
+        // Monotone and never over-reported: the two claims always add up to the target.
+        for (i, step) in steps.iter().enumerate() {
+            assert_eq!(
+                step.done + step.remaining,
+                step.total,
+                "step {i} arithmetic"
+            );
+            if i > 0 {
+                assert!(
+                    step.done >= steps[i - 1].done,
+                    "progress must not go backwards across a restart"
+                );
+            }
+        }
+        let cache = Cache::open(&path).expect("final reopen");
+        assert_eq!(uids(&cache, "主题3"), vec![3], "the finished index answers");
+    }
+
+    #[test]
+    fn a_rebuild_clears_the_index_before_it_starts() {
+        // The half of the operation users can get wrong: if `begin` quietly rebuilt as it went, a
+        // rebuild would be un-cancellable in the only sense that matters — there would be no moment
+        // where "stop" means the index is *partly* rebuilt and the user can see that.
+        let cache = Cache::open_in_memory().unwrap();
+        seed_rebuild_fixture(&cache);
+        assert_eq!(uids(&cache, "对账单"), vec![1], "indexed before");
+
+        cache.rebuild_search_begin().expect("begin");
+        assert!(
+            uids(&cache, "对账单").is_empty(),
+            "the index is empty right after begin"
+        );
+        let progress = cache.rebuild_search_step(1).expect("step");
+        assert_eq!(progress.done, 1);
+        assert_eq!(
+            progress.remaining, 2,
+            "one row at a time, so progress is visible"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_rebuild_still_answers_for_what_was_rebuilt() {
+        // Cancelling means "no next step". The index is then partly rebuilt, and a partly rebuilt
+        // index must be **useful and explicable**: the rebuilt rows answer, the rest do not, and
+        // nothing is left in a state that says "rebuilding" forever.
+        let cache = Cache::open_in_memory().unwrap();
+        seed_rebuild_fixture(&cache);
+        cache.rebuild_search_begin().expect("begin");
+        cache.rebuild_search_step(1).expect("one step, then stop");
+
+        let progress = cache.rebuild_search_step(0).expect("ask where we are");
+        assert_eq!(
+            progress.done, 1,
+            "a zero-limit step still reports the truth"
+        );
+        assert_eq!(progress.remaining, 2);
+
+        // Whatever row the single step rebuilt is searchable; nothing pretends otherwise about the
+        // rest, and re-entering the loop later picks up exactly where it stopped.
+        let rebuilt = progress.done;
+        let total = progress.total;
+        assert!(
+            rebuilt < total,
+            "the fixture is partly rebuilt, which is the state under test"
+        );
+        let mut guard = 0;
+        while cache.rebuild_search_step(2).expect("resume").remaining > 0 && guard < 5 {
+            guard += 1;
+        }
+        assert_eq!(uids(&cache, "对账单"), vec![1], "fully rebuilt at the end");
     }
 
     #[test]

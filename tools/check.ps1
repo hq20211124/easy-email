@@ -535,6 +535,60 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the search index can be rebuilt without touching the network' {
+        # V3-B. The button behind it deletes the whole index and builds it again, so two mistakes are
+        # invisible until they hurt: (1) if a step were not bounded, one call would hold the single
+        # write thread for the whole mailbox and every other command would queue behind it —
+        # `design/09` §5.4 forbids rebuilding inside a startup transaction for the same reason;
+        # (2) if rebuilding ever reached for a connection, "rebuild" would silently become "re-read
+        # the mailbox from the server", which is a different operation with a very different cost.
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($name in @('rebuild_search_begin', 'rebuild_search_step')) {
+            if ($lib -notmatch "fn $name\(") {
+                $problems += "lib.rs must expose $name"
+            } elseif ($lib -notmatch "(?m)^\s+$name,\s*$") {
+                $problems += "$name exists but is missing from generate_handler! — the renderer could not call it"
+            }
+        }
+
+        $step = [regex]::Match($cache, '(?s)pub fn rebuild_search_step.*?\n    \}').Value
+        if ($step.Length -eq 0) {
+            $problems += 'cache.rs: rebuild_search_step is missing'
+        } elseif ($step -notmatch 'limit') {
+            $problems += 'cache.rs: the rebuild step must take a limit — an unbounded rebuild blocks every other writer'
+        } elseif ($step -notmatch 'order by rowid') {
+            $problems += 'cache.rs: the rebuild must walk messages in a stable order, or resuming picks a different order than the first pass'
+        }
+
+        # Neither command may reach the pool. The body is cut at the closing brace at column 0 — the
+        # next `#[tauri::command]` is the wrong cut, because a plain helper (`body_index_pass`) and
+        # its pool call can sit between two commands, and the first version of this step reported
+        # three "violations" that were 200 lines away from the commands it meant.
+        foreach ($name in @('rebuild_search_begin', 'rebuild_search_step')) {
+            $start = $lib.IndexOf("async fn $name(")
+            if ($start -lt 0) { continue }
+            $end = $lib.IndexOf("`n}", $start)
+            $body = if ($end -gt $start) { $lib.Substring($start, $end - $start) } else { $lib.Substring($start) }
+            foreach ($forbidden in @('pool_op', 'secret_for', 'fetch_body', 'state.pool')) {
+                if ($body -match $forbidden) {
+                    # `$forbidden:` would parse as a drive-qualified variable name; the probe found it.
+                    $problems += ($name + ' reaches for ' + $forbidden + ': a rebuild re-derives what is cached, it must not read the server')
+                }
+            }
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the index can be rebuilt in bounded, network-free steps'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

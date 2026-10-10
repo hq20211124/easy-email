@@ -2162,6 +2162,32 @@ async fn index_bodies(
     body_index_pass(&state, &account_id).await
 }
 
+/// Throw the search index away so the renderer can start rebuilding it.
+///
+/// **Deletes nothing the user owns**: the FTS table holds tokenised text derived from `messages`
+/// and `bodies`, both of which stay exactly as they are (`design/09` §5.4). It is separate from
+/// [`Self::index_bodies`] because the two answer different questions — that one goes to the network
+/// for bodies the user never opened, this one only re-derives what is already on this machine.
+#[tauri::command]
+async fn rebuild_search_begin(state: State<'_, AppState>) -> Result<(), String> {
+    let cache = state.cache.clone();
+    cache.rebuild_search_begin().map_err(describe)
+}
+
+/// Rebuild one bounded batch of index rows and report where the rebuild now stands.
+///
+/// Both halves in one command on purpose: the renderer drives the loop, so it must not have to guess
+/// whether a step finished before asking for the next one, and it must not be able to ask for a
+/// second batch while the first is still running.
+#[tauri::command]
+async fn rebuild_search_step(
+    state: State<'_, AppState>,
+    limit: u32,
+) -> Result<mail_core::RebuildProgress, String> {
+    let cache = state.cache.clone();
+    cache.rebuild_search_step(limit as usize).map_err(describe)
+}
+
 /// One pass for one account, shared by the command and the background tick.
 ///
 /// Both callers need the same shape — claim a connection from the pool, walk the pending list, store
@@ -3062,6 +3088,8 @@ pub fn run() {
             index_bodies,
             index_coverage,
             install_update,
+            rebuild_search_begin,
+            rebuild_search_step,
             list_messages,
             list_thread,
             get_sync_window,
