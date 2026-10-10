@@ -93,22 +93,31 @@ jobs:
           REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           python3 - "$VERSION" "$REPO" <<'PY'
           import json, sys, pathlib
+          from urllib.parse import quote
           version, repo = sys.argv[1], sys.argv[2]
+          # Each bundle type gets its own subdirectory under bundle/. The bundles are NOT flat:
+          # `deb/*.deb`, `rpm/*.rpm`, `appimage/*.AppImage` — globbing `*.deb` from here finds
+          # nothing, which is exactly how the first tagged run of this workflow failed.
           root = pathlib.Path('.')
           wanted = {
-              'deb': ('deb', '*.deb'),
-              'rpm': ('rpm', '*.rpm'),
-              'appimage': ('appimage', '*.AppImage'),
+              'deb': ('deb', 'deb/*.deb'),
+              'rpm': ('rpm', 'rpm/*.rpm'),
+              'appimage': ('appimage', 'appimage/*.AppImage'),
           }
           platforms = {}
           for bundle, pattern in wanted.values():
               artifact = next(root.glob(pattern), None)
-              signature = pathlib.Path(str(artifact) + '.sig')
-              if artifact is None or not signature.exists():
-                  print(f"missing {pattern} or its .sig — the bundle was not produced or was not signed")
+              if artifact is None:
+                  print(f"missing {pattern} — the bundle was not produced")
                   sys.exit(1)
+              signature = pathlib.Path(str(artifact) + '.sig')
+              if not signature.exists():
+                  print(f"missing {signature} — the bundle was not signed (was TAURI_SIGNING_PRIVATE_KEY set?)")
+                  sys.exit(1)
+              # The Linux bundle names contain spaces ("Easy Email_0.1.2_amd64.deb"), and a URL with
+              # a literal space is not a URL: the updater would fail to download it.
               platforms[f"linux-x86_64-{bundle}"] = {
-                  "url": f"{repo}/releases/download/v{version}/{artifact.name}",
+                  "url": f"{repo}/releases/download/v{version}/{quote(artifact.name)}",
                   "signature": signature.read_text().strip(),
               }
           json.dump(platforms, open('platforms-linux.json', 'w'), indent=2)
@@ -179,15 +188,21 @@ jobs:
           REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           python3 - "$VERSION" "$REPO" <<'PY'
           import json, sys, pathlib
+          from urllib.parse import quote
           version, repo = sys.argv[1], sys.argv[2]
           artifact = next(pathlib.Path('.').glob('*setup.exe'), None)
+          if artifact is None:
+              print("missing the NSIS installer — the bundle was not produced")
+              sys.exit(1)
           signature = pathlib.Path(str(artifact) + '.sig')
-          if artifact is None or not signature.exists():
-              print("missing the NSIS installer or its .sig — the bundle was not produced or was not signed")
+          if not signature.exists():
+              print(f"missing {signature} — the bundle was not signed (was TAURI_SIGNING_PRIVATE_KEY set?)")
               sys.exit(1)
           json.dump(
               {"windows-x86_64": {
-                  "url": f"{repo}/releases/download/v{version}/{artifact.name}",
+                  # `quote` for the same reason as the Linux job: the day the product name gains a
+                  # space, an unencoded URL stops being a URL.
+                  "url": f"{repo}/releases/download/v{version}/{quote(artifact.name)}",
                   "signature": signature.read_text().strip(),
               }},
               open('platforms-windows.json', 'w'), indent=2,
