@@ -79,6 +79,8 @@ ok: desktop binary is a GUI subsystem (no console window)
 README 顺带修了四处漂移（命令数 44→55、loopback 8→**50**、Rust 1.88+→1.90+、安装表 0.1.0→0.1.2 文件名）
 与 `design/20` §1 的复盘注记；**这些都不是本轮目标，是 C5"文档当场改"的顺带**。
 Windows 侧的一次性副本与两个 `.cmd`/`.ps1`、两份日志在证据摘录后已删除。
+> **push 状态**：本轮提交 `aff30f6` 在本地，推送时本机代理（Windows `127.0.0.1:7897`）未运行、
+> GitHub 直连与代理均不可达，故**推迟到网络恢复后 `git push`**（无代码风险，提交已在本地）。
 
 ---
 
