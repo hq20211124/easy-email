@@ -41,15 +41,18 @@
 **陈旧行断言 `source.fetched == 0`**（这条才是"不联网"的证据），缺正文的行断言 `fetched == 1`。
 → **WSL 371 passed / 7 ignored**（mail-core lib 301 → 307；tauri lib 8 / loopback 50 / oauth 1 /
 bench 1 / reachability 4 不变）。clippy `-D warnings` 干净，`fmt` 干净，`design/tools/audit.py` 0 失败。
-**Windows 未复测**（第 70 轮实测 366/7；按 +6 推断为 372——**这是推断不是实测**，
-下次真机/发版前在 Windows 上重跑一遍 `check.ps1` 即可）。
+**Windows 实测 372 passed / 7 ignored**（mail-core lib 308，**比 WSL 多一个 `cfg(windows)` 单测**）——
+这是同一提交（`3836fbb`）在真 Windows 上跑完整门禁的结果，`CHECK_EXIT=0`、32 步离线全 `ok`。
+> 写这一段时先按"+6 推断 372"落笔，Windows 那遍跑完证实了推断。**记下来是因为上一次
+> （第 70 轮）同样的推断如果没复测就写"完成"，那就是又一次未验证的事写完成。**
 
 **门禁 31 → 32 步（离线）**：新增「attachment names reach the index, and the body cap applies
 to the body alone」——四判据（函数里必须读 attachments、必须先截断后加名、pending 必须认
-`index_version`、必须带 `has_body`）。**本轮没有在 Windows 上重跑整门禁**（那是第 70 轮的证据），
-但新步骤在 Windows PowerShell 5.1 的解析器上**逐条实测过**：`parse_errors=0`、
-顺序判据 `trunc_pos=3964 < names_pos=4560`、`step_count=32`、第 31 步的自钉（无
-`$IsWindows` 字面量、全部读取显式 UTF8）仍然成立。
+`index_version`、必须带 `has_body`）。新步骤在 Windows PowerShell 5.1 的解析器上**逐条实测过**
+（`parse_errors=0`、顺序判据 `trunc_pos=3964 < names_pos=4560`、`step_count=32`、第 31 步的自钉
+仍然成立），随后**整门禁在真 Windows 上跑完**：新步骤输出
+`names reach the index after the cap; stale rows are marked and come back as pending`，
+PE 那步仍是真的在检查（`PE subsystem = 2 (Windows GUI)`，第 70 轮的修复仍然有效）。
 
 **未做/未验**：附件文本抽取（Q3/M2）、`filename:` glob 表（Q8/M2）、`index_queue`、索引重建 UI、
 服务器端回退、查询语法（都还是 `design/09` 的纸面）；10 万封的 ≤100 ms 基准没有实测；

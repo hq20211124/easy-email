@@ -104,9 +104,9 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 → `cargo test` → **负载契约**（`payload_keys.mjs`，含 `EndpointOverride`）→ **exe 的 PE 头 Subsystem 必须是 2**
 （GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**（CDP 探针要用，但留下等于把 webview 交给
 任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
-目前 **33 步**（32 离线 + 1 `-Network`）、**WSL 371 passed / 7 ignored**（mail-core lib 307，
-第 71 轮 +6），Windows 上次实测 366 / 7（第 70 轮；**第 71 轮没有复测 Windows**，
-按 +6 推断 372 —— 推断不是实测，下次发版前在 Windows 上重跑一遍即可）。
+目前 **33 步**（32 离线 + 1 `-Network`）、**WSL 371 passed / 7 ignored，Windows 372 / 7**
+（同一提交实测：mail-core lib 307〔WSL〕/308〔Windows〕，Windows 多一个 `cfg(windows)` 单测；
+loopback 50、tauri lib 8、reachability 4、oauth 1、bench 1）。
 **v0.1.2 已发布**（2026-10-10）：三个 job 全绿，四个安装包 + `.sig` + `latest.json` 齐全，
 `releases/latest` 解析到 `0.1.2`。
 **`check.ps1` 已在真 Windows 上跑过**（2026-10-10 晚，第 70 轮；Windows PowerShell **5.1** ——
