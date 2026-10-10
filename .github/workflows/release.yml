@@ -82,9 +82,14 @@ jobs:
       # resolves to the newest published release, so the file is the single source of truth the
       # installed app asks.
       - name: platform snippet for the manifest
+        # `github.ref_name` is the tag itself (`v0.1.2`). The runner's `GITHUB_REF` is the long form
+        # (`refs/tags/v0.1.2`) and there is no `GITHUB_REF_NAME` variable, so both of the obvious
+        # spellings produce a version string nobody asked for.
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           cd target/release/bundle
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG#v}"
           REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           python3 - "$VERSION" "$REPO" <<'PY'
           import json, sys, pathlib
@@ -166,9 +171,11 @@ jobs:
           Get-Content SHA256SUMS
       - name: platform snippet for the manifest
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           cd target/release/bundle/nsis
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG#v}"
           REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           python3 - "$VERSION" "$REPO" <<'PY'
           import json, sys, pathlib
@@ -210,10 +217,14 @@ jobs:
       - name: assemble latest.json from both snippets
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          TAG="v${VERSION}"
+          VERSION="${TAG#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$TAG" ]; then
+            echo "::error::could not read the tag name (got '$TAG'); the manifest version would be wrong"
+            exit 1
+          fi
           mkdir -p out
           for snippet in platforms-linux.json platforms-windows.json; do
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$snippet" --clobber --dir out
@@ -250,4 +261,7 @@ jobs:
       - name: publish latest.json
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" --clobber out/latest.json
+          # The tag again: each step gets its own environment, so a variable set in the previous
+          # step is not visible here — and an empty `$TAG` would make this upload to no release at all.
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber out/latest.json
