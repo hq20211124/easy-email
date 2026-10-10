@@ -60,15 +60,22 @@ if ($DebugProfile) {
 #   * P15's budget text says "v2→v3", which is from when this table was written. The fixture measures
 #     the migration the *current* version actually performs (v6→v7, the FTS rebuild) on a real
 #     populated file; the row is honest about which step it is rather than pretending the old label.
-#   * P14's percentage is only comparable at the budget's own shape (100k messages, 35% bodies).
-#     A -Quick run prints a different ratio and that is not a regression.
+#   * P14 **is over its budget and the reason is structural, not a regression**: the FTS row stores
+#     the *tokenised* text, and the CJK tokenisation this project is pinned to (`cache.rs::to_tokens`,
+#     one token per character so that 2-character words are searchable) roughly doubles CJK text.
+#     Measured 170% of indexed text at the -Quick shape on both platforms. `design/09` §8's 65.1% came
+#     from a bigram shape we do not use. Either the budget row moves or the index shape does; until
+#     someone decides, the honest thing is to print the number and say this.
+#   * P1/P5/P6 have a harness (`tools\bench-app.ps1`) that needs the running desktop shell built with
+#     a CDP port; it was not run, so they stay "未测". P3 has no harness at all — the script's header
+#     mentions scrolling, its body does not do it.
 $Budgets = @(
-    @{ Id = 'P1';  Name = '冷启动到列表可见';        Budget = '1.5 s';        Where = '需要跑起来的桌面壳 + 首屏打点（WSL 无 GUI）' }
+    @{ Id = 'P1';  Name = '冷启动到列表可见';        Budget = '1.5 s';        Where = '需要跑起来的桌面壳（tools\bench-app.ps1 是那台测量仪；本轮未跑）' }
     @{ Id = 'P2';  Name = '切文件夹';                Budget = '200 ms';       Where = '' }
-    @{ Id = 'P3';  Name = '列表滚动 60 fps';         Budget = '60 fps';       Where = '需要跑起来的窗口 + 滚动采样脚本' }
+    @{ Id = 'P3';  Name = '列表滚动 60 fps';         Budget = '60 fps';       Where = '没有测量手段：bench-app.ps1 头部提到它，脚本里没有实现' }
     @{ Id = 'P4';  Name = '本地搜索 P95';            Budget = '100 ms';       Where = '' }
-    @{ Id = 'P5';  Name = '常驻内存';                Budget = '300 MB';       Where = '需要跑起来的进程 + GetProcessMemoryInfo 采样' }
-    @{ Id = 'P6';  Name = '空闲 CPU';                Budget = '0.5%';         Where = '需要跑起来的进程 + 性能计数器' }
+    @{ Id = 'P5';  Name = '常驻内存';                Budget = '300 MB';       Where = '需要跑起来的桌面壳（tools\bench-app.ps1；本轮未跑）' }
+    @{ Id = 'P6';  Name = '空闲 CPU';                Budget = '0.5%';         Where = '需要跑起来的桌面壳（tools\bench-app.ps1；本轮未跑）' }
     @{ Id = 'P7';  Name = '首同步吞吐（头部）';        Budget = '300 封/秒';     Where = '' }
     @{ Id = 'P8';  Name = '正文预取吞吐';            Budget = '20 封/秒';     Where = '需要真实 IMAP 取件（P9 只测入库，不测取件）' }
     @{ Id = 'P9';  Name = '索引吞吐';                Budget = '20 封/秒';     Where = '' }

@@ -1,4 +1,4 @@
-<#
+﻿<#
     App-level benchmarks for Easy Email (design/15 §4): P1 cold start, P3 scrolling, P5 resident
     memory, P6 idle CPU.
 

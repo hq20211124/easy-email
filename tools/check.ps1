@@ -1,4 +1,4 @@
-<#
+﻿<#
     Pre-commit gate for Easy Email.
 
     Runs the checks that have actually caught bugs in this project. The frontend syntax check is
@@ -21,16 +21,35 @@ $ErrorActionPreference = 'Continue'
 
 Push-Location (Join-Path $PSScriptRoot '..')
 $script:Failed = @()
+$script:Threw = $false
+# Counts steps, not outcomes: a step that threw used to vanish from the tally while the summary said
+# everything passed, so the summary now also checks that every step reported something.
+$script:Ran = 0
 
 function Step {
     param([string]$Name, [scriptblock]$Body)
 
     Write-Host ""
     Write-Host "=== $Name ===" -ForegroundColor Cyan
-    & $Body
-    if ($LASTEXITCODE -ne 0) {
+    $script:Ran++
+    # A step that **throws** is a failed step. It used not to be: `$ErrorActionPreference` is
+    # `Continue` (cargo writes progress to stderr), so an exception inside a step body printed a red
+    # error, skipped the rest of that body, and left `$LASTEXITCODE` at whatever the previous
+    # command left — usually 0 — so the run ended with "All checks passed" and one step silently
+    # absent from the count (round 73: the CJK-range regex died on Windows and the gate said green).
+    # That is the same failure as "ok" after a skip: a check that did not run, reported as one that
+    # passed.
+    $script:Threw = $false
+    try {
+        & $Body
+    } catch {
+        $script:Threw = $true
+        Write-Host $_ -ForegroundColor Red
+    }
+    if ($script:Threw -or $LASTEXITCODE -ne 0) {
         $script:Failed += $Name
-        Write-Host "FAILED: $Name (exit $LASTEXITCODE)" -ForegroundColor Red
+        $why = if ($script:Threw) { 'threw' } else { "exit $LASTEXITCODE" }
+        Write-Host "FAILED: $Name ($why)" -ForegroundColor Red
     } else {
         Write-Host "ok: $Name" -ForegroundColor Green
     }
@@ -997,7 +1016,10 @@ try {
             $bytes = [System.IO.File]::ReadAllBytes($script.FullName)
             $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
             $text = [System.IO.File]::ReadAllText($script.FullName, [System.Text.Encoding]::UTF8)
-            $hasCjk = $text -match '[一-鿿]'
+            # Written as \u escapes, not as a literal range: a literal would make this check depend on
+            # the very encoding it is checking, and the first version died on Windows with
+            # "Unterminated [] set" the moment the file's own Chinese was read as GBK.
+            $hasCjk = $text -match '[\u4e00-\u9fff]'
             if ($hasCjk -and -not $hasBom) {
                 $problems += "$($script.Name) contains Chinese but has no UTF-8 BOM: Windows PowerShell 5.1 would read it as ANSI and fail to parse it"
             }
@@ -1024,6 +1046,7 @@ try {
 # ---------------------------------------------------------------- summary
 
 Write-Host ""
+Write-Host "steps: $($script:Ran) ran, $($script:Ran - $script:Failed.Count) ok, $($script:Failed.Count) failed"
 if ($script:Failed.Count -gt 0) {
     Write-Host "FAILED: $($script:Failed -join ', ')" -ForegroundColor Red
     exit 1
