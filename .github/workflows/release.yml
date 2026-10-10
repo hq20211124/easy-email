@@ -114,10 +114,14 @@ jobs:
               if not signature.exists():
                   print(f"missing {signature} — the bundle was not signed (was TAURI_SIGNING_PRIVATE_KEY set?)")
                   sys.exit(1)
-              # The Linux bundle names contain spaces ("Easy Email_0.1.2_amd64.deb"), and a URL with
-              # a literal space is not a URL: the updater would fail to download it.
+              # The bundle on disk has a space in its name ("Easy Email_0.1.2_amd64.deb"), but
+              # `softprops/action-gh-release` **replaces spaces with dots when it uploads** — the
+              # asset is "Easy.Email_0.1.2_amd64.deb". The URL must name the asset as uploaded, not as
+              # built, or every download 404s and the update chain is silently dead. Percent-encoding
+              # is then still applied, for the day a name carries something else a URL dislikes.
+              uploaded_name = artifact.name.replace(" ", ".")
               platforms[f"linux-x86_64-{bundle}"] = {
-                  "url": f"{repo}/releases/download/v{version}/{quote(artifact.name)}",
+                  "url": f"{repo}/releases/download/v{version}/{quote(uploaded_name)}",
                   "signature": signature.read_text().strip(),
               }
           json.dump(platforms, open('platforms-linux.json', 'w'), indent=2)
@@ -200,9 +204,9 @@ jobs:
               sys.exit(1)
           json.dump(
               {"windows-x86_64": {
-                  # `quote` for the same reason as the Linux job: the day the product name gains a
-                  # space, an unencoded URL stops being a URL.
-                  "url": f"{repo}/releases/download/v{version}/{quote(artifact.name)}",
+                  # Same two rules as the Linux job: the upload renames spaces to dots, and
+                  # whatever survives that is percent-encoded.
+                  "url": f"{repo}/releases/download/v{version}/{quote(artifact.name.replace(' ', '.'))}",
                   "signature": signature.read_text().strip(),
               }},
               open('platforms-windows.json', 'w'), indent=2,
@@ -272,6 +276,26 @@ jobs:
           }
           (pathlib.Path("out") / "latest.json").write_text(json.dumps(manifest, indent=2))
           print(json.dumps(manifest, indent=2)[:400])
+          PY
+          # The manifest is only useful if the URLs in it resolve. This check is here because the
+          # first tagged run produced a manifest whose four URLs all 404'd — the bundles had been
+          # uploaded under a different name than the one the manifest named — and nothing above it
+          # could tell. A HEAD per entry is cheap and turns a silently dead update chain into a red
+          # build.
+          python3 - <<'PY'
+          import json, sys, urllib.request
+          manifest = json.load(open("out/latest.json"))
+          broken = []
+          for target, entry in manifest["platforms"].items():
+              request = urllib.request.Request(entry["url"], method="HEAD")
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      print(f"  {target}: {response.status}")
+              except Exception as error:
+                  broken.append(f"{target} -> {entry['url']} ({error})")
+          if broken:
+              sys.exit("the manifest points at assets that do not exist:\n  " + "\n  ".join(broken))
+          print("every manifest URL resolves")
           PY
       - name: publish latest.json
         env:
