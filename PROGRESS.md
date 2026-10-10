@@ -111,6 +111,44 @@ HANDOFF 的 351 与 PROGRESS 里 29x 的"矛盾"由此解释——后者只数 m
 
 ---
 
+### V2-C2 自动更新：tauri-plugin-updater + minisign 全链路 ✅（第 68 轮）
+
+密钥由用户生成（带密码），公钥内容写进 `tauri.conf.json`、私钥进 CI secrets。
+
+**形状**：整条流在 **Rust 侧**，因为前端没有打包器 —— `@tauri-apps/plugin-updater` 的 JS
+不在产物里，进度数字只存在于 Rust 的下载闭包内，所以经 `update:progress` 事件送到界面。
+`check_update` 返回 `Option<UpdateInfo>`；`Update` 是带 rid 的资源、不能序列化，因此
+"问一次、用户点装"靠 `AppState::pending_update` 持有（`Mutex` 而非 tokio 的：没有跨 await 持锁）。
+
+**一个真 bug 是被新测试当场抓住的**：我原本在安装失败时调 `note.settle(当前版本)` 来"忘掉"
+那条记账，测试直接红了 —— `settle` 返回 `StillOld{expected: 0.2.0, running: 0.1.1}`，
+也就是"更新失败，已回滚"。**那对"安装器根本没启动"是错的句子**：它承诺了一件没发生的事。
+改成新增 `UpdateState::forget()`（删文件、不存在即成功），失败路径走它。
+`settle` 表达不了这个区别，因为下次启动时"还是旧版"对"没装"和"装了没生效"都成立。
+
+**CI 的一个真缺陷（我自己复盘出来的）**：两个 build job 并行，若各自上传 `latest.json`，
+"后上传的赢"，清单就只剩一个平台 —— 而 `tauri-plugin-updater` **验证整个文件之后**才看版本，
+所以缺平台的清单不是"部分可用"，是**全断**。改成：各 job 上传 `platforms-<os>.json` 片段，
+新增第三个 `manifest` job（`needs: [linux, windows]`）合并成唯一一份 `latest.json`，
+并用一个显式的 expected 集合断言四个条目齐全（`linux-x86_64-deb/rpm/appimage` + `windows-x86_64`）。
+另加了"密钥缺失就在第一步失败并说人话"的前置检查 —— 否则报错长在 bundler 里，
+读起来像"配置写错了"而不是"secret 没配"。
+
+**两个实测结论推翻了初稿**（详见设计文档 §7.3 V2-C2 的更正）：
+① Linux 三类包都能更新（`Installer` 有 AppImage/Deb/Rpm/Nsis 四变体，target 串
+`linux-x86_64-deb`），初稿"只承诺 Windows"是猜的；
+② 插件自带 `reqwest ^0.13`、我们是 0.12，两份共存 —— 二进制里有两个 HTTP 栈，
+这是不自己实现 minisign 校验的代价。
+
+**测试**：+1（`an_install_that_failed_is_forgotten_rather_than_reported`）→ **365 passed / 7 ignored**，
+clippy/fmt 干净。`update.rs` 原有 4 条覆盖三态 + 半截文件，本轮补上"失败即忘"。
+**门禁**：+1 项（31 步）：插件已注册、pubkey 是内容不是路径、endpoint 是 https、记账已接。
+
+**未做/未验**：真机点一次「检查更新」需要有 `latest.json` 的 release —— 也就是**下一次打 tag**。
+在那之前这条链路只有单测覆盖。CI 的 `manifest` job 同样只有等 tag 才能验。
+
+---
+
 ## 提交记录
 共 **22 个提交**，从基线到最新（`git log --oneline` 看全量；下表只列里程碑）：
 

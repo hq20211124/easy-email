@@ -96,8 +96,8 @@ M2、M3 ❌。README「已知限制」是 Issue 级清单。候选里最小最�
 → `cargo test` → **负载契约**（`payload_keys.mjs`，含 `EndpointOverride`）→ **exe 的 PE 头 Subsystem 必须是 2**
 （GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**（CDP 探针要用，但留下等于把 webview 交给
 任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
-目前 **30 步全绿**（离线）、**364 passed**（+7 ignored，见 `tools/check.ps1`）。
-**口径**（别再读成矛盾）：364 = 全 workspace（tauri lib 8 + mail-core lib 300 + loopback 49 +
+目前 **31 步全绿**（离线）、**365 passed**（+7 ignored，见 `tools/check.ps1`）。
+**口径**（别再读成矛盾）：365 = 全 workspace（tauri lib 8 + mail-core lib 300 + loopback 49 +
 reachability 4 + oauth_flow 1 + bench_fixture 1）；PROGRESS 里某些轮次写的 29x 只数 mail-core 的 lib 单测。
 加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。
 
