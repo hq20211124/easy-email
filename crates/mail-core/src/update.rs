@@ -103,6 +103,26 @@ impl UpdateState {
         }
     }
 
+    /// Drop the note without saying anything.
+    ///
+    /// This is what an install that **failed to start** must call. `settle` cannot express it: by the
+    /// time the next launch runs, "still the old version" is true both of an install that never
+    /// happened and of one that ran and did not take, and `settle` picks the second reading — which
+    /// would report "更新失败，已回滚" for an install whose installer was never even launched. The
+    /// difference matters because the second sentence promises something the first cannot deliver.
+    ///
+    /// A missing file is not an error: forgetting twice is the same as forgetting once.
+    pub fn forget(&self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(MailError::Config(format!(
+                "无法清除更新状态：{}：{error}",
+                self.path.display()
+            ))),
+        }
+    }
+
     /// The note's path, for a log line when something goes wrong.
     pub fn path(&self) -> &Path {
         &self.path
@@ -195,5 +215,31 @@ mod tests {
             !state.path().exists(),
             "and it is still cleared, so it cannot confuse the next launch either"
         );
+    }
+
+    /// **V2-C2, the failure half.** An install that never ran must not be reported as one that did.
+    ///
+    /// `install_update` calls `begin` *before* spawning the installer and `settle` with the
+    /// **current** version if the install fails. That combination has to come out silent: reporting
+    /// "已更新到 X" for an install that errored out would be a lie the user cannot detect, and
+    /// reporting "更新失败" for one they were never told was starting would be noise.
+    #[test]
+    fn an_install_that_failed_is_forgotten_rather_than_reported() {
+        let dir = TempDir::new("failed-install");
+        let state = UpdateState::new(&dir.0);
+
+        // The installer was about to run, so the note exists.
+        state
+            .begin("0.2.0", Some("user started it"))
+            .expect("begin");
+        assert!(state.path().exists());
+
+        // It failed. `settle` would report "更新失败" here — which is the *wrong* sentence for an
+        // installer that was never launched, and `forget` is what actually drops it.
+        state.forget().expect("forget");
+        assert!(!state.path().exists(), "and the note is gone");
+
+        // The next launch therefore says nothing, which is the whole point.
+        assert_eq!(state.settle("0.1.1").expect("settle again"), None);
     }
 }

@@ -33,7 +33,21 @@ jobs:
         with:
           toolchain: "stable"
           target: x86_64-unknown-linux-gnu
+      # Fails *here*, with a sentence, rather than three steps later inside the bundler. Without the
+      # private key `createUpdaterArtifacts` makes the build fail with a message about signing, and
+      # the obvious reading of that is "the config is wrong" rather than "the secret is missing".
+      - name: signing key present
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set. Every tag build signs its bundles, so a release cannot be built without it."
+            exit 1
+          fi
       - name: cargo tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: cargo install tauri-cli --version "^2" && cargo tauri build
       - name: checksums
         run: |
@@ -41,6 +55,38 @@ jobs:
           find . -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) -print0 \
             | xargs -0 sha256sum | sed 's# \./# #' > SHA256SUMS
           cat SHA256SUMS
+      # The updater manifest: one entry per bundle type, because the plugin looks its target up as
+      # `linux-x86_64-<bundle>` (see `tauri_plugin_updater::Installer`). `latest` in the endpoint
+      # resolves to the newest published release, so the file is the single source of truth the
+      # installed app asks.
+      - name: platform snippet for the manifest
+        run: |
+          cd target/release/bundle
+          VERSION="${GITHUB_REF_NAME#v}"
+          REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          python3 - "$VERSION" "$REPO" <<'PY'
+          import json, sys, pathlib
+          version, repo = sys.argv[1], sys.argv[2]
+          root = pathlib.Path('.')
+          wanted = {
+              'deb': ('deb', '*.deb'),
+              'rpm': ('rpm', '*.rpm'),
+              'appimage': ('appimage', '*.AppImage'),
+          }
+          platforms = {}
+          for bundle, pattern in wanted.values():
+              artifact = next(root.glob(pattern), None)
+              signature = pathlib.Path(str(artifact) + '.sig')
+              if artifact is None or not signature.exists():
+                  print(f"missing {pattern} or its .sig — the bundle was not produced or was not signed")
+                  sys.exit(1)
+              platforms[f"linux-x86_64-{bundle}"] = {
+                  "url": f"{repo}/releases/download/v{version}/{artifact.name}",
+                  "signature": signature.read_text().strip(),
+              }
+          json.dump(platforms, open('platforms-linux.json', 'w'), indent=2)
+          print(json.dumps(platforms, indent=2))
+          PY
       - name: upload
         uses: softprops/action-gh-release@v2
         with:
@@ -48,6 +94,10 @@ jobs:
             target/release/bundle/deb/*.deb
             target/release/bundle/appimage/*.AppImage
             target/release/bundle/rpm/*.rpm
+            target/release/bundle/deb/*.sig
+            target/release/bundle/rpm/*.sig
+            target/release/bundle/appimage/*.AppImage.sig
+            target/release/bundle/platforms-linux.json
             target/release/bundle/SHA256SUMS
 
   windows:
@@ -58,16 +108,109 @@ jobs:
         with:
           toolchain: "stable"
           target: x86_64-pc-windows-msvc
+      - name: signing key present
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set. Every tag build signs its bundles, so a release cannot be built without it."
+            exit 1
+          fi
       - name: cargo tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: cargo install tauri-cli --version "^2" && cargo tauri build
       - name: checksums
         run: |
           cd target/release/bundle/nsis
           Get-FileHash *.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Out-File -Encoding utf8 SHA256SUMS
           Get-Content SHA256SUMS
+      - name: platform snippet for the manifest
+        shell: bash
+        run: |
+          cd target/release/bundle/nsis
+          VERSION="${GITHUB_REF_NAME#v}"
+          REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          python3 - "$VERSION" "$REPO" <<'PY'
+          import json, sys, pathlib
+          version, repo = sys.argv[1], sys.argv[2]
+          artifact = next(pathlib.Path('.').glob('*setup.exe'), None)
+          signature = pathlib.Path(str(artifact) + '.sig')
+          if artifact is None or not signature.exists():
+              print("missing the NSIS installer or its .sig — the bundle was not produced or was not signed")
+              sys.exit(1)
+          json.dump(
+              {"windows-x86_64": {
+                  "url": f"{repo}/releases/download/v{version}/{artifact.name}",
+                  "signature": signature.read_text().strip(),
+              }},
+              open('platforms-windows.json', 'w'), indent=2,
+          )
+          print(open('platforms-windows.json').read())
+          PY
       - name: upload
         uses: softprops/action-gh-release@v2
         with:
           files: |
             target/release/bundle/nsis/*setup.exe
+            target/release/bundle/nsis/*setup.exe.sig
+            target/release/bundle/nsis/platforms-windows.json
             target/release/bundle/nsis/SHA256SUMS
+
+  # The updater manifest is ONE file covering every platform, and the two build jobs run in
+  # parallel — so each of them publishes a snippet under its own asset name and this job is the only
+  # writer of `latest.json`. Two jobs writing the same asset would mean "last upload wins", and the
+  # manifest the installed apps read would then cover whichever platform happened to finish last.
+  # `tauri-plugin-updater` validates the whole file before it even looks at the version, so a
+  # manifest with one platform in it is not a partially-working update: it is a broken one.
+  manifest:
+    runs-on: ubuntu-22.04
+    needs: [linux, windows]
+    steps:
+      - uses: actions/checkout@v4
+      - name: assemble latest.json from both snippets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="v${VERSION}"
+          mkdir -p out
+          for snippet in platforms-linux.json platforms-windows.json; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$snippet" --clobber --dir out
+          done
+          # Every platform the app ships in must be present. A missing entry is not "that platform
+          # stays on the old version" — the plugin treats an incomplete manifest as unusable, so the
+          # whole update chain would break for everyone.
+          python3 - "$VERSION" <<'PY'
+          import json, sys, datetime, pathlib
+          version = sys.argv[1]
+          platforms = {}
+          for name in ("platforms-linux.json", "platforms-windows.json"):
+              path = pathlib.Path("out") / name
+              if not path.exists():
+                  sys.exit(f"{name} was not uploaded by its build job")
+              platforms.update(json.loads(path.read_text()))
+          expected = {
+              "linux-x86_64-deb",
+              "linux-x86_64-rpm",
+              "linux-x86_64-appimage",
+              "windows-x86_64",
+          }
+          missing = expected - set(platforms)
+          if missing:
+              sys.exit(f"the manifest would be incomplete: {sorted(missing)}")
+          manifest = {
+              "version": version,
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          (pathlib.Path("out") / "latest.json").write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2)[:400])
+          PY
+      - name: publish latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" --clobber out/latest.json

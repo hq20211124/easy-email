@@ -21,6 +21,18 @@ thiserror.workspace = true
 tauri = { version = "2.12.1", features = ["image-png", "tray-icon"] }
 tauri-plugin-notification = "2.5.1"
 tauri-plugin-dialog = "2.8.1"
+# In-app updates. Signature verification **cannot be turned off** (official docs), which is the
+# property that makes an update chain trustworthy without an Authenticode certificate: the update
+# bundle is signed with a minisign key whose public half lives in the config, and the private half
+# lives only in the CI secrets. That is also why this dependency arrives together with
+# `bundle.createUpdaterArtifacts` and the key — without the private key at build time the bundler
+# refuses to produce the `.sig` files, so a config without a key turns every tagged build red.
+#
+# Note the dependency's own `reqwest` is 0.13 while this crate uses 0.12: Cargo keeps both, so the
+# binary carries two HTTP stacks. That is the cost of not reimplementing minisign verification.
+#
+# Requires rustc ≥ 1.90 (plugin's own floor); the toolchain here is 1.98/1.99 and CI uses stable.
+tauri-plugin-updater = "2"
 
 [build-dependencies]
 tauri-build = "2.7.1"

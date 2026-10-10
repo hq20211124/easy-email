@@ -1,14 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window capability. Only the app's own commands are reachable; no plugin surface is exposed.",
-  "windows": ["main"],
+  "description": "Main window capability: the app's own commands, plus the updater's check/download/install (the frontend has no bundler, so the whole flow is driven from Rust).",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-is-maximized",
     "core:window:allow-close",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "updater:default"
   ]
 }

@@ -88,6 +88,14 @@ struct AppState {
     /// The tick is 5 s, but three events cannot wait for it: a message just queued (the undo window
     /// counts down in front of the user), an undo window that just expired, and a manual "retry now".
     outbox_wake: Arc<Notify>,
+    /// The update the server announced, waiting for the user to say yes.
+    ///
+    /// Held rather than re-fetched because the plugin's `Update` is a resource with a private
+    /// payload: it cannot be serialised to the renderer and back, so "ask the server again" would
+    /// mean a second round trip and a second chance for the answer to change between the question
+    /// and the click. `Mutex` (not `tokio::sync::Mutex`) because nothing is held across an `.await`
+    /// — the download is started by the same command that owns it.
+    pending_update: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
 }
 
 /// The two tasks that make up one account's push pipeline.
@@ -1330,6 +1338,132 @@ async fn take_update_outcome(
         .settle(env!("CARGO_PKG_VERSION"))
         .map_err(describe)
 }
+/// What the server said about a newer version, or `None` when there is nothing to install.
+///
+/// `notes` is the release text, shown before the user commits to a download: an update that says
+/// nothing about what it fixes is an update nobody should install on faith.
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    version: String,
+    current_version: String,
+    notes: Option<String>,
+}
+
+/// Ask the release page whether there is a newer build.
+///
+/// Returns `None` for three different situations and it does not need to tell them apart, because
+/// all three mean "nothing to do right now": up to date, the manifest is not there yet (a release
+/// that predates `latest.json`, or a draft), and the network is unreachable. The last one is logged
+/// rather than raised — `design/17` §5 is explicit that a failed check must not disturb anyone, and
+/// three consecutive failures are what the UI is allowed to mention.
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|error| error.to_string())?
+        .check()
+        .await
+        .map_err(|error| {
+            log_line(&format!("[easy-email] 检查更新失败：{error}"));
+            error.to_string()
+        })?;
+
+    let Some(update) = update else {
+        // Stale answers must not outlive the answer that replaced them.
+        *app.state::<AppState>()
+            .pending_update
+            .lock()
+            .expect("pending update mutex") = None;
+        return Ok(None);
+    };
+
+    let info = UpdateInfo {
+        version: update.version.clone(),
+        current_version: update.current_version.clone(),
+        notes: update.body.clone(),
+    };
+    *app.state::<AppState>()
+        .pending_update
+        .lock()
+        .expect("pending update mutex") = Some(update);
+    log_line(&format!(
+        "[easy-email] 发现新版本 {}（当前 {}）",
+        info.version, info.current_version
+    ));
+    Ok(Some(info))
+}
+
+/// Download and install the update the user just agreed to.
+///
+/// The signature was verified when the manifest was read, so this cannot install something the
+/// private key did not sign. Progress is emitted as `update:progress` because the frontend has no
+/// bundler: `@tauri-apps/plugin-updater`'s JS object is not in this app's assets, so the closure
+/// here is the only place the numbers exist.
+///
+/// The app exits on Windows as soon as the installer is spawned (a platform limitation, not a
+/// choice), so the "restart" question is answered by `install` itself rather than by the UI.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    // Take it rather than borrow it: a second click must not start a second download of the same
+    // bytes, and the update is single-use by nature (the version it installs is this one).
+    let update = app
+        .state::<AppState>()
+        .pending_update
+        .lock()
+        .expect("pending update mutex")
+        .take();
+
+    let Some(update) = update else {
+        return Err("没有待安装的更新，请先检查一次。".to_string());
+    };
+
+    // **Before** the installer runs: write down which version we are trying to become. If the app is
+    // still the old version next launch, the installer did not take — and a silent failure there is
+    // how someone presses "restart to update" forever (`design/17` §5).
+    let note_dir = app
+        .state::<AppState>()
+        .accounts_path
+        .parent()
+        .ok_or_else(|| "无法确定数据目录".to_string())?
+        .to_path_buf();
+    let note = mail_core::update::UpdateState::new(note_dir);
+    note.begin(&update.version, Some("用户从关于面板启动的更新"))
+        .map_err(describe)?;
+
+    let progress = app.clone();
+    let mut last_logged = std::time::Instant::now();
+    update
+        .download_and_install(
+            |chunk, total| {
+                // Once a second, not once per chunk: a 30 MB download arrives in hundreds of
+                // chunks and emitting every one would turn the IPC channel into the bottleneck.
+                if last_logged.elapsed() >= std::time::Duration::from_secs(1) {
+                    last_logged = std::time::Instant::now();
+                    let _ = progress.emit(
+                        "update:progress",
+                        serde_json::json!({ "downloaded": chunk, "total": total }),
+                    );
+                }
+            },
+            || {
+                log_line("[easy-email] 更新包下载完成，开始安装");
+            },
+        )
+        .await
+        .map_err(|error| {
+            // The installer did not run, so the note is a lie. `settle` would report
+            // "更新失败，已回滚" for an installer that was never launched, which is a promise the
+            // user cannot act on; `forget` drops it instead (`design/20-v0.2-plan.md` V2-C2).
+            let _ = note.forget();
+            log_line(&format!("[easy-email] 安装更新失败：{error}"));
+            error.to_string()
+        })?;
+
+    log_line("[easy-email] 更新已安装，应用即将退出");
+    Ok(())
+}
+
 /// Refresh tokens live beside the account list, in their own subdirectory.
 ///
 /// Derived from `accounts_path` rather than stored as a second field: two paths that must agree are
@@ -2707,6 +2841,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        // Reads its pubkey and endpoint from the config, so the verification is not something this
+        // code can get wrong: there is no path where a downloaded bundle reaches the installer
+        // unsigned.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Fit the window to the monitor.
             //
@@ -2843,6 +2981,7 @@ pub fn run() {
                 spool,
                 user_store_error: Mutex::new(user_store_error),
                 outbox_wake: Arc::new(Notify::new()),
+                pending_update: std::sync::Mutex::new(None),
             });
 
             // Start the outbox worker. Queued messages outlive the window, so this is what actually
@@ -2919,8 +3058,10 @@ pub fn run() {
             verify_account,
             list_mailboxes,
             app_version,
+            check_update,
             index_bodies,
             index_coverage,
+            install_update,
             list_messages,
             list_thread,
             get_sync_window,

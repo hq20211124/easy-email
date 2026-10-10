@@ -316,6 +316,49 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the update chain is signed, and the key is content rather than a path' {
+        # V2-C2. Three properties that must all hold, because each one alone is worthless:
+        #   * signature verification is the updater's own and cannot be disabled (official docs), so
+        #     the plugin must actually be registered — a hand-rolled JSON check would be the
+        #     "unsigned update" failure the whole design avoids;
+        #   * the pubkey must be the key's *content*. A path here builds fine and then verifies
+        #     nothing, which is the kind of silent hole a gate exists for;
+        #   * the endpoint must be https. Tauri enforces this in release builds, but a config that
+        #     only works in debug is a config that gets tested in debug and shipped in release.
+        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $cap = Get-Content 'src-tauri/capabilities/default.json' -Raw
+        $problems = @()
+        if ($conf -notmatch '"createUpdaterArtifacts"\s*:\s*true') {
+            $problems += 'tauri.conf.json: createUpdaterArtifacts must be true, or no .sig is produced and the check has nothing to verify'
+        }
+        if ($conf -notmatch '"pubkey"\s*:\s*"[A-Za-z0-9+/=]{20,}"') {
+            $problems += 'tauri.conf.json: pubkey must be the key CONTENT (a long base64 blob), never a file path'
+        }
+        if ($conf -notmatch '"endpoints"\s*:\s*\[\s*"https://') {
+            $problems += 'tauri.conf.json: the update endpoint must be https'
+        }
+        if ($lib -notmatch 'tauri_plugin_updater::Builder::new\(\)\.build\(\)') {
+            $problems += 'lib.rs must register the updater plugin — the config alone does nothing'
+        }
+        if ($cap -notmatch '"updater:default"') {
+            $problems += 'capabilities must grant updater:default, or the commands are unreachable from the window'
+        }
+        if ($lib -notmatch 'fn install_update\(') {
+            $problems += 'lib.rs must expose install_update'
+        }
+        if ($lib -notmatch 'UpdateState::new') {
+            $problems += 'install_update must leave the "which version am I becoming" note, or a failed install is silent'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the update chain is signed and the note that catches a silent failure is written'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'the receive-only escape hatch is exactly as wide as the user statement' {
         # C8: `smtp_none` is the one hole in "an account must be complete", the rule that keeps a
         # mistyped host from creating a half-account. The hole is only safe while every unflagged

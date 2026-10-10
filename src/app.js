@@ -265,6 +265,9 @@ async function boot() {
   syncThemeButton();
   syncViewModeButton();
   await wirePushEvents();
+  // What the last update attempt actually did, once per launch. A silent failure here is how
+  // somebody presses "restart to update" forever.
+  await reportUpdateOutcome();
   // One timer for the whole window, rather than one per open composer or per outbox row: it is a
   // text update on whatever countdown is on screen, and it does nothing when none is.
   setInterval(updateUndoCountdowns, 1000);
@@ -3297,17 +3300,103 @@ function openAbout() {
     bodyHtml: `
       <p class="about-line">当前版本 <strong>${escapeHtml(version)}</strong></p>
       <p class="about-note">
-        这个版本还没有自动更新：有新版本时点下面按钮去发布页下载。
-        更新包由 GitHub Releases 托管，安装前可以核对页面上的 SHA256SUMS。
-      </p>`,
-    confirmLabel: '打开下载页',
-    onConfirm: async () => {
-      await run('打开下载页', () => invoke('open_download_page'));
-      // Stays open on purpose: the browser is now in front of this window, and dismissing the
-      // dialog before the user has seen the page leaves them wondering whether anything happened.
+        有新版时这里会自动发现；更新包由 GitHub Releases 托管，
+        带签名校验，安装前可以核对页面上的 SHA256SUMS。
+      </p>
+      <p id="about-update-status" class="about-note" hidden></p>`,
+    confirmLabel: '检查更新',
+    onConfirm: async (modal) => {
+      await checkForUpdate(modal);
+      // Stays open either way: the answer (new version / up to date / could not reach the release
+      // page) is shown in the dialog itself, and closing it would hide the answer to a question the
+      // user just asked.
       return false;
     },
   });
+}
+
+/**
+ * Ask the release page whether there is a newer build, and offer to install it.
+ *
+ * The whole flow lives in Rust because the renderer has no bundler: the updater plugin's JavaScript
+ * API is not in this app's assets, so the progress numbers only exist inside the Rust closure
+ * (`install_update`). What is left here is the question and the answer.
+ *
+ * A failed check is a sentence, not an error: the release page may simply not have a `latest.json`
+ * yet (every release before this feature shipped), and the network may be unreachable. Neither is
+ * something the user did wrong, so neither gets a red banner.
+ */
+async function checkForUpdate(modal) {
+  const status = modal.querySelector('#about-update-status');
+  const button = modal.querySelector('[data-role="confirm"]');
+  if (!status || !button) return;
+
+  status.hidden = false;
+  status.className = 'about-note';
+  status.textContent = '正在检查更新…';
+  button.disabled = true;
+
+  const update = await invoke('check_update').catch((error) => {
+    status.textContent = `检查更新失败：${errText(error)}`;
+    return undefined;
+  });
+
+  // `undefined` covers both "up to date" and "could not reach the release page": the command maps
+  // the network failure onto `None` on purpose, because neither is something the user can act on
+  // and both would otherwise need a different red banner.
+  if (!update) {
+    status.textContent = '已经是最新版本。';
+    button.disabled = false;
+    button.textContent = '打开下载页';
+    button.onclick = async () => {
+      await run('打开下载页', () => invoke('open_download_page'));
+    };
+    return;
+  }
+
+  const notes = update.notes ? `\n\n${update.notes}` : '';
+  status.textContent = `发现新版本 ${update.version}（当前 ${update.current_version}）。下载并安装后会重启应用。${notes}`;
+  button.disabled = false;
+  button.textContent = `安装 ${update.version}`;
+
+  button.onclick = async () => {
+    button.disabled = true;
+    status.textContent = `正在下载 ${update.version}…`;
+    // Progress arrives as an event: the numbers are produced inside the Rust download closure.
+    const stop = await listen('update:progress', (event) => {
+      const done = event.payload?.downloaded ?? 0;
+      const total = event.payload?.total;
+      status.textContent = total
+        ? `正在下载 ${update.version}… ${Math.round((done / total) * 100)}%`
+        : `正在下载 ${update.version}…`;
+    });
+    try {
+      await run('安装更新', () => invoke('install_update'));
+      status.textContent = '更新已安装，应用正在重启。';
+    } catch (error) {
+      status.textContent = `安装失败，已保留当前版本：${errText(error)}`;
+      stop();
+      button.disabled = false;
+      button.textContent = '重试安装';
+    }
+  };
+}
+
+/**
+ * Report what the last update attempt actually did.
+ *
+ * The note `install_update` leaves behind is read once, at startup: same version means the update
+ * landed (`design/17` §5's first sentence), a different one means the installer did not take and the
+ * user deserves to hear that instead of pressing restart forever.
+ */
+async function reportUpdateOutcome() {
+  const outcome = await invoke('take_update_outcome').catch(() => null);
+  if (!outcome) return;
+  const text =
+    outcome.outcome === 'updated'
+      ? `已更新到 ${outcome.version}。`
+      : `上次的更新没有生效（尝试装到 ${outcome.expected}，实际仍在 ${outcome.running}）。当前版本可以正常使用。`;
+  toast(text, outcome.outcome === 'updated' ? 'info' : 'err', 15000);
 }
 
 function openAccountWizard() {
