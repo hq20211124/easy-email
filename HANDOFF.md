@@ -97,6 +97,9 @@ M2、M3 ❌。README「已知限制」是 Issue 级清单。候选里最小最�
 （GUI，否则会有 cmd 窗口）→ **不得留下 `--remote-debugging-port`**（CDP 探针要用，但留下等于把 webview 交给
 任何本机进程；这条**曾经被人忘在配置里并提交**，所以现在是机器检查）。
 目前 **31 步全绿**（离线）、**365 passed**（+7 ignored，见 `tools/check.ps1`）。
+**v0.1.2 已发布**（2026-10-10）：三个 job 全绿，四个安装包 + `.sig` + `latest.json` 齐全，
+`releases/latest` 解析到 `0.1.2`。**`check.ps1` 仍未在 Windows 上真跑过**（WSL 无 pwsh，31 项
+都是用等价逻辑逐条验的）——这是下一次接手时第一件该补的事。
 **口径**（别再读成矛盾）：365 = 全 workspace（tauri lib 8 + mail-core lib 300 + loopback 49 +
 reachability 4 + oauth_flow 1 + bench_fixture 1）；PROGRESS 里某些轮次写的 29x 只数 mail-core 的 lib 单测。
 加 `-Network` 会额外跑 40 个真实端点（约 40 秒）。

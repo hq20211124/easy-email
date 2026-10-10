@@ -149,6 +149,40 @@ clippy/fmt 干净。`update.rs` 原有 4 条覆盖三态 + 半截文件，本轮
 
 ---
 
+### v0.1.2 发布：三个真 bug 只会在 CI 里现形 ✅（第 69 轮）
+
+第一次打 tag 失败、第二次仍失败、第三次才成。**三个 bug 有一个共同点：我本地全绿，
+它们只在"真的对着 GitHub Release 跑一遍"时才出现** —— 而其中任何一个都会让自动更新链静默失效。
+
+**① Linux 三个包根本找不到（第一次失败）。**
+`cd target/release/bundle` 后 `glob('*.deb')` 找的是 `bundle/` 根目录，而 deb/rpm/appimage
+**各在自家子目录**（`bundle/deb/`、`bundle/rpm/`、`bundle/appimage/`）。签名本身是好的
+（日志有 `Finished 3 updater signatures at:`，说明密钥与密码都对），白跑 6 分钟构建。
+
+**② URL 里的空格（第二次失败的直接原因，也是最长见识的一个）。**
+构建产出 `Easy Email_0.1.2_amd64.deb`（空格），而 `softprops/action-gh-release`
+**上传时把空格换成点**，资产名是 `Easy.Email_0.1.2_amd64.deb`。我的 URL 用的是构建名
+（percent-encode 成 `%20`）——**四个 URL 全部 404**。因为没有 HEAD 校验，构建全绿、
+清单也生成了，只是指向不存在的东西。
+
+**③ `GITHUB_REF_NAME` 不是 runner 的默认变量**（第一次就修掉了，没等到它咬人）。
+默认的是 `GITHUB_REF` = `refs/tags/v0.1.2`，而 `${VAR#v}` 剥不掉 `refs/tags/` 前缀。
+
+**修法不只看代码，都做了实证：**
+- URL 用 `asset.name.replace(' ', '.')` 再 percent-encode；
+- manifest job 对四个 URL **逐个 HEAD**，任一 404 就让构建红 —— 这是 ② 唯一能被发现的地方；
+- 两个脚本都在本地按 CI 的目录布局实跑过；
+- 下载已发布的 `.deb` + `.sig`，用 `tauri.conf.json` 里那把公钥走**插件同两条路径**
+  （`base64 → PublicKey::decode → verify`）验通，并确认 manifest 的 `signature`
+  与上传的 `.sig` 逐字节相同；
+- 最后从 `releases/latest/download/latest.json` 读到 `version=0.1.2`，
+  **这才是装了 0.1.1 的客户端真正会看到的答案**。
+
+**元教训**：`latest.json` 这种"生成了但指向别处"的产物，是全绿构建掩盖下的死链。
+凡是"拼出一个 URL 给别人去取"的地方，都要有一个**真的去取一次**的检查。
+
+---
+
 ## 提交记录
 共 **22 个提交**，从基线到最新（`git log --oneline` 看全量；下表只列里程碑）：
 
