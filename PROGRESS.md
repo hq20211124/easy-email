@@ -72,6 +72,22 @@ HANDOFF 的 351 与 PROGRESS 里 29x 的"矛盾"由此解释——后者只数 m
 
 ---
 
+### V2-C1 关于面板：版本号 + 打开下载页（零外部依赖）✅（第 66 轮）
+
+红队 C10 的产出之一：自动更新不能一次做完，所以先发**不需要密钥的那一半**。
+`app_version()` 读 `env!("CARGO_PKG_VERSION")`——不是第二份数字，那份会漂
+（v0.1.1 的 `Easy Email_0.1.0_…` 就是这么来的）；「打开下载页」复用 OAuth 那条 argv 直传的
+`SystemBrowser`，不经 shell。侧栏「关于」行常显版本，对话框里两个按钮。
+
+**没做的事（写在这里免得被当成已完成）**：没有 `tauri-plugin-updater`、没有 `createUpdaterArtifacts`、
+没有 `pubkey`、没有 `latest.json`。那些和密钥是同一个 PR，密钥没进 Secrets 之前一行都不写 ——
+否则每个 tag 的构建都会红（C4-2）。
+
+**测试**：+1（`app_version` == `CARGO_PKG_VERSION`，空串即失败）→ **363 passed / 7 ignored**。
+**门禁**：+1 项（28 步）：版本必须来自 `CARGO_PKG_VERSION`，前端不得硬编码。
+
+---
+
 ## 提交记录
 共 **22 个提交**，从基线到最新（`git log --oneline` 看全量；下表只列里程碑）：
 

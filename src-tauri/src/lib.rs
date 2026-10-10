@@ -1963,6 +1963,29 @@ async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<S
     })
 }
 
+/// The version of the build the user is running.
+///
+/// Exists because "which version am I on" had no answer in the UI at all: the only way to find out
+/// was to look at the installer's filename, which is exactly the thing someone reporting a bug
+/// cannot be asked to do. Compile-time, so it is always right and costs nothing.
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Open the release page in the system browser.
+///
+/// The same launcher the OAuth flow uses (argv, never a shell). This is the manual half of updating:
+/// it works without a signing key, without a `latest.json`, and without trusting anything we host,
+/// which is why it ships before automatic updates do (`design/20-v0.2-plan.md` V2-C1).
+#[tauri::command]
+async fn open_download_page() -> Result<(), String> {
+    use mail_core::oauth::BrowserLauncher;
+    mail_core::oauth::SystemBrowser
+        .open("https://github.com/hq20211124/easy-email/releases/latest")
+        .map_err(describe)
+}
+
 /// How much of this account has an indexed body — what search can actually see.
 ///
 /// The number the search box shows. It exists because "search only covers opened mail" was invisible
@@ -2880,6 +2903,7 @@ pub fn run() {
             delete_account,
             verify_account,
             list_mailboxes,
+            app_version,
             index_bodies,
             index_coverage,
             list_messages,
@@ -2895,6 +2919,7 @@ pub fn run() {
             range_cap_hint,
             max_send_bytes,
             classify_link,
+            open_download_page,
             open_link,
             get_notify_enabled,
             set_notify_enabled,
@@ -2929,7 +2954,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureKind, SyncFailure, failure_kind, safe_file_name};
+    use super::{FailureKind, SyncFailure, app_version, failure_kind, safe_file_name};
 
     /// Hostile attachment names, table-driven.
     ///
@@ -3052,6 +3077,18 @@ mod tests {
             FailureKind::Auth,
             "a dead network is not a bad credential"
         );
+    }
+
+    /// **V2-C1.** The version shown is the version that was compiled in.
+    ///
+    /// Not a tautology: it pins that the command reads the manifest rather than a second copy of the
+    /// number that could drift, which is the failure that would make a bug report say the wrong
+    /// build. It also matches the workspace `Cargo.toml`, so a forgotten version bump shows up here
+    /// rather than in a user's screenshot.
+    #[test]
+    fn app_version_matches_the_manifest() {
+        assert_eq!(app_version(), env!("CARGO_PKG_VERSION"));
+        assert!(!app_version().is_empty());
     }
 
     /// A `SyncFailure` prints the sentence and nothing else: the kind is for the machine half of the

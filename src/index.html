@@ -69,6 +69,18 @@
           </button>
         </div>
 
+        <!--
+          Which build this is, and how to get a newer one. The version had no home in the UI at all
+          before this: the only place it existed was the installer's filename, which is not something
+          a user reporting a bug can be asked to read out.
+        -->
+        <div class="section">
+          <button id="btn-about" class="row" type="button">
+            <span class="label">关于</span>
+            <span id="about-version" class="count"></span>
+          </button>
+        </div>
+
         <button id="btn-compose" class="btn primary block">写邮件</button>
       </aside>
 

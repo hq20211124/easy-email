@@ -316,6 +316,34 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the version on screen comes from the manifest, not a second copy' {
+        # V2-C1: the number a bug report quotes must be the build's own. A hardcoded string here
+        # would drift from Cargo.toml the moment someone forgets to bump it — which is the same
+        # failure that produced Easy Email_0.1.0_... artifacts long after 0.1.1 shipped.
+        $js = Get-Content 'src/app.js' -Raw
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw
+        $problems = @()
+        if ($lib -notmatch 'fn app_version\(\) -> String') {
+            $problems += 'lib.rs must expose app_version()'
+        }
+        if ($lib -notmatch 'env!\("CARGO_PKG_VERSION"\)') {
+            $problems += 'app_version must read CARGO_PKG_VERSION — a second copy is what drifts'
+        }
+        if ($js -notmatch "invoke\('app_version'\)") {
+            $problems += 'app.js must show the version the command returns'
+        }
+        if ($js -match "当前版本.*0\\.1\\.1") {
+            $problems += 'app.js appears to hardcode a version string'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the about panel shows the build its own manifest describes'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'the offline notice names the failure, not just "offline"' {
         # C3: `sync_status.offline` means "the last refresh failed", which is true of a dead network,
         # an expired 授权码 and a provider quota alike. Showing all three as "离线" is the failure this

@@ -453,6 +453,24 @@ textarea {
   margin-left: auto;
 }
 
+/* About dialog: the version is the point, so it is the biggest thing in there; the note explains
+   why there is no "check for updates" button yet without apologising for it. */
+.about-line {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.about-line strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.about-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
 /* Which folder a search hit came from, shown only while searching. */
 .msg-folder {
   font-size: 10px;

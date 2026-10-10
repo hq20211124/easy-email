@@ -268,6 +268,11 @@ async function boot() {
   // One timer for the whole window, rather than one per open composer or per outbox row: it is a
   // text update on whatever countdown is on screen, and it does nothing when none is.
   setInterval(updateUndoCountdowns, 1000);
+  // The version is compile-time in Rust; showing it here means the one number a bug report needs
+  // is on screen without anyone having to open a dialog.
+  $('about-version').textContent =
+    (await run('读取版本号', () => invoke('app_version'))) ?? '';
+
   if (state.accounts.length === 0) {
     openAccountWizard();
   } else {
@@ -418,6 +423,7 @@ function wireGlobalEvents() {
   $('btn-drafts').addEventListener('click', showDrafts);
   $('btn-outbox').addEventListener('click', showOutbox);
   $('btn-sync-window').addEventListener('click', openSyncWindowPicker);
+  $('btn-about').addEventListener('click', openAbout);
   $('btn-load-more').addEventListener('click', loadOlder);
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
@@ -3276,6 +3282,33 @@ function setComposeCloudStatus(text) {
  * closes the dialog, `closeModal` removes it so a typo cannot leave a broken account behind.
  */
 let pendingWizardAccountId = null;
+
+/**
+ * "Which build is this, and where do I get a newer one."
+ *
+ * Deliberately not an update *checker*: that needs a signing key and a hosted `latest.json`, and a
+ * button that always says "checking…" and never finds anything is worse than one that opens the
+ * release page (`design/20-v0.2-plan.md` V2-C1).
+ */
+function openAbout() {
+  const version = $('about-version').textContent || '未知';
+  openModal({
+    title: '关于 Easy Email',
+    bodyHtml: `
+      <p class="about-line">当前版本 <strong>${escapeHtml(version)}</strong></p>
+      <p class="about-note">
+        这个版本还没有自动更新：有新版本时点下面按钮去发布页下载。
+        更新包由 GitHub Releases 托管，安装前可以核对页面上的 SHA256SUMS。
+      </p>`,
+    confirmLabel: '打开下载页',
+    onConfirm: async () => {
+      await run('打开下载页', () => invoke('open_download_page'));
+      // Stays open on purpose: the browser is now in front of this window, and dismissing the
+      // dialog before the user has seen the page leaves them wondering whether anything happened.
+      return false;
+    },
+  });
+}
 
 function openAccountWizard() {
   pendingWizardAccountId = null;
