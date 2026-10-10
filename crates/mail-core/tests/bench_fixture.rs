@@ -1270,6 +1270,19 @@ fn bench_message_build() {
     );
     println!();
 
+    // The same two numbers again, prefixed, because `tools\bench.ps1` picks measured rows out of
+    // this output by matching `^P\d+` and the indented block above is invisible to it. A coverage
+    // table that says "measured" without printing the measurement is half a lie (round 73).
+    println!(
+        "P10 耗时            {:.2} s      （预算 ≤ 3 s）",
+        elapsed.as_secs_f64()
+    );
+    println!(
+        "P10 峰值堆增量      {:.1} MB   = {:.3} × 编码后大小   （预算 ≤ 3×）",
+        peak as f64 / (1024.0 * 1024.0),
+        peak as f64 / encoded as f64
+    );
+
     assert!(
         elapsed.as_secs_f64() < 3.0,
         "P10: building a 24 MB message took {:.2} s, budget is 3 s",
