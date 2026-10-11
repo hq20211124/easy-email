@@ -11,6 +11,46 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### 查询语法第一片：字段限定 + `has:attachment`（09 树④）✅（第 77 轮）
+
+**依据**：`design/09` §1 目标 4 的语法清单。分两片：**本片只做文本型前缀 + `has:attachment`**；
+时间/标记/文件夹/大小/账号类是**结构化谓词**（要改 `search` 的 WHERE），留下一片——
+一次同时改两件事等于两件事都没验透。
+
+**做什么**：`parse_query()`（纯：解析与 SQL 分开，"这个串是什么意思"不需要数据库）＋
+`match_expression()`（文本项 → FTS，含 FTS5 列限定）。列映射：
+`subject:`→`{subject}`、`from:`/`sender:`→`{from_name from_addr}`、`to:`/`cc:`→`{to_addrs}`、
+`body:`/`filename:`→`{body}`（**附件名就索引在这一列**，第 71 轮，注释里点名免得下一个人以为漏了列）。
+`to_query()` 收窄成 `match_expression(parse_query(input))` 的薄壳——**分词方式一字未动**
+（那三行是中文可搜的地基，`the_index_and_the_query_use_the_same_transformation` 钉着）。
+
+**过程中测试当场抓到一个真 bug**：**纯 `has:attachment` 什么都不返回**。
+`match_expression` 在没有文本项时返回空串，而 `search()` 一看见空串就"安全空查询"直接 return。
+也就是说：**一个只有谓词的查询，被当成了"没有内容"**。修法是两个查询形状——
+有文本时从 FTS 驱动，没有文本时直接从 `messages` 驱动（谓词照常拼上）。
+这个 bug 单测（`has_attachment_only_finds_mail_that_has_one`）写的正是它会犯的场景。
+
+**测试 +4**：解析（前缀识别/大小写/未知前缀按字面/`filename:`→body/空前缀不当前缀/空串）＋
+端到端（`subject:` 不命中正文、`from:` 命中发件人、`body:` 命中正文不命中主题、
+`has:attachment` 只命中带附件的、`has:attachment from:shop` 组合、
+`会议: 十点` 这种**自带冒号**的文字仍按字面搜到）。→ **WSL 380 passed / 7 ignored**（376+4）。
+
+**门禁 36→37→38 步**：新增「a query prefix scopes the search, and an unknown one stays literal」——
+钉住 `parse_query` 存在、四个列变体都映射、`HasAttachment` 是独立 term、**未知前缀必须落成
+`column: None` 的字面项**（否则手滑一次就静默搜不到）、**无文本项必须从 `messages` 驱动**
+（否则谓词单独用会静默失效）、`to_query` 继续导出。
+
+**顺手给搜索框加了 title**（列出可用前缀）——语法没人知道就等于没有。
+另外又一次踩了 PowerShell 的坑：探针里 `("'"+$p+"'\s=>...")` 这种**插值后紧跟反斜杠**的正则拼接
+Argument exception；门禁这边我一开始也写了同样的拼接正则，**已改成断言枚举变体**
+（`QueryColumn::Subject` 等在位）——更稳，也更贴近"映射还在"这个真正的意图。
+
+**未做/未验**：时间/标记/文件夹/大小/账号前缀、语法错误提示（`design/09` §2 说"查询语法有错时
+给语法提示而不是空结果"）、保存搜索（M2）；**真机未验**（要在真邮箱里试
+`from:` + `has:attachment` 组合——这需要真实账号，等你自己验证那批一起做）。
+
+---
+
 ### 虚拟列表：只渲染视口 ± 8 行（15 块第四片）✅（第 76 轮）
 
 **依据**：`design/15` §6（"虚拟化（视口 ± 8 行）；行高固定/可测；滚动用

@@ -79,9 +79,13 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 
 下一批：**给 P3 拿真窗口基线**（需要你点：应用带 `--remote-debugging-port=9222` 构建 →
 `powershell -File tools\bench-app.ps1`，P1/P3/P5/P6 四个数字进 `target\bench-app-history.jsonl`）；
-之后可继续 09 的查询语法、04 离线队列、16 诊断包。**列表与分页都已完成**（第 75/76 轮）：
-`message_page(offset, limit)` 只读缓存分页 + `src/vlist.js` 视口 ± 8 行窗口化，
-`tools/vlist_test.mjs` 钉住窗口算术与"行高只有一个出处"。
+之后可继续 **09 查询语法第二片**（时间/标记/文件夹前缀：`after:`/`before:`/`is:unread`/`is:flagged`/
+`in:`/`account:` —— 结构化谓词，改的是 `search` 的 WHERE；外加 `design/09` §2 要的"语法提示而不是空结果"）、
+04 离线队列、16 诊断包。
+**列表与分页已完成**（第 75/76 轮）：`message_page(offset, limit)` 只读缓存分页 +
+`src/vlist.js` 视口 ± 8 行窗口化，`tools/vlist_test.mjs` 钉住窗口算术与"行高只有一个出处"。
+**查询语法第一片已完成**（第 77 轮）：`from:`/`to:`/`cc:`/`subject:`/`body:`/`filename:`/`has:attachment`；
+不认识的写法按字面搜。
 性能预算的**覆盖率**已变成机器检查（第 73 轮：`bench.ps1` 打印全部 16 项、自断言条数、
 `check.ps1` 钉住），实测 P2/P4/P7/P9/P10/P12/P13/P14/P15，未测 P1/P3/P5/P6/P8/P11/P16 各自写了原因
 ——**别再把"没测"写成"有"，也别把"有仪表"写成"没仪表"**：第 73 轮我连错两次

@@ -235,33 +235,133 @@ fn clauses_of(term: &str) -> Vec<Clause> {
 /// `账单 发票` means "the adjacent characters 账单, and also 发票", and `invoice 账单` means "the word
 /// invoice, and also 账单". Quotes are dropped: they are FTS5 syntax, and letting them through turns
 /// a pasted string into a `MATCH` syntax error.
-pub fn to_query(input: &str) -> String {
-    let mut clauses: Vec<String> = Vec::new();
+/// Which column a bare search should cover when the user scoped it with a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryColumn {
+    Subject,
+    /// The FTS keeps the display name and the address apart; both are "who sent it" to a user.
+    From,
+    To,
+    /// Body text — and the attachment names, which are indexed into the same column (round 71).
+    Body,
+}
 
-    for term in input.split_whitespace() {
-        let term = term.replace(['"', '\''], "");
+impl QueryColumn {
+    /// The FTS5 column filter for this column, in FTS5's own syntax.
+    pub fn filter(&self) -> &'static str {
+        match self {
+            QueryColumn::Subject => "{subject}",
+            QueryColumn::From => "{from_name from_addr}",
+            QueryColumn::To => "{to_addrs}",
+            QueryColumn::Body => "{body}",
+        }
+    }
+}
+
+/// One term of a parsed query, as the user typed it.
+///
+/// Split from [`Cache::search`] so the parsing rules can be tested without a database: "what does
+/// this string mean" and "what SQL does it become" are two questions, and only the second needs a
+/// cache. Unknown prefixes stay whole: a typo like `frm:boss` should search for the literal text
+/// rather than silently return nothing, which is what treating it as a prefix would do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTerm {
+    /// A text term, optionally scoped to one column.
+    Text {
+        column: Option<QueryColumn>,
+        text: String,
+    },
+    /// `has:attachment` — the only structured predicate in this slice.
+    HasAttachment,
+}
+
+/// Parse a query string into terms.
+///
+/// Every whitespace-separated word is looked at for a `prefix:` head from the tables below. The set
+/// on purpose does not cover the whole syntax `design/09` §1 lists: dates and flags are structured
+/// predicates and belong to the next slice, because they change the `WHERE` rather than the FTS
+/// expression.
+pub fn parse_query(input: &str) -> Vec<QueryTerm> {
+    let mut terms = Vec::new();
+    for raw in input.split_whitespace() {
+        let term = raw.replace(['"', '\''], "");
         if term.is_empty() {
             continue;
         }
-        for clause in clauses_of(&term) {
-            match clause {
-                // A single token, so it is a phrase of one — FTS5 has no other way to say "this word".
-                Clause::Word(word) => clauses.push(format!("\"{word}\"")),
-                // Adjacent characters: `"账 单"` matches 账单 but not 账单-related text where the two
-                // characters are apart, which is what makes Chinese search precise.
-                Clause::Phrase(chars) => {
-                    let phrase: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
-                    clauses.push(format!("\"{}\"", phrase.join(" ")));
+        if let Some(rest) = term.strip_prefix("has:")
+            && rest.eq_ignore_ascii_case("attachment")
+        {
+            terms.push(QueryTerm::HasAttachment);
+            continue;
+        }
+        if let Some((head, rest)) = term.split_once(':')
+            && !rest.trim().is_empty()
+            && let Some(column) = column_of(head)
+        {
+            terms.push(QueryTerm::Text {
+                column: Some(column),
+                text: rest.to_string(),
+            });
+            continue;
+        }
+        // No prefix, or one this slice does not know: the whole word is the term. A user searching
+        // for the string `foo:bar` in a subject must still find it.
+        terms.push(QueryTerm::Text {
+            column: None,
+            text: term,
+        });
+    }
+    terms
+}
+
+fn column_of(head: &str) -> Option<QueryColumn> {
+    match head.to_ascii_lowercase().as_str() {
+        "subject" => Some(QueryColumn::Subject),
+        "from" | "sender" => Some(QueryColumn::From),
+        "to" | "cc" => Some(QueryColumn::To),
+        "body" | "filename" => Some(QueryColumn::Body),
+        _ => None,
+    }
+}
+
+/// The FTS5 MATCH expression for the text terms, and nothing else.
+///
+/// Column scoping is expressed with FTS5's own filter syntax (`{subject}: "账 单"`), so the
+/// tokenisation stays exactly what it was — the index and the query must keep using the same
+/// transformation (`the_index_and_the_query_use_the_same_transformation`), and that test is what
+/// keeps this function from "simplifying" the CJK handling away.
+pub fn match_expression(text_terms: &[QueryTerm]) -> String {
+    let mut clauses: Vec<String> = Vec::new();
+    for term in text_terms {
+        if let QueryTerm::Text { column, text } = term {
+            let head = column
+                .map(|c| format!("{}: ", c.filter()))
+                .unwrap_or_default();
+            for clause in clauses_of(text) {
+                match clause {
+                    Clause::Word(word) => {
+                        clauses.push(format!("{head}\"{word}\""));
+                    }
+                    Clause::Phrase(chars) => {
+                        let phrase: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
+                        clauses.push(format!("{head}\"{}\"", phrase.join(" ")));
+                    }
                 }
             }
         }
     }
-
     if clauses.is_empty() {
         // Nothing searchable. A bare `*` cannot match anything, so this is a safe no-op query.
         return String::new();
     }
     clauses.join(" AND ")
+}
+
+/// The FTS5 MATCH expression for a whole query string — the historical entry point, kept because
+/// it is what the tokenisation symmetry test pins. `match_expression` over `parse_query` is the
+/// same thing with prefixes understood.
+pub fn to_query(input: &str) -> String {
+    match_expression(&parse_query(input))
 }
 
 #[derive(Clone)]
@@ -1480,20 +1580,52 @@ impl Cache {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
 
-        let expression = to_query(query);
-        if expression.is_empty() {
+        let terms = parse_query(query);
+        let expression = match_expression(&terms);
+        let want_attachments = terms.contains(&QueryTerm::HasAttachment);
+        if expression.is_empty() && !want_attachments {
+            // Nothing searchable — a bare `has:` typo or an empty box.
             return Ok(Vec::new());
         }
 
-        let mut stmt = conn.prepare(
-            "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
-             from (select rowid from search where search match ?1) f
-             join messages m on m.search_rowid = f.rowid
-             where m.account_id = ?2
-             order by m.date desc, m.uid desc
-             limit ?3",
-        )?;
-        let rows = stmt.query_map(params![expression, account_id, i64::from(limit)], |row| {
+        // `has:attachment` is the one predicate of this slice that the FTS cannot answer: it is a
+        // fact about the stored message, not about its indexed text. EXISTS over `bodies` reads the
+        // saved JSON and counts the array — an empty array is 0, and a row whose body was never
+        // fetched has no row at all, which is the same answer ("cannot prove it has an attachment").
+        let attachment_clause = if want_attachments {
+            " and exists (select 1 from bodies b
+                    where b.account_id = m.account_id
+                      and b.folder = m.folder
+                      and b.uid = m.uid
+                      and json_array_length(json_extract(b.detail, '$.attachments')) > 0)"
+        } else {
+            ""
+        };
+        // Two shapes, and the distinction matters: with no text to match, the FTS index is not a
+        // starting point but a dead end — an empty MATCH expression returns no rows at all, which is
+        // how a bare `has:attachment` silently found nothing before its test was written.
+        let sql = if expression.is_empty() {
+            format!(
+                "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
+                  from messages m
+                  where m.account_id = ?1{attachment_clause}
+                  order by m.date desc, m.uid desc
+                  limit ?2"
+            )
+        } else {
+            format!(
+                "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
+                  from (select rowid from search where search match ?1) f
+                  join messages m on m.search_rowid = f.rowid
+                  where m.account_id = ?2{attachment_clause}
+                  order by m.date desc, m.uid desc
+                  limit ?3"
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        // One row-mapping for both shapes: they differ only in which query drove them.
+        fn hit_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
             Ok(SearchHit {
                 folder: row.get(0)?,
                 uid: row.get::<_, i64>(1)? as u32,
@@ -1503,8 +1635,16 @@ impl Cache {
                 date: row.get(5)?,
                 seen: row.get::<_, i64>(6)? != 0,
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+
+        let rows = if expression.is_empty() {
+            stmt.query_map(params![account_id, i64::from(limit)], hit_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![expression, account_id, i64::from(limit)], hit_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows)
     }
 
     /// Rebuild one FTS row from whatever is currently cached for that message.
@@ -2172,6 +2312,174 @@ mod tests {
         }
         let cache = Cache::open(&path).expect("final reopen");
         assert_eq!(uids(&cache, "主题3"), vec![3], "the finished index answers");
+    }
+
+    // ---------------------------------------------------------------- query syntax
+
+    #[test]
+    fn parse_query_understands_field_prefixes_and_falls_back_to_literal_text() {
+        use crate::cache::QueryColumn::*;
+        use crate::cache::QueryTerm::*;
+
+        assert_eq!(
+            parse_query("账单"),
+            vec![Text {
+                column: None,
+                text: "账单".to_string()
+            }]
+        );
+        assert_eq!(
+            parse_query("subject:账单"),
+            vec![Text {
+                column: Some(Subject),
+                text: "账单".to_string()
+            }]
+        );
+        assert_eq!(
+            parse_query("from:boss@example.com"),
+            vec![Text {
+                column: Some(From),
+                text: "boss@example.com".to_string()
+            }]
+        );
+        assert_eq!(parse_query("has:attachment"), vec![HasAttachment]);
+        assert_eq!(
+            parse_query("frm:boss"),
+            vec![Text {
+                column: None,
+                text: "frm:boss".to_string()
+            }],
+            "a prefix we do not know is literal text: a typo must still be searchable"
+        );
+        assert_eq!(
+            parse_query("filename:报告.pdf"),
+            vec![Text {
+                column: Some(Body),
+                text: "报告.pdf".to_string()
+            }],
+            "attachment names are indexed in the body column (round 71), so filename: maps there"
+        );
+        assert_eq!(
+            parse_query("From:boss"),
+            vec![Text {
+                column: Some(From),
+                text: "boss".to_string()
+            }],
+            "prefixes are case-insensitive the way users type them"
+        );
+        assert_eq!(parse_query("  账单   has:attachment  ").len(), 2);
+        assert_eq!(parse_query("").len(), 0);
+        assert_eq!(
+            parse_query("subject:"),
+            vec![Text {
+                column: None,
+                text: "subject:".to_string()
+            }],
+            "a prefix with nothing after it is not a prefix"
+        );
+    }
+
+    #[test]
+    fn a_prefixed_query_scopes_to_its_column_and_still_matches_chinese() {
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "月度对账单", "bank@example.com", 100),
+                    summary(2, "开会通知", "boss@example.com", 200),
+                ],
+            )
+            .unwrap();
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail(1, "月度对账单", "正文里有账单两个字"),
+            )
+            .unwrap();
+
+        // Scoped to the subject: the body of message 1 also says 账单, and must not be found.
+        assert_eq!(uids(&cache, "subject:对账单"), vec![1]);
+        assert_eq!(uids(&cache, "from:bank"), vec![1]);
+        assert_eq!(uids(&cache, "from:boss"), vec![2]);
+        assert_eq!(
+            uids(&cache, "body:正文"),
+            vec![1],
+            "body: is the column that means the text, with or without a prefix"
+        );
+        // Chinese inside a scope: the tokenisation must not change with the prefix.
+        assert_eq!(uids(&cache, "subject:对账"), vec![1]);
+        // An ASCII term through a scoped column behaves like the unscoped one.
+        assert_eq!(uids(&cache, "from:example.com").len(), 2);
+    }
+
+    #[test]
+    fn has_attachment_only_finds_mail_that_has_one() {
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "季度报表", "boss@example.com", 100),
+                    summary(2, "发票已开具", "shop@example.com", 200),
+                    summary(3, "纯正文", "plain@example.com", 300),
+                ],
+            )
+            .unwrap();
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail_with_attachments(1, "季度报表", "看附件", &["报告.pdf"]),
+            )
+            .unwrap();
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail_with_attachments(2, "发票已开具", "看附件", &["invoice.pdf"]),
+            )
+            .unwrap();
+        // Message 3 has no body stored at all: no row in `bodies`, so it cannot prove an attachment.
+        assert_eq!(
+            uids(&cache, "has:attachment"),
+            vec![2, 1],
+            "newest first, both attachments"
+        );
+
+        // Combined with a field: only the attachment mail that also matches.
+        cache
+            .put_detail("acc", "INBOX", &detail(1, "季度报表", "看附件"))
+            .expect("re-store 1 as body-only");
+        assert_eq!(
+            uids(&cache, "has:attachment from:shop"),
+            vec![2],
+            "the EXISTS clause must narrow the FTS hits, not replace them"
+        );
+        assert_eq!(
+            uids(&cache, "has:attachment invoice"),
+            vec![2],
+            "a bare word plus the attachment predicate"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_query_still_finds_a_literal_colon_word() {
+        // The regression that a "silently return nothing" prefix parser would produce: the user
+        // searches for text that happens to contain a colon.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "会议: 十点", "boss@example.com", 100)],
+            )
+            .unwrap();
+        assert_eq!(uids(&cache, "会议: 十点").len(), 1);
+        assert_eq!(uids(&cache, "subject:会议").len(), 1);
     }
 
     // ---------------------------------------------------------------- paging
