@@ -2174,6 +2174,76 @@ mod tests {
         assert_eq!(uids(&cache, "主题3"), vec![3], "the finished index answers");
     }
 
+    // ---------------------------------------------------------------- paging
+
+    #[test]
+    fn paging_by_offset_neither_repeats_nor_skips_a_row() {
+        // Paging is the model the list moved to (round 75: `limit` used to grow and every press
+        // re-read the whole visible window). The property that makes it safe is this one: the
+        // pages, concatenated, are exactly the rows a single unbounded read would have returned —
+        // no row twice, none missing. An overlap hides mail (a row that shifts between pages) and a
+        // gap hides it just as permanently, so both directions are asserted here rather than left to
+        // the SQL being obviously right.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &(1..=10)
+                    .map(|uid| {
+                        summary(
+                            uid,
+                            &format!("主题{uid}"),
+                            "boss@example.com",
+                            i64::from(uid),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+        let mut seen: Vec<u32> = Vec::new();
+        for offset in (0..12).step_by(4) {
+            let page = cache
+                .list_summaries("acc", "INBOX", 4, offset)
+                .expect("page");
+            for row in &page {
+                assert!(
+                    !seen.contains(&row.uid),
+                    "uid {} appeared on two pages (offset {offset})",
+                    row.uid
+                );
+            }
+            // Newest first, per page: the renderer appends without re-sorting, so this is load-bearing.
+            let uids: Vec<u32> = page.iter().map(|m| m.uid).collect();
+            assert!(
+                uids.windows(2).all(|w| w[0] > w[1]),
+                "page at offset {offset} is not ordered newest-first: {uids:?}"
+            );
+            seen.extend(uids);
+        }
+        assert_eq!(
+            seen.len(),
+            10,
+            "three pages of four rows must cover exactly the ten rows there are"
+        );
+        // Past the end: empty, not an error, and not a repeat of the last page.
+        assert!(
+            cache
+                .list_summaries("acc", "INBOX", 4, 10)
+                .expect("past end")
+                .is_empty()
+        );
+        assert!(
+            cache
+                .list_summaries("acc", "INBOX", 4, 99)
+                .expect("far past")
+                .is_empty()
+        );
+    }
+
+    // ---------------------------------------------------------------- rebuild
+
     #[test]
     fn a_rebuild_clears_the_index_before_it_starts() {
         // The half of the operation users can get wrong: if `begin` quietly rebuilt as it went, a

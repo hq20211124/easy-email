@@ -11,6 +11,52 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### 列表按 offset 分页：换掉"limit 越加越大"（15 块第三片 / M1b 分页）✅（第 75 轮）
+
+**依据**：`design/19` §7 那条过渡实现的清理项（"用户的『加载更多』语义保留，但底层模型必须换掉"）、
+`design/15` §6 的"IPC 分页 ≤ 200 行"。
+
+**动手前先读代码，发现清单本身是过时的**：`MAX_LIST_ROWS` **早就没了**；真正在增长的是前端的
+`state.limit`，而它的代价此前没人量过——点一次「加载更多」做的是
+`invoke('list_messages', { limit: state.limit + PAGE_SIZE })`：
+**把整个已显示窗口重新取一遍**（IPC 载荷与前端 `slice().sort()` 都是 O(已显示行数)），
+**而且 `list_messages` 会先触发一次 IMAP 刷新**——"看更早的邮件"要先同步一遍。
+
+**做了什么**：
+- **后端** `message_page(account, mailbox, offset, limit)`：`offset` 是行偏移（不是 UID），
+  `limit` clamp 到 ≤200（§6 的 IPC 上限），**只读缓存**（命令体里没有 `refresh_folder`/`pool_op`，
+  门禁逐条钉住）。与 `list_messages` 的分工写进文档注释：后者是**首屏**入口（负责刷新），
+  前者是翻页；与 `load_more_messages`（往更旧回填、真的要联网）也点名区分。
+- **前端** `loadOlder()` 改成：按 `offset: state.messages.length` 取一页 → 有行就
+  **`appendUnique` 追加**（按 UID 去重，不再全量替换与全量排序）→ 空页才问服务器 →
+  仍空才 `historyDone`。`state.limit` 这个"不再变化的变量"整个删除；按钮显隐从
+  `messages.length < state.limit` 改成 `historyDone`（后者才是"两个来源都到底了"的诚实答案）。
+- **规则改写但没削弱**：`historyStep({ shownCount, cachedCount, serverDone })` →
+  `historyStep({ pageCount, serverDone })`。分页之后"已显示"与"已缓存"**按构造就是同一个数**，
+  比较它们是表演；"这一页有没有行"是同一个问题的诚实问法。旧 bug 的形状
+  （"缓存还有行却报 done"）在这种签名下**根本写不出来**，`tools/history_test.mjs` 照旧钉住它。
+
+**测试**：Rust +1（`paging_by_offset_neither_repeats_nor_skips_a_row`：10 行、limit 4 ⇒ 三页 4/4/2，
+并起来正好 10 行、任一页与前页交集为空、每页仍按时间倒序——**"不重不漏"是分页唯一能藏住邮件的两个方向**），
+另有一条既有的 `summaries_come_back_newest_first_with_paging` 保留。
+→ **WSL 376 passed / 7 ignored**（375+1），clippy/fmt 干净，前端七个门禁脚本全过。
+
+**门禁 35 → 36 步**：新增「the list pages by offset instead of growing a limit」——
+`message_page` 已注册、app.js 真的用它且 `offset = 已显示行数`、`state.limit` 不得再被赋值或相加、
+分页页命令体不得出现 `refresh_folder`/`pool_op`/`secret_for`、`history.js` 必须用 `pageCount` 且
+app.js 不得再传 `cachedCount`。
+
+**又一次踩了同一个 PowerShell 坑**：新步骤里写了 `"...$forbidden: ..."`，
+`$var:` 被当成**驱动器限定变量名**，5.1 解析器直接拒收整个文件（`parse_errors=1`）——
+第 72 轮踩过一次、修过一次，这次重犯。**是探针每次都重跑、语法错误零容忍**把它挡在提交之前；
+已改用拼接，并把这个坑写进注释（字符串里带 `:` 的变量必须 `${}` 或 `+`）。
+
+**未做/未验**：虚拟列表渲染（下一片，验收用第 74 轮的 `bench-scroll.mjs` 前后对比）、
+搜索结果分页（M2）；**真机未验**（要在真账号上连点几次「加载更多」，确认行不重不漏、
+按钮在到底时消失——WSL 没有 GUI）。
+
+---
+
 ### P3 的尺子：能测出坏的滚动采样器（15 块第二片）✅（第 74 轮）
 
 **为什么先造尺子**：M1b 下一片就是分页 + 虚拟列表，而 **P3 连测量仪都没有**

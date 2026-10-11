@@ -19,15 +19,23 @@
   'use strict';
 
   /**
-   * Which source the next page comes from.
+   * Which source answers 「加载更多」 next.
    *
-   * `shownCount` is what the list is displaying, `cachedCount` what the local cache holds for this
-   * folder, `serverDone` whether a previous fetch already reported the bottom of the mailbox.
+   * `pageCount` is how many rows the **cache page** returned — not a comparison between "rows shown"
+   * and "rows cached", which is how this used to be phrased. With paging (round 75) those two counts
+   * are the same number by construction, so comparing them was theatre; asking for the next page and
+   * looking at what came back is the same question asked honestly.
+   *
+   * The rule is not weakened by that change, and the old bug is now structurally impossible: the
+   * failure was "report done while the cache still had rows the list had not shown", and a function
+   * whose only inputs are "did the cache page return rows" and "has the server run out" cannot
+   * produce that combination — rows on the page always win.
+   *
+   * @param {{pageCount: number, serverDone: boolean}} input
+   * @returns {'show-cached' | 'ask-server' | 'done'}
    */
-  function historyStep({ shownCount, cachedCount, serverDone }) {
-    // Strictly greater: equal counts mean the list already shows everything cached, so there is
-    // nothing to reveal locally and the server is the only place left to look.
-    if (Number(cachedCount) > Number(shownCount)) return 'show-cached';
+  function historyStep({ pageCount, serverDone }) {
+    if (Number(pageCount) > 0) return 'show-cached';
     if (serverDone) return 'done';
     return 'ask-server';
   }

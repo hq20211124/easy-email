@@ -631,7 +631,6 @@ async function loadMailboxes() {
 
   const inbox = state.mailboxes.find((box) => box.name.toUpperCase() === 'INBOX');
   selectMailbox(inbox ?? state.mailboxes[0]);
-  state.limit = PAGE_SIZE;
   renderMailboxes();
   await loadMessages({ reset: true });
   // After the first page is on screen, and never before: the top-up is worth a round trip only when
@@ -934,7 +933,6 @@ function renderMailboxes() {
       // while loading an account, where jumping out of drafts would be exactly wrong.
       state.view = 'mail';
       selectMailbox(box);
-      state.limit = PAGE_SIZE;
       renderMailboxes();
       loadMessages({ reset: true });
     });
@@ -1534,7 +1532,6 @@ async function openSentCopy(item) {
   state.view = 'mail';
   exitSearchMode({ reload: false });
   selectMailbox(box);
-  state.limit = PAGE_SIZE;
   renderMailboxes();
   await loadMessages({ reset: true });
 
@@ -1589,16 +1586,18 @@ async function loadOlder() {
   button.disabled = true;
   button.textContent = '正在加载更早的邮件…';
 
-  const local = await run('读取本地缓存', () =>
-    invoke('list_messages', {
+  const page = await run('读取本地缓存', () =>
+    invoke('message_page', {
       accountId: state.accountId,
       mailbox: state.mailbox,
-      // One page more than what is on screen. `list_messages` reads the cache newest-first, so this is
-      // "the same list, one page longer".
-      limit: state.limit + PAGE_SIZE,
+      // A page, not "everything so far plus one more": the offset is the number of rows already on
+      // screen, so each press transfers one page instead of re-reading the whole visible window
+      // (round 75). No refresh happens on this path — asking to see older mail must not cost a sync.
+      offset: state.messages.length,
+      limit: PAGE_SIZE,
     })
   );
-  if (local === null) {
+  if (page === null) {
     // Failed: put the button back so the user can retry, and leave the list alone.
     button.disabled = false;
     renderHistoryButton();
@@ -1606,14 +1605,16 @@ async function loadOlder() {
   }
 
   const step = history.historyStep({
-    shownCount: state.messages.length,
-    cachedCount: local.length,
+    pageCount: page.length,
     serverDone: state.historyDone,
   });
 
   if (step === 'show-cached') {
-    state.limit += PAGE_SIZE;
-    state.messages = local.slice().sort((a, b) => b.uid - a.uid);
+    // Append. `list_summaries` orders by date desc, uid desc and the offset is what is already on
+    // screen, so the page continues the list — no re-sorting the whole window, which is what made
+    // every press O(rows shown). Dedup by UID stays as a guard: a sync that inserted new mail
+    // between two presses can shift the window by one row.
+    state.messages = appendUnique(state.messages, page);
     renderMessages();
     button.disabled = false;
     renderHistoryButton();
@@ -1627,7 +1628,7 @@ async function loadOlder() {
     return;
   }
 
-  const page = await run('加载更早的邮件', () =>
+  const older = await run('加载更早的邮件', () =>
     invoke('load_more_messages', {
       accountId: state.accountId,
       mailbox: state.mailbox,
@@ -1635,27 +1636,36 @@ async function loadOlder() {
     })
   );
 
-  if (page === null) {
+  if (older === null) {
     button.disabled = false;
     renderHistoryButton();
     return;
   }
 
-  if (page.messages.length > 0) {
-    const known = new Set(state.messages.map((m) => m.uid));
-    const added = page.messages.filter((m) => !known.has(m.uid));
-    state.messages = state.messages.concat(added).sort((a, b) => b.uid - a.uid);
-    // The visible window grew by exactly what arrived, so the next press asks the cache for the window
-    // after this one rather than asking for a page that is already on screen.
-    state.limit = state.messages.length;
+  if (older.messages.length > 0) {
+    state.messages = appendUnique(state.messages, older.messages);
     renderMessages();
   }
 
-  if (page.done || page.messages.length === 0) {
+  if (older.done || older.messages.length === 0) {
     state.historyDone = true;
   }
   button.disabled = false;
   renderHistoryButton();
+}
+
+/**
+ * Append rows that are not already listed, keeping the newest-first order.
+ *
+ * The order argument: the server returns rows already sorted newest-first (the cache query is
+ * `order by date desc, uid desc`) and every append continues below what is on screen, so the
+ * concatenation stays ordered. Rows are still de-duplicated by UID — the window can shift between
+ * two presses if a sync inserted mail in between, and a repeated row in the list is a bug a user
+ * would notice ("the same mail twice") but a skipped row is one they might not.
+ */
+function appendUnique(existing, incoming) {
+  const known = new Set(existing.map((m) => m.uid));
+  return existing.concat(incoming.filter((m) => !known.has(m.uid)));
 }
 
 /** Put the load-more button into the state the current knowledge implies. */
@@ -1672,7 +1682,6 @@ async function loadMessages({ reset = false } = {}) {
   // trip and paint mail over the list the user is looking at.
   if (state.view !== 'mail') return;
   if (reset) {
-    state.limit = PAGE_SIZE;
     state.selectedUid = null;
     state.selectedMessage = null;
     state.detail = null;
@@ -1700,7 +1709,9 @@ async function loadMessages({ reset = false } = {}) {
     invoke('list_messages', {
       accountId: state.accountId,
       mailbox: state.mailbox,
-      limit: state.limit,
+      // The first page only. 「加载更多」 pages from here by offset (`message_page`), so this number
+      // is a page size, not a growing window — `state.limit` used to be the growing one and is gone.
+      limit: PAGE_SIZE,
     })
   );
 
@@ -1870,7 +1881,11 @@ function renderMessages() {
     }
   }
 
-  $('list-footer').hidden = state.messages.length < state.limit;
+  // The button answers "is there more", not arithmetic on a limit. With paging the honest question is
+  // "have both sources run out", and `historyDone` is exactly that answer. The old test
+  // (`messages.length < state.limit`) only worked because that limit used to grow with every press —
+  // which is the thing round 75 removed.
+  $('list-footer').hidden = state.historyDone;
 }
 
 /** Open or close one conversation in the list. */

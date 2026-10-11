@@ -682,6 +682,66 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the list pages by offset instead of growing a limit' {
+        # Round 75. The load-more path used to ask for `limit = shown + PAGE_SIZE`, i.e. re-read the
+        # entire visible window on every press (payload and re-sort both grew with the screen), and it
+        # called `list_messages`, which refreshes the folder — so asking to see older mail cost a sync.
+        # Regressing to the growing limit is silent: the list still works, just slowly.
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $history = Get-Content 'src/history.js' -Raw -Encoding UTF8
+        $problems = @()
+
+        if ($lib -notmatch 'fn message_page\(') {
+            $problems += 'lib.rs must expose message_page(offset, limit)'
+        } elseif ($lib -notmatch "(?m)^\s+message_page,\s*$") {
+            $problems += 'message_page exists but is missing from generate_handler!'
+        }
+        if ($js -notmatch "invoke\('message_page'") {
+            $problems += 'app.js must page with message_page — the growing-limit path is what this step removed'
+        }
+        if ($js -notmatch 'offset:\s*state\.messages\.length') {
+            $problems += 'the load-more page must be offset by what is already on screen, not by a growing limit'
+        }
+        if ($js -match 'state\.limit\s*=') {
+            $problems += 'app.js still assigns state.limit — that variable grew with every press and is gone by design'
+        }
+        if ($js -match 'state\.limit\s*\+') {
+            $problems += "app.js still asks for 'more than what is on screen'; page by offset instead"
+        }
+
+        # The page must not smuggle a refresh in: asking for older mail must not cost a sync.
+        $start = $lib.IndexOf('async fn message_page(')
+        if ($start -ge 0) {
+            $end = $lib.IndexOf("`n}", $start)
+            $body = if ($end -gt $start) { $lib.Substring($start, $end - $start) } else { $lib.Substring($start) }
+            foreach ($forbidden in @('refresh_folder', 'pool_op', 'secret_for')) {
+                if ($body -match $forbidden) {
+                    # `$forbidden:` parses as a drive-qualified variable name, so the string is built
+                    # by concatenation. The 5.1 parser probe is what catches this — it rejected the file
+                    # outright the first time, which is a much cheaper failure than a broken gate run.
+                    $problems += ('message_page reaches for ' + $forbidden + ': paging reads the cache, it must not talk to the server')
+                }
+            }
+        }
+
+        # The two halves of the rule must agree on the question they ask.
+        if ($history -notmatch 'pageCount') {
+            $problems += 'history.js must take pageCount — with paging, "shown vs cached" is theatre (both are the same number)'
+        }
+        if ($js -match 'cachedCount:') {
+            $problems += 'app.js still passes cachedCount — that was the pre-paging rule shape'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the list pages by offset, reads only the cache, and both halves agree on the rule'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

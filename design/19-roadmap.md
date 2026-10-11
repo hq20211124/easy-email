@@ -132,7 +132,7 @@ M0 库探针 + DB 读池 ──┬─► 03 存储 v3（双库/迁移）──�
 | `src-tauri/lib.rs`（约 90 个命令的目标） | **替换**：拆 `commands/*.rs`，错误统一成 `ApiError` |
 | `src/app.js`（47 KB，单文件） | **替换**：P1 决策后按 `12` 重建；分阶段切换（02 §7.3） |
 | `tools/check.ps1`（11 项） | **演进**：每块加 4-6 项，最终约 40 项。**注意 5 项前端检查的输入路径要跟着新前端改**（现在读 `src/app.js`/`src/index.html`：语法、id 引用、CSP 不变量、命令注册、宽度规则）；新前端上线后它们要指向 `web/src/**` 与构建产物，否则"检查通过"会变成假象。这一步属于 M1a 的前端切换块，**不许漏** |
-| 根 `PLAN.md` 的 `load_more_messages` + `MAX_LIST_ROWS`（把 limit 越加越大） | **过渡实现，M1b 换成分页**（`message_page(offset, limit)` + 虚拟列表）。用户的"加载更多"语义保留，但底层模型必须换掉；换的时候同步删掉 `MAX_LIST_ROWS` 与相关检查 |
+| 根 `PLAN.md` 的 `load_more_messages` + `MAX_LIST_ROWS`（把 limit 越加越大） | **过渡实现，M1b 换成分页**（`message_page(offset, limit)` + 虚拟列表）。用户的"加载更多"语义保留，但底层模型必须换掉；换的时候同步删掉 `MAX_LIST_ROWS` 与相关检查。**第 75 轮已完成一半**：`MAX_LIST_ROWS` 早就不存在，真正在增长的是前端的 `state.limit` —— 现已换成 `message_page(offset, limit)`（只读缓存、不刷新、每次一页），`state.limit` 一并删除；**剩虚拟列表**（§6 视口 ± 8 行 + rAF 批量提交），验收用 `tools\bench-scroll.mjs`（第 74 轮）前后对比 |
 | `tests/loopback.rs`（1814 行） | **演进**：假服务器扩展到 POP3/JMAP/Graph/OAuth/CalDAV |
 | `PLAN.md`（历史回填 + 离线提示） | **属于 M1 的子块**，可先做（它的设计已在 `04` 里被吸收并升级） |
 

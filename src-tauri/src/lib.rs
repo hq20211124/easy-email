@@ -702,6 +702,42 @@ async fn list_messages(
     }
 }
 
+/// One page of the message list, straight from the cache. **No network, no refresh.**
+///
+/// This is the paging endpoint the list moved to in round 75, and it is deliberately *not* the same
+/// command as [`Self::list_messages`]:
+///
+/// * `list_messages` is the **first page** loader — it refreshes the folder first, because arriving
+///   at a mailbox should show something fresh even when the network is the slow part;
+/// * `message_page` is what 「加载更多」 calls, and it only reads what is already cached. It used to
+///   call `list_messages`, which meant every press re-read the *entire* visible window (so both the
+///   IPC payload and the frontend's re-sort grew with what was on screen) and triggered a full IMAP
+///   refresh before it could show anything older.
+///
+/// `offset` is a row offset in the cached ordering (newest first), not a UID: it is the number of
+/// rows the list already shows. `limit` is capped at `design/15` §6's IPC bound (≤ 200 rows per
+/// transfer); the offset is clamped rather than rejected, because a stale offset from a folder the
+/// user just switched away from is a normal thing for the renderer to send.
+#[tauri::command]
+async fn message_page(
+    state: State<'_, AppState>,
+    account_id: String,
+    mailbox: String,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<MessageSummary>, String> {
+    // The account has to exist — otherwise this would page a folder id that nothing knows about.
+    state.find(&account_id)?;
+    let limit = limit.clamp(1, 200);
+    let offset = offset.min(1_000_000);
+
+    state
+        .cache
+        .clone()
+        .list_summaries(&account_id, &mailbox, limit as u32, offset as u32)
+        .map_err(describe)
+}
+
 /// Every cached message of one conversation, across folders, oldest first.
 ///
 /// No network: the conversation is assembled from what is already on disk, so this is the cheap half
@@ -3088,6 +3124,7 @@ pub fn run() {
             index_bodies,
             index_coverage,
             install_update,
+            message_page,
             rebuild_search_begin,
             rebuild_search_step,
             list_messages,

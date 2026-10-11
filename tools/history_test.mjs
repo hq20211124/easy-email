@@ -40,22 +40,24 @@ const checkNot = (label, actual, unwanted) => {
 };
 
 // ---------------------------------------------------------------- the cache comes first
-// The exact shape of the reported bug: 50 on screen, 192 cached, server untouched.
-check('a cache holding more than the list is shown first', historyStep({ shownCount: 50, cachedCount: 192, serverDone: false }), 'show-cached');
+// Round 75 changed the question from "shown vs cached" (two counts that are equal by construction
+// once the list pages) to "did the cache page return rows". These assertions are the same rule in
+// the new shape: a page with rows is always shown, whatever the server has or has not said.
+check('a page of cached rows is shown first', historyStep({ pageCount: 50, serverDone: false }), 'show-cached');
 // Even when a previous server fetch already said "that is the bottom", cached rows the list has not
 // shown yet must still be reachable: the two facts are about different sources.
-check('cached rows still win over a finished server walk', historyStep({ shownCount: 50, cachedCount: 192, serverDone: true }), 'show-cached');
-check('one more cached row is enough to show locally', historyStep({ shownCount: 191, cachedCount: 192, serverDone: false }), 'show-cached');
+check('cached rows still win over a finished server walk', historyStep({ pageCount: 1, serverDone: true }), 'show-cached');
+check('one more cached row is enough to show locally', historyStep({ pageCount: 1, serverDone: false }), 'show-cached');
 
 // ---------------------------------------------------------------- then the server
-check('an exhausted cache asks the server', historyStep({ shownCount: 192, cachedCount: 192, serverDone: false }), 'ask-server');
-check('an empty cache asks the server', historyStep({ shownCount: 0, cachedCount: 0, serverDone: false }), 'ask-server');
+check('an exhausted cache asks the server', historyStep({ pageCount: 0, serverDone: false }), 'ask-server');
 
 // ---------------------------------------------------------------- and only then "no more"
-check('both exhausted means done', historyStep({ shownCount: 192, cachedCount: 192, serverDone: true }), 'done');
-// A list showing *fewer* rows than the cache with a finished server walk is not done either: this is
-// the exact combination the bug produced, and 'done' there is the wrong answer that hid the mail.
-checkNot('done is never reported while the cache has something to show', historyStep({ shownCount: 0, cachedCount: 1, serverDone: true }), 'done');
+check('both exhausted means done', historyStep({ pageCount: 0, serverDone: true }), 'done');
+// The exact combination the 2026-07 bug produced — the list was told "done" while cached rows it had
+// not shown were still there. In this shape it cannot be written down, and the assertion below is
+// what keeps that true if someone reintroduces a "shown vs cached" comparison.
+checkNot('done is never reported while a cache page has rows', historyStep({ pageCount: 1, serverDone: true }), 'done');
 
 if (failures.length > 0) {
   for (const failure of failures) console.error(`- ${failure}`);
