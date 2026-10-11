@@ -2,12 +2,17 @@
     App-level benchmarks for Easy Email (design/15 §4): P1 cold start, P3 scrolling, P5 resident
     memory, P6 idle CPU.
 
-    These four need the **running desktop shell**, which is why they are not in `tools/bench.ps1`:
+    These four need the **running desktop shell**, which is why they are not in `tools\bench.ps1`:
     the storage benchmark measures the database, and reporting its numbers as "the app is fast" is
     the mistake this split exists to prevent. They also could not be measured in the environment
     where the rest of the report was produced — a GUI process started there exited immediately with
     no window and no log line — so **the numbers in reports/performance.md for P1/P3/P5/P6 are
     missing, not estimated.**
+
+    P3 (round 74) is no longer a placeholder: it drives a scroll sweep inside the running window via
+    `tools\bench-scroll.mjs`, which judges both of P3's budgets (60 fps, ≤ 40 rows changed per frame)
+    and exits non-zero when they are missed. What still needs a human is the **run**: the app has to
+    be built with `--remote-debugging-port` and this script started against a real profile.
 
     Usage:
         powershell -ExecutionPolicy Bypass -File tools\bench-app.ps1
@@ -105,9 +110,42 @@ $results['P6_idle_cpu_percent'] = $idlePercent
 Write-Host ("`nP6 空闲 CPU（60 秒）：{0:N2} %   （预算 ≤ 0.5%）" -f $idlePercent) -ForegroundColor Cyan
 
 # ---------------------------------------------------------------- P3: scrolling
-Write-Host "`nP3 列表滚动：需要 CDP 驱动滚动脚本，本脚本不假装能测。" -ForegroundColor Yellow
-Write-Host "    用 node tools/inspect-dom.mjs 的通道手动跑（见 design/15 §6：60fps、每帧 DOM 变更 ≤ 40 行）。"
-$results['P3_scroll_fps'] = $null
+# The placeholder here used to say "this script will not pretend to measure it". It can now:
+# `tools\bench-scroll.mjs` drives the scroll inside the running window and judges both budgets
+# itself, so this step inherits its verdict instead of re-implementing the comparison here.
+Write-Host "`nP3 列表滚动：CDP 采样（design/15 §4：60 fps、每帧 DOM 变更 ≤ 40 行）…" -ForegroundColor Cyan
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    Write-Host "  node not found on PATH；跳过（这是采样器需要的运行时）。" -ForegroundColor Yellow
+    $results['P3_scroll_fps'] = $null
+} else {
+    $scroll = & node tools\bench-scroll.mjs --port $Port --json 2>&1
+    $scrollCode = $LASTEXITCODE
+    $jsonLine = @($scroll | Where-Object { $_ -match '^P3 \{' }) | Select-Object -First 1
+    if ($jsonLine) {
+        $p3 = ($jsonLine -replace '^P3 ', '') | ConvertFrom-Json
+        $results['P3_scroll_fps'] = $p3.fps
+        $results['P3_frame_ms_p95'] = $p3.frameMsP95
+        $results['P3_rows_changed_per_frame_max'] = $p3.rowsChangedPerFrameMax
+        $results['P3_rows_in_dom'] = $p3.rows
+        Write-Host ("  fps {0}   帧时 P95 {1} ms   单帧最多变更 {2} 行   DOM 里 {3} 行" -f `
+            $p3.fps, $p3.frameMsP95, $p3.rowsChangedPerFrameMax, $p3.rows)
+        # A sample of nothing is not a pass. An empty profile has no rows to scroll, and reporting
+        # its 60 fps as P3 would be the exact "checks that cannot fail" mistake this repo keeps
+        # writing down.
+        if ($p3.rows -lt 1) {
+            Write-Host "  列表里一行都没有 —— 应用可能还没进收件箱；这一项不算测到。" -ForegroundColor Yellow
+            $results['P3_rows_changed_per_frame_max'] = $null
+            $results['P3_scroll_fps'] = $null
+        } elseif ($scrollCode -ne 0) {
+            Write-Host "  P3 未达标（采样器已判失败，详见 tools\bench-scroll.mjs 的输出）。" -ForegroundColor Red
+        } else {
+            Write-Host "  P3 在这个形状下达标（注意：这不是 10 万封的形状）。" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  采样器没有产出可解析的结果 —— 它多半连不上调试端口。" -ForegroundColor Red
+        $scroll | ForEach-Object { Write-Host "  $_" }
+    }
+}
 
 # ---------------------------------------------------------------- history
 $historyPath = 'target\bench-app-history.jsonl'

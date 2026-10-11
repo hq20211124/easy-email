@@ -72,7 +72,7 @@ if ($DebugProfile) {
 $Budgets = @(
     @{ Id = 'P1';  Name = '冷启动到列表可见';        Budget = '1.5 s';        Where = '需要跑起来的桌面壳（tools\bench-app.ps1 是那台测量仪；本轮未跑）' }
     @{ Id = 'P2';  Name = '切文件夹';                Budget = '200 ms';       Where = '' }
-    @{ Id = 'P3';  Name = '列表滚动 60 fps';         Budget = '60 fps';       Where = '没有测量手段：bench-app.ps1 头部提到它，脚本里没有实现' }
+    @{ Id = 'P3';  Name = '列表滚动 60 fps';         Budget = '60 fps';       Where = '需要跑起来的桌面壳（tools\bench-scroll.mjs + bench-app.ps1；本轮未跑）' }
     @{ Id = 'P4';  Name = '本地搜索 P95';            Budget = '100 ms';       Where = '' }
     @{ Id = 'P5';  Name = '常驻内存';                Budget = '300 MB';       Where = '需要跑起来的桌面壳（tools\bench-app.ps1；本轮未跑）' }
     @{ Id = 'P6';  Name = '空闲 CPU';                Budget = '0.5%';         Where = '需要跑起来的桌面壳（tools\bench-app.ps1；本轮未跑）' }

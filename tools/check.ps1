@@ -642,6 +642,46 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the scroll sampler exists, and it judges the P3 budgets instead of printing them' {
+        # Round 74. P3 (60 fps, ≤ 40 rows changed per frame) had **no instrument at all**:
+        # `bench-app.ps1` mentioned scrolling in its header and had a placeholder body. Without this
+        # step the next round's virtual-list work would be "done" on the strength of nothing — the
+        # shape of mistake this repo has now written down four times.
+        $scroll = Get-Content 'tools/bench-scroll.mjs' -Raw -Encoding UTF8
+        $app = Get-Content 'tools/bench-app.ps1' -Raw -Encoding UTF8
+        $problems = @()
+
+        if (-not (Test-Path 'tools/bench-scroll-fixture.html')) {
+            $problems += 'tools/bench-scroll-fixture.html is missing: the sampler needs a page whose slow path proves it can fail'
+        }
+        # Judging, not reporting: the budgets must appear in comparisons that end in a non-zero exit.
+        foreach ($budget in @('BUDGET_FPS', 'BUDGET_ROWS')) {
+            if ($scroll -notmatch [regex]::Escape($budget)) {
+                $problems += "bench-scroll.mjs never mentions $budget — it would be printing numbers, not judging them"
+            }
+        }
+        if ($scroll -notmatch 'process\.exit\(1\)') {
+            $problems += 'bench-scroll.mjs must exit non-zero when a budget is missed'
+        }
+        if ($scroll -notmatch 'MutationObserver') {
+            $problems += 'bench-scroll.mjs must count DOM changes with a MutationObserver (rows/frame is the budget being measured)'
+        }
+        if ($app -notmatch 'bench-scroll\.mjs') {
+            $problems += 'bench-app.ps1 must run the sampler — P3 is an app-level budget and this is the app-level runner'
+        }
+        if ($app -match '本脚本不假装能测') {
+            $problems += 'bench-app.ps1 still carries the P3 placeholder; the instrument exists now'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'P3 has an instrument that judges both budgets, wired into the app-level runner'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

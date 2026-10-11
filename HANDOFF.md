@@ -79,8 +79,12 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 
 下一批候选（按"最小最独立"排序）：**15 的分页 + 虚拟列表**（`design/19` §7 要求把
 `load_more_messages` 的"越加越大的 limit"换成 `message_page(offset, limit)`，"加载更多"的语义保留
-但底层模型换掉，并同步删掉 `MAX_LIST_ROWS` 及相关检查；验收是 10 万封 60 fps、每帧 DOM 变更 ≤ 40 行——
-**P3 目前完全没测**，所以改造前要先有测量手段）、09 的查询语法、04 离线队列完整化、16 诊断包；
+但底层模型换掉，并同步删掉 `MAX_LIST_ROWS` 及相关检查；验收是 10 万封 60 fps、每帧 DOM 变更 ≤ 40 行）。
+**尺子已经就位**（第 74 轮）：`tools\bench-scroll.mjs` 与"60 fps / 每帧 ≤40 行"当面对照、
+超了退出非 0，`tools\bench-scroll-fixture.html?mode=heavy` 实测能判失败（单帧 3000 行变更）；
+`bench-app.ps1` 会在应用应答后自动跑它。**跑它需要人点一次**：应用带
+`--remote-debugging-port` 构建（验完必须删掉，`check.ps1` 会拦），再
+`powershell -File tools\bench-app.ps1`。**改造前先跑一次拿基线，改造后再跑一次对比。**
 性能预算的**覆盖率**已变成机器检查（第 73 轮：`bench.ps1` 打印全部 16 项、自断言条数、
 `check.ps1` 钉住），实测 P2/P4/P7/P9/P10/P12/P13/P14/P15，未测 P1/P3/P5/P6/P8/P11/P16 各自写了原因
 ——**别再把"没测"写成"有"，也别把"有仪表"写成"没仪表"**：第 73 轮我连错两次

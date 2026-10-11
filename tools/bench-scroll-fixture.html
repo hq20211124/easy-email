@@ -1,0 +1,61 @@
+<!doctype html>
+<!--
+    Fixture for `tools/bench-scroll.mjs`. It exists so the P3 sampler can be shown to *fail* as well
+    as to pass: a bench that only ever reports success is how P3 went unmeasured for this long.
+
+    Two modes, chosen in the query string:
+      ?mode=fast   rows exist once and scrolling only moves the viewport — what a virtualised list
+                   does. Expect: ~0 rows changed per frame.
+      ?mode=heavy  every scroll event rebuilds every row — what a naive re-render of a loaded page
+                   does. Expect: hundreds of rows changed per frame, and a much worse frame time.
+
+    Extra knobs: ?n=2000 (row count), ?h=48 (row height in px).
+-->
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>bench-scroll fixture</title>
+    <style>
+      html, body { margin: 0; height: 100%; font: 14px/1.4 system-ui, sans-serif; background: #f6f6f4; }
+      #app { display: grid; grid-template-columns: 1fr; height: 100%; }
+      #message-list { overflow: auto; height: 100%; contain: strict; }
+      .message-row { height: var(--row-h, 48px); box-sizing: border-box; padding: 6px 12px; border-bottom: 1px solid #ddd; }
+      .message-row:nth-child(even) { background: #fff; }
+    </style>
+  </head>
+  <body>
+    <div id="app"><div id="message-list"></div></div>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const mode = params.get('mode') || 'fast';
+      const count = Number(params.get('n') || 300);
+      const height = Number(params.get('h') || 48);
+      const list = document.getElementById('message-list');
+      list.style.setProperty('--row-h', `${height}px`);
+
+      const row = (i) => {
+        const el = document.createElement('div');
+        el.className = 'message-row';
+        el.dataset.uid = String(i);
+        el.textContent = `第 ${i + 1} 封 · ${mode}`;
+        return el;
+      };
+
+      const buildAll = () => {
+        const frag = document.createDocumentFragment();
+        for (let i = 0; i < count; i += 1) frag.append(row(i));
+        list.replaceChildren(frag);
+      };
+      buildAll();
+
+      if (mode === 'heavy') {
+        // The shape the budget exists to catch: every scroll rebuilds the whole list. Nothing here
+        // is pathological on purpose — it is what "render the array into the DOM" does.
+        list.addEventListener('scroll', () => buildAll(), { passive: true });
+        document.title = `bench-scroll fixture (heavy, ${count} rows)`;
+      } else {
+        document.title = `bench-scroll fixture (fast, ${count} rows)`;
+      }
+    </script>
+  </body>
+</html>
