@@ -535,6 +535,12 @@ HTML 邮件渲染进 WebView2 时才出现。第 8 个是靠 CDP 探针进入沙
 
 ## 本地缓存与搜索（v0.2）
 
+**列表是窗口化的**：不管缓存里有多少封，DOM 里始终只有视口 ± 8 行（`design/15` §6）。
+行高固定 56px（`--msg-height`，CSS 与 `src/vlist.js` 的 `DEFAULT_ROW_HEIGHT` 共用一个值，
+`tools/vlist_test.mjs` 断言两者相等——一个变一个不变会让滚动时行慢慢漂移，而且任何地方都不报错）。
+滚动提交合并在一个 `requestAnimationFrame` 里。「加载更多」每次只取一页（`message_page`），
+追加而不是全量重取。
+
 `%APPDATA%\com.easyemail.desktop\cache.db`（SQLite，紧挨着 `accounts.json`，不想要就直接删）。
 缓存里**没有任何密码或授权码** —— 那些只在 Windows 凭据管理器里。
 

@@ -98,7 +98,18 @@ const state = {
    */
   unreadCounts: {},
   messages: [],
-  limit: PAGE_SIZE,
+  /**
+   * The list's windowed content: one descriptor per conversation row, plus one per message of each
+   * expanded conversation (`design/15` §6 — only the viewport ± 8 rows is ever in the DOM).
+   *
+   * Descriptors rather than elements because the window changes on every scroll: rebuilding
+   * descriptions would throw away the fold state and the selection every frame.
+   */
+  listRows: [],
+  /** Which view owns `#message-list` right now; the scroll handler only acts on `'mail'`. */
+  listOwner: null,
+  /** The window currently in the DOM, so a scroll can be skipped when it changes nothing. */
+  listWindow: null,
   /**
    * Set once the server says there is nothing older than what we already have.
    *
@@ -410,6 +421,9 @@ async function toggleReaderMode() {
 }
 
 function wireGlobalEvents() {
+  // The mail list is windowed: rows exist only for the visible window, so scrolling has to rebuild
+  // that window. One listener here (not one per render), and one commit per animation frame.
+  wireListScrolling();
   $('btn-theme').addEventListener('click', () => {
     window.__easyEmailTheme.toggle();
     syncThemeButton();
@@ -1801,6 +1815,9 @@ function renderMessages() {
 
   if (state.messages.length === 0) {
     list.innerHTML = '<div class="empty">这个文件夹里还没有邮件。</div>';
+    state.listOwner = null;
+    state.listRows = [];
+    state.listWindow = null;
     $('list-footer').hidden = true;
     return;
   }
@@ -1810,92 +1827,221 @@ function renderMessages() {
   // (`src/threads.js`) — and the count on the row says how many messages were folded, so nothing is
   // hidden behind a single subject.
   const conversations = threads.groupConversations(state.messages);
+  state.listRows = conversationRows(conversations);
+  state.listOwner = 'mail';
+  state.listWindow = null;
 
+  // Windowed (`design/15` §6): the scrollbar gets the whole list's height from a sizer, and only the
+  // rows of the current window are in the DOM. Without this the DOM held one button per conversation
+  // forever, so every scroll re-laid-out every row — the exact cost P3 exists to catch.
+  const sizer = document.createElement('div');
+  sizer.className = 'vlist-sizer';
+  const window_ = document.createElement('div');
+  window_.className = 'vlist-window';
+  sizer.appendChild(window_);
+  list.replaceChildren(sizer);
+  state.listSizer = sizer;
+  state.listWindowEl = window_;
+  renderListWindow();
+
+  $('list-footer').hidden = state.historyDone;
+}
+
+/**
+ * Row descriptors for the mail list: one per conversation, plus one per message of each expanded
+ * conversation, in the order they appear on screen.
+ *
+ * Kept separate from DOM building because the window changes on every scroll and rebuilding
+ * descriptions would lose the fold state and the selection a dozen times per second. `unread` and
+ * `selected` are computed per row, exactly where they are needed.
+ */
+function conversationRows(conversations) {
+  const rows = [];
   for (const conversation of conversations) {
     const message = conversation.messages[0];
     const extra = conversation.messages.length - 1;
     const folded = state.expandedThreads.has(conversation.key);
-    const button = document.createElement('button');
-    // Highlighted by conversation as well as by message: in the conversation view the reader can be
-    // focused on a reply that lives in another folder, and the row on screen is still the one the user
-    // is reading. Without this the list would look unselected while a message from it is open.
-    const selected =
-      (message.uid === state.selectedUid && state.mailbox === state.selectedFolder) ||
-      (state.threadKey !== null && message.thread_key === state.threadKey);
-    // A conversation is unread when any of its messages is: hiding an unread one behind a read
-    // subject is how a list starts lying about what needs attention.
-    const unread = conversation.messages.some((entry) => !entry.seen);
-    button.className = 'msg' + (unread ? ' unread' : '') + (selected ? ' selected' : '');
-    button.innerHTML = `
-      <div class="msg-top">
-        ${
-          unread
-            ? '<span class="unread-dot" role="img" aria-label="未读" title="此会话有未读邮件"></span>'
-            : '<span class="unread-dot read" aria-hidden="true"></span>'
-        }
-        <span class="msg-from">${
-          extra > 0
-            ? `<span class="msg-caret" role="button" title="${
-                folded ? '收起这个会话' : '展开这个会话'
-              }">${folded ? '▾' : '▸'}</span>`
-            : ''
-        }${escapeHtml(senderLabel(message))}</span>
-        <span class="msg-date">${escapeHtml(formatDate(message.date))}</span>
-      </div>
-      <div class="msg-subject">${escapeHtml(message.subject)}${
-        extra > 0 ? `<span class="msg-count" title="这个会话里的邮件数">${conversation.messages.length}</span>` : ''
-      }</div>`;
-
-    // The caret toggles the fold; the rest of the row opens the newest message. Keeping those two
-    // apart matters: "read the newest" is what a click on a row means everywhere else in the app.
-    button.addEventListener('click', (event) => {
-      if (extra > 0 && event.target?.classList?.contains('msg-caret')) {
-        event.stopPropagation();
-        toggleThread(conversation.key);
-        return;
-      }
-      openMessage(message);
+    rows.push({
+      kind: 'conversation',
+      key: conversation.key,
+      message,
+      extra,
+      // A conversation is unread when any of its messages is: hiding an unread one behind a read
+      // subject is how a list starts lying about what needs attention.
+      unread: conversation.messages.some((entry) => !entry.seen),
+      folded,
     });
-    list.appendChild(button);
-
     if (folded) {
-      // The rest of the conversation, oldest last, indented. Each is a real row the user can open:
-      // a fold that hides messages without a way to reach them is just a shorter list.
+      // The rest of the conversation, oldest last. Each is a real row the user can open: a fold that
+      // hides messages without a way to reach them is just a shorter list.
       for (const entry of conversation.messages.slice(1)) {
-        const child = document.createElement('button');
-        child.className = 'msg thread-child' + (entry.seen ? '' : ' unread');
-        child.innerHTML = `
-          <div class="msg-top">
-            ${
-              entry.seen
-                ? '<span class="unread-dot read" aria-hidden="true"></span>'
-                : '<span class="unread-dot" role="img" aria-label="未读" title="未读"></span>'
-            }
-            <span class="msg-from">${escapeHtml(senderLabel(entry))}</span>
-            <span class="msg-date">${escapeHtml(formatDate(entry.date))}</span>
-          </div>
-          <div class="msg-subject">${escapeHtml(entry.subject)}</div>`;
-        child.addEventListener('click', () => openMessage(entry));
-        list.appendChild(child);
+        rows.push({ kind: 'child', key: conversation.key, entry, unread: !entry.seen });
       }
     }
   }
+  return rows;
+}
 
-  // The button answers "is there more", not arithmetic on a limit. With paging the honest question is
-  // "have both sources run out", and `historyDone` is exactly that answer. The old test
-  // (`messages.length < state.limit`) only worked because that limit used to grow with every press —
-  // which is the thing round 75 removed.
-  $('list-footer').hidden = state.historyDone;
+/** Build one conversation row. The same markup as before windowing, per row. */
+function buildConversationRow(row) {
+  const { message, extra, unread, folded } = row;
+  const button = document.createElement('button');
+  // Highlighted by conversation as well as by message: in the conversation view the reader can be
+  // focused on a reply that lives in another folder, and the row on screen is still the one the user
+  // is reading. Without this the list would look unselected while a message from it is open.
+  const selected =
+    (message.uid === state.selectedUid && state.mailbox === state.selectedFolder) ||
+    (state.threadKey !== null && message.thread_key === state.threadKey);
+  button.className = 'msg' + (unread ? ' unread' : '') + (selected ? ' selected' : '');
+  button.dataset.uid = String(message.uid);
+  button.innerHTML = `
+    <div class="msg-top">
+      ${
+        unread
+          ? '<span class="unread-dot" role="img" aria-label="未读" title="此会话有未读邮件"></span>'
+          : '<span class="unread-dot read" aria-hidden="true"></span>'
+      }
+      <span class="msg-from">${
+        extra > 0
+          ? `<span class="msg-caret" role="button" title="${
+              folded ? '收起这个会话' : '展开这个会话'
+            }">${folded ? '▾' : '▸'}</span>`
+          : ''
+      }${escapeHtml(senderLabel(message))}</span>
+      <span class="msg-date">${escapeHtml(formatDate(message.date))}</span>
+    </div>
+    <div class="msg-subject">${escapeHtml(message.subject)}${
+      extra > 0 ? `<span class="msg-count" title="这个会话里的邮件数">${extra + 1}</span>` : ''
+    }</div>`;
+
+  // The caret toggles the fold; the rest of the row opens the newest message. Keeping those two
+  // apart matters: "read the newest" is what a click on a row means everywhere else in the app.
+  button.addEventListener('click', (event) => {
+    if (extra > 0 && event.target?.classList?.contains('msg-caret')) {
+      event.stopPropagation();
+      toggleThread(row.key);
+      return;
+    }
+    openMessage(message);
+  });
+  return button;
+}
+
+/** Build one row of an expanded conversation. */
+function buildChildRow(row) {
+  const entry = row.entry;
+  const child = document.createElement('button');
+  child.className = 'msg thread-child' + (entry.seen ? '' : ' unread');
+  child.dataset.uid = String(entry.uid);
+  child.innerHTML = `
+    <div class="msg-top">
+      ${
+        entry.seen
+          ? '<span class="unread-dot read" aria-hidden="true"></span>'
+          : '<span class="unread-dot" role="img" aria-label="未读" title="未读"></span>'
+      }
+      <span class="msg-from">${escapeHtml(senderLabel(entry))}</span>
+      <span class="msg-date">${escapeHtml(formatDate(entry.date))}</span>
+    </div>
+    <div class="msg-subject">${escapeHtml(entry.subject)}</div>`;
+  child.addEventListener('click', () => openMessage(entry));
+  return child;
+}
+
+/**
+ * Render the current window of the mail list.
+ *
+ * Called from a `requestAnimationFrame` after a scroll (one commit per frame, `design/15` §6) and
+ * directly whenever the rows change. The cheap exit matters: a wheel gesture fires more scroll events
+ * than there are frames, and most of them land in a window that is already on screen.
+ */
+function renderListWindow() {
+  if (state.listOwner !== 'mail' || !state.listSizer || !state.listWindowEl) return;
+  const list = $('message-list');
+  const rows = state.listRows;
+  const next = vlist.computeWindow({
+    scrollTop: list.scrollTop,
+    viewportHeight: list.clientHeight,
+    count: rows.length,
+  });
+  if (!vlist.windowChanged(state.listWindow, next)) return;
+  state.listWindow = next;
+
+  state.listSizer.style.height = `${next.totalHeight}px`;
+  state.listWindowEl.style.top = `${next.offsetTop}px`;
+
+  const built = [];
+  for (let index = next.start; index < next.end; index += 1) {
+    const row = rows[index];
+    built.push(row.kind === 'child' ? buildChildRow(row) : buildConversationRow(row));
+  }
+  state.listWindowEl.replaceChildren(...built);
+}
+
+/** How many rows the scroll handler produced since it was armed (one edit per frame, not per event). */
+function wireListScrolling() {
+  const list = $('message-list');
+  let scheduled = false;
+  list.addEventListener(
+    'scroll',
+    () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        renderListWindow();
+      });
+    },
+    { passive: true }
+  );
+}
+
+/**
+ * Bring one row of the windowed list into view.
+ *
+ * `scrollIntoView` cannot be used: the row that is wanted is very often not in the DOM at all, which
+ * is the point of windowing. So the offset is computed from the row height instead.
+ */
+function scrollToRow(index) {
+  const list = $('message-list');
+  const top = vlist.scrollTopForRow(index, {
+    scrollTop: list.scrollTop,
+    viewportHeight: list.clientHeight,
+  });
+  list.scrollTop = top;
+  renderListWindow();
+}
+
+/**
+ * Which windowed row belongs to a message (by UID) or a conversation (by key), or -1.
+ *
+ * UID alone for messages, because the windowed list always belongs to the mailbox it is showing —
+ * a summary row carries no `folder` to compare against. The key form is what the fold needs: a
+ * conversation's key is not any of its UIDs.
+ */
+function rowIndexOf({ uid = null, key = null } = {}) {
+  return state.listRows.findIndex((row) => {
+    if (key !== null) return row.kind === 'conversation' && row.key === key;
+    const entry = row.kind === 'child' ? row.entry : row.message;
+    return Boolean(entry) && entry.uid === uid;
+  });
 }
 
 /** Open or close one conversation in the list. */
 function toggleThread(key) {
-  if (state.expandedThreads.has(key)) {
-    state.expandedThreads.delete(key);
-  } else {
+  const expanding = !state.expandedThreads.has(key);
+  if (expanding) {
     state.expandedThreads.add(key);
+  } else {
+    state.expandedThreads.delete(key);
   }
   renderMessages();
+  // Expanding changes the row count, so the fold's rows may well be below the window. Keep them
+  // where the user is looking instead of re-rendering from the top.
+  if (expanding) {
+    const index = rowIndexOf({ key });
+    if (index >= 0) scrollToRow(index);
+  }
 }
 
 /** Search results, each tagged with the folder it came from. */

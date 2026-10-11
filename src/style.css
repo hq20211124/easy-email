@@ -17,6 +17,11 @@
   --unread: #2563eb;
   --radius: 10px;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.06);
+  /* One home for the message-list row height. The list is windowed (`src/vlist.js`: only the
+     viewport +/- 8 rows is in the DOM), and windowing only works with a measurable row height —
+     index-to-offset would need measuring otherwise, and every measurement would force a re-render.
+     `tools/vlist_test.mjs` fails if this value and `DEFAULT_ROW_HEIGHT` drift apart. */
+  --msg-height: 56px;
   /* Tells the engine to draw native widgets — <select> popups, scrollbars, spinners — for a
      light background. Without this the dropdown list keeps its light-mode text colour and
      renders black-on-dark against our dark surface. */
@@ -487,6 +492,21 @@ textarea {
   min-height: 0;
 }
 
+/* Virtualised list: two fixed-height rows (a conversation header and a folded child) inside a
+   container that is only as tall as the viewport plus overscan. The sizer gives the scrollbar the
+   whole list's height; the window is positioned at the first rendered row. */
+.vlist-sizer {
+  position: relative;
+  width: 100%;
+}
+
+.vlist-window {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+}
+
 .msg {
   display: block;
   width: 100%;
@@ -496,6 +516,11 @@ textarea {
   background: transparent;
   padding: 6px 9px;
   cursor: pointer;
+  /* Fixed height, so the window can compute offsets instead of measuring (design/15 §6). A long
+     subject truncates instead of wrapping — the visible half of "10万封不卡". */
+  box-sizing: border-box;
+  height: var(--msg-height);
+  overflow: hidden;
 }
 
 .msg:hover {

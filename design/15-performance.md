@@ -115,6 +115,15 @@ pragma auto_vacuum = incremental;   -- **必须是第一条 pragma，排在 jour
 | 项 | 做法 |
 |---|---|
 | 列表 | 虚拟化（视口 ± 8 行）；行高固定/可测；滚动用 `requestAnimationFrame` 批量提交 |
+
+> **实现注记（第 75/76 轮）**：**虚拟化已实现**。形状：`src/vlist.js`（纯函数，
+> `computeWindow`/`windowChanged`/`scrollToRow` 的前身 `scrollTopForRow`）+
+> `.vlist-sizer`（撑总高）+ `.vlist-window`（按 `offsetTop` 定位、`replaceChildren` 是唯一提交点）
+> + 一次性的 rAF 滚动监听。行描述（`conversationRows`）与 DOM 分离，所以窗口每帧变化不会丢
+> 展开态与选中态。上一轮（第 75 轮）先把分页从"limit 越加越大"换成 `message_page(offset, limit)`，
+> 否则窗口化还要同时处理"追加时全量重排"。
+> ⚠️ **P3 的真窗口测量仍未跑**（尺子在第 74 轮就位）：`tools\bench-scroll.mjs` +
+> `tools\bench-app.ps1` 需要带调试端口的构建和一次人工执行。**在那之前不说"60 fps 了"。**
 | IPC | 分页 ≤ 200 行；大文本（正文）单独取；事件节流（进度 ≤ 5 次/秒） |
 | 首屏 | 骨架屏优先；非首屏模块（设置/规则）动态 import |
 | 搜索 | 输入防抖 250 ms；结果分页；高亮在 Rust 侧算（09 §5.2） |

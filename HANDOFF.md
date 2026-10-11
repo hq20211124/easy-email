@@ -77,15 +77,11 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 `design/19` §4 有各块验收。另有三件卡在外部条件的真机验证（Outlook / 163·126 / 自建服务器，
 清单见 §7 ④），不拦发版但每次接手时值得催一次。
 
-下一批候选（按"最小最独立"排序）：**15 的虚拟列表**（`design/15` §6：视口 ± 8 行、
-行高固定、滚动用 `requestAnimationFrame` 批量提交；验收是 10 万封 60 fps、每帧 DOM 变更 ≤ 40 行）。
-**分页那半已经做完**（第 75 轮）：`message_page(offset, limit)` 只读缓存、每次一页、按 UID 追加；
-`state.limit` 与"limit 越加越大"整个删除；`historyStep` 改成按"这一页有没有行"判断。
-**尺子也已经就位**（第 74 轮）：`tools\bench-scroll.mjs` 与"60 fps / 每帧 ≤40 行"当面对照、
-超了退出非 0，`tools\bench-scroll-fixture.html?mode=heavy` 实测能判失败（单帧 3000 行变更）；
-`bench-app.ps1` 会在应用应答后自动跑它。**跑它需要人点一次**：应用带
-`--remote-debugging-port` 构建（验完必须删掉，`check.ps1` 会拦），再
-`powershell -File tools\bench-app.ps1`。**虚拟列表改造前先跑一次拿基线，改造后再跑一次对比。**
+下一批：**给 P3 拿真窗口基线**（需要你点：应用带 `--remote-debugging-port=9222` 构建 →
+`powershell -File tools\bench-app.ps1`，P1/P3/P5/P6 四个数字进 `target\bench-app-history.jsonl`）；
+之后可继续 09 的查询语法、04 离线队列、16 诊断包。**列表与分页都已完成**（第 75/76 轮）：
+`message_page(offset, limit)` 只读缓存分页 + `src/vlist.js` 视口 ± 8 行窗口化，
+`tools/vlist_test.mjs` 钉住窗口算术与"行高只有一个出处"。
 性能预算的**覆盖率**已变成机器检查（第 73 轮：`bench.ps1` 打印全部 16 项、自断言条数、
 `check.ps1` 钉住），实测 P2/P4/P7/P9/P10/P12/P13/P14/P15，未测 P1/P3/P5/P6/P8/P11/P16 各自写了原因
 ——**别再把"没测"写成"有"，也别把"有仪表"写成"没仪表"**：第 73 轮我连错两次

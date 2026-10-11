@@ -742,6 +742,85 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the message list is windowed, with one source for the row height' {
+        # Round 76, design/15 §6 (virtualise: viewport +/- 8 rows, fixed and measurable row height,
+        # commit on requestAnimationFrame) and §4 P3 (<= 40 rows changed per frame).
+        #
+        # The regression this prevents is invisible in a small mailbox: the list held one DOM button
+        # per conversation forever, and with a thousand cached messages every scroll re-layed-out
+        # every one of them. Nothing errors — it is just not 60 fps, which no offline check can see.
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $css = Get-Content 'src/style.css' -Raw -Encoding UTF8
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $problems = @()
+
+        if (-not (Test-Path 'src/vlist.js')) {
+            $problems += 'src/vlist.js is missing: the window arithmetic must be a pure, testable module'
+        }
+        # Loaded, not merely present: a script that index.html never references cannot be anything.
+        if ($html -notmatch '<script src="vlist\.js"></script>') {
+            $problems += 'index.html does not load vlist.js — a module nobody imports is not a list'
+        }
+        if (Test-Path 'src/vlist.js') {
+            $v = Get-Content 'src/vlist.js' -Raw -Encoding UTF8
+            foreach ($needed in @('DEFAULT_ROW_HEIGHT', 'computeWindow', 'windowChanged')) {
+                if ($v -notmatch [regex]::Escape($needed)) {
+                    $problems += "vlist.js no longer defines $needed"
+                }
+            }
+        }
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        # The maths is pure, so it is tested — and running the test here is what keeps it that way.
+        node tools/vlist_test.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $global:LASTEXITCODE = $LASTEXITCODE
+            return
+        }
+        if ($js -notmatch 'vlist-sizer' -or $js -notmatch 'vlist-window') {
+            $problems += 'app.js must build the windowed DOM (sizer + window), not append rows to the list'
+        }
+        if ($js -notmatch 'requestAnimationFrame') {
+            $problems += 'scrolling must commit on requestAnimationFrame (one commit per frame, design/15 §6)'
+        }
+        # Scoped to the mail branch, because the other views (search hits, drafts, outbox) legitimately
+        # append rows to the same element — they are short lists and windowing them would buy nothing.
+        # An unscoped "no appendChild anywhere" was the first version of this check and it failed a
+        # correct tree, which is how a gate starts ignoring its own greens.
+        $render = [regex]::Match($js, '(?s)function renderMessages\(\) \{.*?\n\}').Value
+        if ($render.Length -eq 0) {
+            $problems += 'renderMessages is gone — the list entry point must stay a named function'
+        } else {
+            if ($render -match 'list\.appendChild') {
+                $problems += 'renderMessages appends rows to the scroll container: only the window element may receive them'
+            }
+            if ($render -notmatch 'renderListWindow\(\)') {
+                $problems += 'the mail branch must render through renderListWindow() — the window, not the whole list'
+            }
+        }
+        if ($js -notmatch 'listWindowEl\.replaceChildren\(') {
+            $problems += 'the window element must be the single commit point for mail rows (replaceChildren)'
+        }
+        # Exactly one home for the row height, and the CSS must actually use it.
+        if ($css -notmatch '--msg-height:\s*\d+px') {
+            $problems += 'style.css must declare --msg-height (a row height with no home drifts from the JS constant)'
+        }
+        if ($css -notmatch '--msg-height\)') {
+            $problems += 'no rule uses --msg-height: a declared variable with no consumer is a lie about the layout'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the list renders a window, and the row height has one home'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

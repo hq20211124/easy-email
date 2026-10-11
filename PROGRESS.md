@@ -11,6 +11,58 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### 虚拟列表：只渲染视口 ± 8 行（15 块第四片）✅（第 76 轮）
+
+**依据**：`design/15` §6（"虚拟化（视口 ± 8 行）；行高固定/可测；滚动用
+`requestAnimationFrame` 批量提交"）与 §4 的 **P3（60 fps、每帧 DOM 变更 ≤ 40 行）**。
+上一轮做完了分页，这一轮让 DOM 不再随行数增长。
+
+**动手前读代码**：`renderMessages()` 把每个会话、每个展开的会话成员都建成 DOM 按钮，
+`list.appendChild` 一路到底 ⇒ **DOM 节点数 = 行数**。10 万封就是 10 万个按钮，每次滚动重排全部。
+而且 `.msg` 的高度是内容驱动的（`padding: 6px 9px` + 1px 边框，主题换行）——
+**这与 §6 的"行高固定/可测"相反**，也是任何窗口化的前提问题。
+
+**做了什么**：
+- **新 `src/vlist.js`**（纯逻辑，不碰 DOM）：`computeWindow({scrollTop, viewportHeight, count,
+  rowHeight, overscan})` → `{start, end, offsetTop, totalHeight}`；`windowChanged()`；
+  `scrollTopForRow()`（展开后会滚到能看到的地方——虚拟化之后"滚到某行"必须自己算，
+  因为那一行多半根本不在 DOM 里）。**它单独成文件的理由和 `history.js`/`threads.js` 一样：
+  能脱离窗口测的部分才不会慢慢烂掉。**
+- **CSS** `--msg-height: 56px` 一个出处 + `.msg` 固定高 + 两行文字省略号
+  （`.msg-from`/`.msg-subject` 本来就是 nowrap+ellipsis，所以这轮的外观变化**只有"行高固定了"**），
+  加 `.vlist-sizer`（撑总高）/`.vlist-window`（按 offsetTop 定位）。
+- **`src/app.js`**：会话 → 行描述（`conversationRows`，**描述不是元素**——窗口每帧都可能变，
+  反复重建描述会丢掉展开态与选中态）→ `renderListWindow()` 只建窗口内的行；
+  滚动监听**只挂一次**、`requestAnimationFrame` 里提交（一个手势的事件远多于帧，
+  合并成一个提交正是 §6 说的"批量提交"）；`toggleThread` 展开后把折叠的行滚进视口；
+  搜索/草稿/发件箱三个短视图**保持原路径**（窗口化它们买不到什么）。
+- **`tools/vlist_test.mjs`**：纯函数单测（空表/单行/短表/长表中段/两端/负 scrollTop/零视口 NaN、
+  10 万封仍是小窗口、窗口未变不重建、`scrollTopForRow` 三种情形）+ **一条常量守卫**：
+  CSS 的 `--msg-height` 与 `DEFAULT_ROW_HEIGHT` 必须相等——**这条才是真正会毁掉功能的那种回归**
+  （一个数变、另一个不变 ⇒ 滚动时行位置缓慢漂移，而且**任何地方都不报错**）。
+- **门禁 36 → 37 步**：钉住 window 化结构（`vlist.js` 存在且被 `index.html` 加载、三个符号在、
+  sizer/window 结构、rAF 提交、`renderMessages` 的邮件分支不得往滚动容器 append、
+  唯一提交点是 `replaceChildren`）、行高有且只有一个家（声明 + 有消费者），并且**运行**
+  `tools/vlist_test.mjs`。
+
+**验证**：`node tools/vlist_test.mjs` 与全部前端门禁脚本通过；本轮无 Rust 改动
+（WSL 与前一轮同为 376/7 的口径不变）；门禁新步 14 项判据在 Windows PowerShell 5.1 解析器上
+逐条实测全绿（`parse_errors=0`、37 步）。
+
+**这一轮门禁的判据被我自己改对了两次**：第一版"全文不得出现 `list.appendChild(button)`"
+**误报**了正确的树（搜索命中路径也往同一个容器追加，而那是有意不虚拟化的短列表）；
+第二版在 `renderMessages` 里禁一切 `appendChild`，又被 `sizer.appendChild(window_)` 这一处
+合法结构触发。最后用 PowerShell 把 `renderMessages` 函数体切出来、只禁 `list.appendChild`：
+**判据必须说它真正想说的那件事**，"哪里别出现这个串"和"邮件分支不许往滚动容器追加行"不是一句话。
+
+**未做/未验**：**真机未验**（WSL 没有 GUI；滚动手感、行高观感、省略号截断的位置都要在
+Windows 上看一眼）。**P3 的测量也还没在真窗口上跑**——尺子在第 74 轮就做好了，
+**基线需要你点一次**：应用带 `--remote-debugging-port=9222` 构建 → `powershell -File tools\bench-app.ps1`
+（它会跑 P1/P3/P5/P6 并把 P3 的四个数字写进 `target\bench-app-history.jsonl`）。
+在那之前，这次改动只能说"结构上成了"，不能说"60 fps 了"。
+
+---
+
 ### 列表按 offset 分页：换掉"limit 越加越大"（15 块第三片 / M1b 分页）✅（第 75 轮）
 
 **依据**：`design/19` §7 那条过渡实现的清理项（"用户的『加载更多』语义保留，但底层模型必须换掉"）、
