@@ -341,6 +341,14 @@ cycle:
 
 
 ### 5.5 断网/恢复
+
+> **实现注记（第 80 轮）**：`pending_ops` 表**从第一个 schema 就存在、且长期无人写入**
+> （界面上的"0"是诚实的，功能是缺席的）。本轮补齐存储层：入队（同意图幂等，
+> 原子性来自"单写线程"而非从未存在的唯一索引）、到期查询、compare-and-set 认领、
+> 退避重试（与 outbox 共用曲线）、崩溃 requeue、取消、以及**只数剩余工作量**的
+> `pending_ops_outstanding`（原先 `SyncStatus` 喂的是裸行数，done/cancelled 也算 ⇒ 只涨不跌）。
+> **刻意"不猜"的两处**：未知 kind 读成 `None` 且行留着；坏 payload 读成 `None`。
+> 仍未接线：重放执行器与 IMAP 侧（mark_read/move/delete 的失败入队）是下一片。
 ```
 command 失败(IO/timeout) → NetMonitor 记 Degraded → 当前任务退避重排
 连续失败 ≥ 3 或系统报告无网络 → Offline：

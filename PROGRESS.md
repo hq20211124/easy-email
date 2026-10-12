@@ -11,6 +11,53 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### `pending_ops` 从空表变成真的队列（04 离线意图，存储层）✅（第 80 轮）
+
+**依据**：`design/04-sync.md` §5.5（断网："outbox/pending_ops 保持排队"；恢复："flush outbox
+→ flush pending_ops"）、SYN-14（"旗标/已读/删除以服务器为准，本地意图用离线队列补偿"）。
+
+**动手前读代码发现的真相**：`pending_ops` 表**从第一个 schema 就在**（`state`/`attempts`/
+`next_attempt_at` 齐全），`SyncStatus.pending_ops` **也一直在报数**——但**没有任何代码入队、
+列出、认领或重放**。界面上的"0"是诚实的，功能是缺席的。SYN-14 只搭了 DDL 骨架。
+
+**做了什么（只动存储层，不接线）**：
+- `PendingOpKind`（四种：MarkRead/MarkUnread/Move/Delete）+ `PendingPayload` + `PendingOp`；
+- `enqueue_pending_op` / `due_pending_ops` / `list_pending_ops` / `claim_pending_op` /
+  `finish_pending_op` / `retry_pending_op` / `requeue_pending_ops` / `cancel_pending_op` /
+  `pending_ops_outstanding` / `pending_op`；
+- **去重是原子的**，理由是"这个库只有一个写线程"（M0-02）：读-然后-写在同一个
+  `write_blocking` 闭包里。我最初在注释里声称"部分唯一索引兜底"**却从没建那个索引**——
+  已改成说真话的版本（单写线程就是保证；而且 `uid` 的 NULL 在唯一索引里互不相同，
+  索引本来是更差的工具）。
+
+**设计上两处"不猜"**：
+- **未知 kind 读成 `None`、行留着**：映射到四种之一是猜用户没表达过的意图，丢掉行是丢他表达过的。
+  行是用户的数据，"这个 build 读不出来"是关于 build 的事实；
+- **未知/坏 payload 读成 `None`**：理由同上，worker 里不得 panic。
+
+**顺手修了一个门禁判据当场逮到的真问题**：`SyncStatus.pending_ops` 喂的是
+`pending_op_count()`——**原始行数**，done/cancelled 也算 ⇒ 那个数字只会涨不会跌
+（"3 个待处理"在所有事都做完之后还在）。已改为 `pending_ops_outstanding()`
+（queued + in_flight），并在测试里钉住：做完两条、取消一条之后计数不动。
+
+**测试 +11** → **WSL 402 passed / 7 ignored**（391+11）。其中：
+- 同一意图连入队 20 次 ⇒ **1 行、id 不变**（离线点 20 次"标已读" = 一次重放；
+  否则计量连接上就是 20 个往返）；
+- 认领是 compare-and-set ⇒ 第二次 `claim` 返回 false、`in_flight` 不再进 due；
+- 失败退避 ⇒ `attempts+1`、`next_attempt_at` 在未来、**立刻重试取不到**（曲线复用 outbox 的）；
+- 崩溃留下的 `in_flight` ⇒ `requeue_pending_ops` 能救回来；
+- done 之后同键**可以再入队**（一个月后第二次"标已读"不该静默失效）。
+
+**门禁 40 → 41 步**：新增「the offline intent queue is real, and one writer makes it idempotent」——
+入队/到期查询/compare-and-set 认领/未知 kind 不猜/计数只数剩余工作量、且 `SyncStatus`
+必须喂那个函数（不是裸行数）。
+
+**未做/未验**：**重放执行器与 IMAP 接线没做**（下一片：loopback 假服务器 + 接
+`mark_read`/`move_message`/`delete_message` 的失败路径 + 一个"200 次混合操作"的放大测试）；
+UI 文案（计数已在了，等有东西可数）。
+
+---
+
 ### 大小前缀 `larger:`/`smaller:`（09 树⑥）✅（第 79 轮）
 
 **依据**：`design/09` §1 目标 4 语法清单里最后一项前缀；§13 验收清单也列着

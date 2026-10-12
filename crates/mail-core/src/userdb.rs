@@ -215,6 +215,384 @@ impl OutboxItem {
     }
 }
 
+// The pending-ops layer for `user.db`'s `pending_ops` table — the offline intent queue of
+// `design/04` §5.5 / SYN-14 ("flags and deletions follow the server; local intents are compensated
+// by an offline queue").
+//
+// The table has been in the schema since the beginning and **nothing ever wrote to it**: the queue
+// was scaffolded as DDL and then left. Meanwhile `SyncStatus.pending_ops` reports a count of its
+// rows, so the UI has been showing a permanent and honest 0 — the number was right, the feature was
+// absent.
+//
+// The shape is the outbox's on purpose: the same states, the same claim-that-compares, the same
+// backoff curve. Two queues with two vocabularies is how one of them ends up wrong.
+
+/// What the user did while offline, to be replayed against the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingOpKind {
+    MarkRead,
+    MarkUnread,
+    Move,
+    Delete,
+}
+
+impl PendingOpKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PendingOpKind::MarkRead => "mark_read",
+            PendingOpKind::MarkUnread => "mark_unread",
+            PendingOpKind::Move => "move",
+            PendingOpKind::Delete => "delete",
+        }
+    }
+
+    /// Anything unreadable becomes `None`.
+    ///
+    /// Deliberately **not** mapped onto one of the four: guessing would replay an intent the user
+    /// never expressed, and dropping the row would lose one they did. The row stays, unread, and the
+    /// replay pass reports it — the row is the user's data, and a version that cannot read it is a
+    /// fact about this build, not a reason to throw their intent away.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "mark_read" => Some(PendingOpKind::MarkRead),
+            "mark_unread" => Some(PendingOpKind::MarkUnread),
+            "move" => Some(PendingOpKind::Move),
+            "delete" => Some(PendingOpKind::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// The parameters of one pending op.
+///
+/// A struct rather than free-form JSON because the only variable part is a destination folder, and a
+/// struct makes "unreadable" something the parser can say out loud instead of a panic in a worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingPayload {
+    /// Where a `move` goes. `None` for everything else.
+    #[serde(default)]
+    pub target_folder: Option<String>,
+}
+
+/// One queued offline intent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingOp {
+    pub id: i64,
+    pub account_id: String,
+    pub folder: String,
+    /// `None` for an op about a folder rather than a message.
+    pub uid: Option<u64>,
+    /// `None` when the stored kind is not one this build knows — see [`PendingOpKind::parse`].
+    pub kind: Option<PendingOpKind>,
+    pub payload_json: String,
+    /// Stored form, exactly like the outbox's. Never compare it as a string.
+    pub state: String,
+    pub attempts: u32,
+    pub next_attempt_at: i64,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl PendingOp {
+    /// The payload, or `None` when the stored JSON is not one.
+    pub fn payload(&self) -> Option<PendingPayload> {
+        serde_json::from_str(&self.payload_json).ok()
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn a_kind_round_trips_and_unknown_values_stay_unknown() {
+        for kind in [
+            PendingOpKind::MarkRead,
+            PendingOpKind::MarkUnread,
+            PendingOpKind::Move,
+            PendingOpKind::Delete,
+        ] {
+            assert_eq!(PendingOpKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(PendingOpKind::parse("teleport"), None);
+        assert_eq!(PendingOpKind::parse(""), None);
+    }
+
+    #[test]
+    fn an_empty_payload_is_a_valid_payload() {
+        // Rows written before a field existed read as `{}`; both shapes must be acceptable.
+        assert_eq!(
+            serde_json::from_str::<PendingPayload>("{}").ok(),
+            Some(PendingPayload::default())
+        );
+        assert_eq!(
+            serde_json::from_str::<PendingPayload>(r#"{"target_folder":"Archive"}"#)
+                .ok()
+                .and_then(|p| p.target_folder),
+            Some("Archive".to_string())
+        );
+        assert!(serde_json::from_str::<PendingPayload>("not json").is_err());
+    }
+}
+
+/// Offline intent queue (`design/04` §5.5 / SYN-14).
+///
+/// The table has existed since the first schema and nothing ever wrote to it; this is the half that
+/// makes it real. The API mirrors the outbox's: claim-that-compares, one bounded pass, one backoff
+/// curve shared with `next_attempt_delay_secs`.
+impl UserStore {
+    /// Queue an intent, or refresh it if the same one is already waiting.
+    ///
+    /// **Idempotent by design**: the same intent (account, folder, uid, kind, payload) queued twenty
+    /// times while offline must stay one row — twenty replays of "mark this read" is twenty round
+    /// trips for one user action, and on a metered connection that is the difference between a
+    /// queue and a waste.
+    ///
+    /// The read-then-write is atomic **because this database has one writer thread** (M0-02): both
+    /// statements run inside one `write_blocking` closure, so there is no interleaving to protect
+    /// against. An earlier draft of this comment promised a partial unique index as a backstop and
+    /// then never created it — a claim in a comment that no test or statement backs is the same lie
+    /// as a green check that did not run, so the comment now says what is actually true: the
+    /// single writer is the guarantee, and `uid`'s NULL being distinct in a unique index is exactly
+    /// why an index would have been the weaker tool here anyway.
+    ///
+    /// Returns the row id (the existing one when the intent was already queued).
+    pub fn enqueue_pending_op(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: Option<u64>,
+        kind: PendingOpKind,
+        payload: &PendingPayload,
+        now: i64,
+    ) -> Result<i64> {
+        let payload_json = serde_json::to_string(payload)
+            .map_err(|e| crate::error::MailError::Cache(format!("序列化离线意图失败：{e}")))?;
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        let uid = uid.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+        self.db.write_blocking(move |conn| {
+            // "Update the waiting row, else insert" — both inside the one writer closure, which is
+            // what makes it atomic.
+            let existing: Option<i64> = conn
+                .query_row(
+                    "select id from pending_ops
+                      where account_id = ?1 and folder = ?2 and uid is ?3
+                        and kind = ?4 and payload_json = ?5
+                        and state in ('queued', 'in_flight')",
+                    rusqlite::params![account_id, folder, uid, kind.as_str(), payload_json],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                // `updated_at` is ?2, not ?4: a SQL fragment with a gap in its numbering is a
+                // query that needs four parameters and is handed two.
+                conn.execute(
+                    "update pending_ops set updated_at = ?2, next_attempt_at = 0,
+                       attempts = 0, last_error = null
+                      where id = ?1",
+                    rusqlite::params![id, now],
+                )?;
+                return Ok(id);
+            }
+            conn.execute(
+                "insert into pending_ops
+                    (account_id, folder, uid, kind, payload_json, state,
+                     attempts, next_attempt_at, created_at, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5, 'queued', 0, 0, ?6, ?6)",
+                rusqlite::params![account_id, folder, uid, kind.as_str(), payload_json, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Rows whose turn it is: queued, and past their backoff.
+    ///
+    /// `in_flight` rows are **not** returned — a pass that sees them is the next pass, after a crash
+    /// or a kill, and the startup path requeues them explicitly (the outbox does the same).
+    pub fn due_pending_ops(&self, now: i64, limit: usize) -> Result<Vec<PendingOp>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select id, account_id, folder, uid, kind, payload_json, state, attempts,
+                    next_attempt_at, last_error, created_at, updated_at
+             from pending_ops
+             where state = 'queued' and next_attempt_at <= ?1
+             order by id asc
+             limit ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![now, limit as i64], |row| {
+            Ok(PendingOp {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                folder: row.get(2)?,
+                uid: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                kind: row
+                    .get::<_, String>(4)
+                    .ok()
+                    .and_then(|raw| PendingOpKind::parse(&raw)),
+                payload_json: row.get(5)?,
+                state: row.get(6)?,
+                attempts: row.get::<_, i64>(7)? as u32,
+                next_attempt_at: row.get(8)?,
+                last_error: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_pending_ops(&self, account_id: Option<&str>) -> Result<Vec<PendingOp>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        // Both account and id ordering so a list a user is looking at does not jump around while
+        // the queue is being worked.
+        let sql = "select id, account_id, folder, uid, kind, payload_json, state, attempts,
+                          next_attempt_at, last_error, created_at, updated_at
+                   from pending_ops
+                   where (?1 is null or account_id = ?1)
+                     and state in ('queued', 'in_flight')
+                   order by account_id, id asc";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![account_id], |row| {
+            Ok(PendingOp {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                folder: row.get(2)?,
+                uid: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                kind: row
+                    .get::<_, String>(4)
+                    .ok()
+                    .and_then(|raw| PendingOpKind::parse(&raw)),
+                payload_json: row.get(5)?,
+                state: row.get(6)?,
+                attempts: row.get::<_, i64>(7)? as u32,
+                next_attempt_at: row.get(8)?,
+                last_error: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Claim one row for this pass. `false` means somebody else has it.
+    ///
+    /// The compare-and-set is the whole point: a tick racing a manual "retry now", or two ticks after
+    /// a wake-from-sleep, must not both apply the same intent.
+    pub fn claim_pending_op(&self, id: i64, now: i64) -> Result<bool> {
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update pending_ops set state = 'in_flight', updated_at = ?2
+                  where id = ?1 and state = 'queued'",
+                rusqlite::params![id, now],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// The intent has been applied. The row stays as `done` on purpose: it is the audit trail that
+    /// answers "what did the app do to my mailbox while I was offline".
+    pub fn finish_pending_op(&self, id: i64, now: i64) -> Result<()> {
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update pending_ops set state = 'done', updated_at = ?2, last_error = null
+                  where id = ?1",
+                rusqlite::params![id, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Put a row back after a failed attempt, with the shared backoff curve.
+    pub fn retry_pending_op(&self, id: i64, error: &str, now: i64) -> Result<()> {
+        let error = error.to_string();
+        self.db.write_blocking(move |conn| {
+            let attempts: i64 = conn.query_row(
+                "select attempts from pending_ops where id = ?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            let delay = crate::outbox::next_attempt_delay_secs(attempts as u32 + 1);
+            conn.execute(
+                "update pending_ops
+                    set state = 'queued', attempts = ?2, next_attempt_at = ?3,
+                        last_error = ?4, updated_at = ?3
+                  where id = ?1",
+                rusqlite::params![id, attempts + 1, now + delay, error],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Rows a previous run left mid-flight (crash between claim and outcome).
+    ///
+    /// They are requeued by the startup path rather than assumed done, exactly like the outbox: an
+    /// intent that may or may not have been applied must be re-applied, because every one of these
+    /// is idempotent on the server side (`STORE`/`MOVE`/`EXPUNGE` of the same message twice is the
+    /// same state as once).
+    pub fn requeue_pending_ops(&self, now: i64) -> Result<u32> {
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update pending_ops set state = 'queued', updated_at = ?1
+                  where state = 'in_flight'",
+                rusqlite::params![now],
+            )?;
+            Ok(changed as u32)
+        })
+    }
+
+    /// Cancel a queued intent (the user said never mind).
+    pub fn cancel_pending_op(&self, id: i64) -> Result<bool> {
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update pending_ops set state = 'cancelled'
+                  where id = ?1 and state in ('queued', 'in_flight')",
+                rusqlite::params![id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn pending_op(&self, id: i64) -> Result<Option<PendingOp>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let row = conn
+            .query_row(
+                "select id, account_id, folder, uid, kind, payload_json, state, attempts,
+                        next_attempt_at, last_error, created_at, updated_at
+                 from pending_ops where id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok(PendingOp {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        folder: row.get(2)?,
+                        uid: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                        kind: row
+                            .get::<_, String>(4)
+                            .ok()
+                            .and_then(|raw| PendingOpKind::parse(&raw)),
+                        payload_json: row.get(5)?,
+                        state: row.get(6)?,
+                        attempts: row.get::<_, i64>(7)? as u32,
+                        next_attempt_at: row.get(8)?,
+                        last_error: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+}
+
 /// One account's quota state for the current window (`design/04` §5.7).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuotaLedger {
@@ -1068,8 +1446,19 @@ impl UserStore {
     }
 
     /// How many offline operations are queued.
-    pub fn pending_op_count(&self) -> Result<u32> {
-        self.count("pending_ops")
+    /// How much offline work is left: queued and in-flight, **not** done or cancelled.
+    ///
+    /// This used to be a raw row count, which is the sort of number that only ever goes up — a
+    /// status bar showing "3 个待处理" after everything has been sent is worse than showing nothing,
+    /// because the user learns to stop reading it.
+    pub fn pending_ops_outstanding(&self) -> Result<u32> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn.query_row(
+            "select count(*) from pending_ops where state in ('queued', 'in_flight')",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n as u32),
+        )?)
     }
 
     fn count(&self, table: &str) -> Result<u32> {
@@ -1317,7 +1706,7 @@ mod tests {
 
         assert_eq!(store.draft_count().expect("drafts"), 0);
         assert_eq!(store.outbox_count().expect("outbox"), 0);
-        assert_eq!(store.pending_op_count().expect("ops"), 0);
+        assert_eq!(store.pending_ops_outstanding().expect("ops"), 0);
     }
 
     /// Re-opening must be a no-op, not a second migration: a schema version that changes on every
@@ -1919,5 +2308,300 @@ mod tests {
         );
         drop(again);
         let _ = std::fs::remove_file(&path);
+    }
+    // ------------------------------------------------------------ pending ops
+
+    fn store() -> UserStore {
+        UserStore::open_in_memory().expect("store")
+    }
+
+    #[test]
+    fn a_pending_op_survives_the_round_trip() {
+        let store = store();
+        let id = store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(42),
+                PendingOpKind::Move,
+                &PendingPayload {
+                    target_folder: Some("Archive".to_string()),
+                },
+                1_000,
+            )
+            .expect("enqueue");
+        let row = store.pending_op(id).expect("read").expect("row");
+        assert_eq!(row.account_id, "acc");
+        assert_eq!(row.folder, "INBOX");
+        assert_eq!(row.uid, Some(42));
+        assert_eq!(row.kind, Some(PendingOpKind::Move));
+        assert_eq!(
+            row.payload().and_then(|p| p.target_folder),
+            Some("Archive".to_string()),
+            "the destination must survive, or the replay would move mail nowhere"
+        );
+        assert_eq!(row.state, "queued");
+    }
+
+    #[test]
+    fn re_enqueueing_the_same_intent_keeps_one_row() {
+        // Twenty clicks on "mark read" while offline is one intent, not twenty: each replay costs a
+        // round trip on a metered connection, and the queue exists to save work, not to create it.
+        let store = store();
+        let mut ids = Vec::new();
+        for _ in 0..20 {
+            ids.push(
+                store
+                    .enqueue_pending_op(
+                        "acc",
+                        "INBOX",
+                        Some(7),
+                        PendingOpKind::MarkRead,
+                        &PendingPayload::default(),
+                        1_000,
+                    )
+                    .expect("enqueue"),
+            );
+        }
+        assert!(
+            ids.windows(2).all(|w| w[0] == w[1]),
+            "the same intent must keep its row (and its id)"
+        );
+        assert_eq!(store.list_pending_ops(None).expect("list").len(), 1);
+        assert_eq!(store.pending_ops_outstanding().expect("count"), 1);
+
+        // A different destination is a different intent, so a second move does get its own row.
+        store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(7),
+                PendingOpKind::Move,
+                &PendingPayload {
+                    target_folder: Some("Other".to_string()),
+                },
+                1_000,
+            )
+            .expect("enqueue move");
+        assert_eq!(store.list_pending_ops(None).expect("list").len(), 2);
+    }
+
+    #[test]
+    fn a_claimed_op_is_not_handed_to_the_next_pass() {
+        let store = store();
+        let id = store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(1),
+                PendingOpKind::MarkRead,
+                &PendingPayload::default(),
+                1,
+            )
+            .expect("enqueue");
+
+        assert!(store.claim_pending_op(id, 10).expect("first claim"));
+        assert!(
+            !store.claim_pending_op(id, 11).expect("second claim"),
+            "the compare-and-set is what stops two ticks applying one intent"
+        );
+        assert!(
+            store.due_pending_ops(12, 10).expect("due").is_empty(),
+            "an in-flight row is not due again — that is the same claim, one layer up"
+        );
+        store.finish_pending_op(id, 20).expect("finish");
+        assert_eq!(store.pending_ops_outstanding().expect("count"), 0);
+    }
+
+    #[test]
+    fn a_failed_op_comes_back_later_and_not_immediately() {
+        let store = store();
+        let id = store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(1),
+                PendingOpKind::Delete,
+                &PendingPayload::default(),
+                1,
+            )
+            .expect("enqueue");
+        store.claim_pending_op(id, 2).expect("claim");
+        store
+            .retry_pending_op(id, "connection refused", 2)
+            .expect("retry");
+
+        let row = store.pending_op(id).expect("read").expect("row");
+        assert_eq!(
+            row.attempts, 1,
+            "the attempt is counted, for the backoff curve"
+        );
+        assert!(row.next_attempt_at > 2, "the next try is in the future");
+        assert_eq!(row.last_error.as_deref(), Some("connection refused"));
+        assert!(
+            store.due_pending_ops(2, 10).expect("not yet").is_empty(),
+            "immediately retrying is what got the server annoyed in the first place"
+        );
+        let delay = crate::outbox::next_attempt_delay_secs(1);
+        assert_eq!(
+            store.due_pending_ops(2 + delay, 10).expect("due now").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_is_preserved_not_fatal() {
+        // A row written by a newer version: the intent is real, this build just cannot name it. It
+        // stays visible with `kind: None`, and the replay pass reports it rather than guessing.
+        let store = store();
+        store
+            .db
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "insert into pending_ops
+                        (account_id, folder, uid, kind, payload_json, state, created_at, updated_at)
+                     values ('acc', 'INBOX', 5, 'teleport', '{}', 'queued', 1, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("plant a row from the future");
+        let rows = store.list_pending_ops(None).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].kind, None,
+            "an unreadable kind reads as None, not as a guess"
+        );
+        assert_eq!(
+            rows[0].uid,
+            Some(5),
+            "the rest of the row is still there to look at"
+        );
+    }
+
+    #[test]
+    fn unreadable_payload_is_reported_not_dropped() {
+        let store = store();
+        let id = store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(5),
+                PendingOpKind::MarkRead,
+                &PendingPayload::default(),
+                1,
+            )
+            .expect("enqueue");
+        store
+            .db
+            .write_blocking(move |conn| {
+                conn.execute(
+                    "update pending_ops set payload_json = 'not json' where id = ?1",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .expect("corrupt the payload");
+        let row = store.pending_op(id).expect("read").expect("row");
+        assert!(
+            row.payload().is_none(),
+            "a bad payload is a None, not a panic"
+        );
+    }
+
+    #[test]
+    fn done_ops_do_not_block_the_same_key_again() {
+        // The dedupe only covers waiting rows: an intent that was applied must be queueable again,
+        // or the second "mark read" a month later would silently do nothing.
+        let store = store();
+        let id = store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(9),
+                PendingOpKind::MarkRead,
+                &PendingPayload::default(),
+                1,
+            )
+            .expect("enqueue");
+        store.claim_pending_op(id, 2).expect("claim");
+        store.finish_pending_op(id, 3).expect("finish");
+
+        let again = store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(9),
+                PendingOpKind::MarkRead,
+                &PendingPayload::default(),
+                100,
+            )
+            .expect("enqueue again");
+        assert_ne!(again, id, "a finished row is history; this is a new intent");
+        assert_eq!(store.pending_ops_outstanding().expect("count"), 1);
+    }
+
+    #[test]
+    fn the_count_means_work_left_not_history() {
+        let store = store();
+        for kind in [PendingOpKind::MarkRead, PendingOpKind::MarkUnread] {
+            store
+                .enqueue_pending_op("acc", "INBOX", Some(3), kind, &PendingPayload::default(), 1)
+                .expect("enqueue");
+        }
+        assert_eq!(store.pending_ops_outstanding().expect("count"), 2);
+        let done = store
+            .enqueue_pending_op(
+                "acc",
+                "Sent",
+                None,
+                PendingOpKind::MarkRead,
+                &PendingPayload::default(),
+                1,
+            )
+            .expect("enqueue");
+        store.claim_pending_op(done, 2).expect("claim");
+        store.finish_pending_op(done, 3).expect("finish");
+        assert_eq!(
+            store.pending_ops_outstanding().expect("count"),
+            2,
+            "a finished intent is not work; counting it would make the status number only rise"
+        );
+        let cancelled = store
+            .enqueue_pending_op(
+                "acc",
+                "Sent",
+                None,
+                PendingOpKind::Delete,
+                &PendingPayload::default(),
+                1,
+            )
+            .expect("enqueue");
+        assert!(store.cancel_pending_op(cancelled).expect("cancel"));
+        assert_eq!(store.pending_ops_outstanding().expect("count"), 2);
+        assert!(
+            !store.cancel_pending_op(cancelled).expect("cancel twice"),
+            "cancelling twice is a no-op, not a second state change"
+        );
+    }
+
+    #[test]
+    fn a_crash_leaves_rows_requeueable_rather_than_stuck() {
+        // The outbox requeues in-flight rows at startup for the same reason: an intent that may have
+        // been applied is re-applied, and every one of these is idempotent on the server.
+        let store = store();
+        let id = store
+            .enqueue_pending_op(
+                "acc",
+                "INBOX",
+                Some(1),
+                PendingOpKind::MarkRead,
+                &PendingPayload::default(),
+                1,
+            )
+            .expect("enqueue");
+        store.claim_pending_op(id, 2).expect("claim");
+        assert_eq!(store.requeue_pending_ops(50).expect("requeue"), 1);
+        assert_eq!(store.due_pending_ops(51, 10).expect("due").len(), 1);
     }
 }

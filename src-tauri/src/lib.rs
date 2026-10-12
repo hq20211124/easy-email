@@ -2131,7 +2131,7 @@ async fn sync_status(state: State<'_, AppState>, account_id: String) -> Result<S
     // have to survive a restart — which is exactly what this file is for.
     let user = state.user.clone();
     let drafts = user.draft_count().map_err(describe)?;
-    let pending = user.pending_op_count().map_err(describe)?;
+    let pending = user.pending_ops_outstanding().map_err(describe)?;
 
     Ok(SyncStatus {
         offline: failure.is_some(),

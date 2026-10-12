@@ -958,6 +958,46 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+    Step 'the offline intent queue is real, and one writer makes it idempotent' {
+        # Round 80 / design/04 §5.5, SYN-14. The `pending_ops` table has been in the schema since the
+        # first version while `SyncStatus` has been counting its rows — a permanent 0 that was honest
+        # and a feature that was absent. This step keeps both halves connected.
+        $db = Get-Content 'crates/mail-core/src/userdb.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        if ($db -notmatch 'fn enqueue_pending_op\(') {
+            $problems += 'userdb.rs must be able to enqueue an offline intent'
+        }
+        if ($db -notmatch 'fn due_pending_ops\(') {
+            $problems += 'userdb.rs must be able to list the intents whose turn it is'
+        }
+        # The claim must compare, or two ticks apply one intent.
+        if ($db -notmatch "where id = \?1 and state = 'queued'") {
+            $problems += 'claim_pending_op must be a compare-and-set on state'
+        }
+        # An unknown kind must stay a row, not a panic and not a guess.
+        if ($db -notmatch 'PendingOpKind::parse\(') {
+            $problems += 'an unreadable kind must read as None and leave the row intact'
+        }
+        # The UI number must not include history.
+        if ($db -notmatch "state in \('queued', 'in_flight'\)") {
+            $problems += 'pending_ops_outstanding must count work left, not rows that exist (done/cancelled are history)'
+        }
+        # The status field must be fed by that function, not by a raw count.
+        if ($lib -notmatch 'pending_ops_outstanding') {
+            $problems += 'SyncStatus must report pending_ops_outstanding — the count the UI shows has to be the one that means work left'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'offline intents are queueable, claimable, and countable as work rather than history'
+        $global:LASTEXITCODE = 0
+    }
+
         Write-Host 'KB is a thousand bytes, KiB is 1024, and a bad size is reported rather than guessed'
         $global:LASTEXITCODE = 0
     }
