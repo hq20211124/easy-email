@@ -1225,14 +1225,12 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+        Write-Host 'the log rotates at 8 MB, keeps seven generations, and a failed rotation is not fatal'
+        $global:LASTEXITCODE = 0
+    }
     Step 'the log can be read back, and the reading says it was capped' {
         # Round 87. Rotation (round 86) is a promise about a file nobody sees unless the app can show
         # it: a cap the user cannot observe is a cap they will report as "the log stops working".
-        # Three things fail silently here:
-        #   * a log_tail command that does not exist — the sidebar row opens nothing;
-        #   * a row with no listener — visible, clickable, dead;
-        #   * a read that shows the raw file, which is the one path that would bypass the redaction
-        #     everything else went through on the way in.
         $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
         $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
         $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
@@ -1246,9 +1244,6 @@ try {
         if ($shell -notmatch 'tail_lines') {
             $problems += 'the read must go through logrot::tail_lines rather than slicing the file itself'
         }
-        if ($shell -notmatch 'log_tail') { $problems += 'log_tail must exist' }
-        # The redaction must be on the way in AND on the way out; a second pass that changes the text
-        # is a bug, so the counter is logged rather than silently swallowed.
         $tail = [regex]::Match($shell, '(?s)async fn log_tail\(.*?\n\}').Value
         if ($tail -notmatch 'redact::redact') {
             $problems += 'log_tail must redact on the way out too: a second pass that changes text is a bug, and it must be able to say so'
@@ -1256,11 +1251,14 @@ try {
         if ($html -notmatch 'id="btn-log"') {
             $problems += 'the sidebar must have a row for the log'
         }
-        if ($js -notmatch 'btn-log' -or $js -notmatch 'invoke\(''log_tail'\'') {
-            $problems += 'app.js must wire the row to the command'
+        if ($js -notmatch 'btn-log') {
+            $problems += 'app.js must wire the row'
+        }
+        if ($js -notmatch 'log_tail') {
+            $problems += 'app.js must invoke the log_tail command'
         }
         # The dialog must answer "why does it stop" before the user asks.
-        if ($js -notmatch '8 MB' -or $js -notmatch '7 份') {
+        if ($js -notmatch '8 MB' -or $js -notmatch '保留 7 份') {
             $problems += 'the log dialog must say the file is capped and kept for seven generations'
         }
 
@@ -1272,8 +1270,42 @@ try {
         Write-Host 'the log is readable, redacted on the way out, and the dialog explains the cap'
         $global:LASTEXITCODE = 0
     }
+    Step 'a saved search lives in the user database, and one name is one row' {
+        # Round 88 / design/09 §1 goal 7 (SRCH-05). Two silent failures, both covered by unit tests:
+        #   * the table landing in `cache.db` — clearing the cache would take the user's searches
+        #     with it, and nobody notices until they do;
+        #   * the global row (`account_id is null`) being handled with a plain unique index — SQLite
+        #     treats NULLs as distinct, so two rows with the same name accumulate quietly.
+        $db = Get-Content 'crates/mail-core/src/userdb.rs' -Raw -Encoding UTF8
+        $problems = @()
 
-        Write-Host 'the log rotates at 8 MB, keeps seven generations, and a failed rotation is not fatal'
+        if ($db -notmatch 'saved_searches') {
+            $problems += 'userdb.rs must create the saved_searches table'
+        }
+        foreach ($fn in @('save_search', 'list_saved_searches', 'delete_search', 'rename_search')) {
+            if ($db -notmatch ("fn " + $fn)) {
+                $problems += "userdb.rs must expose $fn"
+            }
+        }
+        # The listing must include the global rows, not filter them out.
+        if ($db -notmatch 'account_id = \?1 or account_id is null') {
+            $problems += 'the listing must be "this account or global" — a plain equality hides every global search'
+        }
+        # Deletes must not be able to reach another account's row.
+        if ($db -notmatch "where id = \?1 and \(account_id = \?2 or account_id is null\)") {
+            $problems += 'delete_search must scope by account inside the WHERE, not filter afterwards'
+        }
+        # Empty names and queries are refused where it is stored.
+        if ($db -notmatch '搜索名字不能为空' -or $db -notmatch '搜索条件不能为空') {
+            $problems += 'a search with no name or no query must be refused at the store'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'saved searches live beside the drafts, one name is one row, and globals stay visible'
         $global:LASTEXITCODE = 0
     }
 

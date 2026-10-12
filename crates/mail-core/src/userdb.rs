@@ -593,6 +593,145 @@ impl UserStore {
     }
 }
 
+/// A search the user asked to keep (`design/09` §1 goal 7, SRCH-05).
+///
+/// It lives in `user.db`, next to the drafts, for the same reason drafts do: it is the user's own
+/// data, and clearing the cache must not take it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedSearch {
+    pub id: i64,
+    /// The account it was saved for, or `None` for one that shows up for **every** account.
+    ///
+    /// The global row is why the listing is `account_id = ?1 or account_id is null` and not a plain
+    /// equality: writing it the obvious way hides the global searches from everybody, which is a bug
+    /// nobody would report until they wondered where their search went.
+    pub account_id: Option<String>,
+    pub name: String,
+    pub query: String,
+    pub created_at: i64,
+}
+
+/// Where saved searches live, and the shape they are keyed by.
+impl UserStore {
+    /// Save (or re-save) a search under this name.
+    ///
+    /// **Same name means the same search**: a user tightening a query they already saved expects the
+    /// old one to change, not to find two rows with the same name in the sidebar. The match is on
+    /// `(account_id, name)`, and because SQLite's unique index treats NULLs as distinct — which
+    /// would let two *global* rows share a name — the upsert is an explicit read-then-write inside
+    /// one `write_blocking` closure (this database has a single writer, so that is atomic).
+    ///
+    /// Returns the row id.
+    pub fn save_search(
+        &self,
+        account_id: Option<&str>,
+        name: &str,
+        query: &str,
+        now: i64,
+    ) -> Result<i64> {
+        let name = name.trim().to_string();
+        let query = query.trim().to_string();
+        let account_id = account_id.map(|s| s.to_string());
+        if name.is_empty() {
+            return Err(crate::error::MailError::Config(
+                "搜索名字不能为空".to_string(),
+            ));
+        }
+        if query.is_empty() {
+            return Err(crate::error::MailError::Config(
+                "搜索条件不能为空".to_string(),
+            ));
+        }
+        if name.chars().count() > 60 {
+            return Err(crate::error::MailError::Config(
+                "搜索名字太长（最多 60 个字符）".to_string(),
+            ));
+        }
+        self.db.write_blocking(move |conn| {
+            let existing: Option<i64> = conn
+                .query_row(
+                    "select id from saved_searches
+                      where name = ?1 and account_id is ?2",
+                    rusqlite::params![name, account_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                conn.execute(
+                    "update saved_searches set query = ?2 where id = ?1",
+                    rusqlite::params![id, query],
+                )?;
+                return Ok(id);
+            }
+            conn.execute(
+                "insert into saved_searches (account_id, name, query, created_at)
+                 values (?1, ?2, ?3, ?4)",
+                rusqlite::params![account_id, name, query, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// This account's searches, plus the global ones. Newest first.
+    pub fn list_saved_searches(&self, account_id: &str) -> Result<Vec<SavedSearch>> {
+        let account_id = account_id.to_string();
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select id, account_id, name, query, created_at
+             from saved_searches
+             where account_id = ?1 or account_id is null
+             order by created_at desc, id desc",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![account_id], |row| {
+            Ok(SavedSearch {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                name: row.get(2)?,
+                query: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Delete one of this account's searches. `false` means it was not theirs to delete.
+    ///
+    /// The account is part of the condition, not a filter applied afterwards: a delete that reaches
+    /// another account's row is a delete that will eventually happen.
+    pub fn delete_search(&self, id: i64, account_id: &str) -> Result<bool> {
+        let account_id = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "delete from saved_searches
+                  where id = ?1 and (account_id = ?2 or account_id is null)",
+                rusqlite::params![id, account_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Rename one of this account's searches. `false` means it was not theirs to rename.
+    pub fn rename_search(&self, id: i64, account_id: &str, name: &str) -> Result<bool> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(crate::error::MailError::Config(
+                "搜索名字不能为空".to_string(),
+            ));
+        }
+        let account_id = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            let changed = conn.execute(
+                "update saved_searches set name = ?3
+                  where id = ?1 and (account_id = ?2 or account_id is null)",
+                rusqlite::params![id, account_id, name],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+}
+
 /// One account's quota state for the current window (`design/04` §5.7).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuotaLedger {
@@ -1581,6 +1720,17 @@ impl UserStore {
                      updated_at      integer not null
                  );
                  create index if not exists pending_ops_queue on pending_ops(state, next_attempt_at);
+
+                 -- Searches the user asked to keep (design/09 §1 goal 7, SRCH-05). Next to the
+                 -- drafts, for the drafts' reason: their own data, and clearing the cache must not
+                 -- take it. `account_id is null` is a search that shows up for every account.
+                 create table if not exists saved_searches (
+                     id          integer primary key autoincrement,
+                     account_id  text,
+                     name        text not null,
+                     query       text not null,
+                     created_at  integer not null
+                 );
 
                  -- The daily download quota ledger (design/04 §5.7). It lives here, in the file that
                  -- is never deleted, on purpose: a ledger in the deletable cache would forget how
@@ -2620,5 +2770,153 @@ mod tests {
         store.claim_pending_op(id, 2).expect("claim");
         assert_eq!(store.requeue_pending_ops(50).expect("requeue"), 1);
         assert_eq!(store.due_pending_ops(51, 10).expect("due").len(), 1);
+    }
+    // ------------------------------------------------------------ saved searches
+
+    #[test]
+    fn a_saved_search_survives_the_round_trip() {
+        let store = store();
+        let id = store
+            .save_search(Some("acc"), "未读发票", "has:attachment is:unread", 1_000)
+            .expect("save");
+        let list = store.list_saved_searches("acc").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].name, "未读发票");
+        assert_eq!(list[0].query, "has:attachment is:unread");
+        assert_eq!(list[0].account_id.as_deref(), Some("acc"));
+    }
+
+    #[test]
+    fn saving_the_same_name_again_changes_the_query_rather_than_adding_a_row() {
+        // A user tightening a search they already saved expects the sidebar entry to change, not to
+        // find two rows with the same name.
+        let store = store();
+        store
+            .save_search(Some("acc"), "未读", "is:unread", 1_000)
+            .expect("first");
+        store
+            .save_search(Some("acc"), "未读", "is:unread after:2026-01-01", 2_000)
+            .expect("second");
+        let list = store.list_saved_searches("acc").expect("list");
+        assert_eq!(list.len(), 1, "one name, one row");
+        assert_eq!(list[0].query, "is:unread after:2026-01-01");
+    }
+
+    #[test]
+    fn a_global_search_is_visible_to_every_account_and_stays_one_row() {
+        // `account_id is null` means "every account", and the two halves of that are the listing's
+        // `or account_id is null` and the upsert's explicit read-then-write (a unique index would
+        // treat the two NULLs as distinct and quietly allow two rows with the same name).
+        let store = store();
+        store
+            .save_search(None, "全部未读", "is:unread", 1_000)
+            .expect("save global");
+        store
+            .save_search(None, "全部未读", "is:unread is:flagged", 2_000)
+            .expect("re-save global");
+        assert_eq!(store.list_saved_searches("acc-a").expect("list a").len(), 1);
+        assert_eq!(store.list_saved_searches("acc-b").expect("list b").len(), 1);
+        assert_eq!(
+            store.list_saved_searches("acc-b").expect("list b")[0].query,
+            "is:unread is:flagged"
+        );
+    }
+
+    #[test]
+    fn an_account_search_is_not_visible_to_another_account() {
+        let store = store();
+        store
+            .save_search(Some("acc-a"), "只给 A", "is:unread", 1_000)
+            .expect("save");
+        assert!(
+            store
+                .list_saved_searches("acc-b")
+                .expect("list b")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deleting_reaches_only_the_callers_own_rows() {
+        // The account is part of the WHERE, not a filter applied afterwards: a delete that can reach
+        // another account's row is a delete that will eventually happen.
+        let store = store();
+        let mine = store.save_search(Some("a"), "我的", "q", 1).expect("save");
+        let theirs = store
+            .save_search(Some("b"), "他们的", "q", 1)
+            .expect("save");
+        assert!(!store.delete_search(theirs, "a").expect("not theirs"));
+        assert!(store.delete_search(mine, "a").expect("mine"));
+        assert_eq!(store.list_saved_searches("a").expect("list").len(), 0);
+        assert_eq!(store.list_saved_searches("b").expect("list").len(), 1);
+    }
+
+    #[test]
+    fn a_global_search_can_be_deleted_by_any_account_that_sees_it() {
+        let store = store();
+        let id = store.save_search(None, "全局", "q", 1).expect("save");
+        assert!(store.delete_search(id, "whichever").expect("delete"));
+    }
+
+    #[test]
+    fn empty_names_and_queries_are_refused() {
+        // A saved search with no query is a button that shows an empty list; with no name it is a
+        // button with no label. Both are refused at the store, not at the dialog.
+        let store = store();
+        assert!(store.save_search(Some("acc"), "  ", "q", 1).is_err());
+        assert!(store.save_search(Some("acc"), "名字", "   ", 1).is_err());
+        assert!(store.save_search(Some("acc"), "", "q", 1).is_err());
+        let long = "名".repeat(61);
+        assert!(
+            store.save_search(Some("acc"), &long, "q", 1).is_err(),
+            "60 is the cap"
+        );
+        assert!(
+            store
+                .save_search(Some("acc"), &"名".repeat(60), "q", 1)
+                .is_ok()
+        );
+        assert_eq!(store.list_saved_searches("acc").expect("list").len(), 1);
+    }
+
+    #[test]
+    fn renaming_reaches_only_the_callers_own_rows() {
+        let store = store();
+        let mine = store.save_search(Some("a"), "旧名", "q", 1).expect("save");
+        let theirs = store
+            .save_search(Some("b"), "他们的", "q", 1)
+            .expect("save");
+        assert!(
+            !store
+                .rename_search(theirs, "a", "抢注")
+                .expect("not theirs")
+        );
+        assert!(store.rename_search(mine, "a", "新名").expect("mine"));
+        assert_eq!(
+            store.list_saved_searches("a").expect("list")[0].name,
+            "新名"
+        );
+        assert_eq!(
+            store.list_saved_searches("b").expect("list")[0].name,
+            "他们的"
+        );
+    }
+
+    #[test]
+    fn saved_searches_live_in_the_user_database_so_clearing_the_cache_keeps_them() {
+        // The reason this table is not in `cache.db`. There is no cache to clear in a unit test, so
+        // what is asserted is the home: the table is created by `UserStore`'s own migration.
+        let store = store();
+        store
+            .save_search(Some("acc"), "留着", "q", 1)
+            .expect("save");
+        let names: Vec<String> = store
+            .list_saved_searches("acc")
+            .expect("list")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["留着".to_string()]);
     }
 }
