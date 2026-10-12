@@ -1225,6 +1225,54 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+    Step 'the log can be read back, and the reading says it was capped' {
+        # Round 87. Rotation (round 86) is a promise about a file nobody sees unless the app can show
+        # it: a cap the user cannot observe is a cap they will report as "the log stops working".
+        # Three things fail silently here:
+        #   * a log_tail command that does not exist — the sidebar row opens nothing;
+        #   * a row with no listener — visible, clickable, dead;
+        #   * a read that shows the raw file, which is the one path that would bypass the redaction
+        #     everything else went through on the way in.
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $problems = @()
+
+        if ($shell -notmatch 'fn log_tail\(') {
+            $problems += 'lib.rs must expose log_tail'
+        } elseif ($shell -notmatch "(?m)^\s+log_tail,\s*$") {
+            $problems += 'log_tail exists but is missing from generate_handler!'
+        }
+        if ($shell -notmatch 'tail_lines') {
+            $problems += 'the read must go through logrot::tail_lines rather than slicing the file itself'
+        }
+        if ($shell -notmatch 'log_tail') { $problems += 'log_tail must exist' }
+        # The redaction must be on the way in AND on the way out; a second pass that changes the text
+        # is a bug, so the counter is logged rather than silently swallowed.
+        $tail = [regex]::Match($shell, '(?s)async fn log_tail\(.*?\n\}').Value
+        if ($tail -notmatch 'redact::redact') {
+            $problems += 'log_tail must redact on the way out too: a second pass that changes text is a bug, and it must be able to say so'
+        }
+        if ($html -notmatch 'id="btn-log"') {
+            $problems += 'the sidebar must have a row for the log'
+        }
+        if ($js -notmatch 'btn-log' -or $js -notmatch 'invoke\(''log_tail'\'') {
+            $problems += 'app.js must wire the row to the command'
+        }
+        # The dialog must answer "why does it stop" before the user asks.
+        if ($js -notmatch '8 MB' -or $js -notmatch '7 份') {
+            $problems += 'the log dialog must say the file is capped and kept for seven generations'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the log is readable, redacted on the way out, and the dialog explains the cap'
+        $global:LASTEXITCODE = 0
+    }
+
         Write-Host 'the log rotates at 8 MB, keeps seven generations, and a failed rotation is not fatal'
         $global:LASTEXITCODE = 0
     }

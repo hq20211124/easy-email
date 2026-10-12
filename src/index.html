@@ -67,6 +67,14 @@
             <span class="label">同步窗口</span>
             <span id="sync-window-value" class="count"></span>
           </button>
+          <!--
+            The log, readable. Rotation (8 MB, seven files) only means something to the user if they
+            can look at the thing being rotated; otherwise the cap is a promise about a file nobody
+            sees.
+          -->
+          <button id="btn-log" class="row" type="button" title="查看最近的程序日志（最多 500 行，内容已脱敏）">
+            <span class="label">查看日志</span>
+          </button>
         </div>
 
         <!--

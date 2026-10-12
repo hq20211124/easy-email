@@ -3201,6 +3201,35 @@ fn unique_path(directory: &Path, name: &str) -> PathBuf {
 /// directory — so the `com.easyemail.desktop` identifier is not duplicated here by hand.
 static PANIC_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+// The rotation round (86) made the file bounded; reading it back is the other half of that
+// promise — a user asking "what has the app been doing" gets an answer, in the same redacted form
+// the file is written in. Reading it through the same redactor is deliberate: the file was
+// redacted on the way in, so a second pass must not change it, and if one ever does, that is a bug
+// worth seeing rather than hiding (see the counter below).
+
+/// The last `n` lines of the app log, already redacted.
+#[tauri::command]
+async fn log_tail(state: State<'_, AppState>, lines: u32) -> Result<String, String> {
+    let _ = &state;
+    let Some(dir) = PANIC_LOG_DIR.get() else {
+        return Ok(String::new());
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("startup-error.log")) else {
+        // No log yet is not an error: a fresh install has nothing to say.
+        return Ok(String::new());
+    };
+    // Capped like the design says (500), and clamped so a caller cannot ask for the whole file.
+    let n = lines.clamp(1, 500) as usize;
+    let tail = mail_core::logrot::tail_lines(&text, n).join("\n");
+    let (redacted, hidden) = mail_core::redact::redact(&tail);
+    if hidden > 0 {
+        // The file was redacted when written, so this should be zero. If it is not, say so rather
+        // than quietly showing the user a second layer of masking they did not ask for.
+        log_line(&format!("读日志时又掩掉 {hidden} 项（写入时应当已掩）"));
+    }
+    Ok(redacted)
+}
+
 /// Format one log line, redacted.
 ///
 /// Split out of [`log_line`] because the redaction is the part with rules worth testing and the file
@@ -3573,6 +3602,7 @@ pub fn run() {
             rebuild_search_step,
             search_hints,
             diagnostics_preview,
+            log_tail,
             diagnostics_export,
             list_messages,
             list_thread,

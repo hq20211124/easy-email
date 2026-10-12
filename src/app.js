@@ -441,6 +441,7 @@ function wireGlobalEvents() {
   $('btn-outbox').addEventListener('click', showOutbox);
   $('btn-sync-window').addEventListener('click', openSyncWindowPicker);
   $('btn-about').addEventListener('click', openAbout);
+  $('btn-log').addEventListener('click', openLog);
   $('btn-load-more').addEventListener('click', loadOlder);
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
@@ -3633,6 +3634,31 @@ async function wireDiagnostics(modal) {
       button.disabled = true;
     };
   });
+}
+
+/**
+ * The app's log, tailed.
+ *
+ * Two things this owes the user beyond showing text: it says the file is **capped** (so "why does
+ * it stop at some point" has an answer before they ask), and it says the content is redacted —
+ * because a log with addresses blanked looks broken until somebody explains the blanking.
+ */
+async function openLog() {
+  const text = await run('读取日志', () => invoke('log_tail', { lines: 500 }));
+  if (text === null) return;
+  openModal({
+    title: '程序日志',
+    bodyHtml: `
+      <p class="about-note">
+        最近 500 行。日志文件上限 8 MB，超出后自动轮转、保留 7 份（更早的会消失）。
+        显示内容与写入时一致：邮箱、授权码等已脱敏，所以你会看到「[已脱敏]」这样的占位。
+      </p>
+      <pre id="log-view" class="diag-preview"></pre>`,
+    confirmLabel: '关闭',
+  });
+  const view = $('log-view');
+  view.textContent = text && text.trim() ? text : '（还没有任何日志）';
+  view.scrollTop = view.scrollHeight;
 }
 
 function openAbout() {
