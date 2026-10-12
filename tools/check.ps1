@@ -1039,6 +1039,51 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+    Step 'redaction covers the eight categories, and normal lines survive it' {
+        # Round 82 / design/16 §3.4. The instruction is explicit: the eight categories are pinned by
+        # tests. Both halves of "pinned" matter here and they fail differently:
+        #   * a category whose pattern stops matching leaks, silently — nothing turns red;
+        #   * a redactor that eats everything makes diagnostics useless, and the next person deletes it.
+        $m = Get-Content 'crates/mail-core/src/redact.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($rule in @('mask_key_blocks', 'mask_emails', 'mask_secrets', 'mask_windows_user',
+                           'mask_phones', 'mask_long_digit_runs', 'mask_authorization_codes', 'mask_ipv4')) {
+            if ($m -notmatch [regex]::Escape($rule)) {
+                $problems += "redact.rs is missing $rule — that is one of design/16 §3.4's eight categories"
+            }
+        }
+        # The two partial masks are the difference between a useful diagnosis and a useless one.
+        if ($m -notmatch 'format!\("\{MASK\}@') {
+            $problems += 'an email must keep its domain: which provider refused the login is the actionable half'
+        }
+        if ($m -notmatch 'format!\("Users') {
+            $problems += 'a path must keep its Users prefix, or the rest of the path stops reading'
+        }
+        # Exact-length rules must swallow the whole run, or a 17-run is masked for its 16-substring.
+        if ($m -notmatch 'Span::verbatim') {
+            $problems += 'exact-length rules must skip the whole run (Span::verbatim), not retry one byte later'
+        }
+        # A private key block goes whole; a certificate does not.
+        if ($m -notmatch 'PRIVATE KEY') {
+            $problems += 'only PRIVATE KEY blocks are masked: a certificate is public data'
+        }
+        # The module must be reachable, not just written.
+        $lib = Get-Content 'crates/mail-core/src/lib.rs' -Raw -Encoding UTF8
+        if ($lib -notmatch 'pub mod redact;') {
+            $problems += 'lib.rs does not declare the redact module'
+        }
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) { return }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'eight categories, partial masks where they help, and normal lines untouched'
+        $global:LASTEXITCODE = 0
+    }
+
         Write-Host 'only network failures queue, all three commands are wired, and the outbox goes first'
         $global:LASTEXITCODE = 0
     }

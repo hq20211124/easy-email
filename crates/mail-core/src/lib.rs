@@ -35,6 +35,7 @@ pub mod pending;
 pub mod pool;
 pub mod providers;
 pub mod query;
+pub mod redact;
 pub mod sanitize;
 pub mod secret;
 pub mod sentcopy;
