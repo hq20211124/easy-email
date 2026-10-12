@@ -1436,7 +1436,10 @@ try {
             $problems += 'diag.rs must format the sample part (rows in, text out)'
         }
         if ($db -notmatch 'X-UID') { $problems += 'the sample is message headers, keyed by UID' }
-        if ($db -notmatch 'fn sender_of\|（无发件人）') {
+        # `|` unescaped: in a .NET regex `\|` is a literal pipe, not an alternation, and the step
+        # below failed on Windows for exactly that reason (it searched for a function literally named
+        # "sender_of|（无发件人）"). The gate caught its own typo, which is the system working.
+        if ($db -notmatch 'fn sender_of|（无发件人）') {
             $problems += 'a row with no sender must say so rather than print an empty line'
         }
         # The summaries carry no body — that is what makes "headers only" structural.
