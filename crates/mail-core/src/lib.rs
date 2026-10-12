@@ -20,6 +20,7 @@ pub mod attach;
 pub mod backfill;
 pub mod cache;
 pub mod db;
+pub mod diag;
 pub mod error;
 pub mod folders;
 pub mod idle;

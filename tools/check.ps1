@@ -1127,6 +1127,51 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+    Step 'the diagnostics bundle redacts every part, and a preview writes nothing' {
+        # Round 84 / design/16 §3.3. The bundle is the file a user attaches to a bug report, so it is
+        # the one place the program copies its insides out of the machine. Four properties, each of
+        # which fails silently rather than loudly:
+        #   * a part that is not redacted — the leak nobody sees until someone else finds it;
+        #   * "accounts off" read as "accounts **raw**" — the dangerous reading of that option;
+        #   * sample headers on by default — the design wants an explicit tick;
+        #   * a preview that still names a file — something on disk the user did not confirm sending.
+        $d = Get-Content 'crates/mail-core/src/diag.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'crates/mail-core/src/lib.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($need in @('DiagOptions', 'DiagInputs', 'DiagManifest', 'build_bundle', 'include_logs',
+                           'include_settings', 'include_accounts_redacted', 'include_sample_headers', 'preview_only')) {
+            if ($d -notmatch [regex]::Escape($need)) {
+                $problems += "diag.rs must model $need (design/16 §3.3)"
+            }
+        }
+        if ($d -notmatch 'redact\(') {
+            $problems += 'every part must go through redact()'
+        }
+        # Off means omitted, never raw.
+        if ($d -notmatch 'accounts-redacted') {
+            $problems += 'an omitted account list must be omitted, not written unredacted'
+        }
+        # The sample-headers field is the only content field there is; bodies have nowhere to go.
+        if ($d -match 'body_text|include_bodies') {
+            $problems += 'diag.rs must have no field for message bodies: headers only, and only on request'
+        }
+        if ($d -notmatch 'preview_only') {
+            $problems += 'preview_only must exist and must not name a file'
+        }
+        if ($lib -notmatch 'pub mod diag;') {
+            $problems += 'lib.rs does not declare the diag module'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
+        $global:LASTEXITCODE = 0
+    }
+
         Write-Host 'the log path redacts, and the other raw sinks are listed rather than remembered'
         $global:LASTEXITCODE = 0
     }
