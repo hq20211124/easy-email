@@ -11,6 +11,61 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### 查询语法第二片：结构化谓词 + "打错有提示"（09 树⑤）✅（第 78 轮）
+
+**依据**：`design/09` §1 目标 4 的后半与 **§2 的原话**——"查询语法有错时给'语法提示'而不是空结果"。
+第 77 轮做了文本型前缀；本片做结构化谓词并把"你打错了"这件事说出来。
+
+**代码搬了家**：解析从 `cache.rs` 抽到新模块 **`crates/mail-core/src/query.rs`**
+（`QueryColumn`/`QueryTerm`/`parse_query`/`match_expression`/`parse_date`/`query_issues`），
+`cache.rs` 只留 `to_query` 薄壳（tokenisation 的对称测试仍然钉它）。**这次搬家是必要的**：
+cache.rs 已经 3700 行，而"这个串是什么意思"和"它变成什么 SQL"是两个问题，
+只有一个需要数据库——能单独测的那部分才不会烂。
+分词原语 `clauses_of`/`Clause` 提升为 `pub(crate)`（索引与查询必须共用同一个分词函数）。
+
+**谓词怎么进 SQL**：`Predicates` 结构收集"片段 + 绑定值"，**编号只由带 `?` 的子句推进**
+（`has:attachment` 的 EXISTS 不绑定任何东西，若也占一个号，它后面的谓词全体错位一号；
+最后 `params_from_iter` 绑定。全程**没有字符串拼 SQL**。
+
+**`account:` 是覆盖，不是叠加**：第一版把它写成又一条 `m.account_id = ?`，
+和调用方的作用域条件**互相矛盾** ⇒ 永远 0 行（且没有任何报错）。测试当场抓住，
+改成"显式 `account:` 替换调用方范围"。
+
+**`parse_date` 的三段式 + 一个真缺陷**：`YYYY-MM-DD` / `YYYY-MM-DDTHH:MM` / 纯 epoch 秒数。
+**按 UTC 解释**（不为它引时区库；东八区用户看到的边界是 UTC 当日 00:00，
+这点写进文档而不是留给用户猜）。测试抓到一个真缺陷：**2023-02-29 被接受了**
+（只查了 1..=31，没查该月实际天数）——一个不存在的日期会让筛选悄悄落到三月。
+闰年也一并覆盖（2024-02-29 应可解析，已断言）。
+
+**"打错有提示"落了三处**：`query_issues()`（纯函数两种提示：不认识的**像前缀的写法**、
+**看不懂的日期**）；新命令 `search_hints(query)`（**不改 `search` 的返回类型**——
+`payload_keys` 钉着那个契约，为一句建议改形状不划算）；前端状态行 `.search-hint`，
+只在查询里**有冒号**时才问（普通词零成本）。
+
+**测试 +7**（query.rs 5 + cache 的谓词单测 1 + 端到端 1）→ **WSL 387 passed / 7 ignored**（380+7）。
+端到端那条钉住：日期闭区间、`is:unread`/`in:` 组合、`has:attachment` 与日期混合
+（两种查询形状同时在场）、**另一个账号的邮件绝不串门**、`account:other` 真的在查别的账号。
+
+**门禁 38 → 39 步**：新增「the structured predicates are bound, and one of them cannot shift the
+others」——五个谓词 term 在位、`account:` 不得被绑第二次、EXISTS 必须走 `add_raw`、
+值必须 `params_from_iter` 绑定、`search_hints` 命令已注册且前端真的渲染 `.search-hint`。
+
+**这一轮我连续犯了三次同类错误，都记在这里**：
+1. 追加测试的 Python 脚本 `s[:idx] + block` **把 cache.rs 从 paging 标记处截断**，
+   **36 个测试消失**（3706 行→2550 行）。是从"362 变成 287"这个数字变化发现的——
+   数字变小永远是个信号。恢复方式：`git checkout HEAD --` 后只重新应用第 78 轮的四处改动。
+2. `Predicates` 初版给 EXISTS 也分配占位符 ⇒ 后面的谓词错位（见上）。
+3. `account:` 写成叠加 ⇒ 自相矛盾。
+三次都是"自己写的东西当场被自己的测试抓住"，说明测试的位置是对的；
+但** Brittle 的还有工具用法**：批量改文件要用"插入"而不是"替换+截断"，
+`git checkout` 是秒级回滚——这两条也写进了本轮的教训。
+
+**未做/未验**：`larger:`/`smaller:`、保存搜索、语法高亮、服务器端回退（M2）；
+日期按 UTC 的本地化；**真机未验**（要在真邮箱里试 `from:shop has:attachment after:2026-01-01`
+和一条打错的前缀——等你自己验证那批一起做）。
+
+---
+
 ### 查询语法第一片：字段限定 + `has:attachment`（09 树④）✅（第 77 轮）
 
 **依据**：`design/09` §1 目标 4 的语法清单。分两片：**本片只做文本型前缀 + `has:attachment`**；

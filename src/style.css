@@ -477,6 +477,13 @@ textarea {
 }
 
 /* Which folder a search hit came from, shown only while searching. */
+.search-hint {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--danger);
+  line-height: 1.4;
+}
+
 .msg-folder {
   font-size: 10px;
   color: var(--accent);

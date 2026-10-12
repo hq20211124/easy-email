@@ -865,6 +865,55 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the structured predicates are bound, and one of them cannot shift the others' {
+        # Round 78, design/09 §1 goal 4's second half plus §2 ("a syntax mistake must produce a hint,
+        # not an empty result"). The two regressions this step exists for:
+        #   * `account:` implemented as *another* `m.account_id = ?` instead of an override of the
+        #     caller's scope: two conditions on the same column can only contradict, and the wrong
+        #     answer is silence;
+        #   * a clause that binds nothing (the `has:attachment` EXISTS) consuming a placeholder,
+        #     which shifts every predicate after it — a query that returns the wrong rows without
+        #     erroring anywhere.
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($term in @('Date', 'Unread', 'Flagged', 'InFolder', 'Account')) {
+            if ($cache -notmatch ("QueryTerm::" + $term)) {
+                $problems += "cache.rs no longer models $term as its own term"
+            }
+        }
+        if ($cache -match '(?m)^\s*pred\.add\("m\.account_id = \?", id\.clone\(\)\)') {
+            $problems += 'account: must REPLACE the caller scope, not add a second m.account_id condition (two conditions can only contradict)'
+        }
+        if ($cache -notmatch 'add_raw\(') {
+            $problems += 'the EXISTS clause must be added without a placeholder (add_raw), or every predicate after it shifts'
+        }
+        if ($cache -notmatch 'params_from_iter') {
+            $problems += 'predicate values must be bound as parameters; a format!-built WHERE is an injection surface'
+        }
+        # The hint must reach the screen, which means the command exists, is registered, and the
+        # renderer asks for it.
+        foreach ($pair in @(@('search_hints', $lib), @('search_hints', $js))) {
+            if ($pair[1] -notmatch 'search_hints') { $problems += 'search_hints is missing on one side (command or renderer): a hint nobody shows is not a hint' }
+        }
+        if ($lib -notmatch "(?m)^\s+search_hints,\s*$") {
+            $problems += 'search_hints is missing from generate_handler!'
+        }
+        if ($js -notmatch 'search-hint') {
+            $problems += 'app.js must render the hint line (design/09 §2 asks for the hint, not the capability)'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'predicates bind as parameters, account: overrides, and the hint reaches the screen'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

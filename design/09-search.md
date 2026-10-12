@@ -15,7 +15,7 @@
 | 1. 中文 2 字词 100% 命中（逐字空格化 + `unicode61`，§4.2 已定案并钉进测试） | ✅ 已实现并真机验证（QQ 收信） |
 | 2. 覆盖：主题/发件人/收件人 + **正文**（后台有界回填，v0.1.2）+ **附件名**（第 71 轮） | ✅ 两项都实现；**附件文本按 Q3 默认关**（M2 的开关） |
 | 3. 输入即出 ≤ 100 ms（10 万封） | ⚠️ 10 万封未实测；20 000 封基准在 `design/15` 与 `bench_fixture`，查询形状已按实测改过（见 `cache.rs::search` 的注释） |
-| 4. 查询语法（`from:`/`has:attachment`/`filename:` 等） | ⚠️ **第一片已做**（第 77 轮）：`from:`/`to:`/`cc:`/`subject:`/`body:`/`filename:`/`has:attachment`。不认识的写法按字面搜（手滑不换来静默空结果）。时间/标记/文件夹/大小/账号前缀、以及"语法提示"仍未做 |
+| 4. 查询语法（`from:`/`has:attachment`/`filename:` 等） | ⚠️ **第一片已做**（第 77 轮）：`from:`/`to:`/`cc:`/`subject:`/`body:`/`filename:`/`has:attachment`。**第二片已做**（第 78 轮）：`after:`/`before:`/`is:unread`/`is:flagged`/`in:`/`account:`，且"打错有提示而不是空结果"（§2）。剩下的：`larger:`/`smaller:`、保存搜索、语法高亮、服务器端回退 |
 | 5. 可重建/可暂停/可取消（`index_queue`、重建 UI） | ⚠️ **重建 UI 第 72 轮已做**（分批、可续跑、可停止、二次确认）；`index_queue` 队列与 FTS 损坏的**自动**探测/heal 仍未做（M2） |
 | 6. 服务器回退（`UID SEARCH`） | ❌ 未做 |
 | 7. 保存搜索/虚拟文件夹 | ❌ M2 |

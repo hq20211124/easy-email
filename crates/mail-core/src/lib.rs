@@ -33,6 +33,7 @@ pub mod oauthclient;
 pub mod outbox;
 pub mod pool;
 pub mod providers;
+pub mod query;
 pub mod sanitize;
 pub mod secret;
 pub mod sentcopy;
@@ -49,10 +50,7 @@ pub use attach::{AttachmentIssue, check_attachment, file_sha256, prepare_attachm
 pub use backfill::{
     BackfillBudget, BackfillReport, BackfillStop, backfill_older, fill_thread_keys,
 };
-pub use cache::{
-    BodyCoverage, Cache, FolderState, QueryColumn, QueryTerm, RebuildProgress, SearchHit,
-    match_expression, parse_query, to_query,
-};
+pub use cache::{BodyCoverage, Cache, FolderState, RebuildProgress, SearchHit, to_query};
 pub use error::{AuthHint, MailError, Result};
 pub use idle::{PushEvent, watch, watch_every};
 pub use imap::Credential;
@@ -70,6 +68,9 @@ pub use outbox::{
 };
 pub use pool::{ConnectionPool, PooledClient};
 pub use providers::Provider;
+pub use query::{
+    QueryColumn, QueryTerm, known_prefixes, match_expression, parse_date, parse_query, query_issues,
+};
 pub use sentcopy::{DraftMirrorReport, SentCopy, draft_to_mail, ensure_sent_copy, mirror_draft};
 pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};

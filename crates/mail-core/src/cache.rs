@@ -185,7 +185,9 @@ fn truncate_chars(text: &str, limit: usize) -> &str {
 }
 
 /// One clause of a `MATCH` expression: an ASCII word, or a run of characters that must be adjacent.
-enum Clause {
+/// Crate-visible because `crate::query` builds the FTS expression from it: the index and the
+/// query must tokenise with the *same* function, and that is only true while there is one of it.
+pub(crate) enum Clause {
     Word(String),
     Phrase(Vec<char>),
 }
@@ -195,7 +197,7 @@ enum Clause {
 /// Keeping this in one place is the whole point: the previous version of `to_query` called
 /// `to_tokens` and wrapped the result in quotes, so the two could not disagree. They still cannot —
 /// both walk the input and cut it at the same boundaries.
-fn clauses_of(term: &str) -> Vec<Clause> {
+pub(crate) fn clauses_of(term: &str) -> Vec<Clause> {
     let mut clauses = Vec::new();
     let mut word = String::new();
     let mut run: Vec<char> = Vec::new();
@@ -235,133 +237,74 @@ fn clauses_of(term: &str) -> Vec<Clause> {
 /// `账单 发票` means "the adjacent characters 账单, and also 发票", and `invoice 账单` means "the word
 /// invoice, and also 账单". Quotes are dropped: they are FTS5 syntax, and letting them through turns
 /// a pasted string into a `MATCH` syntax error.
-/// Which column a bare search should cover when the user scoped it with a prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryColumn {
-    Subject,
-    /// The FTS keeps the display name and the address apart; both are "who sent it" to a user.
-    From,
-    To,
-    /// Body text — and the attachment names, which are indexed into the same column (round 71).
-    Body,
-}
-
-impl QueryColumn {
-    /// The FTS5 column filter for this column, in FTS5's own syntax.
-    pub fn filter(&self) -> &'static str {
-        match self {
-            QueryColumn::Subject => "{subject}",
-            QueryColumn::From => "{from_name from_addr}",
-            QueryColumn::To => "{to_addrs}",
-            QueryColumn::Body => "{body}",
-        }
-    }
-}
-
-/// One term of a parsed query, as the user typed it.
-///
-/// Split from [`Cache::search`] so the parsing rules can be tested without a database: "what does
-/// this string mean" and "what SQL does it become" are two questions, and only the second needs a
-/// cache. Unknown prefixes stay whole: a typo like `frm:boss` should search for the literal text
-/// rather than silently return nothing, which is what treating it as a prefix would do.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryTerm {
-    /// A text term, optionally scoped to one column.
-    Text {
-        column: Option<QueryColumn>,
-        text: String,
-    },
-    /// `has:attachment` — the only structured predicate in this slice.
-    HasAttachment,
-}
-
-/// Parse a query string into terms.
-///
-/// Every whitespace-separated word is looked at for a `prefix:` head from the tables below. The set
-/// on purpose does not cover the whole syntax `design/09` §1 lists: dates and flags are structured
-/// predicates and belong to the next slice, because they change the `WHERE` rather than the FTS
-/// expression.
-pub fn parse_query(input: &str) -> Vec<QueryTerm> {
-    let mut terms = Vec::new();
-    for raw in input.split_whitespace() {
-        let term = raw.replace(['"', '\''], "");
-        if term.is_empty() {
-            continue;
-        }
-        if let Some(rest) = term.strip_prefix("has:")
-            && rest.eq_ignore_ascii_case("attachment")
-        {
-            terms.push(QueryTerm::HasAttachment);
-            continue;
-        }
-        if let Some((head, rest)) = term.split_once(':')
-            && !rest.trim().is_empty()
-            && let Some(column) = column_of(head)
-        {
-            terms.push(QueryTerm::Text {
-                column: Some(column),
-                text: rest.to_string(),
-            });
-            continue;
-        }
-        // No prefix, or one this slice does not know: the whole word is the term. A user searching
-        // for the string `foo:bar` in a subject must still find it.
-        terms.push(QueryTerm::Text {
-            column: None,
-            text: term,
-        });
-    }
-    terms
-}
-
-fn column_of(head: &str) -> Option<QueryColumn> {
-    match head.to_ascii_lowercase().as_str() {
-        "subject" => Some(QueryColumn::Subject),
-        "from" | "sender" => Some(QueryColumn::From),
-        "to" | "cc" => Some(QueryColumn::To),
-        "body" | "filename" => Some(QueryColumn::Body),
-        _ => None,
-    }
-}
-
-/// The FTS5 MATCH expression for the text terms, and nothing else.
-///
-/// Column scoping is expressed with FTS5's own filter syntax (`{subject}: "账 单"`), so the
-/// tokenisation stays exactly what it was — the index and the query must keep using the same
-/// transformation (`the_index_and_the_query_use_the_same_transformation`), and that test is what
-/// keeps this function from "simplifying" the CJK handling away.
-pub fn match_expression(text_terms: &[QueryTerm]) -> String {
-    let mut clauses: Vec<String> = Vec::new();
-    for term in text_terms {
-        if let QueryTerm::Text { column, text } = term {
-            let head = column
-                .map(|c| format!("{}: ", c.filter()))
-                .unwrap_or_default();
-            for clause in clauses_of(text) {
-                match clause {
-                    Clause::Word(word) => {
-                        clauses.push(format!("{head}\"{word}\""));
-                    }
-                    Clause::Phrase(chars) => {
-                        let phrase: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
-                        clauses.push(format!("{head}\"{}\"", phrase.join(" ")));
-                    }
-                }
-            }
-        }
-    }
-    if clauses.is_empty() {
-        // Nothing searchable. A bare `*` cannot match anything, so this is a safe no-op query.
-        return String::new();
-    }
-    clauses.join(" AND ")
-}
+use crate::query::{QueryTerm, match_expression, parse_query};
 
 /// The FTS5 MATCH expression for a whole query string — the historical entry point, kept because
-/// it is what the tokenisation symmetry test pins. `match_expression` over `parse_query` is the
-/// same thing with prefixes understood.
+/// the tokenisation symmetry test pins it. Parsing lives in [`crate::query`]; this is the bridge the
+/// existing callers and that test still use.
 pub fn to_query(input: &str) -> String {
     match_expression(&parse_query(input))
+}
+
+/// Build the WHERE conditions for one search, in a fixed parameter order.
+///
+/// Each condition is a fragment with a bare `?` plus the value to bind. The numbering advances only
+/// for clauses that bind something: the `has:attachment` clause is an EXISTS with no `?`, and
+/// counting it would shift every predicate after it by one — a query that returns the wrong rows
+/// instead of an error. That is the whole reason predicates travel as a structure rather than as
+/// `format!` sprinkled through `search`: string-built SQL with foreign text in it is both an
+/// injection surface and a quoting bug waiting for a name with an apostrophe.
+struct Predicates {
+    clauses: Vec<String>,
+    values: Vec<rusqlite::types::Value>,
+    next: usize,
+}
+
+impl Predicates {
+    /// `first` is the number the first bound value takes: 2 when the query carries an FTS MATCH (that
+    /// expression holds ?1) and 1 otherwise. Getting it wrong binds the account id where the search
+    /// expression was meant to go, which SQLite answers with silence rather than an error.
+    fn new(first: usize) -> Self {
+        Self {
+            clauses: Vec::new(),
+            values: Vec::new(),
+            next: first,
+        }
+    }
+
+    fn add<T: Into<rusqlite::types::Value>>(&mut self, clause: &str, value: T) {
+        self.clauses
+            .push(clause.replacen('?', &format!("?{}", self.next), 1));
+        self.next += 1;
+        self.values.push(value.into());
+    }
+
+    /// A clause that binds nothing (`exists (...)`), so it must not consume a placeholder.
+    fn add_raw(&mut self, clause: &str) {
+        self.clauses.push(clause.to_string());
+    }
+
+    fn sql(&self) -> String {
+        self.clauses.join(" and ")
+    }
+}
+
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_predicate_cannot_shift_anothers_placeholder() {
+        let mut p = Predicates::new(1);
+        p.add("m.account_id = ?", "acc".to_string());
+        p.add("m.date >= ?", 1_767_225_600_i64);
+        p.add("m.seen = ?", 0_i64);
+        assert_eq!(
+            p.sql(),
+            "m.account_id = ?1 and m.date >= ?2 and m.seen = ?3"
+        );
+        assert_eq!(p.values.len(), 3);
+    }
 }
 
 #[derive(Clone)]
@@ -1582,48 +1525,86 @@ impl Cache {
 
         let terms = parse_query(query);
         let expression = match_expression(&terms);
-        let want_attachments = terms.contains(&QueryTerm::HasAttachment);
-        if expression.is_empty() && !want_attachments {
-            // Nothing searchable — a bare `has:` typo or an empty box.
+
+        // Predicates are collected first, in a fixed order, because each one adds a bound value and a
+        // numbered placeholder — and a predicate that silently shifts another's index is a query that
+        // returns the wrong rows rather than an error. `first` leaves ?1 free for the MATCH
+        // expression when there is one.
+        // An explicit `account:` **replaces** the caller's scope rather than adding to it: two
+        // conditions on the same column can only contradict each other, and "0 results" is the worst
+        // way to say so. The caller's account is the default; `account:` is the override, and it is
+        // what a unified inbox would use.
+        let explicit_account = terms.iter().find_map(|term| match term {
+            QueryTerm::Account { id } => Some(id.clone()),
+            _ => None,
+        });
+        let mut pred = Predicates::new(if expression.is_empty() { 1 } else { 2 });
+        pred.add(
+            "m.account_id = ?",
+            explicit_account.unwrap_or_else(|| account_id.to_string()),
+        );
+        for term in &terms {
+            match term {
+                QueryTerm::HasAttachment => pred.add_raw(
+                    // A fact about the stored row, not about indexed text. EXISTS over `bodies` reads
+                    // the saved JSON and counts the array: an empty array is 0, and a row whose body
+                    // was never fetched has no row at all — which is the same answer.
+                    "exists (select 1 from bodies b
+                        where b.account_id = m.account_id
+                          and b.folder = m.folder
+                          and b.uid = m.uid
+                          and json_array_length(json_extract(b.detail, '$.attachments')) > 0)",
+                ),
+                QueryTerm::Date { after, ts } => {
+                    let clause = if *after { "m.date >= ?" } else { "m.date <= ?" };
+                    pred.add(clause, *ts);
+                }
+                QueryTerm::Unread => pred.add("m.seen = ?", 0_i64),
+                QueryTerm::Flagged => pred.add("m.flagged = ?", 1_i64),
+                // Case-insensitive: the wire spells `INBOX` and a user types `inbox`.
+                QueryTerm::InFolder { folder } => {
+                    pred.add("lower(m.folder) = lower(?)", folder.clone())
+                }
+                // Handled above, as an override of the caller's scope.
+                QueryTerm::Account { .. } => {}
+                QueryTerm::Text { .. } => {}
+            }
+        }
+        let has_text = !expression.is_empty();
+        // Asked of the **terms**, never of the predicate list: `pred` always carries the account
+        // condition, so "is anything left to narrow by" is a question about the query, not about the
+        // clause count. Getting that wrong is exactly how a bare `has:attachment` came back empty in
+        // round 77, and again in the first version of this function.
+        let has_predicate = terms
+            .iter()
+            .any(|term| !matches!(term, QueryTerm::Text { .. }));
+        if !has_text && !has_predicate {
+            // Nothing to answer: no words to match and no conditions to narrow by.
             return Ok(Vec::new());
         }
 
-        // `has:attachment` is the one predicate of this slice that the FTS cannot answer: it is a
-        // fact about the stored message, not about its indexed text. EXISTS over `bodies` reads the
-        // saved JSON and counts the array — an empty array is 0, and a row whose body was never
-        // fetched has no row at all, which is the same answer ("cannot prove it has an attachment").
-        let attachment_clause = if want_attachments {
-            " and exists (select 1 from bodies b
-                    where b.account_id = m.account_id
-                      and b.folder = m.folder
-                      and b.uid = m.uid
-                      and json_array_length(json_extract(b.detail, '$.attachments')) > 0)"
-        } else {
-            ""
-        };
-        // Two shapes, and the distinction matters: with no text to match, the FTS index is not a
-        // starting point but a dead end — an empty MATCH expression returns no rows at all, which is
-        // how a bare `has:attachment` silently found nothing before its test was written.
-        let sql = if expression.is_empty() {
-            format!(
-                "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
-                  from messages m
-                  where m.account_id = ?1{attachment_clause}
-                  order by m.date desc, m.uid desc
-                  limit ?2"
-            )
-        } else {
+        let where_clause = pred.sql();
+        let sql = if has_text {
             format!(
                 "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
                   from (select rowid from search where search match ?1) f
                   join messages m on m.search_rowid = f.rowid
-                  where m.account_id = ?2{attachment_clause}
+                  where {where_clause}
                   order by m.date desc, m.uid desc
-                  limit ?3"
+                  limit ?{}",
+                pred.next
+            )
+        } else {
+            format!(
+                "select m.folder, m.uid, m.subject, m.from_name, m.from_addr, m.date, m.seen
+                  from messages m
+                  where {where_clause}
+                  order by m.date desc, m.uid desc
+                  limit ?{}",
+                pred.next
             )
         };
 
-        let mut stmt = conn.prepare(&sql)?;
         // One row-mapping for both shapes: they differ only in which query drove them.
         fn hit_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
             Ok(SearchHit {
@@ -1637,13 +1618,20 @@ impl Cache {
             })
         }
 
-        let rows = if expression.is_empty() {
-            stmt.query_map(params![account_id, i64::from(limit)], hit_from)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            stmt.query_map(params![expression, account_id, i64::from(limit)], hit_from)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        // The MATCH expression first (when there is one), then the predicates in the same order they
+        // were numbered, then the limit — the order is the contract, which is why the values travel
+        // together with the clauses that produced them.
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        if has_text {
+            params.push(expression.into());
+        }
+        params.extend(pred.values);
+        params.push(i64::from(limit).into());
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), hit_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -2318,8 +2306,8 @@ mod tests {
 
     #[test]
     fn parse_query_understands_field_prefixes_and_falls_back_to_literal_text() {
-        use crate::cache::QueryColumn::*;
         use crate::cache::QueryTerm::*;
+        use crate::query::QueryColumn::*;
 
         assert_eq!(
             parse_query("账单"),
@@ -2480,6 +2468,95 @@ mod tests {
             .unwrap();
         assert_eq!(uids(&cache, "会议: 十点").len(), 1);
         assert_eq!(uids(&cache, "subject:会议").len(), 1);
+    }
+
+    // ---------------------------------------------------------------- structured predicates
+
+    /// Four messages that differ only in the things predicates test: date, folder, flags,
+    /// attachments. Dates are chosen around 2026-01-01 (1_767_225_600) so the boundaries bite.
+    fn seed_predicates(cache: &Cache) {
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "一", "a@x.com", 1_000_000_000),
+                    summary(2, "二", "b@x.com", 1_767_225_600),
+                    summary(3, "三", "c@x.com", 1_767_300_000),
+                    summary(4, "四", "d@x.com", 1_800_000_000),
+                ],
+            )
+            .unwrap();
+        cache
+            .upsert_summaries("acc", "Sent", &[summary(5, "五", "e@x.com", 1_700_000_000)])
+            .unwrap();
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail_with_attachments(4, "四", "正文四", &["附件四.pdf"]),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn structured_predicates_narrow_the_same_hits_the_text_would_find() {
+        let cache = Cache::open_in_memory().unwrap();
+        seed_predicates(&cache);
+
+        // Boundaries are inclusive on both sides: "inclusive" is one rule, not two, and a user
+        // typing a day means the whole day.
+        assert_eq!(
+            uids(&cache, "after:2026-01-01"),
+            vec![4, 3, 2],
+            "a cut-off date includes mail from that day (newest first)"
+        );
+        assert_eq!(uids(&cache, "before:2026-01-01"), vec![2, 5, 1]);
+
+        // Every row in the fixture is unread — including the one in `Sent` — which is what makes
+        // `in:` worth testing next to it.
+        assert_eq!(uids(&cache, "is:unread").len(), 5);
+        assert_eq!(uids(&cache, "in:sent"), vec![5]);
+        assert_eq!(
+            uids(&cache, "in:INBOX is:unread").len(),
+            4,
+            "two predicates narrow together"
+        );
+
+        // Attachments alone and mixed with a date — the combination that exercises both query
+        // shapes at once (text from the index, predicate from the table).
+        assert_eq!(uids(&cache, "has:attachment"), vec![4]);
+        assert_eq!(uids(&cache, "has:attachment after:2026-01-01"), vec![4]);
+        assert!(uids(&cache, "has:attachment before:2026-01-01").is_empty());
+
+        // Another account's mail must never answer this account's query, even through `account:`.
+        cache
+            .upsert_summaries(
+                "other",
+                "INBOX",
+                &[summary(9, "九", "z@x.com", 1_900_000_000)],
+            )
+            .unwrap();
+        assert!(
+            uids(&cache, "after:2026-01-01").iter().all(|uid| *uid != 9),
+            "the account condition is always present, with or without `account:`"
+        );
+        // With the override in place, `account:other` really does answer for the other account.
+        assert_eq!(
+            uids(&cache, "account:other"),
+            vec![9],
+            "an explicit account replaces the caller's scope"
+        );
+        assert_eq!(
+            uids(&cache, "account:other in:INBOX").len(),
+            1,
+            "…and combines with the other predicates"
+        );
+        assert_eq!(
+            uids(&cache, "account:other after:2026-01-01"),
+            vec![9],
+            "the other account's mail is in 2030, so the date keeps it"
+        );
     }
 
     // ---------------------------------------------------------------- paging

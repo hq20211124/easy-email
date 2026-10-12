@@ -730,6 +730,19 @@ async function runSearch() {
     ? `正文已索引 ${coverage.indexed}/${coverage.total} 封`
     : '正文索引覆盖率未知';
 
+  // A hint about the query itself, when the backend can see the user meant something it did not get
+  // (`design/09` §2: a syntax mistake must produce a hint, not an empty result). Asked only when
+  // there is a colon in the query, so a plain word costs no extra call.
+  if (state.searchQuery.includes(':')) {
+    const hints = await run('读取查询提示', () => invoke('search_hints', { query: state.searchQuery }));
+    if (hints?.length) {
+      const line = document.createElement('div');
+      line.className = 'search-hint';
+      line.textContent = hints.join(' ');
+      status.append(line);
+    }
+  }
+
   if (hits.length) {
     status.append(document.createTextNode(`本地缓存命中 ${hits.length} 条 · ${cover}`));
   } else {

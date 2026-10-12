@@ -79,13 +79,13 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 
 下一批：**给 P3 拿真窗口基线**（需要你点：应用带 `--remote-debugging-port=9222` 构建 →
 `powershell -File tools\bench-app.ps1`，P1/P3/P5/P6 四个数字进 `target\bench-app-history.jsonl`）；
-之后可继续 **09 查询语法第二片**（时间/标记/文件夹前缀：`after:`/`before:`/`is:unread`/`is:flagged`/
-`in:`/`account:` —— 结构化谓词，改的是 `search` 的 WHERE；外加 `design/09` §2 要的"语法提示而不是空结果"）、
-04 离线队列、16 诊断包。
-**列表与分页已完成**（第 75/76 轮）：`message_page(offset, limit)` 只读缓存分页 +
-`src/vlist.js` 视口 ± 8 行窗口化，`tools/vlist_test.mjs` 钉住窗口算术与"行高只有一个出处"。
-**查询语法第一片已完成**（第 77 轮）：`from:`/`to:`/`cc:`/`subject:`/`body:`/`filename:`/`has:attachment`；
-不认识的写法按字面搜。
+之后剩下的候选：09 的 `larger:`/`smaller:` 与保存搜索、04 离线队列完整化、16 诊断包。
+**09 查询语法两片都已完成**（第 77/78 轮）：文本前缀 + `has:attachment` + 结构化谓词
+（`after:`/`before:`/`is:unread`/`is:flagged`/`in:`/`account:`）+ 打错有提示（`search_hints`）；
+解析住在独立的 `crates/mail-core/src/query.rs`，分词原语 `clauses_of` 与索引共用。
+**第 78 轮的三个坑**（都是自己的测试当场抓住）：`account:` 写成叠加 ⇒ 与调用方作用域自相矛盾、
+永远 0 行；EXISTS 不绑定却占占位符 ⇒ 后面的谓词全体错位；批量追加测试时把 cache.rs 截断、
+丢了 36 个测试（是 PASS 数变小发现的）。**批量改文件要么只插入、要么先 `git checkout` 兜底。**
 性能预算的**覆盖率**已变成机器检查（第 73 轮：`bench.ps1` 打印全部 16 项、自断言条数、
 `check.ps1` 钉住），实测 P2/P4/P7/P9/P10/P12/P13/P14/P15，未测 P1/P3/P5/P6/P8/P11/P16 各自写了原因
 ——**别再把"没测"写成"有"，也别把"有仪表"写成"没仪表"**：第 73 轮我连错两次

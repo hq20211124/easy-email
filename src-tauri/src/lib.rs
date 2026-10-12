@@ -2185,6 +2185,17 @@ async fn index_coverage(
     cache.body_coverage(&account_id).map_err(describe)
 }
 
+/// What, if anything, is wrong with this query string, in words the user can act on.
+///
+/// A separate command rather than a field on the search result on purpose: `payload_keys` pins the
+/// shape of the search contract, and changing that shape for a line of advice would be a poor trade.
+/// The renderer only asks when the query contains a colon, so the extra call costs nothing in the
+/// normal case.
+#[tauri::command]
+async fn search_hints(query: String) -> Result<Vec<String>, String> {
+    Ok(mail_core::query::query_issues(&query))
+}
+
 /// One bounded pass of body indexing, so mail the user never opened becomes searchable.
 ///
 /// Bounded on purpose: reading a body costs what opening the message costs, so this must not turn
@@ -3127,6 +3138,7 @@ pub fn run() {
             message_page,
             rebuild_search_begin,
             rebuild_search_step,
+            search_hints,
             list_messages,
             list_thread,
             get_sync_window,
