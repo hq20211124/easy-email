@@ -75,6 +75,14 @@
           <button id="btn-log" class="row" type="button" title="查看最近的程序日志（最多 500 行，内容已脱敏）">
             <span class="label">查看日志</span>
           </button>
+          <!--
+            What the cache costs, and the one place it can be trimmed. The cache only ever grows, and
+            the only way out of a full disk used to be deleting it and syncing again — so this shows
+            the size, offers a dry run, and keeps a log of what a cleanup actually did.
+          -->
+          <button id="btn-storage" class="row" type="button" title="缓存占了多少空间、能清什么、清过什么">
+            <span class="label">存储与清理</span>
+          </button>
         </div>
 
         <!--
@@ -306,6 +314,7 @@
     <script src="reply.js"></script>
     <script src="history.js"></script>
     <script src="saved-search.js"></script>
+    <script src="storage.js"></script>
     <script src="vlist.js"></script>
     <script src="wizard.js"></script>
     <script src="app.js"></script>

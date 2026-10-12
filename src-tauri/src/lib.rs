@@ -2250,6 +2250,13 @@ async fn cleanup_apply(
     Ok(report)
 }
 
+/// Forget the cleanup log. The cache is untouched — this is the record, not the thing.
+#[tauri::command]
+async fn clear_cleanup_logs(state: State<'_, AppState>) -> Result<(), String> {
+    state.user.clone().clear_cleanup_logs().map_err(describe)?;
+    Ok(())
+}
+
 /// What cleanups have happened, newest first (`design/03` §5.4 设置页留痕).
 #[tauri::command]
 async fn cleanup_history(state: State<'_, AppState>) -> Result<Vec<mail_core::CleanupLog>, String> {
@@ -3874,6 +3881,7 @@ pub fn run() {
             cleanup_plan,
             cleanup_apply,
             cleanup_history,
+            clear_cleanup_logs,
             index_heal,
             history_search_push,
             history_search_clear,

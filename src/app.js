@@ -453,6 +453,7 @@ function wireGlobalEvents() {
   $('btn-sync-window').addEventListener('click', openSyncWindowPicker);
   $('btn-about').addEventListener('click', openAbout);
   $('btn-log').addEventListener('click', openLog);
+  $('btn-storage').addEventListener('click', openStoragePanel);
   $('btn-load-more').addEventListener('click', loadOlder);
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
@@ -4081,9 +4082,139 @@ async function openLog() {
   });
 }
 
-function openAbout() {
-  const version = $('about-version').textContent || '未知';
+/* ---------------------------------------------------------------- storage & cleanup */
+/**
+ * The storage panel: what the cache costs, what a cleanup would do, and what the last one did.
+ *
+ * Two rules from `design/03` §5.4 shape this screen, and both are about consent rather than
+ * mechanics:
+ *
+ *   1. **the dry run comes first.** The 开始清理 button stays disabled until a dry run has been
+ *      shown, because the plan is what the user is agreeing to. This is the interface echo of the
+ *      command taking a plan rather than a policy (round 94) — the same principle in two layers on
+ *      purpose: the signature makes skipping hard, the button makes skipping visible.
+ *   2. **nothing says what will not be touched.** Unread and flagged bodies are never cleaned, and
+ *      the mail on the server is never touched at all. A user who does not know that reads every
+ *      cleanup as a deletion.
+ */
+async function openStoragePanel() {
+  const report = await run('读取存储占用', () => invoke('storage_report'));
+  if (report === null) return;
+
+  const helper = window.__easyEmailStorage;
   openModal({
+    title: '存储与清理',
+    bodyHtml: `
+      <p class="about-note">
+        本地缓存：<strong>${escapeHtml(helper.formatBytes(report.cache_bytes))}</strong>，
+        其中已下载正文 ${escapeHtml(helper.formatBytes(report.bodies_bytes))}
+        （${report.messages} 封摘要、${report.bodies} 封带正文）。
+      </p>
+      <label class="field">
+        <span class="field-label">缓存上限（MB，只在超过时清理）</span>
+        <input id="storage-limit" type="text" inputmode="numeric"
+               value="${helper.DEFAULT_LIMIT_MB}" />
+      </label>
+      <div class="about-storage-actions">
+        <button class="btn ghost small" id="btn-storage-dry" type="button">看看会清什么</button>
+        <button class="btn primary small" id="btn-storage-run" type="button" disabled>开始清理</button>
+      </div>
+      <p id="storage-plan" class="about-note" hidden></p>
+      <p class="about-note">
+        清理只会删<strong>已下载正文的缓存</strong>，服务器上的邮件不受影响；
+        <strong>未读的、有旗标的永远不会被清</strong>。清完仍可按主题/发件人搜索，
+        正文要看时重新下载。
+      </p>
+      <div class="about-storage-history">
+        <div class="about-storage-history-head">
+          <span>最近清理</span>
+          <button class="btn ghost small" id="btn-storage-clear-log" type="button">清空记录</button>
+        </div>
+        <p id="storage-history" class="about-note">（还没有清理过）</p>
+      </div>`,
+    confirmLabel: '关闭',
+    onReady: async (modal) => {
+      const plan = modal.querySelector('#storage-plan');
+      const runButton = modal.querySelector('#btn-storage-run');
+      const limitBox = modal.querySelector('#storage-limit');
+      let currentPlan = null;
+
+      modal.querySelector('#btn-storage-dry').addEventListener('click', async () => {
+        const limitMb = window.__easyEmailStorage.suggestStorageLimit(limitBox.value);
+        limitBox.value = String(limitMb);
+        const policy = { max_bytes: limitMb * 1024 * 1024, max_age_days: null,
+                         keep_unread: true, keep_flagged: true };
+        const planned = await run('计算清理', () => invoke('cleanup_plan', { policy }));
+        if (planned === null) return;
+        currentPlan = planned;
+        const summary = window.__easyEmailStorage.cleanupSummary(planned);
+        plan.hidden = false;
+        plan.textContent = summary.text;
+        // The consent, in one control: nothing to run until something was shown.
+        runButton.disabled = !summary.actionable;
+      });
+
+      runButton.addEventListener('click', async () => {
+        if (!currentPlan) return;
+        runButton.disabled = true;
+        const policy = {
+          max_bytes: window.__easyEmailStorage.suggestStorageLimit(limitBox.value) * 1024 * 1024,
+          max_age_days: null,
+          keep_unread: true,
+          keep_flagged: true,
+        };
+        const done = await run('清理缓存', () =>
+          invoke('cleanup_apply', { plan: currentPlan, policy })
+        );
+        if (done === null) {
+          runButton.disabled = false;
+          return;
+        }
+        toast(
+          `已清理：释放 ${window.__easyEmailStorage.formatBytes(done.freed_bytes)}，` +
+            `${done.bodies_deleted} 封正文`,
+          'ok'
+        );
+        plan.textContent = `完成：释放 ${window.__easyEmailStorage.formatBytes(done.freed_bytes)}。`;
+        currentPlan = null;
+        runButton.disabled = true;
+        await refreshStorageHistory(modal);
+      });
+
+      modal.querySelector('#btn-storage-clear-log').addEventListener('click', async () => {
+        // The name says what it does not do: this is the record, not the cache.
+        if (!confirm('清空清理记录？\n这只删记录，不动缓存。')) return;
+        const ok = await run('清空清理记录', () => invoke('clear_cleanup_logs'));
+        if (ok === null) return;
+        await refreshStorageHistory(modal);
+      });
+
+      await refreshStorageHistory(modal);
+    },
+  });
+}
+
+async function refreshStorageHistory(modal) {
+  const host = modal.querySelector('#storage-history');
+  const log = await run('读取清理记录', () => invoke('cleanup_history'));
+  if (log === null) return;
+  if (log.length === 0) {
+    host.textContent = '（还没有清理过）';
+    return;
+  }
+  const helper = window.__easyEmailStorage;
+  const lines = log
+    .slice(0, 5)
+    .map(
+      (row) =>
+        `${clockLabel(row.created_at)}：释放 ${helper.formatBytes(row.freed_bytes)}，` +
+        `${row.bodies_deleted} 封正文`
+    );
+  host.textContent = lines.join('\n');
+}
+
+function openAbout() {
+  const version = $('about-version').textContent || '未知';  openModal({
     title: '关于 Easy Email',
     bodyHtml: `
       <p class="about-line">当前版本 <strong>${escapeHtml(version)}</strong></p>

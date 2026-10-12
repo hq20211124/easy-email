@@ -1646,6 +1646,64 @@ try {
         Write-Host 'the cleanup runs the plan the user read, and logs both numbers'
         $global:LASTEXITCODE = 0
     }
+    Step 'the storage panel cleans only after a dry run, and never touches the server' {
+        # Round 95 / design/03 §5.4. The interface echo of round 94's "the command takes a plan": a
+        # signature makes skipping the dry run hard, a disabled button makes it visible. Both halves
+        # fail silently:
+        #   * a 开始清理 button that is enabled from the start — the consent the design asks for is
+        #     gone, and nothing on screen looks wrong;
+        #   * a cleanup that can reach the server, or that could take unread mail.
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $mod = Get-Content 'src/storage.js' -Raw -Encoding UTF8
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $problems = @()
+
+        # The panel exists, and its dry-run button leads to the write button.
+        if ($html -notmatch 'id="btn-storage"') { $problems += 'index.html must have the storage row' }
+        if ($js -notmatch 'btn-storage-dry') { $problems += 'app.js must have the dry-run button' }
+        if ($js -notmatch 'btn-storage-run') { $problems += 'app.js must have the clean-up button' }
+        if ($js -notmatch 'openStoragePanel') { $problems += 'the row must open the panel' }
+        if ($js -notmatch 'clear_cleanup_logs') { $problems += 'the panel must offer to clear the log' }
+
+        # The write button starts disabled and only a shown dry run enables it.
+        $dry = [regex]::Match($js, '(?s)btn-storage-dry.{0,8}addEventListener.*?\n      \}\);').Value
+        $write = [regex]::Match($js, '(?s)runButton.{0,8}addEventListener.*?\n      \}\);').Value
+        if ($write -notmatch 'disabled = true') {
+            $problems += 'the clean-up button must start disabled — it is the consent, in one control'
+        }
+        if ($dry -notmatch 'disabled') {
+            $problems += 'the dry run is what enables it: nothing may be cleaned before something was shown'
+        }
+        if ($write -notmatch 'currentPlan') {
+            $problems += 'the clean-up button must run the plan that was shown, not plan for itself'
+        }
+        # The plan is handed to the command that takes a plan.
+        if ($write -notmatch 'cleanup_apply') { $problems += 'the panel must call cleanup_apply' }
+        if ($dry -notmatch 'cleanup_plan') { $problems += 'the dry run must call cleanup_plan' }
+
+        # What the panel promises, said on screen: unread and flagged are never touched, and the
+        # server is never touched.
+        if ($js -notmatch '未读' -or $js -notmatch '有旗标') {
+            $problems += 'the panel must say unread and flagged bodies are never cleaned'
+        }
+        if ($js -notmatch '服务器上的邮件不受影响') {
+            $problems += 'the panel must say the server is never touched'
+        }
+        # The cap box cannot hold zero (that would mean "clean everything, always").
+        if ($mod -notmatch 'suggestStorageLimit') { $problems += 'storage.js must own the cap-box rule' }
+        if ($shell -notmatch 'fn storage_report\(' -or $shell -notmatch 'fn cleanup_apply\(') {
+            $problems += 'lib.rs must expose both commands'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the panel cleans only after a shown dry run, and says what it will not touch'
+        $global:LASTEXITCODE = 0
+    }
 
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0

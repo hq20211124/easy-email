@@ -447,6 +447,36 @@ textarea {
   color: var(--danger);
 }
 
+/* Storage panel: the two buttons that express the consent, and the log under them. */
+.about-storage-actions {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+
+.about-storage-actions .btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.about-storage-history {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.about-storage-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.about-storage-history .about-note {
+  white-space: pre-line;
+}
+
 /*
   Recent queries. It overlaps the list below it on purpose — it is a dropdown, and a real one costs
   the list a row for the second it is open rather than pushing the messages the user is looking at
