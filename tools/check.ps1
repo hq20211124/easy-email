@@ -1355,6 +1355,68 @@ try {
         Write-Host 'a saved search runs through the one search path, and its suggested name is capped'
         $global:LASTEXITCODE = 0
     }
+    Step 'search history keeps the newest, and a query is pushed only once it ran' {
+        # Round 90 / design/09 §4.1. Four things fail silently here, and none of them crash:
+        #   * the eviction query written backwards — a history that keeps the *oldest* fifty still
+        #     looks correct (fifty rows!) while being useless;
+        #   * no de-duplication — the same query typed twice pushes the ones the user actually asked
+        #     for further down;
+        #   * a blank query recorded — the user meets it next time as "which of my searches produced
+        #     nothing";
+        #   * a push in the keystroke handler rather than at the end of the search — the history fills
+        #     with half-typed queries, which is worse than no history.
+        $db = Get-Content 'crates/mail-core/src/userdb.rs' -Raw -Encoding UTF8
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $problems = @()
+
+        if ($db -notmatch 'search_history') { $problems += 'userdb.rs must create the search_history table' }
+        foreach ($fn in @('push_search_query', 'list_history_queries', 'clear_history_queries')) {
+            if ($db -notmatch ("fn " + $fn)) { $problems += "userdb.rs must expose $fn" }
+        }
+        # De-duplication is a refresh, not a second row.
+        if ($db -notmatch "update search_history set created_at") {
+            $problems += 'the same query twice must refresh the row, not add a second one'
+        }
+        # Eviction keeps the newest: the ORDER BY is inside the DELETE's own subquery. Captured as
+        # "from the delete to its limit" rather than "anything after the delete", so the assertion
+        # cannot pass on an ORDER BY that happens to appear further down the file.
+        $del = [regex]::Match($db, '(?s)delete from search_history\s+where account_id = \?1(.*?limit \?2)')
+        if (-not $del.Success) {
+            $problems += 'the eviction query is missing — the bound is fifty, one place, one statement'
+        } elseif ($del.Groups[1].Value -notmatch 'order by created_at desc') {
+            $problems += 'eviction must keep the newest — an ORDER BY the other way still yields fifty rows'
+        }
+        if ($db -notmatch 'SEARCH_HISTORY_LIMIT: u32 = 50') { $problems += 'the bound is fifty, one place, one constant' }
+
+        foreach ($cmd in @('history_search_list', 'history_search_push', 'history_search_clear')) {
+            if ($shell -notmatch ("fn " + $cmd + "\(")) { $problems += "lib.rs must define $cmd" }
+            elseif ($shell -notmatch ("(?m)^\s+" + $cmd + ",\s*$")) { $problems += "$cmd is missing from generate_handler!" }
+        }
+
+        # The push belongs at the end of a search that actually ran, never in the keystroke handler.
+        $run = [regex]::Match($js, '(?s)async function runSearch\(\).*?\n\}').Value
+        if ($run -notmatch 'history_search_push') {
+            $problems += 'runSearch must record the query — that is where a query is known to have run'
+        }
+        $inputHandler = [regex]::Match($js, "search-input'\)\.addEventListener\('input'.*?\n  \}\);").Value
+        if ($inputHandler -match 'history_search_push') {
+            $problems += 'a push in the input handler fills history with half-typed queries'
+        }
+
+        # And the panel has to exist, or the feature is a store nobody reads.
+        if ($html -notmatch 'id="search-history"') { $problems += 'index.html must have the history panel' }
+        if ($html -notmatch 'id="btn-search-history"') { $problems += 'index.html must have the history button' }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'history keeps the newest fifty, one row per query, and nothing is pushed until it ran'
+        $global:LASTEXITCODE = 0
+    }
 
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0

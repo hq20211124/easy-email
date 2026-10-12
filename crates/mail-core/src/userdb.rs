@@ -732,6 +732,90 @@ impl UserStore {
     }
 }
 
+/// How many queries one account's history keeps.
+///
+/// Fifty: past that the list stops being something you scan and becomes something you scroll, and
+/// the queries that matter are the recent ones anyway. Eviction happens inside the push rather than
+/// in a maintenance tick, so the bound holds even if the app is killed between two ticks.
+pub const SEARCH_HISTORY_LIMIT: u32 = 50;
+
+/// Queries this account used recently (`design/09` §4.1).
+impl UserStore {
+    /// Record a query the user just ran.
+    ///
+    /// **The same query twice is one entry, refreshed** — not two. The list is "most recently used",
+    /// and a duplicate would push something the user actually asked for further down. That is what
+    /// every browser and editor does with its history, and it is what the timestamp is for.
+    ///
+    /// The bound is applied here rather than by a sweeper, so it holds even across a kill.
+    pub fn push_search_query(&self, account_id: &str, query: &str, now: i64) -> Result<()> {
+        let query = query.trim().to_string();
+        // A half-typed query in history is pollution: the user sees it next time and wonders which
+        // of their searches produced nothing.
+        if query.is_empty() {
+            return Ok(());
+        }
+        let account_id = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            // Refresh rather than insert, and count how many rows that touched: SQLite cannot tell
+            // "updated one row" from "updated the same row twice", so this is the read that decides.
+            let refreshed = conn.execute(
+                "update search_history set created_at = ?3
+                  where account_id = ?1 and query = ?2",
+                rusqlite::params![account_id, query, now],
+            )?;
+            if refreshed == 0 {
+                conn.execute(
+                    "insert into search_history (account_id, query, created_at) values (?1, ?2, ?3)",
+                    rusqlite::params![account_id, query, now],
+                )?;
+            }
+            // Keep the newest per account, drop the rest. Written as a subquery rather than a
+            // separate count so one kill cannot leave the table half-trimmed.
+            conn.execute(
+                "delete from search_history
+                  where account_id = ?1
+                    and id not in (
+                        select id from search_history
+                         where account_id = ?1
+                         order by created_at desc, id desc
+                         limit ?2
+                    )",
+                rusqlite::params![account_id, SEARCH_HISTORY_LIMIT],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// This account's recent queries, newest first.
+    pub fn list_history_queries(&self, account_id: &str, limit: u32) -> Result<Vec<String>> {
+        let account_id = account_id.to_string();
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select query from search_history
+             where account_id = ?1
+             order by created_at desc, id desc
+             limit ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![account_id, limit], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Forget this account's queries. Nobody else's.
+    pub fn clear_history_queries(&self, account_id: &str) -> Result<usize> {
+        let account_id = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            let removed = conn.execute(
+                "delete from search_history where account_id = ?1",
+                rusqlite::params![account_id],
+            )?;
+            Ok(removed)
+        })
+    }
+}
+
 /// One account's quota state for the current window (`design/04` §5.7).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuotaLedger {
@@ -1731,6 +1815,18 @@ impl UserStore {
                      query       text not null,
                      created_at  integer not null
                  );
+
+                 -- Queries this account typed recently (`design/09` §4.1 history_push). The other
+                 -- half of search memory: saved searches are kept on purpose, history is simply
+                 -- what was just used. Same home as the drafts and the saved searches, same reason.
+                 create table if not exists search_history (
+                     id          integer primary key autoincrement,
+                     account_id  text not null,
+                     query       text not null,
+                     created_at  integer not null
+                 );
+                 create index if not exists search_history_recent
+                     on search_history(account_id, created_at desc);
 
                  -- The daily download quota ledger (design/04 §5.7). It lives here, in the file that
                  -- is never deleted, on purpose: a ledger in the deletable cache would forget how
@@ -2918,5 +3014,109 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(names, vec!["留着".to_string()]);
+    }
+    // ------------------------------------------------------------ search history
+
+    #[test]
+    fn a_query_typed_again_moves_to_the_top_instead_of_duplicating() {
+        // The list is "most recently used": a duplicate would push the queries the user actually
+        // asked for further down, which is the one thing a history is for.
+        let store = store();
+        store
+            .push_search_query("acc", "is:unread", 1_000)
+            .expect("push");
+        store
+            .push_search_query("acc", "from:shop", 2_000)
+            .expect("push");
+        store
+            .push_search_query("acc", "is:unread", 3_000)
+            .expect("push again");
+
+        let list = store.list_history_queries("acc", 10).expect("list");
+        assert_eq!(list, vec!["is:unread".to_string(), "from:shop".to_string()]);
+    }
+
+    #[test]
+    fn history_keeps_the_newest_fifty_and_says_so_by_name() {
+        // Written as "the oldest is gone and the newest is here" rather than a count: an eviction
+        // query that deleted everything would pass a count of zero and a count of fifty alike.
+        let store = store();
+        for i in 0..(SEARCH_HISTORY_LIMIT + 5) {
+            store
+                .push_search_query("acc", &format!("query-number-{i:03}"), 1_000 + i as i64)
+                .expect("push");
+        }
+        let list = store.list_history_queries("acc", 100).expect("list");
+        assert_eq!(list.len() as u32, SEARCH_HISTORY_LIMIT);
+        assert_eq!(
+            list[0],
+            format!("query-number-{:03}", SEARCH_HISTORY_LIMIT + 4)
+        );
+        assert!(
+            !list.iter().any(|q| q == "query-number-000"),
+            "the oldest is gone — a count alone would not show whether the trim kept the right end"
+        );
+        assert!(!list.iter().any(|q| q == "query-number-004"));
+    }
+
+    #[test]
+    fn a_blank_query_is_not_recorded() {
+        // A half-typed query in history is pollution: the user sees it next time and wonders which
+        // of their searches produced nothing.
+        let store = store();
+        store.push_search_query("acc", "   ", 1).expect("blank");
+        store.push_search_query("acc", "", 1).expect("empty");
+        store
+            .push_search_query("acc", "  is:unread  ", 2)
+            .expect("padded");
+        let list = store.list_history_queries("acc", 10).expect("list");
+        assert_eq!(
+            list,
+            vec!["is:unread".to_string()],
+            "padded is trimmed, blank is nothing"
+        );
+    }
+
+    #[test]
+    fn clearing_reaches_only_the_callers_own_history() {
+        let store = store();
+        store.push_search_query("a", "mine", 1).expect("push");
+        store.push_search_query("b", "theirs", 1).expect("push");
+        store.clear_history_queries("a").expect("clear");
+        assert!(
+            store
+                .list_history_queries("a", 10)
+                .expect("list a")
+                .is_empty()
+        );
+        assert_eq!(
+            store.list_history_queries("b", 10).expect("list b"),
+            vec!["theirs".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_limit_the_caller_asks_for_is_respected() {
+        let store = store();
+        for i in 0..5 {
+            store
+                .push_search_query("acc", &format!("q{i}"), i)
+                .expect("push");
+        }
+        assert_eq!(store.list_history_queries("acc", 2).expect("list").len(), 2);
+        assert_eq!(store.list_history_queries("acc", 0).expect("list").len(), 0);
+    }
+
+    #[test]
+    fn history_lives_in_the_user_database_next_to_the_drafts() {
+        // The reason this is not in `cache.db`: it is the user's own data.
+        let store = store();
+        store
+            .push_search_query("acc", "from:shop", 1)
+            .expect("push");
+        assert_eq!(
+            SEARCH_HISTORY_LIMIT, 50,
+            "the bound is a decision, and this is it being visible"
+        );
     }
 }

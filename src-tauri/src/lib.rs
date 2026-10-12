@@ -2185,6 +2185,55 @@ async fn index_coverage(
     cache.body_coverage(&account_id).map_err(describe)
 }
 
+/// Queries this account typed recently (`design/09` §4.1).
+///
+/// The other half of search memory: saved searches are kept on purpose, history is simply what was
+/// just used. It lives in `user.db` for the reason the saved searches do — it is the user's own
+/// data, and clearing the cache must not take it.
+#[tauri::command]
+async fn history_search_list(
+    state: State<'_, AppState>,
+    account_id: String,
+    limit: u32,
+) -> Result<Vec<String>, String> {
+    state
+        .user
+        .clone()
+        .list_history_queries(&account_id, limit)
+        .map_err(describe)
+}
+
+/// Record a query the user just ran.
+///
+/// Called from the end of the search path, never from the keystroke handler: a half-typed query in
+/// history is pollution the user meets next time as "which of my searches produced nothing".
+#[tauri::command]
+async fn history_search_push(
+    state: State<'_, AppState>,
+    account_id: String,
+    query: String,
+) -> Result<(), String> {
+    state
+        .user
+        .clone()
+        .push_search_query(&account_id, &query, now_secs())
+        .map_err(describe)
+}
+
+/// Forget this account's queries.
+#[tauri::command]
+async fn history_search_clear(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<(), String> {
+    state
+        .user
+        .clone()
+        .clear_history_queries(&account_id)
+        .map_err(describe)?;
+    Ok(())
+}
+
 /// Searches this account has asked to keep (`design/09` §1 goal 7, SRCH-05).
 ///
 /// The account goes in every call, including the reads, because the store scopes by it — and because
@@ -3677,6 +3726,9 @@ pub fn run() {
             diagnostics_preview,
             log_tail,
             saved_search_list,
+            history_search_list,
+            history_search_push,
+            history_search_clear,
             saved_search_save,
             saved_search_delete,
             saved_search_rename,

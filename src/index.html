@@ -153,6 +153,18 @@
           >
             保存
           </button>
+          <!--
+            What was just searched. A button rather than a focus popup: the panel appears when asked,
+            because "I only want to change one word" should not begin with closing something.
+          -->
+          <button id="btn-search-history" class="btn ghost" title="最近搜过的查询">历史</button>
+          <!--
+            The dropdown itself. Hidden until the history button is pressed, and closed by anything
+            that means "not this": another search, a click elsewhere, Escape. A panel that stays is a
+            panel that ends up in a screenshot. It lives inside the bar so its absolute position is
+            measured against the pane rather than the window.
+          -->
+          <div id="search-history" class="search-history" hidden></div>
         </div>
         <div id="search-status" class="search-status" hidden></div>
         <div id="message-list" class="message-list"></div>

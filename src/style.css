@@ -398,8 +398,12 @@ textarea {
   gap: 6px;
 }
 
-/* Search runs against the local cache only, so it needs no spinner and no network state. */
+/* Search runs against the local cache only, so it needs no spinner and no network state.
+   `position: relative` is here for the history dropdown below, which is positioned against the pane
+   rather than the window — the difference between a panel that opens over the list and one that
+   opens over the reader. */
 .search-bar {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -431,6 +435,46 @@ textarea {
   padding: 0 10px 6px;
   font-size: 11px;
   color: var(--text-muted);
+}
+
+/*
+  Recent queries. It overlaps the list below it on purpose — it is a dropdown, and a real one costs
+  the list a row for the second it is open rather than pushing the messages the user is looking at
+  down the screen.
+*/
+.search-history {
+  position: absolute;
+  z-index: 5;
+  top: 34px;
+  right: 8px;
+  left: 8px;
+  overflow: auto;
+  max-height: 240px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.search-history .row {
+  width: 100%;
+}
+
+/* The query, not just the row: two histories that look alike are one history you cannot pick from. */
+.search-history .saved-hint {
+  font-size: 11px;
+}
+
+/* "清空历史" spans the panel rather than sitting in the row rhythm: it is not a query. */
+.saved-act-full {
+  width: 100%;
+  margin-top: 2px;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-align: center;
 }
 
 /* "This is cached data, and here is why." Deliberately quieter than a toast: it stays until the

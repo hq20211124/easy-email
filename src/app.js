@@ -433,6 +433,8 @@ function wireGlobalEvents() {
   // The mail list is windowed: rows exist only for the visible window, so scrolling has to rebuild
   // that window. One listener here (not one per render), and one commit per animation frame.
   wireListScrolling();
+  // The search-history panel is a dropdown, so a click elsewhere means "not this".
+  wireSearchHistoryDismiss();
   $('btn-theme').addEventListener('click', () => {
     window.__easyEmailTheme.toggle();
     syncThemeButton();
@@ -479,6 +481,7 @@ function wireGlobalEvents() {
   });
   $('search-input').addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    closeSearchHistory();
     $('search-input').value = '';
     exitSearchMode();
   });
@@ -488,6 +491,13 @@ function wireGlobalEvents() {
     exitSearchMode();
   });
   $('btn-search-save').addEventListener('click', openSaveSearchModal);
+  $('btn-search-history').addEventListener('click', () => {
+    // The panel is closed by anything that means "not this"; a second press on the button is one of
+    // those things, so it toggles rather than re-rendering what is already open.
+    const open = !$('search-history').hidden;
+    closeSearchHistory();
+    if (!open) toggleSearchHistory();
+  });
   $('btn-delete').addEventListener('click', deleteSelected);
   $('btn-toggle-read').addEventListener('click', toggleRead);
   $('tab-html').addEventListener('click', () => setBodyMode('html'));
@@ -617,6 +627,7 @@ async function selectAccount(accountId) {
   // The saved searches are per account too, and the global ones ride along — which is what the
   // "所有账号" label in the sidebar says out loud.
   await refreshSavedSearches();
+  await refreshSearchHistory();
 }
 
 async function removeAccount(account) {
@@ -730,6 +741,10 @@ async function runSearch() {
   // The save button appears exactly now: there is something in the box worth keeping, and it
   // disappears the moment the box is cleared or a newer query is on its way.
   updateSearchSaveButton();
+  // And the query is history (`design/09` §4.1). Here rather than in the keystroke handler: the
+  // guard above has already established that this query is the newest one, so no half-typed or
+  // superseded query reaches the list.
+  invoke('history_search_push', { accountId: state.accountId, query }).catch(() => {});
   // Search covers cached mail, so it takes the pane out of the drafts list — leaving it in drafts
   // would swallow the results the user just asked for.
   state.view = 'mail';
@@ -1109,6 +1124,107 @@ async function runSavedSearch(item) {
 /** Show the save button exactly when there is something in the box to keep. */
 function updateSearchSaveButton() {
   $('btn-search-save').hidden = !$('search-input').value.trim();
+}
+
+/* ---------------------------------------------------------------- search history */
+
+/** How many recent queries the dropdown shows, and how many the store keeps. */
+const HISTORY_SHOWN = 12;
+
+/**
+ * Recent queries, and the panel that shows them (`design/09` §4.1).
+ *
+ * The panel appears when asked and disappears on anything that means "not this" — another search, a
+ * click outside, Escape. That is the whole UX decision: a popup on focus would make "I only want to
+ * change one word" begin with closing something.
+ */
+async function refreshSearchHistory() {
+  if (!state.accountId) return;
+  const list = await run('读取搜索历史', () =>
+    invoke('history_search_list', { accountId: state.accountId, limit: HISTORY_SHOWN })
+  );
+  if (list === null) return;
+  renderSearchHistory(list);
+}
+
+function renderSearchHistory(list) {
+  const panel = $('search-history');
+  if (!list || list.length === 0) {
+    panel.hidden = true;
+    panel.replaceChildren();
+    // An empty panel that still says "历史" is how a feature looks broken rather than unused.
+    $('btn-search-history').hidden = true;
+    return;
+  }
+  $('btn-search-history').hidden = false;
+  if (panel.hidden) return; // Refreshed in the background; do not pop open what is not open.
+
+  panel.replaceChildren();
+  for (const query of list) {
+    const row = document.createElement('button');
+    row.className = 'row';
+    row.type = 'button';
+    const label = document.createElement('span');
+    label.className = 'label saved-hint';
+    label.textContent = query;
+    row.append(label);
+    row.addEventListener('click', () => {
+      closeSearchHistory();
+      $('search-input').value = query;
+      updateSearchSaveButton();
+      runSearch();
+    });
+    panel.appendChild(row);
+  }
+
+  const clear = document.createElement('button');
+  clear.className = 'row saved-act-full';
+  clear.type = 'button';
+  clear.textContent = '清空历史';
+  clear.title = '忘掉这个账号最近搜过的查询';
+  clear.addEventListener('click', async () => {
+    if (!confirm('清空这个账号的搜索历史？\n已保存的搜索不受影响。')) return;
+    const ok = await run('清空搜索历史', () =>
+      invoke('history_search_clear', { accountId: state.accountId })
+    );
+    if (ok === null) return;
+    closeSearchHistory();
+    await refreshSearchHistory();
+  });
+  panel.appendChild(clear);
+}
+
+function toggleSearchHistory() {
+  const panel = $('search-history');
+  if (panel.hidden) {
+    // Drawn from the store each time it opens, so a query searched from another row is already
+    // here — the one thing a panel that renders once gets wrong.
+    refreshSearchHistory().then(() => {
+      panel.hidden = false;
+    });
+    return;
+  }
+  panel.hidden = true;
+}
+
+function closeSearchHistory() {
+  $('search-history').hidden = true;
+}
+
+/**
+ * Closed by a click anywhere that is not the panel or its button.
+ *
+ * Unlike the modal — which deliberately ignores outside clicks, because closing it destroyed typed
+ * work (M1a-66) — this panel holds nothing, so the usual dropdown rule is the right one: a click
+ * elsewhere means "not this".
+ */
+function wireSearchHistoryDismiss() {
+  document.addEventListener('click', (event) => {
+    const panel = $('search-history');
+    if (panel.hidden) return;
+    if (event.target.closest('#search-history') || event.target.closest('#btn-search-history')) return;
+    closeSearchHistory();
+  });
 }
 
 /** Open a search hit, switching folder first when the hit lives somewhere else. */
