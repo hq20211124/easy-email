@@ -170,6 +170,12 @@ const state = {
   expandedThreads: new Set(),  /** Non-empty means the list is showing cache hits rather than the current folder. */
   searchQuery: '',
   searchHits: [],
+  /**
+   * Queries this account asked to keep (`design/09` §1 goal 7). Each carries its `account_id`
+   * through to the renderer because some are global — shown for every account — and the sidebar has
+   * to label those rather than let them look like they followed the user.
+   */
+  savedSearches: [],
 };
 
 /* ---------------------------------------------------------------- utilities */
@@ -275,6 +281,9 @@ async function boot() {
   wireGlobalEvents();
   syncThemeButton();
   syncViewModeButton();
+  // The saved-search rows are part of the sidebar from the first paint: on a fresh install they are
+  // the empty-state line that tells the user the feature exists, rather than an absence.
+  await refreshSavedSearches();
   await wirePushEvents();
   // What the last update attempt actually did, once per launch. A silent failure here is how
   // somebody presses "restart to update" forever.
@@ -464,7 +473,10 @@ function wireGlobalEvents() {
       void sendThreadReply();
     }
   });
-  $('search-input').addEventListener('input', scheduleSearch);
+  $('search-input').addEventListener('input', () => {
+    updateSearchSaveButton();
+    scheduleSearch();
+  });
   $('search-input').addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     $('search-input').value = '';
@@ -475,6 +487,7 @@ function wireGlobalEvents() {
     $('search-input').focus();
     exitSearchMode();
   });
+  $('btn-search-save').addEventListener('click', openSaveSearchModal);
   $('btn-delete').addEventListener('click', deleteSelected);
   $('btn-toggle-read').addEventListener('click', toggleRead);
   $('tab-html').addEventListener('click', () => setBodyMode('html'));
@@ -601,6 +614,9 @@ async function selectAccount(accountId) {
     await refreshDrafts();
     await refreshOutbox();
   }
+  // The saved searches are per account too, and the global ones ride along — which is what the
+  // "所有账号" label in the sidebar says out loud.
+  await refreshSavedSearches();
 }
 
 async function removeAccount(account) {
@@ -711,6 +727,9 @@ async function runSearch() {
 
   state.searchQuery = query;
   state.searchHits = hits;
+  // The save button appears exactly now: there is something in the box worth keeping, and it
+  // disappears the moment the box is cleared or a newer query is on its way.
+  updateSearchSaveButton();
   // Search covers cached mail, so it takes the pane out of the drafts list — leaving it in drafts
   // would swallow the results the user just asked for.
   state.view = 'mail';
@@ -899,7 +918,197 @@ function exitSearchMode({ reload = true } = {}) {
   clearTimeout(searchTimer);
   $('search-status').hidden = true;
   $('btn-search-clear').hidden = true;
+  $('btn-search-save').hidden = true;
   if (wasSearching && reload) loadMessages({ reset: true });
+}
+
+/* ---------------------------------------------------------------- saved searches */
+
+/**
+ * The rows in the sidebar, and the buttons that act on them.
+ *
+ * One rule holds this whole block together: **showing a saved search is the same thing as running
+ * it.** The row fills the search box and calls the one search path (`runSearch`), so a saved search
+ * cannot drift from what the user would have typed — which is what would happen if there were two
+ * ways to run a query in this app and only one of them kept up with the coverage line, the hint, and
+ * the "a newer query already answered" guard.
+ */
+async function refreshSavedSearches() {
+  if (!state.accountId) {
+    state.savedSearches = [];
+    renderSavedSearches();
+    return;
+  }
+  const list = await run('读取保存的搜索', () =>
+    invoke('saved_search_list', { accountId: state.accountId })
+  );
+  if (list === null) return;
+  state.savedSearches = list;
+  renderSavedSearches();
+}
+
+/** Draw the rows. Global ones are labelled, for the reason `splitByScope` explains. */
+function renderSavedSearches() {
+  const host = $('saved-searches');
+  const { account, global } = window.__easyEmailSavedSearch.splitByScope(state.savedSearches);
+  host.replaceChildren();
+
+  const rows = [
+    ...account.map((item) => ({ item, scope: '' })),
+    ...global.map((item) => ({ item, scope: '所有账号' })),
+  ];
+
+  if (rows.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'saved-empty';
+    empty.textContent = '还没有保存的搜索。在搜索框里输入条件后点「保存」。';
+    host.appendChild(empty);
+    return;
+  }
+
+  for (const { item, scope } of rows) {
+    const row = document.createElement('div');
+    row.className = 'saved-row';
+
+    const run = document.createElement('button');
+    run.className = 'row';
+    run.type = 'button';
+    run.title = item.query;
+    // The active one is the row whose query is in the box right now — the only state a user can see
+    // for free, and the difference between "my click did nothing" and "it is already showing".
+    if (item.query === $('search-input').value.trim()) run.classList.add('active');
+    run.append(nameSpan(item), scopeSpan(scope));
+    run.addEventListener('click', () => runSavedSearch(item));
+
+    const rename = smallButton('✎', '改名', () => renameSavedSearch(item));
+    const remove = smallButton('✕', '删除这个保存的搜索', () => deleteSavedSearch(item));
+    row.append(run, rename, remove);
+    host.appendChild(row);
+  }
+}
+
+function nameSpan(item) {
+  const span = document.createElement('span');
+  span.className = 'label';
+  span.textContent = item.name;
+  if (item.query !== item.name) {
+    // The query, faintly: a saved search whose name is not the query is the one people re-type wrong.
+    const hint = document.createElement('span');
+    hint.className = 'saved-hint';
+    hint.textContent = item.query;
+    span.append(hint);
+  }
+  return span;
+}
+
+function scopeSpan(scope) {
+  const span = document.createElement('span');
+  span.className = 'count';
+  span.textContent = scope;
+  return span;
+}
+
+function smallButton(text, title, onClick) {
+  const button = document.createElement('button');
+  button.className = 'saved-act';
+  button.type = 'button';
+  button.textContent = text;
+  button.title = title;
+  button.addEventListener('click', (event) => {
+    // A click on ✕ must not also run the search behind it.
+    event.stopPropagation();
+    onClick();
+  });
+  return button;
+}
+
+/** Offer to keep the query in the box. The name is suggested, not demanded. */
+function openSaveSearchModal() {
+  const query = $('search-input').value.trim();
+  if (!query) return;
+  const suggested = window.__easyEmailSavedSearch.suggestName(query);
+  openModal({
+    title: '保存搜索',
+    bodyHtml: `
+      <label class="field">
+        <span class="field-label">名字</span>
+        <input id="save-name" type="text" maxlength="60" value="${escapeHtml(suggested)}" />
+      </label>
+      <p class="about-note">
+        保存的是「${escapeHtml(query)}」这个条件。同名再保存会替换原来的，
+        侧栏里点一下就能重新搜。
+      </p>`,
+    confirmLabel: '保存',
+    onReady: (modal) => {
+      const input = modal.querySelector('#save-name');
+      input.focus();
+      input.select();
+    },
+    onConfirm: async () => {
+      const name = modalName();
+      if (!name) return;
+      const saved = await run('保存搜索', () =>
+        invoke('saved_search_save', { accountId: state.accountId, name, query })
+      );
+      if (saved === null) return;
+      await refreshSavedSearches();
+    },
+  });
+}
+
+/** The name in the save dialog, read through the modal's own DOM. */
+function modalName() {
+  const input = $('modal-root').querySelector('#save-name');
+  return input ? input.value.trim() : '';
+}
+
+async function renameSavedSearch(item) {
+  openModal({
+    title: '改名',
+    bodyHtml: `
+      <label class="field">
+        <span class="field-label">新名字</span>
+        <input id="rename-name" type="text" maxlength="60" value="${escapeHtml(item.name)}" />
+      </label>`,
+    confirmLabel: '保存',
+    onReady: (modal) => {
+      const input = modal.querySelector('#rename-name');
+      input.focus();
+      input.select();
+    },
+    onConfirm: async () => {
+      const name = $('modal-root').querySelector('#rename-name').value.trim();
+      if (!name || name === item.name) return;
+      const renamed = await run('改名', () =>
+        invoke('saved_search_rename', { accountId: state.accountId, id: String(item.id), name })
+      );
+      if (renamed === null) return;
+      await refreshSavedSearches();
+    },
+  });
+}
+
+async function deleteSavedSearch(item) {
+  // The browser's confirm, the same one removing an account uses: a dialog of our own for a
+  // one-line question is more machinery than the question deserves.
+  if (!confirm(`删除保存的搜索「${item.name}」？\n这个操作不可撤销。`)) return;
+  const removed = await run('删除保存的搜索', () =>
+    invoke('saved_search_delete', { accountId: state.accountId, id: String(item.id) })
+  );
+  if (removed === null) return;
+  await refreshSavedSearches();
+}
+
+/** Run a saved search: fill the box, then let the one search path do the rest. */
+async function runSavedSearch(item) {
+  $('search-input').value = item.query;
+  await runSearch();
+  renderSavedSearches();
+}
+
+/** Show the save button exactly when there is something in the box to keep. */
+function updateSearchSaveButton() {
+  $('btn-search-save').hidden = !$('search-input').value.trim();
 }
 
 /** Open a search hit, switching folder first when the hit lives somewhere else. */

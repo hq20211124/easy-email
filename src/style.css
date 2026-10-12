@@ -739,6 +739,89 @@ textarea {
   margin-top: 8px;
 }
 
+/* ---------------------------------------------------------------- saved searches */
+
+.saved-searches:empty {
+  display: none;
+}
+
+.saved-empty {
+  margin: 2px 0 4px;
+  padding: 0 8px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/*
+  One row: the name runs the query, and ✎ / ✕ sit beside it. They are separate small buttons rather
+  than a menu on the row, because deleting a saved search is a click a user would rather not make by
+  accident, and the only way to be sure they did not is to ask them to aim at something small.
+*/
+.saved-row {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.saved-row .row {
+  flex: 1;
+  min-width: 0;
+}
+
+.saved-row .row.active .label {
+  color: var(--accent);
+}
+
+/* The query, faintly, under a name that is not the query: the row people re-type wrong. */
+.saved-hint {
+  display: block;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 10px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.saved-act {
+  flex: none;
+  width: 22px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.saved-act:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.field {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.field input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+}
+
 .reader-header h2 {
   margin: 0 0 6px;
   font-size: 15.5px;

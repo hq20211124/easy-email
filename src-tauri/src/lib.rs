@@ -2185,6 +2185,79 @@ async fn index_coverage(
     cache.body_coverage(&account_id).map_err(describe)
 }
 
+/// Searches this account has asked to keep (`design/09` §1 goal 7, SRCH-05).
+///
+/// The account goes in every call, including the reads, because the store scopes by it — and because
+/// a "global" search (one saved for every account) is returned here on purpose. That is the same
+/// distinction the renderer has to make (`splitByScope`), which is why `SavedSearch` carries
+/// `account_id` through to the UI instead of being flattened out.
+#[tauri::command]
+async fn saved_search_list(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<mail_core::userdb::SavedSearch>, String> {
+    state
+        .user
+        .clone()
+        .list_saved_searches(&account_id)
+        .map_err(describe)
+}
+
+/// Save the query in the search box, or re-save one that already has this name.
+///
+/// A string id comes back for the same reason the drafts' do: Tauri's IPC is happier with strings,
+/// and the renderer only needs it to delete or rename.
+#[tauri::command]
+async fn saved_search_save(
+    state: State<'_, AppState>,
+    account_id: String,
+    name: String,
+    query: String,
+) -> Result<String, String> {
+    let store = state.user.clone();
+    let empty = query.trim().is_empty();
+    if empty {
+        return Err(describe(mail_core::error::MailError::Config(
+            "搜索条件不能为空".to_string(),
+        )));
+    }
+    let id = store
+        .save_search(Some(&account_id), &name, &query, now_secs())
+        .map_err(describe)?;
+    Ok(id.to_string())
+}
+
+/// Delete one of this account's searches. `false` means it was not theirs to delete.
+#[tauri::command]
+async fn saved_search_delete(
+    state: State<'_, AppState>,
+    account_id: String,
+    id: String,
+) -> Result<bool, String> {
+    let id: i64 = id.parse().map_err(|_| "无效的搜索 ID".to_string())?;
+    state
+        .user
+        .clone()
+        .delete_search(id, &account_id)
+        .map_err(describe)
+}
+
+/// Rename one of this account's searches. `false` means it was not theirs to rename.
+#[tauri::command]
+async fn saved_search_rename(
+    state: State<'_, AppState>,
+    account_id: String,
+    id: String,
+    name: String,
+) -> Result<bool, String> {
+    let id: i64 = id.parse().map_err(|_| "无效的搜索 ID".to_string())?;
+    state
+        .user
+        .clone()
+        .rename_search(id, &account_id, &name)
+        .map_err(describe)
+}
+
 /// The bundle, as the renderer sees it before anything is written.
 #[derive(serde::Serialize)]
 struct DiagPreview {
@@ -3603,6 +3676,10 @@ pub fn run() {
             search_hints,
             diagnostics_preview,
             log_tail,
+            saved_search_list,
+            saved_search_save,
+            saved_search_delete,
+            saved_search_rename,
             diagnostics_export,
             list_messages,
             list_thread,

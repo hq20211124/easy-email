@@ -78,6 +78,19 @@
         </div>
 
         <!--
+          Searches the user asked to keep (`design/09` §1 goal 7, SRCH-05). A row runs the query;
+          the ✕ beside it deletes it, and ✎ renames it — three actions that all need a click the user
+          meant, which is why delete and rename are separate small buttons rather than a menu on the
+          row itself. The "所有账号" label is what the row shows when it is global: without it, a
+          global row appearing after an account switch looks like it followed the user, which is
+          exactly the thing that makes people wonder whether their mail leaked between accounts.
+        -->
+        <div class="section">
+          <div class="section-title">保存的搜索</div>
+          <div id="saved-searches" class="saved-searches"></div>
+        </div>
+
+        <!--
           Which build this is, and how to get a newer one. The version had no home in the UI at all
           before this: the only place it existed was the installer's filename, which is not something
           a user reporting a bug can be asked to read out.
@@ -128,6 +141,18 @@
             title="多个词是 AND。可按字段限定：from: / to: / subject: / body: / filename:（附件名）。has:attachment 只找带附件的邮件。"
           />
           <button id="btn-search-clear" class="btn ghost" hidden title="退出搜索">✕</button>
+          <!--
+            Keeping the query in the box. Hidden until there is something to keep, because a "save"
+            button next to an empty search box is a button that can only fail.
+          -->
+          <button
+            id="btn-search-save"
+            class="btn ghost"
+            hidden
+            title="把这个查询保存到侧栏，下次直接点"
+          >
+            保存
+          </button>
         </div>
         <div id="search-status" class="search-status" hidden></div>
         <div id="message-list" class="message-list"></div>
@@ -261,6 +286,7 @@
     <script src="threads.js"></script>
     <script src="reply.js"></script>
     <script src="history.js"></script>
+    <script src="saved-search.js"></script>
     <script src="vlist.js"></script>
     <script src="wizard.js"></script>
     <script src="app.js"></script>

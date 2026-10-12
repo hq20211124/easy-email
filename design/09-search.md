@@ -196,6 +196,14 @@ pub async fn saved_list(db: &Db) -> Result<Vec<SavedSearch>>;
 pub async fn saved_save(db: &Db, s: &SavedSearch) -> Result<()>;
 pub async fn saved_delete(db: &Db, id: &str) -> Result<()>;
 pub async fn history_push(db: &Db, q: &str) -> Result<()>;
+
+> **实现注记（第 88/89 轮）**：存储与界面都已落地。表在 `user.db`（用户自己的数据，
+> 清缓存不该让它消失——与草稿同一条理由），`account_id` 可为 **NULL = 对所有账号可见**；
+> SQLite 唯一索引把 NULL 视为互不相同，所以同名全局搜索用"单写线程里显式读-然后-写"，
+> 并有测试钉住"同名只有一行"。前端一条规则：**显示一个保存的搜索 == 跑它**——
+> 行点一下填搜索框后调 `runSearch()`，**全程序只有一条搜索路径**（两份一定会分叉）。
+> `suggestName` 的建议名 capped 在 18 字符且**停在词边界**（`after:2026-0` 那种截断
+> 会让用户以为行坏了）。搜索历史（`history_push`）仍未做。
 ```
 
 ## 4.2 分词器：**已用实测定案 —— CJK 感知的 bigram**（证据见 `A1-F47`）

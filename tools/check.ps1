@@ -1308,6 +1308,53 @@ try {
         Write-Host 'saved searches live beside the drafts, one name is one row, and globals stay visible'
         $global:LASTEXITCODE = 0
     }
+    Step 'a saved search runs through the one search path, and its name is not the whole query' {
+        # Round 89 / design/09 §1 goal 7 (SRCH-05). The renderer half, with two silent failures:
+        #   * a second way to run a query. Two search paths diverge — one keeps up with the coverage
+        #     line, the hint and the "a newer query already answered" guard, and the other quietly
+        #     stops meaning what it says;
+        #   * a suggested name that is the whole query. The search box accepts 200 characters, a
+        #     sidebar row does not, and a row that wraps is a row nobody reads.
+        # A third thing is checked too, because it is the one a *user* would report as "it did
+        # nothing": a row whose click is not wired at all.
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $mod = Get-Content 'src/saved-search.js' -Raw -Encoding UTF8
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($cmd in @('saved_search_list', 'saved_search_save', 'saved_search_delete', 'saved_search_rename')) {
+            if ($shell -notmatch ("fn " + $cmd + "\(")) { $problems += "lib.rs must define $cmd" }
+            elseif ($shell -notmatch ("(?m)^\s+" + $cmd + ",\s*$")) {
+                $problems += "$cmd exists but is missing from generate_handler! — a command nobody can call"
+            }
+        }
+        # One search path: running a saved search fills the box and calls runSearch.
+        $run = [regex]::Match($js, '(?s)async function runSavedSearch\(.*?\n\}').Value
+        if ($run -notmatch 'runSearch\(') {
+            $problems += 'runSavedSearch must fill the box and call runSearch, not run a second copy of the search'
+        }
+        if ($js -notmatch "addEventListener\('click', \(\) => runSavedSearch") {
+            $problems += 'every saved row must actually be wired to run its query — a row nobody can click is a feature that does not exist'
+        }
+        # The suggested name is the pure module's job, and it is capped.
+        if ($mod -notmatch 'NAME_MAX') { $problems += 'src/saved-search.js must cap the suggested name' }
+        if ($mod -notmatch '…') {
+            $problems += 'a truncated name must say it was truncated — one that just stops looks like the query ended there'
+        }
+        # The rows and the save button must exist in the markup, and be wired.
+        if ($html -notmatch 'id="saved-searches"') { $problems += 'index.html must have the saved-searches container' }
+        if ($html -notmatch 'id="btn-search-save"') { $problems += 'index.html must have the save button' }
+        if ($js -notmatch 'refreshSavedSearches') { $problems += 'app.js must refresh the rows' }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'a saved search runs through the one search path, and its suggested name is capped'
+        $global:LASTEXITCODE = 0
+    }
 
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0
