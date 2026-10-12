@@ -1179,6 +1179,56 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+    Step 'the log rotates instead of growing forever' {
+        # Round 86 / design/16 §3.4. `startup-error.log` was append-forever: it only grew, the
+        # diagnostics bundle then read a file the size of the app's history rather than the size of the
+        # problem, and nothing ever cleaned it up. Three things, all of them silent:
+        #   * the cap not being enforced at all;
+        #   * a cap enforced only at startup (a long session would fill the file until relaunch);
+        #   * a rotation that keeps more than seven generations, which is the same leak slower.
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $rot = Get-Content 'crates/mail-core/src/logrot.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'crates/mail-core/src/lib.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        if ($lib -notmatch 'pub mod logrot;') {
+            $problems += 'lib.rs does not declare the logrot module'
+        }
+        foreach ($need in @('MAX_LOG_BYTES', 'KEEP_LOG_FILES', 'rotation_action', 'tail_lines')) {
+            if ($rot -notmatch [regex]::Escape($need)) {
+                $problems += "logrot.rs must define $need"
+            }
+        }
+        if ($rot -notmatch '8 \* 1024 \* 1024') {
+            $problems += 'the per-file cap must be 8 MB, the number design/16 §3.4 gives'
+        }
+        if ($rot -notmatch 'KEEP_LOG_FILES: u32 = 7') {
+            $problems += 'seven generations kept, per the design'
+        }
+        # The rotation must be on the write path, not the startup path.
+        $body = [regex]::Match($shell, '(?s)fn log_line\(message: &str\) \{.*?
+\}').Value
+        if ($body -notmatch 'rotate_log_if_needed') {
+            $problems += 'log_line must rotate before writing: a cap checked only at startup lets a long session fill the file'
+        }
+        if ($shell -notmatch 'fn rotate_log_if_needed') {
+            $problems += 'the rotation itself must exist as a function, not an inline comment'
+        }
+        # A failed rotation must not be fatal — that is the property that keeps a log from being a
+        # startup failure.
+        if ($shell -notmatch 'let _ = std::fs::remove_file') {
+            $problems += 'rotation failures must be ignored on purpose (let _ =), so a log can never stop the app starting'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the log rotates at 8 MB, keeps seven generations, and a failed rotation is not fatal'
+        $global:LASTEXITCODE = 0
+    }
+
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0
     }

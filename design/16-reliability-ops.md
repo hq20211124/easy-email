@@ -89,7 +89,13 @@ pub struct DiagManifest { pub app_version: String, pub os: String, pub webview: 
 pub struct LogPolicy { pub level: Level, pub file_max_bytes: u64 /* 8 MB */, pub keep_files: u32 /* 7 */, pub redact: bool /* true */ }
 pub fn log_init(policy: &LogPolicy) -> Result<()>;                 // tauri-plugin-log + 自定义脱敏层
 pub fn log_line(msg: &str);                                        // 既有 startup-error.log 的正式化
-pub fn tail(n: usize) -> Vec<String>;                              // 设置页"查看日志"（最多 500 行）
+pub fn tail(n: usize) -> Vec<String>;
+
+> **实现注记（第 86 轮）**：轮转已落地。`crates/mail-core/src/logrot.rs` 持有纯规则
+> （8 MB / 7 份 / `rotation_action` / `tail_lines`），`src-tauri` 的 `log_line` 在**每次写入前**
+> 检查并轮转（不是只在启动时——否则一次长会话会把文件撑到下次重启）。阈值判定 `>=`
+> （"差一字节"没有意义，测试钉住边界）。**轮转失败一律忽略**：日志绝不能成为应用启动不了的原因。
+> 取舍记录：轮转途中崩溃 ⇒ 内容不丢但分两份，`recent_log_lines` 会少看一段，**不做合并**。                              // 设置页"查看日志"（最多 500 行）
 ```
 **脱敏规则**（`redact()`，测试钉住 8 类）
 

@@ -3218,6 +3218,40 @@ fn format_log_line(message: &str, now: i64) -> (String, usize) {
     (format!("[{now}] {redacted}{note}\n"), hidden)
 }
 
+/// Rotate the log when it has reached the cap, so the file a diagnostic bundle reads is the size of
+/// the problem rather than the size of the app's history.
+///
+/// Three moves and one open: drop the oldest, shift `.n-1` to `.n`, move the current file to `.1`,
+/// and let the caller's `append` create a fresh one. Every failure is **ignored on purpose**: a log
+/// must never be the reason the app does not start, and a failed rotation costs a bigger file until
+/// the next write, which is the failure this whole mechanism exists to make rare.
+fn rotate_log_if_needed(dir: &std::path::Path) {
+    use mail_core::logrot::{KEEP_LOG_FILES, MAX_LOG_BYTES, rotated_names, rotation_action};
+
+    let current = dir.join("startup-error.log");
+    let Ok(metadata) = std::fs::metadata(&current) else {
+        return; // No file yet: nothing to rotate, and the caller is about to create it.
+    };
+    if !rotation_action(metadata.len(), MAX_LOG_BYTES) {
+        return;
+    }
+
+    let names = rotated_names(KEEP_LOG_FILES);
+    // From the oldest end so nothing is overwritten before it has been moved aside.
+    if let Some(oldest) = names.last() {
+        let _ = std::fs::remove_file(dir.join(format!("startup-error{oldest}")));
+    }
+    for n in (1..names.len()).rev() {
+        let from = dir.join(format!("startup-error{}", names[n - 1]));
+        let to = dir.join(format!("startup-error{}", names[n]));
+        if from.exists() {
+            let _ = std::fs::rename(from, to);
+        }
+    }
+    let rotated = dir.join(format!("startup-error{}", names[0]));
+    let _ = std::fs::rename(&current, rotated);
+}
+
 /// Append one diagnostic line to `startup-error.log`.
 ///
 /// The desktop build has no console (see the `windows_subsystem` note in `main.rs`), so anything
@@ -3227,6 +3261,10 @@ fn format_log_line(message: &str, now: i64) -> (String, usize) {
 /// **Everything is redacted on the way in.** This file is the first thing anyone attaches to a bug
 /// report, so the secret that reaches it is the secret that leaves the machine — and the caller
 /// should not have to remember that (53 call sites do not, and one day one of them would).
+///
+/// And it **rotates**: the file is capped at 8 MB with seven generations kept (`design/16` §3.4),
+/// checked before every write — a cap checked only at startup would let a long session fill a file
+/// nobody trims until the next launch.
 fn log_line(message: &str) {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3235,6 +3273,7 @@ fn log_line(message: &str) {
     let (line, _) = format_log_line(message, seconds as i64);
 
     let stored = PANIC_LOG_DIR.get().is_some_and(|dir| {
+        rotate_log_if_needed(dir);
         std::fs::create_dir_all(dir).is_ok()
             && std::fs::OpenOptions::new()
                 .create(true)
