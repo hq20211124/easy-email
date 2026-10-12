@@ -115,6 +115,30 @@ pub struct RebuildProgress {
     pub remaining: u32,
 }
 
+/// What the health check found (`design/09` goal 5 / `design/16` §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IndexHealth {
+    /// Messages this account has cached.
+    pub messages: u32,
+    /// Rows this account has in the search index — asked of the index itself, not computed.
+    pub indexed: u32,
+    /// Whether FTS5's own integrity check passes.
+    pub fts_ok: bool,
+    /// Bodies whose message row is gone. They inflate the coverage number and nothing else.
+    pub orphan_bodies: u32,
+}
+
+/// What one heal step did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HealReport {
+    /// Messages re-indexed in this step.
+    pub rebuilt: u32,
+    /// Bodies rows deleted because their message no longer exists.
+    pub orphans_deleted: u32,
+    /// Still to rebuild, when a rebuild is in progress.
+    pub remaining: u32,
+}
+
 /// The columns that feed one row of the search index.
 ///
 /// The body is not a column of its own: it lives inside the serialised `MessageDetail`, so it is
@@ -1489,6 +1513,119 @@ impl Cache {
     }
 
     // ------------------------------------------------------------------ search
+
+    /// Whether FTS5 considers itself consistent.
+    ///
+    /// FTS5's own `integrity-check` is the authority here, and that is the point: a count comparison
+    /// between the FTS table and `messages` would catch "a row went missing" and nothing else, while
+    /// reporting a perfectly normal mid-write state as broken. The one thing a heuristic like that
+    /// achieves is a heal the user did not need.
+    ///
+    /// Returns `false` rather than an error when the check fails — a caller asking "is the index
+    /// healthy" has an answer either way, and a corrupt index is a finding, not an exception.
+    pub fn fts_integrity_ok(&self) -> bool {
+        self.db
+            .write_blocking(|conn: &Connection| {
+                // The command is a special INSERT into the table's own shadow table; a corrupt index
+                // raises SQLITE_CORRUPT_VTAB from here rather than at query time.
+                conn.execute(
+                    "insert into search(search, rank) values('integrity-check', 1)",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(Into::into)
+            })
+            .is_ok()
+    }
+
+    /// What the search index looks like right now, for one account.
+    ///
+    /// `indexed` counts this account's rows in the FTS table, and is asked of the FTS table rather
+    /// than computed from `messages` — a detector that cannot see the thing it is checking for is
+    /// worse than none, because it reports healthy while rows are gone.
+    pub fn index_health(&self, account_id: &str) -> Result<IndexHealth> {
+        let account_id = account_id.to_string();
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let messages: u32 = conn.query_row(
+            "select count(*) from messages where account_id = ?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0).map(|n| n as u32),
+        )?;
+        let indexed: u32 = conn.query_row(
+            "select count(*) from search where account_id = ?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0).map(|n| n as u32),
+        )?;
+        let orphan_bodies: u32 = conn.query_row(
+            "select count(*) from bodies b
+             where b.account_id = ?1
+               and not exists (select 1 from messages m
+                               where m.account_id = b.account_id
+                                 and m.folder = b.folder
+                                 and m.uid = b.uid)",
+            params![account_id],
+            |row| row.get::<_, i64>(0).map(|n| n as u32),
+        )?;
+        drop(guard);
+        Ok(IndexHealth {
+            messages,
+            indexed,
+            fts_ok: self.fts_integrity_ok(),
+            orphan_bodies,
+        })
+    }
+
+    /// Repair what the health check can name.
+    ///
+    /// One bounded step, so it can be called from a tick: an FTS that failed its integrity check is
+    /// rebuilt through the same begin/step pair the round-72 UI drives — a second rebuild path is a
+    /// second thing that can disagree with the first. Orphan bodies are deleted in the same call,
+    /// because a count that includes rows for messages that no longer exist is a count that lies
+    /// about coverage.
+    ///
+    /// A healthy index is left alone and reports zeros. A healer that "fixes" a healthy index is a
+    /// healer that cannot tell, and the user pays for the rebuild either way.
+    pub fn heal_index(&self, account_id: &str, step: usize) -> Result<HealReport> {
+        let mut report = HealReport::default();
+        let health = self.index_health(account_id)?;
+
+        // Orphans first, and scoped by account: the FTS rebuild walks every message in the cache,
+        // but the bodies table only needs its own rows cleaned.
+        if health.orphan_bodies > 0 {
+            let removed = self.db.write_blocking({
+                let account_id = account_id.to_string();
+                move |conn: &Connection| {
+                    conn.execute(
+                        "delete from bodies
+                         where account_id = ?1
+                           and not exists (select 1 from messages m
+                                           where m.account_id = bodies.account_id
+                                             and m.folder = bodies.folder
+                                             and m.uid = bodies.uid)",
+                        params![account_id],
+                    )
+                    .map_err(Into::into)
+                }
+            })?;
+            report.orphans_deleted = removed as u32;
+        }
+
+        // Either signal is enough, and the count one matters more: a row that went missing is the
+        // damage a user actually meets (the mail stops being findable) while a structurally corrupt
+        // index usually announces itself. The count is a trustworthy signal **because** every write
+        // path puts the message row and its index row in one transaction
+        // (`upsert_summaries`/`put_detail`), so a reader can never see the half that is missing.
+        // That is the fact this relies on; if a write path ever splits in two, this becomes a
+        // detector that repairs a race, which is why the comment is here.
+        if !health.fts_ok || health.indexed < health.messages {
+            self.rebuild_search_begin()?;
+            let progress = self.rebuild_search_step(step)?;
+            report.rebuilt = progress.done;
+            report.remaining = progress.remaining;
+        }
+        Ok(report)
+    }
 
     /// Local full-text search over headers (always) and bodies (for messages already read).
     ///
@@ -3858,5 +3995,201 @@ mod tests {
         };
         assert!(matches!(error, MailError::Cache(_)), "got {error:?}");
         let _ = std::fs::remove_file(&path);
+    }
+    // ------------------------------------------------- index health and heal
+
+    /// Put one message in the cache the way the sync path does, so the index has a row to keep.
+    ///
+    /// The summary alone leaves the FTS row header-only, which is fine for the tests below — the
+    /// damage they do is to the row, not to what is in it.
+    fn seed_one(cache: &Cache, account_id: &str, subject: &str) -> u32 {
+        let uid = 11;
+        cache
+            .upsert_summaries(
+                account_id,
+                "INBOX",
+                &[summary(uid, subject, "shop@example.com", 1_700_000_000)],
+            )
+            .expect("summary");
+        uid
+    }
+
+    #[test]
+    fn a_healthy_index_says_so_and_a_heal_does_nothing() {
+        // The boring half, and the half that keeps heal honest: a healer that cannot tell healthy from
+        // broken rebuilds every time somebody asks, and the user pays for the rebuild either way.
+        let cache = Cache::open_in_memory().unwrap();
+        seed_one(&cache, "acc", "订单");
+
+        let health = cache.index_health("acc").expect("health");
+        assert!(health.fts_ok);
+        assert_eq!(health.messages, 1);
+        assert_eq!(health.indexed, 1);
+        assert_eq!(health.orphan_bodies, 0);
+
+        let healed = cache.heal_index("acc", 100).expect("heal");
+        assert_eq!(
+            (healed.rebuilt, healed.orphans_deleted),
+            (0, 0),
+            "nothing to do means nothing to do"
+        );
+    }
+
+    #[test]
+    fn a_row_the_index_lost_is_found_again_by_a_heal() {
+        // The whole reason this round exists. The index is a second copy of the mail, and a row can
+        // vanish from it without anything crashing: search simply answers with fewer results, and
+        // the user concludes the mail never arrived. Nothing was asking "is the index still right".
+        let cache = Cache::open_in_memory().unwrap();
+        let uid = seed_one(&cache, "acc", "订单");
+
+        // Break it behind the index's back — the same shape a crash between writes produces.
+        cache
+            .db
+            .write_blocking(move |conn: &Connection| {
+                conn.execute("delete from search where uid = ?1", params![uid])
+                    .map(|_| ())
+                    .map_err(Into::into)
+            })
+            .expect("corrupt the index");
+
+        // And the failure is silent: the message still opens, the list still shows it.
+        assert_eq!(
+            cache.search("acc", "订单", 10).expect("search").len(),
+            0,
+            "search answers fewer results, which is what a user sees as \"that mail never came\""
+        );
+        let health = cache.index_health("acc").expect("health");
+        assert!(
+            health.indexed < health.messages,
+            "a missing row is visible in the count — and it is a trustworthy signal because every write
+             path puts the message row and its index row in one transaction"
+        );
+
+        cache.heal_index("acc", 100).expect("heal");
+        let health = cache.index_health("acc").expect("health after");
+        assert_eq!(health.indexed, health.messages, "the row is back");
+        assert!(health.fts_ok, "and the index says so itself");
+        assert_eq!(
+            cache.search("acc", "订单", 10).expect("search again").len(),
+            1,
+            "and the user's mail is findable again"
+        );
+    }
+
+    #[test]
+    fn orphan_bodies_are_cleaned_without_touching_the_live_ones() {
+        // Orphans inflate "正文已索引 N/M" — a count that lies about coverage is worse than none.
+        let cache = Cache::open_in_memory().unwrap();
+        let uid = seed_one(&cache, "acc", "订单");
+        // A body that belongs to the live message, so there is something to leave alone.
+        cache
+            .put_detail(
+                "acc",
+                "INBOX",
+                &detail(uid, "订单", "正文里有对账单这三个字"),
+            )
+            .expect("body");
+        // A body whose message row is gone: what a cleared cache or a failed migration leaves.
+        cache
+            .db
+            .write_blocking(move |conn: &Connection| {
+                conn.execute(
+                    "insert into bodies (account_id, folder, uid, detail, fetched_at)
+                     values ('acc', 'Trash', 99, '孤儿的正文', 1)",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(Into::into)
+            })
+            .expect("plant an orphan");
+
+        let health = cache.index_health("acc").expect("health");
+        assert_eq!(health.orphan_bodies, 1, "the extra row is named");
+
+        let healed = cache.heal_index("acc", 100).expect("heal");
+        assert_eq!(healed.orphans_deleted, 1);
+        let health = cache.index_health("acc").expect("health after");
+        assert_eq!(health.orphan_bodies, 0);
+        // The live body is still there — a cleanup that removes the wrong row is worse than the mess.
+        let kept = cache
+            .db
+            .read_guard()
+            .query_row(
+                "select count(*) from bodies where account_id = 'acc' and folder = 'INBOX' and uid = 11",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("the live body is still indexed");
+        assert_eq!(kept, 1, "the orphan is gone and the real one stays");
+    }
+
+    #[test]
+    fn another_accounts_mess_is_not_cleaned_by_this_accounts_heal() {
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "a",
+                "INBOX",
+                &[MessageSummary {
+                    uid: 1,
+                    subject: "甲的".into(),
+                    from_name: None,
+                    from_addr: None,
+                    date: Some(1),
+                    size: None,
+                    seen: false,
+                    flagged: false,
+                    thread_key: None,
+                    subject_key: Some("甲".into()),
+                }],
+            )
+            .expect("a");
+        cache
+            .db
+            .write_blocking(|conn: &Connection| {
+                conn.execute(
+                    "insert into bodies (account_id, folder, uid, detail, fetched_at)
+                     values ('b', 'INBOX', 1, '乙的孤儿', 1)",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(Into::into)
+            })
+            .expect("b's orphan");
+
+        let healed = cache.heal_index("a", 100).expect("heal a");
+        assert_eq!(healed.orphans_deleted, 0, "not this account's row");
+        assert_eq!(
+            cache.index_health("b").expect("b's health").orphan_bodies,
+            1,
+            "still there, where it belongs"
+        );
+    }
+
+    #[test]
+    fn the_health_count_comes_from_the_index_itself() {
+        // `indexed` asked of the FTS table rather than computed from `messages`: a detector that
+        // cannot see what it is checking for reports healthy while rows are missing.
+        let cache = Cache::open_in_memory().unwrap();
+        seed_one(&cache, "acc", "订单");
+        let health = cache.index_health("acc").expect("health");
+        assert_eq!((health.messages, health.indexed), (1, 1));
+
+        // Drop the FTS row again and the count follows it down: the answer comes from the index.
+        cache
+            .db
+            .write_blocking(|conn: &Connection| {
+                conn.execute("delete from search where uid = 11", [])
+                    .map(|_| ())
+                    .map_err(Into::into)
+            })
+            .expect("drop the row");
+        let health = cache.index_health("acc").expect("health");
+        assert_eq!(
+            (health.messages, health.indexed),
+            (1, 0),
+            "the messages count holds and the index count drops — which is the whole signal"
+        );
     }
 }

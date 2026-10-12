@@ -167,6 +167,13 @@
           <div id="search-history" class="search-history" hidden></div>
         </div>
         <div id="search-status" class="search-status" hidden></div>
+        <!--
+          "Why does search not find that mail?" — asked here, answered here. The index is a second
+          copy of the mail, and a row can leave it without anything failing, so nothing would ever
+          say a word unless something asked. The repair is a button, not a background job: the
+          rebuild clears the index first, so a search during it answers with less.
+        -->
+        <div id="index-health" class="index-health" hidden></div>
         <div id="message-list" class="message-list"></div>
         <div id="list-footer" class="list-footer" hidden>
           <button id="btn-load-more" class="btn ghost block">加载更多</button>

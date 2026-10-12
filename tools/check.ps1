@@ -1473,6 +1473,65 @@ try {
         Write-Host 'sample headers need an explicit tick, and they can only ever be headers'
         $global:LASTEXITCODE = 0
     }
+    Step 'a search index that lost a row says so, and only the user can order the repair' {
+        # Round 92 / design/09 goal 5. The index is a second copy of the mail, and the failure is
+        # silent in the worst way: search answers with fewer results, so the user concludes the mail
+        # never arrived. Nothing was asking "is the index still whole".
+        #
+        # The rules this pins, and why each one is a rule rather than a nicety:
+        #   * the count must be asked of the index, not computed from `messages` — a detector that
+        #     cannot see what it checks for reports healthy while rows are missing;
+        #   * the count is a *trustworthy* signal only because every write path puts the message row
+        #     and its index row in one transaction, so the comment has to say so, and a future split
+        #     of that write has to notice this;
+        #   * the repair must not be automatic: the rebuild clears the index first, so a search
+        #     during it answers with less. A self-healing index that rebuilds while somebody is
+        #     searching is a worse problem than the one it fixed;
+        #   * there must be one rebuild, not two: a second implementation is a second thing that can
+        #     disagree with the first.
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($fn in @('fts_integrity_ok', 'index_health', 'heal_index')) {
+            if ($cache -notmatch ("fn " + $fn)) { $problems += "cache.rs must expose $fn" }
+        }
+        # The count comes from the index itself.
+        if ($cache -notmatch 'select count\(\*\) from search where account_id') {
+            $problems += 'indexed must be counted in the FTS table, not computed from messages — that is what makes the detector able to see the thing it checks for'
+        }
+        # The signal's basis is stated, so a future split of the write path has to notice it.
+        if ($cache -notmatch 'one transaction') {
+            $problems += 'the row-count signal must say why it is trustworthy (the write path is one transaction)'
+        }
+        # One rebuild: heal drives begin/step rather than its own.
+        if ($cache -notmatch 'rebuild_search_begin') {
+            $problems += 'heal must drive the existing begin/step rebuild — a second rebuild is a second thing that can disagree'
+        }
+        # The repair is on a button, with a confirmation, in the place the question is asked.
+        if ($shell -notmatch 'fn index_health\(' -or $shell -notmatch 'fn index_heal\(') {
+            $problems += 'lib.rs must expose both commands'
+        }
+        foreach ($cmd in @('index_health', 'index_heal')) {
+            if ($shell -notmatch ("(?m)^\s+" + $cmd + ",\s*$")) { $problems += "$cmd is missing from generate_handler!" }
+        }
+        if ($js -notmatch 'id="index-health"' -and $html -notmatch 'id="index-health"') {
+            $problems += 'the renderer must have somewhere to say the index is not whole'
+        }
+        if ($js -notmatch 'confirm\(') {
+            $problems += 'the repair must be confirmed: the rebuild clears the index first, so a search during it answers with less'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'a missing row is visible, its basis is stated, and the repair needs the user'
+        $global:LASTEXITCODE = 0
+    }
 
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0

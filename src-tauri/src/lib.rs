@@ -2185,6 +2185,41 @@ async fn index_coverage(
     cache.body_coverage(&account_id).map_err(describe)
 }
 
+/// What the search index looks like for this account (`design/09` goal 5).
+///
+/// The check answers one question a user has actually asked: "why does search not find that mail?"
+/// The index is a second copy of the mail, and a row can vanish from it without anything failing —
+/// search simply answers with fewer results, which reads as "the mail never arrived".
+#[tauri::command]
+async fn index_health(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<mail_core::IndexHealth, String> {
+    state
+        .cache
+        .clone()
+        .index_health(&account_id)
+        .map_err(describe)
+}
+
+/// Repair the index, one bounded step at a time.
+///
+/// Shared with the round-72 rebuild path on purpose: a second rebuild implementation is a second
+/// thing that can disagree with the first. The UI has to confirm for the same reason it does there —
+/// the rebuild clears the index first, so a search during it answers with less.
+#[tauri::command]
+async fn index_heal(
+    state: State<'_, AppState>,
+    account_id: String,
+    step: u32,
+) -> Result<mail_core::HealReport, String> {
+    state
+        .cache
+        .clone()
+        .heal_index(&account_id, step as usize)
+        .map_err(describe)
+}
+
 /// Queries this account typed recently (`design/09` §4.1).
 ///
 /// The other half of search memory: saved searches are kept on purpose, history is simply what was
@@ -3763,6 +3798,8 @@ pub fn run() {
             log_tail,
             saved_search_list,
             history_search_list,
+            index_health,
+            index_heal,
             history_search_push,
             history_search_clear,
             saved_search_save,

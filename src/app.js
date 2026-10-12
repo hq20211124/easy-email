@@ -750,6 +750,9 @@ async function runSearch() {
   state.view = 'mail';
   syncMailboxRows();
   $('btn-search-clear').hidden = false;
+  // "Why does search not find that mail?" is asked right here, so the index's answer belongs here
+  // too — once per search, not on a timer, because the user is the one who knows to ask.
+  checkIndexHealth();
 
   const status = $('search-status');
   status.hidden = false;
@@ -924,6 +927,81 @@ async function indexBodiesNow() {
   // Re-run the search so the new coverage lands in the status line, and any hit that only exists
   // in a body that was just fetched shows up.
   await runSearch();
+}
+
+/* ---------------------------------------------------------------- index health */
+
+/**
+ * Ask whether the search index is still whole, and say so where the user looked.
+ *
+ * Where the user looked is the status line under the search box: the question "why does search not
+ * find that mail" is asked there, so that is where the answer has to be. A check that reports
+ * somewhere else is a check the user meets only by accident.
+ *
+ * The repair is **not** automatic. The rebuild clears the index first, so a search during it
+ * answers with less than before — the same reason the round-72 rebuild asks for confirmation. An
+ * index that quietly rebuilds itself while somebody is searching is a worse problem than the one it
+ * fixed.
+ */
+async function checkIndexHealth() {
+  if (!state.accountId) return;
+  const health = await run('检查索引', () =>
+    invoke('index_health', { accountId: state.accountId })
+  );
+  if (health === null) return;
+  renderIndexHealth(health);
+}
+
+function renderIndexHealth(health) {
+  const host = $('index-health');
+  const broken = !health.fts_ok || health.indexed < health.messages || health.orphan_bodies > 0;
+  if (!broken) {
+    host.hidden = true;
+    host.replaceChildren();
+    return;
+  }
+  host.hidden = false;
+  host.replaceChildren();
+
+  const what = [];
+  if (!health.fts_ok) what.push('索引自检未通过');
+  if (health.indexed < health.messages) {
+    what.push(`${health.messages - health.indexed} 封邮件不在索引里`);
+  }
+  if (health.orphan_bodies > 0) what.push(`${health.orphan_bodies} 条无用的正文缓存`);
+
+  const line = document.createElement('span');
+  line.textContent = `索引可能不完整（${what.join('，')}）：`;
+  host.appendChild(line);
+
+  const fix = document.createElement('button');
+  fix.className = 'btn ghost small';
+  fix.type = 'button';
+  fix.textContent = '修复索引';
+  fix.title = '重建索引。重建期间搜索范围会变小，所以需要你确认（与「重建索引」同一个理由）。';
+  fix.addEventListener('click', () => {
+    // Same confirmation as the round-72 rebuild, for its reason: the rebuild clears the index first.
+    if (!confirm('要重建搜索索引吗？\n重建期间搜索能搜到的邮件会变少。')) return;
+    healIndex(fix);
+  });
+  host.appendChild(fix);
+}
+
+async function healIndex(button) {
+  button.disabled = true;
+  button.textContent = '正在修复…';
+  const report = await run('修复索引', () =>
+    invoke('index_heal', { accountId: state.accountId, step: 500 })
+  );
+  button.disabled = false;
+  if (report === null) {
+    button.textContent = '修复索引';
+    return;
+  }
+  toast(`索引已修复：重建 ${report.rebuilt} 封，清理 ${report.orphans_deleted} 条`, 'ok');
+  // Ask again rather than assume: the line disappears only when the index really says it is whole.
+  checkIndexHealth();
+  runSearch();
 }
 
 function exitSearchMode({ reload = true } = {}) {

@@ -437,6 +437,16 @@ textarea {
   color: var(--text-muted);
 }
 
+/* The one red line in this pane, because it is the one thing the user has to act on. */
+.index-health {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 6px;
+  font-size: 11px;
+  color: var(--danger);
+}
+
 /*
   Recent queries. It overlaps the list below it on purpose — it is a dropdown, and a real one costs
   the list a row for the second it is open rather than pushing the messages the user is looking at
