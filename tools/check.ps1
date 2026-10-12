@@ -994,6 +994,55 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+    Step 'offline intents are queued for network failures only, and sent before flags' {
+        # Round 81 / design/04 §5.5. The two ways this wiring goes wrong, both silent:
+        #   * queueing a *refusal* (bad authorization code, server says NO) — the intent then retries
+        #     forever and the user is never told, which is worse than the error it replaced;
+        #   * replaying flags before the outbox sends — the server can end up with a read/moved
+        #     message whose mail was never delivered.
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $err = Get-Content 'crates/mail-core/src/error.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        # The queue is entered through one door, and that door checks.
+        if ($lib -notmatch 'fn queue_offline_intent\(') {
+            $problems += 'lib.rs must have one place that enqueues an offline intent'
+        }
+        foreach ($command in @('mark_seen', 'delete_message', 'move_message')) {
+            $body = [regex]::Match($lib, ('(?s)async fn ' + $command + '\(.*?\n\}')).Value
+            if ($body.Length -eq 0) {
+                $problems += "$command is missing — the offline queue must cover the three mutating commands"
+                continue
+            }
+            if ($body -notmatch 'is_network\(\)') {
+                $problems += "$command does not check is_network() before queueing: a refusal would be queued and retried forever"
+            }
+            if ($body -notmatch '(queue_offline_intent|enqueue_pending_op)') {
+                $problems += "$command never enqueues the intent it failed to apply"
+            }
+        }
+        if ($err -notmatch 'pub fn is_network\(') {
+            $problems += 'MailError::is_network is missing: the queue needs the network/refusal split'
+        }
+        if ($err -notmatch 'is_network') {
+            $problems += 'the classification the queue uses must be tested'
+        }
+        # Order: the outbox worker is started before this one, and the pass runs after the outbox pass.
+        $outboxAt = $lib.IndexOf('start_outbox_worker(app.handle().clone());')
+        $pendingAt = $lib.IndexOf('start_pending_replay_worker(app.handle().clone());')
+        if ($outboxAt -lt 0 -or $pendingAt -lt 0 -or $pendingAt -lt $outboxAt) {
+            $problems += 'the outbox worker must be started before the pending-ops worker (design/04 §5.5: send first, then flags)'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'only network failures queue, all three commands are wired, and the outbox goes first'
+        $global:LASTEXITCODE = 0
+    }
+
         Write-Host 'offline intents are queueable, claimable, and countable as work rather than history'
         $global:LASTEXITCODE = 0
     }

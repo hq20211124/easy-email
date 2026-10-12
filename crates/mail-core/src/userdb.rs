@@ -1446,6 +1446,23 @@ impl UserStore {
     }
 
     /// How many offline operations are queued.
+    /// Test seam: rewrite a row's kind to something this build cannot read.
+    ///
+    /// `#[cfg(test)]` because no production path needs it — the point of the tests that use it is
+    /// that a row written by a *newer* version stays a row (with `kind: None` and a reason) rather
+    /// than being guessed at or dropped, and that shape is impossible to produce through the API.
+    #[cfg(test)]
+    pub fn force_pending_kind(&self, id: i64, kind: &str) -> Result<()> {
+        let kind = kind.to_string();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update pending_ops set kind = ?2 where id = ?1",
+                rusqlite::params![id, kind],
+            )?;
+            Ok(())
+        })
+    }
+
     /// How much offline work is left: queued and in-flight, **not** done or cancelled.
     ///
     /// This used to be a raw row count, which is the sort of number that only ever goes up — a

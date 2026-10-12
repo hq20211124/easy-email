@@ -31,6 +31,7 @@ pub mod mutf7;
 pub mod oauth;
 pub mod oauthclient;
 pub mod outbox;
+pub mod pending;
 pub mod pool;
 pub mod providers;
 pub mod query;
@@ -67,6 +68,7 @@ pub use outbox::{
     OutboxState, Verdict, is_permanent_failure, needs_user_decision, next_attempt_delay_secs,
     verdict_for_failure,
 };
+pub use pending::{DEFAULT_REPLAY_LIMIT, OpApplier, ReplayReport, ReplayRun, replay_pending_ops};
 pub use pool::{ConnectionPool, PooledClient};
 pub use providers::Provider;
 pub use query::{

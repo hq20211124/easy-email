@@ -11,6 +11,54 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### 离线意图的重放与接线——"不会丢信"收口（04 最后一片）✅（第 81 轮）
+
+**依据**：`design/04-sync.md` §5.5（恢复顺序："flush outbox（先）→ flush pending_ops（后）"）、
+§9 验收（"断网做 200 次混合操作 → 联网 → 断言服务器最终一致"）。第 80 轮建好队列，本片让它被消费。
+
+**做了什么**：
+- **`crates/mail-core/src/pending.rs`**：`replay_pending_ops(run, applier)` —— 一遍有界重放
+  （`claim → apply → finish / retry`），形状照 `index.rs`（transport 注入、假 applier 可测）；
+  `remaining` 是**再问一次**而不是算出来的（与 `IndexReport` 同一纪律）。
+- **`MailError::is_network()`**：只有"服务器没听到我们"的失败才可入队。
+  **刻意与 `failure_kind` 的 Network 分支不同**：`Timeout` 在刷新路径算 Busy，在这里**算可入队**——
+  一次超时的 `STORE` 正是"不知道服务器做没做"，而队列里每条意图都是幂等的，
+  重放它安全。`Auth`/`Imap` 拒绝**不可入队**（排一个永远不会成功的意图只是把错误藏起来）。
+- **三个命令接线**：`mark_seen` / `delete_message` / `move_message` 在网络类失败时
+  **本地立即生效 + 入队 + 返回 Ok**（用户不看到错误框，Intent 已经在路上）；
+  永久失败照旧当场报错。`move` 的目标文件夹存在 `payload.target_folder` 里，重放才知往哪搬。
+- **`start_pending_replay_worker`**：每 30 s 一遍（比发件箱慢，因为刚恢复的服务器不该被敲）；
+  启动时先把上次崩溃留下的 `in_flight` requeue（幂等，理由与 outbox 的崩溃恢复同源）；
+  **顺序**：`outbox` worker 先启动、`pending_replay_pass` 在 `outbox_pass` 之后跑
+  —— 先发信再改旗标（§5.5 的直觉顺序）。
+
+**为什么每条都能安全重放**（写进注释，防止下一个人改成"先查再做"）：`STORE +FLAGS` 两次是一次，
+`MOVE` 已搬过的是空操作或报错（我们当完成），`EXPUNGE` 已删掉的不存在。
+**"先查再做"恰是需要第二条连接才能解的 race**，而队列的存在就是为了不花那条连接。
+
+**未知 kind 的重放结局**：`retry` + `last_error` 写明"这个版本不认识这种离线操作"。
+行**不删**（那是用户的意图），退避保证不自旋，`pending_ops_outstanding` 一直数它——
+**界面一直显示"1 个待处理"是事实**：确实有一件这个 build 做不到的事。没为它加
+`needs_attention` 状态（schema 改动不值这个价）。
+
+**测试 +6** → **WSL 408 passed / 7 ignored**（402+6）。
+`pending.rs` 五条：先败后成（第一遍 failed、退避期间**立刻重试取不到**、到期后 applied、
+`remaining` 归零）；服务器一直坏 ⇒ 同一秒内 10 个 tick **只尝试一次**；
+未知 kind ⇒ 不 apply、行留着、`last_error` 说人话；空队列零成本；一遍最多 `limit` 条。
+`error.rs` 一条：`Connect`/`Timeout` 可入队，`Auth`/`Imap`/`Busy`/`Cache` **不可**。
+
+**门禁 41 → 42 步**：钉住"一个入口、三个命令都检查 `is_network()`、`is_network` 有测试、
+outbox worker 先于 pending-ops worker 启动"。
+
+**未做/未验（如实）**：
+- **applier → ImapClient 的映射没有端到端测试**：它是 30 行分派，每个分支调用的方法
+  loopback 已覆盖；在测试里复刻一份映射只能证明复刻的那份对。**真机验收（§9 的"200 次混合
+  操作"）仍待你在真账号上做一次**：断网点已读/删除/移动 → 恢复联网 → 看队列清零、服务器状态一致。
+- 前端没有为"已排入离线队列"加 toast（现在静默返回 Ok，本地已生效；体验上够用，
+  但一句提示更好——记在这里，别当成已完成）。
+
+---
+
 ### `pending_ops` 从空表变成真的队列（04 离线意图，存储层）✅（第 80 轮）
 
 **依据**：`design/04-sync.md` §5.5（断网："outbox/pending_ops 保持排队"；恢复："flush outbox

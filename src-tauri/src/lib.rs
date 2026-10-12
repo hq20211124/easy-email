@@ -2308,6 +2308,147 @@ fn start_body_index_worker(app: AppHandle) {
     });
 }
 
+/// The offline intent queue's tick.
+///
+/// Slower than the outbox tick on purpose: the queue is compensation for a period of being offline,
+/// and the one thing it must not do is hammer a server that is only just back. Asking the store
+/// first makes the common case (nothing queued) free — no credential, no connection, no handshake.
+fn start_pending_replay_worker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // A previous run may have died between claiming an intent and recording the outcome. Every
+        // intent in the queue is idempotent, so putting them back is the same answer the outbox
+        // gives for its own crash recovery.
+        {
+            let state = app.state::<AppState>();
+            match state.user.requeue_pending_ops(now_seconds()) {
+                Ok(n) if n > 0 => log_line(&format!(
+                    "[easy-email] 上一次运行留下 {n} 个没做完的离线意图，重新排队"
+                )),
+                _ => {}
+            }
+        }
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Err(error) = pending_replay_pass(&app).await {
+                log_line(&format!("[easy-email] 离线意图补做失败：{error}"));
+            }
+        }
+    });
+}
+
+/// One bounded pass over every account's offline intent queue.
+///
+/// Runs **after** the outbox pass, which is the order `design/04` §5.5 asks for: send the mail
+/// first, then fix the flags — otherwise a message the user archived while offline could be marked
+/// read on the server before the message that move refers to exists. Both are idempotent, so the
+/// ordering is about not looking strange to the user rather than about correctness.
+///
+/// An applier per account: the intents are applied through the same pooled connection the rest of
+/// the app uses, so a pass that finds nothing costs one `pending_ops_outstanding()` per account and
+/// no handshake at all.
+async fn pending_replay_pass(app: &AppHandle) -> Result<(), String> {
+    let (accounts, store, pool) = {
+        let state = app.state::<AppState>();
+        (state.snapshot(), state.user.clone(), state.pool.clone())
+    };
+
+    for account in accounts {
+        // Asking the store first is what makes the empty case free: no credential, no connection.
+        let outstanding = store.pending_ops_outstanding().unwrap_or(0);
+        if outstanding == 0 {
+            continue;
+        }
+        let password = match secret::load_password(&account.id) {
+            Ok(Some(password)) => password,
+            _ => continue,
+        };
+
+        struct AccountApplier<'a> {
+            pool: &'a crate::ConnectionPool,
+            cfg: &'a mail_core::model::AccountConfig,
+            password: &'a str,
+        }
+
+        #[allow(async_fn_in_trait)]
+        impl mail_core::pending::OpApplier for AccountApplier<'_> {
+            async fn apply(
+                &mut self,
+                op: &mail_core::userdb::PendingOp,
+            ) -> mail_core::error::Result<()> {
+                use mail_core::userdb::PendingOpKind::*;
+                let Some(uid) = op.uid else {
+                    // An intent about a folder rather than a message. None exists yet, and guessing
+                    // at one would apply something the user never asked for.
+                    return Err(mail_core::error::MailError::Config(
+                        "这个离线操作没有指定邮件".to_string(),
+                    ));
+                };
+                let uid = u32::try_from(uid).unwrap_or(u32::MAX);
+                pool_op!(self.pool, self.cfg, self.password, |client| {
+                    match op.kind {
+                        Some(MarkRead) => {
+                            client.select(&op.folder).await?;
+                            client.mark_seen(uid, true).await
+                        }
+                        Some(MarkUnread) => {
+                            client.select(&op.folder).await?;
+                            client.mark_seen(uid, false).await
+                        }
+                        Some(Delete) => {
+                            client.select(&op.folder).await?;
+                            client.delete_message(&op.folder, uid).await
+                        }
+                        Some(Move) => {
+                            let target =
+                                op.payload().and_then(|p| p.target_folder).ok_or_else(|| {
+                                    mail_core::error::MailError::Config(
+                                        "这个离线移动没有目标文件夹".to_string(),
+                                    )
+                                })?;
+                            client.select(&op.folder).await?;
+                            client.move_message(&op.folder, uid, &target).await
+                        }
+                        None => Err(mail_core::error::MailError::Config(
+                            "这个版本不认识这种离线操作".to_string(),
+                        )),
+                    }
+                })
+            }
+        }
+
+        let mut applier = AccountApplier {
+            pool: &pool,
+            cfg: &account,
+            password: &password,
+        };
+        let run = mail_core::pending::ReplayRun {
+            store: &store,
+            now: now_seconds(),
+            limit: mail_core::pending::DEFAULT_REPLAY_LIMIT,
+        };
+        match mail_core::pending::replay_pending_ops(run, &mut applier).await {
+            Ok(report) if report.applied + report.failed > 0 => {
+                log_line(&format!(
+                    "[easy-email] 离线意图补做 {}：应用 {} / 重试 {} / 还剩 {}",
+                    account.id, report.applied, report.failed, report.remaining
+                ));
+                if report.remaining == 0 {
+                    let _ = app.emit("pending-ops:changed", ());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log_line(&format!(
+                    "[easy-email] 离线意图补做 {} 失败：{error}",
+                    account.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Search the local cache. Never touches the network, so it also works offline.
 #[tauri::command]
 async fn search_messages(
@@ -2359,11 +2500,32 @@ async fn mark_seen(
     let cfg = state.find(&account_id)?;
     let password = secret_for(&state, &cfg).await?;
 
-    pool_op!(state.pool, &cfg, &password, |client| {
+    let outcome = pool_op!(state.pool, &cfg, &password, |client| {
         client.select(&mailbox).await?;
         client.mark_seen(uid, seen).await
-    })
-    .map_err(describe)?;
+    });
+    match outcome {
+        Ok(()) => {}
+        Err(error) => {
+            // Offline is not a failure of the user's intent: the flag is applied locally now and the
+            // queue carries it to the server when the connection is back (`design/04` §5.5). A
+            // *refusal* is still a refusal — `is_network` is what tells the two apart.
+            if !error.is_network() {
+                return Err(describe(error));
+            }
+            queue_offline_intent(
+                &state,
+                &account_id,
+                &mailbox,
+                Some(uid),
+                if seen {
+                    mail_core::userdb::PendingOpKind::MarkRead
+                } else {
+                    mail_core::userdb::PendingOpKind::MarkUnread
+                },
+            )?;
+        }
+    }
 
     // Mirror it locally, or the cached list keeps showing the old flag next time it is opened
     // offline and the UI disagrees with the server.
@@ -2373,6 +2535,41 @@ async fn mark_seen(
         .set_seen(&account_id, &mailbox, uid, seen)
         .map_err(describe)?;
     Ok(())
+}
+
+/// Put a mutating intent on the offline queue, so the server catches up when it can.
+///
+/// Only called for failures [`MailError::is_network`] accepts, which is why it does not need to
+/// decide anything: a queue that also swallowed refusals would hide them behind retries that can
+/// never succeed. The queue lives in `user.db`, so it survives a restart — the intent outlives the
+/// process that made it.
+fn queue_offline_intent(
+    state: &AppState,
+    account_id: &str,
+    folder: &str,
+    uid: Option<u32>,
+    kind: mail_core::userdb::PendingOpKind,
+) -> Result<(), String> {
+    let store = state.user.clone();
+    store
+        .enqueue_pending_op(
+            account_id,
+            folder,
+            uid.map(u64::from),
+            kind,
+            &mail_core::userdb::PendingPayload::default(),
+            now_secs(),
+        )
+        .map_err(describe)?;
+    Ok(())
+}
+
+/// Unix seconds, in one place, so a queued row and its backoff agree on what "now" is.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -2385,10 +2582,24 @@ async fn delete_message(
     let cfg = state.find(&account_id)?;
     let password = secret_for(&state, &cfg).await?;
 
-    pool_op!(state.pool, &cfg, &password, |client| {
+    let outcome = pool_op!(state.pool, &cfg, &password, |client| {
         client.delete_message(&mailbox, uid).await
-    })
-    .map_err(describe)?;
+    });
+    match outcome {
+        Ok(()) => {}
+        Err(error) => {
+            if !error.is_network() {
+                return Err(describe(error));
+            }
+            queue_offline_intent(
+                &state,
+                &account_id,
+                &mailbox,
+                Some(uid),
+                mail_core::userdb::PendingOpKind::Delete,
+            )?;
+        }
+    }
 
     // Drop it from the cache as well, so a deleted message cannot reappear from disk.
     state
@@ -2410,10 +2621,32 @@ async fn move_message(
     let cfg = state.find(&account_id)?;
     let password = secret_for(&state, &cfg).await?;
 
-    pool_op!(state.pool, &cfg, &password, |client| {
+    let outcome = pool_op!(state.pool, &cfg, &password, |client| {
         client.move_message(&mailbox, uid, &destination).await
-    })
-    .map_err(describe)?;
+    });
+    match outcome {
+        Ok(()) => {}
+        Err(error) => {
+            if !error.is_network() {
+                return Err(describe(error));
+            }
+            // `move` carries its destination in the payload, so the replay knows where to put it.
+            let payload = mail_core::userdb::PendingPayload {
+                target_folder: Some(destination.clone()),
+            };
+            let store = state.user.clone();
+            store
+                .enqueue_pending_op(
+                    &account_id,
+                    &mailbox,
+                    Some(u64::from(uid)),
+                    mail_core::userdb::PendingOpKind::Move,
+                    &payload,
+                    now_secs(),
+                )
+                .map_err(describe)?;
+        }
+    }
     Ok(())
 }
 
@@ -3060,6 +3293,10 @@ pub fn run() {
             // Start the outbox worker. Queued messages outlive the window, so this is what actually
             // sends them: the composer only commits them to `user.db`.
             start_outbox_worker(app.handle().clone());
+            // The offline intent queue. It runs after the outbox worker is started, and its pass
+            // runs after the outbox pass inside its own loop, because `design/04` §5.5 wants mail
+            // sent before flags are fixed.
+            start_pending_replay_worker(app.handle().clone());
             start_body_index_worker(app.handle().clone());
 
             // The tray icon. Built here rather than in config so the menu can drive the app.

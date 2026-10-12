@@ -229,6 +229,23 @@ fn tidy_server_message(raw: &str) -> String {
 }
 
 impl MailError {
+    /// Whether this failure is one the offline intent queue can repair.
+    ///
+    /// **Not** the same question as `failure_kind`'s `Network`, and the difference is the point:
+    /// `Timeout` is `Busy` for the refresh path (try again in a moment) but queueable here, because
+    /// a `STORE` that timed out is exactly the "we do not know whether the server did it" case —
+    /// and every intent in the queue is idempotent, so replaying it is safe. `Auth` and a refusal
+    /// from the server are **not** queueable: an intent that can never succeed only hides the error
+    /// behind a queue that will retry it forever.
+    pub fn is_network(&self) -> bool {
+        matches!(
+            self,
+            MailError::Connect { .. } | MailError::Tls { .. } | MailError::Timeout { .. }
+        )
+    }
+}
+
+impl MailError {
     /// Actionable guidance for the end user, when we have any.
     pub fn user_hint(&self) -> Option<&'static str> {
         match self {
@@ -391,6 +408,36 @@ impl From<lettre::address::AddressError> for MailError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_failures_a_queue_can_repair_are_queueable() {
+        // The ones that mean "the server never heard us" — or never answered, and replaying is safe
+        // because every queued intent is idempotent.
+        assert!(
+            MailError::Connect {
+                host: "h".into(),
+                port: 993,
+                source: std::io::Error::other("nope"),
+            }
+            .is_network()
+        );
+        assert!(
+            MailError::Timeout(30).is_network(),
+            "a timed-out STORE is queueable"
+        );
+        // The ones that must reach the user now: a queue would only hide them behind endless retries.
+        assert!(
+            !MailError::Auth {
+                server: "gmail".into(),
+                raw: "no".into(),
+                hint: crate::error::AuthHint::UseAppPassword,
+            }
+            .is_network()
+        );
+        assert!(!MailError::Imap("NO".into()).is_network());
+        assert!(!MailError::Busy("busy".into()).is_network());
+        assert!(!MailError::Cache("disk".into()).is_network());
+    }
 
     /// The exact shape async-imap produced for QQ, minus the truncation.
     const QQ_REJECTION: &str = concat!(

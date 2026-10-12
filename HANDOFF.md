@@ -79,7 +79,7 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 
 下一批：**给 P3 拿真窗口基线**（需要你点：应用带 `--remote-debugging-port=9222` 构建 →
 `powershell -File tools\bench-app.ps1`，P1/P3/P5/P6 四个数字进 `target\bench-app-history.jsonl`）；
-**09 的语法三片已完成**（第 77/78/79 轮：文本前缀、结构化谓词、大小前缀 + 打错有提示），剩下的候选：**04 的重放执行器与接线**（存储层第 80 轮已就绪：userdb 的 pending-ops API 齐了，接线 + loopback 验收是下一片）、16 诊断包、保存搜索（M2）。
+**09 的语法三片已完成**（第 77/78/79 轮：文本前缀、结构化谓词、大小前缀 + 打错有提示），**04 离线意图已收口**（第 80/81 轮）：队列 + 有界重放 + 三个命令接线（仅网络类失败入队、本地即时生效）+ 每 30 秒一遍的 worker（崩溃 requeue、outbox 先于 flags）。剩下候选：16 诊断包、保存搜索（M2），以及**真机的 §9 验收**（断网混合操作 → 恢复 → 服务器一致，需要你点一次）。
 **09 查询语法两片都已完成**（第 77/78 轮）：文本前缀 + `has:attachment` + 结构化谓词
 （`after:`/`before:`/`is:unread`/`is:flagged`/`in:`/`account:`）+ 打错有提示（`search_hints`）；
 解析住在独立的 `crates/mail-core/src/query.rs`，分词原语 `clauses_of` 与索引共用。
