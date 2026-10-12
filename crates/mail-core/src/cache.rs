@@ -1552,41 +1552,65 @@ impl Cache {
         self.with_connection(move |conn| {
             let plan = crate::quota::plan(conn, &policy, now)?;
             let report = crate::quota::apply(conn, &policy, &plan, now)?;
-            // Header-only rows for the messages whose body is gone, in the same write as the delete:
-            // the whole cleanup is one transaction, so a crash mid-way cannot leave an index that
-            // answers for a body that is still there.
-            let stale: Vec<(String, String, u32)> = {
-                let mut stmt = conn.prepare(
-                    "select m.account_id, m.folder, m.uid from messages m
-                     where m.search_rowid is not null
-                       and not exists (select 1 from bodies b
-                                        where b.account_id = m.account_id
-                                          and b.folder = m.folder
-                                          and b.uid = m.uid)",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)? as u32,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            for (account_id, folder, uid) in stale {
-                Self::refresh_search_row(
-                    conn,
-                    &account_id,
-                    &folder,
-                    uid,
-                    crate::index::DEFAULT_BODY_INDEX_CHARS,
-                )
-                .map_err(|e| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e)))
-                })?;
-            }
+            Self::refresh_stale_index_rows(conn)?;
             Ok((plan, report))
         })
+    }
+
+    /// Apply **the plan that was shown to the user**, index refresh included.
+    ///
+    /// Separate from [`Self::cleanup`] because of who calls it: the desktop shell's `cleanup_apply`
+    /// receives the plan the user just read and runs that one. A command that planned for itself
+    /// would make the dry run a step a future edit could skip, and the dry run is the consent.
+    pub fn apply_plan(
+        &self,
+        plan: crate::quota::CleanupPlan,
+        policy: crate::quota::CleanupPolicy,
+        now: i64,
+    ) -> Result<crate::quota::CleanupReport> {
+        self.with_connection(move |conn| {
+            let report = crate::quota::apply(conn, &policy, &plan, now)?;
+            Self::refresh_stale_index_rows(conn)?;
+            Ok(report)
+        })
+    }
+
+    /// Header-only index rows for every message whose body is gone.
+    ///
+    /// In the same write as the delete, so a crash mid-way cannot leave an index that answers for a
+    /// body that is still there.
+    fn refresh_stale_index_rows(conn: &Connection) -> rusqlite::Result<()> {
+        let stale: Vec<(String, String, u32)> = {
+            let mut stmt = conn.prepare(
+                "select m.account_id, m.folder, m.uid from messages m
+                 where m.search_rowid is not null
+                   and not exists (select 1 from bodies b
+                                    where b.account_id = m.account_id
+                                      and b.folder = m.folder
+                                      and b.uid = m.uid)",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u32,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (account_id, folder, uid) in stale {
+            Self::refresh_search_row(
+                conn,
+                &account_id,
+                &folder,
+                uid,
+                crate::index::DEFAULT_BODY_INDEX_CHARS,
+            )
+            .map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e)))
+            })?;
+        }
+        Ok(())
     }
 
     /// Whether FTS5 considers itself consistent.

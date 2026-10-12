@@ -1591,6 +1591,61 @@ try {
         Write-Host 'the dry run and the apply share one predicate, and nothing here can reach the network'
         $global:LASTEXITCODE = 0
     }
+    Step 'the cleanup runs the plan the user read, and keeps a log of what it did' {
+        # Round 94 / design/03 §5.4. The one command in this program that deletes user data, so its
+        # shape is the safety:
+        #   * it must take a **plan**, not a policy. A command that planned for itself would let a
+        #     caller go straight to deleting, and "永远先干跑" would become a step a future edit could
+        #     skip — silently, because nothing else would look wrong;
+        #   * it must record **both** numbers (what the dry run promised, what the apply measured).
+        #     They agree because both go through one predicate, so a row where they differ is a bug,
+        #     and that log is the only place such a row would ever be seen;
+        #   * the log lives in `user.db`: clearing the cache must not erase the record of something
+        #     the user asked for.
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $db = Get-Content 'crates/mail-core/src/userdb.rs' -Raw -Encoding UTF8
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($cmd in @('storage_report', 'cleanup_plan', 'cleanup_apply', 'cleanup_history')) {
+            if ($shell -notmatch ("fn " + $cmd + "\(")) { $problems += "lib.rs must define $cmd" }
+            elseif ($shell -notmatch ("(?m)^\s+" + $cmd + ",\s*$")) { $problems += "$cmd is missing from generate_handler!" }
+        }
+        # The apply takes a plan, and runs that one.
+        $apply = [regex]::Match($shell, '(?s)async fn cleanup_apply\(.*?\n\}').Value
+        if ($apply -notmatch 'plan: mail_core::quota::CleanupPlan') {
+            $problems += 'cleanup_apply must take a plan (the one shown to the user), not a policy — a self-planning command makes the dry run skippable'
+        }
+        if ($apply -notmatch 'apply_plan\(') {
+            $problems += 'cleanup_apply must run the plan it was handed: that is what the consent means'
+        }
+        if ($apply -notmatch 'record_cleanup') {
+            $problems += 'cleanup_apply must leave a log entry'
+        }
+        # Both numbers reach the log.
+        if ($apply -notmatch 'plan.freed_bytes') {
+            $problems += 'the log must record what the dry run promised next to what happened'
+        }
+        if ($apply -notmatch 'report.freed_bytes') {
+            $problems += 'the log must record what the apply measured'
+        }
+        # The log is in user.db and bounded.
+        if ($db -notmatch 'cleanup_log') { $problems += 'userdb.rs must create the cleanup_log table' }
+        if ($db -notmatch 'CLEANUP_LOG_LIMIT: u32 = 20') { $problems += 'the log keeps the design''s twenty newest' }
+        foreach ($fn in @('record_cleanup', 'cleanup_logs', 'clear_cleanup_logs')) {
+            if ($db -notmatch ("fn " + $fn)) { $problems += "userdb.rs must expose $fn" }
+        }
+        # The index refresh is shared, not duplicated inside the shell.
+        if ($cache -notmatch 'fn apply_plan\(') { $problems += 'cache.rs must expose apply_plan — the shell should not re-implement the index half' }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the cleanup runs the plan the user read, and logs both numbers'
+        $global:LASTEXITCODE = 0
+    }
 
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0

@@ -2185,6 +2185,77 @@ async fn index_coverage(
     cache.body_coverage(&account_id).map_err(describe)
 }
 
+/// What the cache costs right now (`design/03` §4.3).
+#[tauri::command]
+async fn storage_report(state: State<'_, AppState>) -> Result<mail_core::StorageReport, String> {
+    state
+        .cache
+        .clone()
+        .with_connection(mail_core::quota::report)
+        .map_err(describe)
+}
+
+/// What a cleanup **would** do. Read-only; nothing is deleted by this command.
+///
+/// The renderer shows the result and asks, so this is the consent step the design requires
+/// (`plan` before `apply`, "永远先干跑"). It is a separate command from the apply precisely so
+/// that running one cannot skip the other.
+#[tauri::command]
+async fn cleanup_plan(
+    state: State<'_, AppState>,
+    policy: mail_core::quota::CleanupPolicy,
+) -> Result<mail_core::quota::CleanupPlan, String> {
+    state
+        .cache
+        .clone()
+        .with_connection(move |conn| mail_core::quota::plan(conn, &policy, now_secs()))
+        .map_err(describe)
+}
+
+/// Run a cleanup the user has already seen.
+///
+/// **Takes a plan, not a policy.** That is the whole shape of the consent: a command that took a
+/// policy would let a caller go straight to deleting, and the dry run — the one step the design
+/// insists on — would become something a future edit could skip.
+///
+/// The report records **both** numbers, the plan's and the apply's. They agree because both go
+/// through the same predicate, so a row where they differ is a bug, and this table is the only
+/// place such a row would ever be seen.
+#[tauri::command]
+async fn cleanup_apply(
+    state: State<'_, AppState>,
+    plan: mail_core::quota::CleanupPlan,
+    policy: mail_core::quota::CleanupPolicy,
+) -> Result<mail_core::quota::CleanupReport, String> {
+    // The plan the caller passed is what the user approved; the one that ran is what happened.
+    // Recording both is how a disagreement between them stays visible instead of being averaged
+    // away — and this table is the only place such a row would ever be seen.
+    let shown = plan.freed_bytes;
+    let report = state
+        .cache
+        .clone()
+        .apply_plan(plan, policy, now_secs())
+        .map_err(describe)?;
+    state
+        .user
+        .clone()
+        .record_cleanup(
+            None,
+            report.freed_bytes,
+            report.bodies_deleted,
+            shown,
+            now_secs(),
+        )
+        .map_err(describe)?;
+    Ok(report)
+}
+
+/// What cleanups have happened, newest first (`design/03` §5.4 设置页留痕).
+#[tauri::command]
+async fn cleanup_history(state: State<'_, AppState>) -> Result<Vec<mail_core::CleanupLog>, String> {
+    state.user.clone().cleanup_logs(20).map_err(describe)
+}
+
 /// What the search index looks like for this account (`design/09` goal 5).
 ///
 /// The check answers one question a user has actually asked: "why does search not find that mail?"
@@ -3799,6 +3870,10 @@ pub fn run() {
             saved_search_list,
             history_search_list,
             index_health,
+            storage_report,
+            cleanup_plan,
+            cleanup_apply,
+            cleanup_history,
             index_heal,
             history_search_push,
             history_search_clear,

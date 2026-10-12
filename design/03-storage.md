@@ -519,6 +519,13 @@ pub mod quota {
 > **删正文与刷新索引在同一个写事务里**（正文带走它的词，留着那些词的索引行会继续为缓存里
 > 已经没有的邮件作答——这是本轮一次返工的结论）。**无上限且无年龄规则 ⇒ 什么都不删**
 > （用户没要求过就删缓存，比缓存变大更糟）；未读/有旗标永不清。**零网络**由门禁钉住。
+
+> **命令与留痕注记（第 94 轮）**：`cleanup_apply` 收 **plan 不收 policy**——收 policy 的命令能让
+> 调用方直奔删除，"永远先干跑"会变成一次可顺手跳过、且没有东西会因此看着不对的改动。
+> 第一版实现正是如此（收了 plan 却自己重算），已重构出 `Cache::apply_plan(plan)`：
+> **跑用户刚读过的那一份**，与 `Cache::cleanup` 共用索引刷新。
+> 留痕 `cleanup_log`（在 `user.db`，清缓存不带走）记**两个数字**：plan 承诺的与 apply 实测的。
+> 它们相等是因为共用同一谓词，所以**不一致的行就是 bug，而这张表是它唯一会显形的地方**。
     pub async fn apply(db: &Db, plan: CleanupPlan, ctx: &JobCtx) -> Result<CleanupReport>;
     pub async fn vacuum(db: &Db, incremental: bool) -> Result<u64>;
 }

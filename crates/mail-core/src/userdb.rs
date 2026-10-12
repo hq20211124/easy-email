@@ -816,6 +816,100 @@ impl UserStore {
     }
 }
 
+/// How many cleanup entries are kept. The design's "前 20 条", and the bound is applied inside the
+/// write for the reason the search history's is: a kill between two maintenance runs must not leave
+/// the table half trimmed.
+pub const CLEANUP_LOG_LIMIT: u32 = 20;
+
+/// What one cleanup did, for the settings page (`design/03` §5.4).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CleanupLog {
+    pub id: i64,
+    /// `None` for a cleanup that covered every account.
+    pub account_id: Option<String>,
+    /// Bytes the apply measured as deleted.
+    pub freed_bytes: i64,
+    /// Bodies actually deleted.
+    pub bodies_deleted: i32,
+    /// Bytes the dry run promised. Kept next to the two above so a disagreement is visible.
+    pub planned_bytes: i64,
+    pub created_at: i64,
+}
+
+/// The cleanup log: what was deleted, and what it freed.
+impl UserStore {
+    /// Record one cleanup.
+    ///
+    /// Both numbers, on purpose: `planned_bytes` is what the dry run said and `freed_bytes` is what
+    /// the apply measured. They agree because both go through the same predicate, so a row where
+    /// they differ is a bug — and this table is the only place such a row would ever be seen.
+    pub fn record_cleanup(
+        &self,
+        account_id: Option<&str>,
+        freed_bytes: u64,
+        bodies_deleted: u32,
+        planned_bytes: u64,
+        now: i64,
+    ) -> Result<i64> {
+        let account_id = account_id.map(|s| s.to_string());
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "insert into cleanup_log (account_id, freed_bytes, bodies_deleted, planned_bytes, created_at)
+                 values (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    account_id,
+                    freed_bytes as i64,
+                    bodies_deleted as i64,
+                    planned_bytes as i64,
+                    now
+                ],
+            )?;
+            // Keep the newest, drop the rest — in the same statement batch as the insert, so one
+            // kill cannot leave the log half trimmed.
+            conn.execute(
+                "delete from cleanup_log
+                  where id not in (select id from cleanup_log
+                                    order by created_at desc, id desc
+                                    limit ?1)",
+                rusqlite::params![CLEANUP_LOG_LIMIT],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// Recent cleanups, newest first.
+    pub fn cleanup_logs(&self, limit: u32) -> Result<Vec<CleanupLog>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select id, account_id, freed_bytes, bodies_deleted, planned_bytes, created_at
+             from cleanup_log
+             order by created_at desc, id desc
+             limit ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit], |row| {
+            Ok(CleanupLog {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                freed_bytes: row.get(2)?,
+                bodies_deleted: row.get(3)?,
+                planned_bytes: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Forget the log. The cache is untouched — this is the record, not the thing.
+    pub fn clear_cleanup_logs(&self) -> Result<usize> {
+        self.db.write_blocking(move |conn| {
+            let removed = conn.execute("delete from cleanup_log", [])?;
+            Ok(removed)
+        })
+    }
+}
+
 /// One account's quota state for the current window (`design/04` §5.7).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuotaLedger {
@@ -1827,6 +1921,20 @@ impl UserStore {
                  );
                  create index if not exists search_history_recent
                      on search_history(account_id, created_at desc);
+
+                 -- What a cache cleanup actually did (design/03 §5.4 设置页留痕). A record of
+                 -- something the *user* asked for, not a derivative of the cache — which is why it
+                 -- lives here and clearing the cache does not take it with it. Both numbers are
+                 -- stored: what the dry run promised and what the apply measured. Those two differ
+                 -- only when there is a bug, and this table is the only place it would show.
+                 create table if not exists cleanup_log (
+                     id              integer primary key autoincrement,
+                     account_id      text,
+                     freed_bytes     integer not null,
+                     bodies_deleted  integer not null,
+                     planned_bytes   integer not null,
+                     created_at      integer not null
+                 );
 
                  -- The daily download quota ledger (design/04 §5.7). It lives here, in the file that
                  -- is never deleted, on purpose: a ledger in the deletable cache would forget how
@@ -3118,5 +3226,100 @@ mod tests {
             SEARCH_HISTORY_LIMIT, 50,
             "the bound is a decision, and this is it being visible"
         );
+    }
+    // ------------------------------------------------------------ cleanup log
+
+    #[test]
+    fn a_cleanup_is_recorded_with_both_numbers() {
+        // plan 说的与实际删的都记：它们的差只在有 bug 时出现，而这张表是它唯一会显形的地方。
+        let store = store();
+        let id = store
+            .record_cleanup(Some("acc"), 2048, 3, 2048, 1_800_000_000)
+            .expect("record");
+        let log = store.cleanup_logs(10).expect("list");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].id, id);
+        assert_eq!(log[0].account_id.as_deref(), Some("acc"));
+        assert_eq!((log[0].freed_bytes, log[0].bodies_deleted), (2048, 3));
+        assert_eq!(log[0].planned_bytes, 2048);
+    }
+
+    #[test]
+    fn a_disagreement_between_the_two_numbers_survives_the_round_trip() {
+        // The whole reason both columns exist: an apply that measured something other than what the
+        // dry run promised is a bug, and a reader of the log has to be able to see it.
+        let store = store();
+        store
+            .record_cleanup(Some("acc"), 900, 2, 2048, 1_800_000_000)
+            .expect("record");
+        let row = &store.cleanup_logs(10).expect("list")[0];
+        assert_eq!((row.planned_bytes, row.freed_bytes), (2048, 900));
+    }
+
+    #[test]
+    fn the_log_keeps_the_newest_twenty() {
+        // Bound applied inside the write, like the search history: a kill between two maintenance
+        // runs must not leave the log half trimmed.
+        let store = store();
+        for i in 0..(CLEANUP_LOG_LIMIT + 5) {
+            store
+                .record_cleanup(Some("acc"), i as u64, 1, i as u64, 1_800_000_000 + i as i64)
+                .expect("record");
+        }
+        let log = store.cleanup_logs(100).expect("list");
+        assert_eq!(log.len() as u32, CLEANUP_LOG_LIMIT);
+        assert_eq!(
+            log[0].freed_bytes,
+            (CLEANUP_LOG_LIMIT + 4) as i64,
+            "newest first"
+        );
+        // The oldest is gone, and it is the *first* one, not the newest.
+        assert!(
+            !log.iter().any(|row| row.freed_bytes == 0),
+            "the oldest is gone"
+        );
+    }
+
+    #[test]
+    fn clearing_the_log_leaves_everything_else_alone() {
+        let store = store();
+        store
+            .record_cleanup(Some("acc"), 10, 1, 10, 1)
+            .expect("record");
+        store
+            .save_search(Some("acc"), "留着", "q", 1)
+            .expect("saved search");
+        store.clear_cleanup_logs().expect("clear");
+        assert!(store.cleanup_logs(10).expect("list").is_empty());
+        assert_eq!(
+            store.list_saved_searches("acc").expect("still there").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_global_cleanup_is_recorded_and_shown() {
+        // `account_id: None` is a cleanup that covered every account — which is what a cache-wide
+        // pass produces. It must round-trip as None, not as an empty string the reader has to guess
+        // about.
+        let store = store();
+        store
+            .record_cleanup(None, 4096, 9, 4096, 1)
+            .expect("record");
+        let row = &store.cleanup_logs(10).expect("list")[0];
+        assert_eq!(row.account_id, None);
+        assert_eq!(row.freed_bytes, 4096);
+    }
+
+    #[test]
+    fn the_log_limit_the_caller_asks_for_is_respected() {
+        let store = store();
+        for i in 0..5 {
+            store
+                .record_cleanup(Some("acc"), 1, 1, 1, i)
+                .expect("record");
+        }
+        assert_eq!(store.cleanup_logs(2).expect("list").len(), 2);
+        assert_eq!(store.cleanup_logs(0).expect("list").len(), 0);
     }
 }

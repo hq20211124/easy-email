@@ -80,11 +80,14 @@ pub use providers::Provider;
 pub use query::{
     QueryColumn, QueryTerm, known_prefixes, match_expression, parse_date, parse_query, query_issues,
 };
+pub use quota::{
+    CleanupPlan, CleanupPolicy, CleanupReport, CleanupStep, CleanupTarget, StorageReport,
+};
 pub use sentcopy::{DraftMirrorReport, SentCopy, draft_to_mail, ensure_sent_copy, mirror_draft};
 pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
 pub use threads::root_of;
-pub use userdb::{Draft, DraftMirror, NewOutbox, OutboxItem, UserStore};
+pub use userdb::{CleanupLog, Draft, DraftMirror, NewOutbox, OutboxItem, UserStore};
 pub use worker::{
     DEFAULT_CRASH_RESEND_LIMIT, FilingReport, FilingRun, OutboxRun, Recovery, RecoveryQuestion,
     RecoveryReport, RecoveryRun, RunReport, file_sent_copies, recover_in_flight, run_due,
