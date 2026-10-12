@@ -3646,6 +3646,10 @@ async function wireDiagnostics(modal) {
 async function openLog() {
   const text = await run('读取日志', () => invoke('log_tail', { lines: 500 }));
   if (text === null) return;
+  // The log view lives in the dialog's own template, so it is reached through the modal the dialog
+  // hands over. A global document-wide lookup would search for an element that only exists while
+  // this dialog is open — the gate caught exactly that (its "ids used in app.js must exist in
+  // index.html" rule; dialog fields are reached by querySelector on the modal instead).
   openModal({
     title: '程序日志',
     bodyHtml: `
@@ -3655,10 +3659,13 @@ async function openLog() {
       </p>
       <pre id="log-view" class="diag-preview"></pre>`,
     confirmLabel: '关闭',
+    onReady: (modal) => {
+      const view = modal.querySelector('#log-view');
+      view.textContent = text && text.trim() ? text : '（还没有任何日志）';
+      // Tail first: the question "what just happened" is the one being asked.
+      view.scrollTop = view.scrollHeight;
+    },
   });
-  const view = $('log-view');
-  view.textContent = text && text.trim() ? text : '（还没有任何日志）';
-  view.scrollTop = view.scrollHeight;
 }
 
 function openAbout() {
