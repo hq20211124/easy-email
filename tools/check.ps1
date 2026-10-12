@@ -1532,6 +1532,65 @@ try {
         Write-Host 'a missing row is visible, its basis is stated, and the repair needs the user'
         $global:LASTEXITCODE = 0
     }
+    Step 'a cleanup dry-run and its apply agree, and neither talks to the network' {
+        # Round 93 / design/03 §4.3 + §5.4. The acceptance is literally "干跑数字与实跑一致；零网络调用",
+        # and both halves are silent failures:
+        #   * two SQL statements that drift — one `where` gets changed in one of them, and the toast
+        #     then promises what did not happen (or hides what did);
+        #   * a quota pass that can reach the network — the design forbids it outright, because a
+        #     cleanup should never be able to fail in a way that leaves the cache half-trimmed
+        #     while the user waits for a server.
+        # The plan and the apply are kept honest by the module having ONE predicate, so this checks
+        # that the second half exists at all (and that nothing re-introduced a transport).
+        $q = Get-Content 'crates/mail-core/src/quota.rs' -Raw -Encoding UTF8
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($fn in @('report', 'plan', 'apply')) {
+            if ($q -notmatch ("fn " + $fn)) { $problems += "quota.rs must expose $fn" }
+        }
+        if ($q -notmatch 'CleanupPolicy') { $problems += 'the policy must be a struct the caller can see' }
+        if ($q -notmatch 'cleanup_predicate') {
+            $problems += 'plan and apply must share one predicate — that is what makes the numbers agree'
+        }
+        # Both paths must go through it.
+        $planBody = [regex]::Match($q, '(?s)fn plan\(.*?\n\}').Value
+        $applyBody = [regex]::Match($q, '(?s)fn apply\(.*?\n\}').Value
+        if ($planBody -notmatch 'cleanup_predicate' -or $applyBody -notmatch 'cleanup_predicate') {
+            $problems += 'one of the two paths writes its own WHERE — that is the drift the acceptance is about'
+        }
+        # The apply must re-measure before deleting, so the report is what went.
+        if ($applyBody -notmatch 'sum\(length\(detail\)\)') {
+            $problems += 'apply must measure immediately before the delete, not repeat the plan''s number'
+        }
+        # Nothing over the limit, no age rule: nothing is deleted.
+        if ($q -notmatch 'over_limit') { $problems += 'a cache under its limit must not be cleaned' }
+        if ($q -notmatch 'keep_unread' -or $q -notmatch 'keep_flagged') {
+            $problems += 'unread and flagged bodies are never cleaned (design §5.4)'
+        }
+        # Zero network, checked as a negative list: this module must not name any of them.
+        # Names only code would use, not words a comment would use to explain their absence. The
+        # first version of this list banned 'Pool' and 'transport' as words, and the module's own
+        # comment explaining why they are absent made it fail — the same trap as the round-87
+        # self-referencing step. Names that appear in code and nowhere else.
+        foreach ($banned in @('ImapClient', 'OpApplier', 'Smtp', 'crate::pool', 'ImapPool', 'send(')) {
+            if ($q -match [regex]::Escape($banned)) {
+                $problems += "quota.rs must not reference $banned — a cleanup never reaches a server"
+            }
+        }
+        # The index half lives with the cache, not in the quota module.
+        if ($cache -notmatch 'fn cleanup\(') {
+            $problems += 'cache.rs must own the entry point that pairs the delete with the index refresh'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the dry run and the apply share one predicate, and nothing here can reach the network'
+        $global:LASTEXITCODE = 0
+    }
 
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0

@@ -1514,6 +1514,81 @@ impl Cache {
 
     // ------------------------------------------------------------------ search
 
+    /// Run one closure on the cache's writer connection.
+    ///
+    /// For the modules whose work is "a few SQL statements over this database" — quota, the
+    /// diagnostics bundle — so they can be written against a `&Connection` and tested against an
+    /// in-memory one, instead of each taking a `Cache` and reaching into it. Routed through
+    /// `write_blocking` like every other write here, so it holds the writer for exactly as long as
+    /// the closure and no longer.
+    ///
+    /// Read-only closures belong on [`Self::db`]'s readers; this is the write door.
+    pub fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+    {
+        self.db.write_blocking(move |conn| {
+            f(conn).map_err(|e| MailError::Cache(format!("数据库读写失败：{e}")))
+        })
+    }
+
+    /// Clean the cache: what it would do, what it did, and the index told about both.
+    ///
+    /// The two-step shape (`plan` then `apply`) is the design's, and the whole entry point exists so
+    /// the caller can show the plan before it is run — a cleanup whose numbers only appear afterwards
+    /// is a cleanup the user cannot consent to.
+    ///
+    /// The index refresh after the delete is why this is a `Cache` method and not a call straight
+    /// into `quota`: the bodies that went took their words with them, and a search row that still
+    /// carries them would keep answering for mail the cache no longer has.
+    pub fn cleanup(
+        &self,
+        policy: crate::quota::CleanupPolicy,
+        now: i64,
+    ) -> Result<(crate::quota::CleanupPlan, crate::quota::CleanupReport)> {
+        self.with_connection(move |conn| {
+            let plan = crate::quota::plan(conn, &policy, now)?;
+            let report = crate::quota::apply(conn, &policy, &plan, now)?;
+            // Header-only rows for the messages whose body is gone, in the same write as the delete:
+            // the whole cleanup is one transaction, so a crash mid-way cannot leave an index that
+            // answers for a body that is still there.
+            let stale: Vec<(String, String, u32)> = {
+                let mut stmt = conn.prepare(
+                    "select m.account_id, m.folder, m.uid from messages m
+                     where m.search_rowid is not null
+                       and not exists (select 1 from bodies b
+                                        where b.account_id = m.account_id
+                                          and b.folder = m.folder
+                                          and b.uid = m.uid)",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as u32,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (account_id, folder, uid) in stale {
+                Self::refresh_search_row(
+                    conn,
+                    &account_id,
+                    &folder,
+                    uid,
+                    crate::index::DEFAULT_BODY_INDEX_CHARS,
+                )
+                .map_err(|e| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e)))
+                })?;
+            }
+            Ok((plan, report))
+        })
+    }
+
     /// Whether FTS5 considers itself consistent.
     ///
     /// FTS5's own `integrity-check` is the authority here, and that is the point: a count comparison
@@ -1792,7 +1867,7 @@ impl Cache {
     /// An associated function taking `conn` rather than a `&self` method: a `&self` call from inside
     /// a `write_blocking` closure would capture the handle and turn "one transaction per batch" back
     /// into one per row (and would not compile, since the closure must be `'static`).
-    fn refresh_search_row(
+    pub(crate) fn refresh_search_row(
         conn: &Connection,
         account_id: &str,
         folder: &str,

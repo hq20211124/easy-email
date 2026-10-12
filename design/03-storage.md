@@ -511,6 +511,14 @@ pub struct CleanupPlan { pub steps: Vec<CleanupStep>, pub freed_bytes: u64, pub 
 pub mod quota {
     pub async fn report(db: &Db) -> Result<StorageReport>;
     pub async fn plan(db: &Db, p: &CleanupPolicy) -> Result<CleanupPlan>;      // 干跑，永远先干跑
+
+> **实现注记（第 93 轮）**：`crates/mail-core/src/quota.rs` 落地。验收"**干跑数字 == 实跑数字**"
+> 不靠两次算，靠**一条谓词**（`cleanup_predicate` 只写一遍，plan 拿它 SELECT/SUM、apply 拿它
+> DELETE）——两份 SQL 一定会分叉，用户从那句 toast 里发现。apply 在删之前**再量一次**
+> （告诉用户的是实际发生的，不是几毫秒前承诺的）。`Cache::cleanup` 是生产入口：
+> **删正文与刷新索引在同一个写事务里**（正文带走它的词，留着那些词的索引行会继续为缓存里
+> 已经没有的邮件作答——这是本轮一次返工的结论）。**无上限且无年龄规则 ⇒ 什么都不删**
+> （用户没要求过就删缓存，比缓存变大更糟）；未读/有旗标永不清。**零网络**由门禁钉住。
     pub async fn apply(db: &Db, plan: CleanupPlan, ctx: &JobCtx) -> Result<CleanupReport>;
     pub async fn vacuum(db: &Db, incremental: bool) -> Result<u64>;
 }
