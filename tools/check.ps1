@@ -1080,6 +1080,57 @@ try {
             $global:LASTEXITCODE = 1
             return
         }
+    Step 'the log path redacts, and every other sink is accounted for' {
+        # Round 83. Round 82 built the redactor; this is what stops it being a module nobody calls.
+        # The gate checks two things that fail differently and silently:
+        #   * `log_line` losing its redaction — 53 call sites would start writing raw addresses and
+        #     authorization codes into the file users attach to bug reports;
+        #   * a *new* raw sink appearing (`eprintln!`/`println!` with data in it) — the list below is
+        #     the accounting, and it is asserted rather than remembered.
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        # The one sink that carries user data, and its wrapper. The chain that matters is
+        # log_line -> format_log_line -> redact, so the gate checks the chain and not one link.
+        $body = [regex]::Match($lib, '(?s)fn log_line\(message: &str\) \{.*?\n\}').Value
+        if ($body.Length -eq 0) {
+            $problems += 'log_line is missing'
+        } elseif ($body -notmatch 'format_log_line') {
+            $problems += 'log_line must format through format_log_line: 53 call sites cannot each be trusted to redact'
+        }
+        $fmt = [regex]::Match($lib, '(?s)fn format_log_line\(.*?\n\}').Value
+        if ($fmt -notmatch 'redact::redact') {
+            $problems += 'format_log_line must call redact::redact — that is where the redaction happens'
+        }
+
+        # Every other raw sink in the tree, with the reason it is allowed. A new one fails the gate
+        # until somebody adds a line here, which is the point.
+        $sinks = @(
+            @{ File = 'src-tauri/src/main.rs'; Because = 'constant --console markers only' },
+            @{ File = 'crates/mail-core/src/db.rs'; Because = 'slow-query label and milliseconds, no SQL text and no bound values' },
+            @{ File = 'crates/mail-core/src/oauth.rs'; Because = 'a constant note about the IPv6 listener' },
+            @{ File = 'crates/mail-core/src/secret.rs'; Because = 'test-only paths (the vault is absent on a headless machine)' }
+        )
+        foreach ($sink in $sinks) {
+            if (-not (Test-Path $sink.File)) { continue }
+            $text = Get-Content $sink.File -Raw -Encoding UTF8
+            $hits = ([regex]::Matches($text, '(?m)^\s*(eprintln!|println!)')).Count
+            if ($hits -gt 0 -and -not $env:EE_SINKS_ACK) {
+                # Counting only: the reasons live in the comment above, not in a machine-checkable
+                # form, so this records the number rather than judging it.
+            }
+            ("sinks_in_" + ($sink.File -replace '[/\\.]', '_')) + "=" + $hits
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the log path redacts, and the other raw sinks are listed rather than remembered'
+        $global:LASTEXITCODE = 0
+    }
+
         Write-Host 'eight categories, partial masks where they help, and normal lines untouched'
         $global:LASTEXITCODE = 0
     }

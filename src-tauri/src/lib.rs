@@ -3092,17 +3092,38 @@ fn unique_path(directory: &Path, name: &str) -> PathBuf {
 /// directory — so the `com.easyemail.desktop` identifier is not duplicated here by hand.
 static PANIC_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// Format one log line, redacted.
+///
+/// Split out of [`log_line`] because the redaction is the part with rules worth testing and the file
+/// append is the part that needs a filesystem. Returns the line and how many things were hidden —
+/// the count is appended to the line when it is not zero, so a reader who compares their own actions
+/// against the file sees *why* the line differs from what they expected instead of concluding the log
+/// lied to them.
+fn format_log_line(message: &str, now: i64) -> (String, usize) {
+    let (redacted, hidden) = mail_core::redact::redact(message);
+    let note = if hidden > 0 {
+        format!(" [已脱敏 {hidden} 项]")
+    } else {
+        String::new()
+    };
+    (format!("[{now}] {redacted}{note}\n"), hidden)
+}
+
 /// Append one diagnostic line to `startup-error.log`.
 ///
 /// The desktop build has no console (see the `windows_subsystem` note in `main.rs`), so anything
 /// that used to be an `eprintln!` would otherwise disappear without a trace. Falls back to stderr,
 /// which is visible when the app is started with `--console`.
+///
+/// **Everything is redacted on the way in.** This file is the first thing anyone attaches to a bug
+/// report, so the secret that reaches it is the secret that leaves the machine — and the caller
+/// should not have to remember that (53 call sites do not, and one day one of them would).
 fn log_line(message: &str) {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    let line = format!("[{seconds}] {message}\n");
+    let (line, _) = format_log_line(message, seconds as i64);
 
     let stored = PANIC_LOG_DIR.get().is_some_and(|dir| {
         std::fs::create_dir_all(dir).is_ok()
@@ -3116,6 +3137,33 @@ fn log_line(message: &str) {
 
     if !stored {
         eprint!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::format_log_line;
+
+    #[test]
+    fn a_normal_line_is_written_unchanged() {
+        let (line, hidden) = format_log_line("同步 INBOX：新增 5 封", 1_800_000_000);
+        assert_eq!(hidden, 0);
+        assert_eq!(line, "[1800000000] 同步 INBOX：新增 5 封\n");
+    }
+
+    #[test]
+    fn a_line_with_a_secret_is_written_redacted_and_says_so() {
+        let (line, hidden) = format_log_line(
+            "登录失败：bestbychinas@gmail.com 用了授权码 abcdefghij123456",
+            1_800_000_000,
+        );
+        assert_eq!(hidden, 2, "the address and the code");
+        assert!(!line.contains("bestbychinas"));
+        assert!(!line.contains("abcdefghij123456"));
+        // The domain survives: it is the half a maintainer can act on.
+        assert!(line.contains("@gmail.com"));
+        // And the reader is told the line was altered, and how much.
+        assert!(line.contains("[已脱敏 2 项]"), "got {line}");
     }
 }
 
