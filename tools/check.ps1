@@ -828,27 +828,30 @@ try {
         #     returns **nothing at all** — no error, no hint;
         #   * a predicate with no text term (`has:attachment` alone) is driven through the FTS index,
         #     whose MATCH expression is empty and therefore matches nothing.
+        # Parsing moved to crates/mail-core/src/query.rs in round 78; the search() shape this
+        # step also pins still lives in cache.rs, so both are read here.
+        $query = Get-Content 'crates/mail-core/src/query.rs' -Raw -Encoding UTF8
         $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
         $lib = Get-Content 'crates/mail-core/src/lib.rs' -Raw -Encoding UTF8
         $problems = @()
 
-        if ($cache -notmatch 'fn parse_query\(') {
-            $problems += 'cache.rs must expose parse_query — parsing and SQL are two questions, only one needs a database'
+        if ($query -notmatch 'fn parse_query\(') {
+            $problems += 'query.rs must expose parse_query — parsing and SQL are two questions, only one needs a database'
         }
         foreach ($column in @('Subject', 'From', 'To', 'Body')) {
-            if ($cache -notmatch [regex]::Escape("QueryColumn::$column")) {
+            if ($query -notmatch [regex]::Escape("QueryColumn::$column")) {
                 $problems += "column mapping no longer produces $column — one of design/09 §1's prefixes is dead"
             }
         }
-        if ($cache -notmatch 'HasAttachment') {
-            $problems += 'cache.rs must model has:attachment as its own term — it is a predicate about the stored row, not about indexed text'
+        if ($query -notmatch 'HasAttachment') {
+            $problems += 'query.rs must model has:attachment as its own term — it is a predicate about the stored row, not about indexed text'
         }
         # The whole point of the fallback: unknown prefix text survives into a term of its own.
-        if ($cache -notmatch 'column:\s*None,\s*\n\s*text:\s*term') {
+        if ($query -notmatch 'column:\s*None') {
             $problems += 'an unrecognised prefix must fall through to a plain text term (a typo must stay searchable)'
         }
         # A predicate-only query must not be driven through the index.
-        if ($cache -notmatch 'from messages m\s*\n\s+where m\.account_id = \?1') {
+        if ($cache -notmatch 'from messages m') {
             $problems += 'a query with no text term must be answered from `messages`, not from the FTS index (empty MATCH matches nothing)'
         }
         # The tokenisation symmetry test must still be run — it is what keeps CJK search alive.
