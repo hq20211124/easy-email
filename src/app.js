@@ -3582,6 +3582,59 @@ let pendingWizardAccountId = null;
  * button that always says "checking…" and never finds anything is worse than one that opens the
  * release page (`design/20-v0.2-plan.md` V2-C1).
  */
+/**
+ * The diagnostics bundle, previewed then written.
+ *
+ * The order is the feature (`design/16` §3.3): assemble **nothing on disk**, show the user exactly
+ * what a bundle contains, and only then write it. A single "export" button would put a copy of
+ * someone's log and account list on disk before they had seen what was in it — which is the whole
+ * reason `preview_only` exists on the backend.
+ *
+ * The redaction is the backend's job; what this function owes the user is the **accounting**: how
+ * many things were hidden, and the path the file will land in, both before it exists.
+ */
+async function wireDiagnostics(modal) {
+  const button = modal.querySelector('#btn-diag');
+  const preview = modal.querySelector('#diag-preview');
+  const status = modal.querySelector('#diag-status');
+  let plannedPath = '';
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    status.hidden = false;
+    status.textContent = '正在准备…';
+    const result = await run('生成诊断包', () => invoke('diagnostics_preview'));
+    if (result === null) {
+      status.textContent = '准备失败，请看右下角提示。';
+      button.disabled = false;
+      return;
+    }
+    plannedPath = result.planned_path;
+    preview.hidden = false;
+    preview.textContent = result.preview;
+    status.textContent =
+      `掩掉了 ${result.manifest.redactions} 项。确认内容后点「写入文件」——` +
+      `将保存到 ${plannedPath || '数据目录'}。`;
+    // The same button becomes the write step: a second, differently-named action in the same row
+    // would be a decision the user has to read twice.
+    button.textContent = '写入文件';
+    button.disabled = false;
+    button.onclick = async () => {
+      button.disabled = true;
+      status.textContent = '正在写入…';
+      const written = await run('写入诊断包', () => invoke('diagnostics_export'));
+      button.disabled = false;
+      if (written === null) {
+        status.textContent = '写入失败，请看右下角提示。';
+        return;
+      }
+      status.textContent = `已写入 ${written}`;
+      button.textContent = '已写入';
+      button.disabled = true;
+    };
+  });
+}
+
 function openAbout() {
   const version = $('about-version').textContent || '未知';
   openModal({
@@ -3592,8 +3645,20 @@ function openAbout() {
         有新版时这里会自动发现；更新包由 GitHub Releases 托管，
         带签名校验，安装前可以核对页面上的 SHA256SUMS。
       </p>
-      <p id="about-update-status" class="about-note" hidden></p>`,
+      <p id="about-update-status" class="about-note" hidden></p>
+      <div class="about-diag">
+        <button class="btn ghost small" id="btn-diag" type="button">生成诊断包（先预览）</button>
+        <p class="about-note">
+          诊断包 = 最近 3 天的日志 + 账号列表，<strong>全部脱敏</strong>（邮箱保留域名、
+          授权码/手机号/路径用户名等整项掩掉）。先在这里给你看内容，<strong>确认后才写盘</strong>。
+        </p>
+        <pre id="diag-preview" class="diag-preview" hidden></pre>
+        <p id="diag-status" class="about-note" hidden></p>
+      </div>`,
     confirmLabel: '检查更新',
+    onReady: (modal) => {
+      wireDiagnostics(modal);
+    },
     onConfirm: async (modal) => {
       await checkForUpdate(modal);
       // Stays open either way: the answer (new version / up to date / could not reach the release

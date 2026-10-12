@@ -2185,6 +2185,115 @@ async fn index_coverage(
     cache.body_coverage(&account_id).map_err(describe)
 }
 
+/// The bundle, as the renderer sees it before anything is written.
+#[derive(serde::Serialize)]
+struct DiagPreview {
+    manifest: mail_core::diag::DiagManifest,
+    preview: String,
+    /// Where the export would land, so the preview can say it before it exists.
+    planned_path: String,
+}
+
+/// Assemble a diagnostics bundle from what this installation actually has, previewing it.
+///
+/// Reads the two inputs the shell owns — the log file next to `startup-error.log` and the account
+/// list — and hands them to the pure assembler. **Nothing is written.** The renderer shows the
+/// result and asks, which is the entire point of `design/16` §3.3's `preview_only`.
+#[tauri::command]
+async fn diagnostics_preview(state: State<'_, AppState>) -> Result<DiagPreview, String> {
+    let (log_text, settings_text, dir) = {
+        let state = &state;
+        (
+            read_log_text(state),
+            read_settings_text(state),
+            state.accounts_path.parent().map(|p| p.to_path_buf()),
+        )
+    };
+    let opts = mail_core::diag::DiagOptions {
+        preview_only: true,
+        ..mail_core::diag::DiagOptions::default()
+    };
+    let now = now_secs();
+    let inputs = mail_core::diag::DiagInputs {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        // The WebView2 version is not readable synchronously from here; saying "unknown" is better
+        // than a number that would be a guess in a file whose whole purpose is to be trusted.
+        webview: "unknown".to_string(),
+        log_text,
+        settings_text,
+        sample_headers_text: String::new(),
+    };
+    let bundle = mail_core::diag::build_bundle(&inputs, &opts, now);
+    let planned_path = dir
+        .map(|d| d.join(format!("easy-email-diagnostics-{now}.txt")))
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    Ok(DiagPreview {
+        manifest: bundle.manifest,
+        preview: bundle.preview,
+        planned_path,
+    })
+}
+
+/// Write the bundle, after the preview has been shown.
+///
+/// A separate command from the preview on purpose: one writes a file the user has seen and confirmed,
+/// and the other must not be able to. Sharing an entry point would make "export" the easy typo away
+/// from putting an unconfirmed copy of someone's mailbox on disk.
+#[tauri::command]
+async fn diagnostics_export(state: State<'_, AppState>) -> Result<String, String> {
+    let (log_text, settings_text) = (read_log_text(&state), read_settings_text(&state));
+    let dir = state
+        .accounts_path
+        .parent()
+        .ok_or_else(|| "无法确定数据目录".to_string())?
+        .to_path_buf();
+    let opts = mail_core::diag::DiagOptions::default();
+    let now = now_secs();
+    let inputs = mail_core::diag::DiagInputs {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        webview: "unknown".to_string(),
+        log_text,
+        settings_text,
+        sample_headers_text: String::new(),
+    };
+    let bundle = mail_core::diag::build_bundle(&inputs, &opts, now);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建数据目录：{e}"))?;
+    std::fs::write(
+        dir.join(format!("easy-email-diagnostics-{now}.txt")),
+        &bundle.preview,
+    )
+    .map_err(|e| format!("无法写入诊断包：{e}"))?;
+    log_line(&format!(
+        "诊断包已生成（{} 字节，{} 项已脱敏）",
+        bundle.bytes, bundle.manifest.redactions
+    ));
+    Ok(dir
+        .join(format!("easy-email-diagnostics-{now}.txt"))
+        .display()
+        .to_string())
+}
+
+/// The log file's contents, trimmed to the days the bundle is allowed to show.
+fn read_log_text(_state: &AppState) -> String {
+    // The log directory is a process-global set in `setup`, not a field on the state: the two
+    // places that write it (this and the panic hook) must not be able to disagree about a path.
+    let Some(dir) = PANIC_LOG_DIR.get() else {
+        return String::new();
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("startup-error.log")) else {
+        return String::new();
+    };
+    mail_core::diag::recent_log_lines(&text, 3, now_secs())
+}
+
+/// The account list, as stored. It goes through redaction like everything else.
+fn read_settings_text(state: &AppState) -> String {
+    std::fs::read_to_string(&state.accounts_path).unwrap_or_default()
+}
+
 /// What, if anything, is wrong with this query string, in words the user can act on.
 ///
 /// A separate command rather than a field on the search result on purpose: `payload_keys` pins the
@@ -3424,6 +3533,8 @@ pub fn run() {
             rebuild_search_begin,
             rebuild_search_step,
             search_hints,
+            diagnostics_preview,
+            diagnostics_export,
             list_messages,
             list_thread,
             get_sync_window,

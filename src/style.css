@@ -720,6 +720,25 @@ textarea {
   flex: none;
 }
 
+.diag-preview {
+  max-height: 220px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.about-diag {
+  margin-top: 8px;
+}
+
 .reader-header h2 {
   margin: 0 0 6px;
   font-size: 15.5px;

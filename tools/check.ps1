@@ -1159,6 +1159,15 @@ try {
         if ($d -notmatch 'preview_only') {
             $problems += 'preview_only must exist and must not name a file'
         }
+        # The renderer must preview before it writes: two commands, not one.
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        if ($lib -notmatch 'fn diagnostics_preview\(' -or $lib -notmatch 'fn diagnostics_export\(') {
+            $problems += 'there must be a preview command and a separate export command: one entry point makes "export" the easy typo away from writing a file nobody has seen'
+        }
+        if ($js -notmatch 'diagnostics_preview') {
+            $problems += 'the about dialog must preview first — that ordering is the feature'
+        }
         if ($lib -notmatch 'pub mod diag;') {
             $problems += 'lib.rs does not declare the diag module'
         }

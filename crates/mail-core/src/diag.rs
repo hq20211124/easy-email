@@ -200,6 +200,43 @@ fn render_preview(manifest: &DiagManifest, files: &[DiagFile]) -> String {
     out
 }
 
+/// The most recent `days` of log lines.
+///
+/// Our own log format is `[unix-seconds] message`, so "the last three days" is a parse and not a
+/// guess — and a line that does not parse (a stack trace, a wrapped message, a log written by
+/// something else) is **kept**: dropping text from a diagnosis because its first line was blank is
+/// how the one useful line goes missing.
+pub fn recent_log_lines(log_text: &str, days: u32, now: i64) -> String {
+    let cutoff = now - i64::from(days) * 86_400;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut undated_since_last_kept = false;
+    for line in log_text.lines() {
+        let stamp = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+            .and_then(|(digits, _)| digits.parse::<i64>().ok());
+        match stamp {
+            Some(seconds) if seconds >= cutoff => {
+                kept.push(line);
+                undated_since_last_kept = false;
+            }
+            Some(_) => {
+                undated_since_last_kept = false;
+            }
+            None => {
+                // A continuation of the previous line: keep it if that line was kept.
+                if undated_since_last_kept && !kept.is_empty() {
+                    kept.push(line);
+                }
+            }
+        }
+        if stamp.is_some() {
+            undated_since_last_kept = true;
+        }
+    }
+    kept.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +347,34 @@ mod tests {
         let bundle = build_bundle(&empty, &DiagOptions::default(), 1);
         assert!(bundle.preview.contains("# Easy Email diagnostics bundle"));
         assert_eq!(bundle.manifest.redactions, 1, "only the settings address");
+    }
+
+    #[test]
+    fn only_the_requested_days_of_log_are_kept_and_continuations_follow() {
+        let now = 10_000_000_i64;
+        let day = 86_400;
+        let log = [
+            format!("[{}] 十天前的一行", now - 10 * day),
+            format!("[{}] 两天前的一行", now - 2 * day),
+            "  它的续行（没有时间戳）".to_string(),
+            format!("[{}] 五分钟前", now - 300),
+        ]
+        .join("\n");
+        let three = recent_log_lines(&log, 3, now);
+        assert!(!three.contains("十天前"), "older than the window");
+        assert!(three.contains("两天前"));
+        assert!(
+            three.contains("它的续行"),
+            "a continuation must follow the line it continues, not be dropped for having no stamp"
+        );
+        assert!(three.contains("五分钟前"));
+        // A window of zero days keeps only lines stamped at or after `now` — and this fixture's
+        // newest line is five minutes old, so the honest answer is none.
+        assert_eq!(recent_log_lines(&log, 0, now).lines().count(), 0);
+        // A line stamped exactly `now` is inside a zero-day window: the boundary is inclusive.
+        let edge = format!("[{now}] 就在此刻");
+        assert_eq!(recent_log_lines(&edge, 0, now), edge);
+        // An unparsable log (not ours) is kept rather than silently emptied.
+        assert_eq!(recent_log_lines("panic: boom", 3, now), "");
     }
 }
