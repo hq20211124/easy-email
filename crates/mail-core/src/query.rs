@@ -52,6 +52,8 @@ pub enum QueryTerm {
     InFolder { folder: String },
     /// `account:` — an account id.
     Account { id: String },
+    /// `larger:` / `smaller:` — a byte count already resolved from what the user typed.
+    Size { larger: bool, bytes: u64 },
 }
 
 /// Every prefix this version understands.
@@ -72,6 +74,8 @@ pub fn known_prefixes() -> Vec<&'static str> {
         "is:flagged",
         "in",
         "account",
+        "larger",
+        "smaller",
     ]
 }
 
@@ -145,6 +149,18 @@ pub fn parse_query(input: &str) -> Vec<QueryTerm> {
             "account" => Some(QueryTerm::Account {
                 id: rest.to_string(),
             }),
+            "larger" | "smaller" => match crate::size::parse_size(rest) {
+                Some(bytes) => Some(QueryTerm::Size {
+                    larger: lower == "larger",
+                    bytes,
+                }),
+                // A size we cannot read is not a size, and it is not a word either: the hint says
+                // so and the rest of the query survives.
+                None => {
+                    unusable = true;
+                    None
+                }
+            },
             _ => None,
         };
         if unusable {
@@ -204,6 +220,8 @@ pub fn query_issues(input: &str) -> Vec<String> {
                     | "before"
                     | "in"
                     | "account"
+                    | "larger"
+                    | "smaller"
             );
             if !known {
                 issues.push(format!(
@@ -215,6 +233,13 @@ pub fn query_issues(input: &str) -> Vec<String> {
             if (lower == "after" || lower == "before") && parse_date(rest).is_none() {
                 issues.push(format!(
                     "日期「{rest}」看不懂，这个条件没有生效。支持 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM。"
+                ));
+            }
+            if (lower == "larger" || lower == "smaller") && crate::size::parse_size(rest).is_none()
+            {
+                issues.push(format!(
+                    "大小「{rest}」看不懂，这个条件没有生效。支持 {}。",
+                    crate::size::known_size_units().join("、")
                 ));
             }
         }

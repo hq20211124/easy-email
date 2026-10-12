@@ -917,6 +917,51 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the size prefixes are decimal by default, and an unreadable one is reported' {
+        # Round 79, the last prefix on design/09 §1's list. Two things worth pinning because both are
+        # invisible in a passing run:
+        #   * what a "KB" means. Decimal (1000) here, binary when spelled KiB — the decision is
+        #     documented in `size.rs`, and a test pins a 1024-byte message as NOT "smaller than 1KB";
+        #   * a size the user typed wrong. It must not become zero bytes (which would match
+        #     everything) and it must not become literal text (which would search for "10MB" in
+        #     subjects); it must be dropped and reported.
+        $query = Get-Content 'crates/mail-core/src/query.rs' -Raw -Encoding UTF8
+        $size = Get-Content 'crates/mail-core/src/size.rs' -Raw -Encoding UTF8
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        if (-not (Test-Path 'crates/mail-core/src/size.rs')) {
+            $problems += 'crates/mail-core/src/size.rs is missing: the unit decision must live in one documented place'
+        }
+        foreach ($need in @('parse_size', 'known_size_units')) {
+            if ($size -notmatch ("fn " + $need)) {
+                $problems += "size.rs must define $need"
+            }
+        }
+        if ($query -notmatch 'larger.*smaller' -and $query -notmatch '"larger" \| "smaller"') {
+            $problems += 'parse_query must recognise larger: and smaller:'
+        }
+        if ($size -notmatch 'MiB' -or $size -notmatch '1_000_000.0') {
+            $problems += 'size.rs must distinguish MB (decimal) from MiB (binary) — that distinction is the whole point of the file'
+        }
+        # An unreadable size must be skipped-and-reported, not searched as literal text.
+        if ($query -notmatch 'unusable = true;') {
+            $problems += 'an unreadable size must be dropped with a hint, not turn into literal text'
+        }
+        # Unknown sizes are NULL in the table; they must not be treated as zero.
+        if ($cache -notmatch 'm\.size >= \?' -or $cache -notmatch 'm\.size <= \?') {
+            $problems += 'the size predicate must compare m.size with a bound value (NULL stays unknown, not zero)'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'KB is a thousand bytes, KiB is 1024, and a bad size is reported rather than guessed'
+        $global:LASTEXITCODE = 0
+    }
+
     # ------------------------------------------------------------ rust
 
     Step 'conversation grouping joins replies and refuses to merge strangers' {

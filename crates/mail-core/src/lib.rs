@@ -37,6 +37,7 @@ pub mod query;
 pub mod sanitize;
 pub mod secret;
 pub mod sentcopy;
+pub mod size;
 pub mod smtp;
 pub mod spool;
 pub mod sync;

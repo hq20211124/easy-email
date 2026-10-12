@@ -79,7 +79,7 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 
 下一批：**给 P3 拿真窗口基线**（需要你点：应用带 `--remote-debugging-port=9222` 构建 →
 `powershell -File tools\bench-app.ps1`，P1/P3/P5/P6 四个数字进 `target\bench-app-history.jsonl`）；
-之后剩下的候选：09 的 `larger:`/`smaller:` 与保存搜索、04 离线队列完整化、16 诊断包。
+**09 的语法三片已完成**（第 77/78/79 轮：文本前缀、结构化谓词、大小前缀 + 打错有提示），剩下的候选：04 离线队列完整化、16 诊断包、保存搜索（M2）。
 **09 查询语法两片都已完成**（第 77/78 轮）：文本前缀 + `has:attachment` + 结构化谓词
 （`after:`/`before:`/`is:unread`/`is:flagged`/`in:`/`account:`）+ 打错有提示（`search_hints`）；
 解析住在独立的 `crates/mail-core/src/query.rs`，分词原语 `clauses_of` 与索引共用。

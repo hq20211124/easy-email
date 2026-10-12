@@ -1561,6 +1561,17 @@ impl Cache {
                 }
                 QueryTerm::Unread => pred.add("m.seen = ?", 0_i64),
                 QueryTerm::Flagged => pred.add("m.flagged = ?", 1_i64),
+                // A message whose size the server never said is NULL, and a comparison with NULL is
+                // not true in SQL — an unknown size is neither a small message nor a large one, and
+                // treating it as 0 would quietly claim "smaller than 1KB".
+                QueryTerm::Size { larger, bytes } => {
+                    let clause = if *larger {
+                        "m.size >= ?"
+                    } else {
+                        "m.size <= ?"
+                    };
+                    pred.add(clause, i64::try_from(*bytes).unwrap_or(i64::MAX));
+                }
                 // Case-insensitive: the wire spells `INBOX` and a user types `inbox`.
                 QueryTerm::InFolder { folder } => {
                     pred.add("lower(m.folder) = lower(?)", folder.clone())
@@ -2556,6 +2567,74 @@ mod tests {
             uids(&cache, "account:other after:2026-01-01"),
             vec![9],
             "the other account's mail is in 2030, so the date keeps it"
+        );
+    }
+
+    // ---------------------------------------------------------------- size predicates
+
+    #[test]
+    fn size_predicates_use_the_size_the_server_actually_said() {
+        let cache = Cache::open_in_memory().unwrap();
+        // The fixture helper writes size: Some(1024) for every row, so sizes come from the rows
+        // themselves here: 1 KB, 1 MB, and one with no size at all.
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "小", "a@x.com", 100),
+                    summary(2, "大", "b@x.com", 200),
+                    summary(3, "未知", "c@x.com", 300),
+                ],
+            )
+            .unwrap();
+        {
+            // Give 2 a real one-megabyte size and leave 3 without one.
+            let mut two = summary(2, "大", "b@x.com", 200);
+            two.size = Some(1_000_000);
+            cache
+                .upsert_summaries("acc", "INBOX", &[two])
+                .expect("re-write row 2 with a size");
+            let mut three = summary(3, "未知", "c@x.com", 300);
+            three.size = None;
+            cache
+                .upsert_summaries("acc", "INBOX", &[three])
+                .expect("re-write row 3 with no size");
+        }
+
+        // The unit decision, end to end: a KB is a thousand bytes here (`size.rs`), so a 1024-byte
+        // message is not "smaller than 1KB" — it is "smaller than 1 KiB". That surprise is exactly
+        // why the choice is documented and pinned rather than left to whichever library was handy.
+        assert!(
+            uids(&cache, "smaller:1KB").is_empty(),
+            "1KB means 1000 bytes, and 1024 is more"
+        );
+        assert_eq!(
+            uids(&cache, "smaller:1KiB"),
+            vec![1],
+            "…and 1 KiB means 1024"
+        );
+        assert_eq!(uids(&cache, "larger:1MB"), vec![2], "one megabyte or more");
+        assert_eq!(
+            uids(&cache, "larger:100KB"),
+            vec![2],
+            "the unknown-size row is not reported as large: NULL is not a comparison"
+        );
+        assert_eq!(
+            uids(&cache, "smaller:100KB"),
+            vec![1],
+            "…and not as small either. An unknown size is its own state, not zero."
+        );
+        assert_eq!(
+            uids(&cache, "larger:1KB").len(),
+            2,
+            "both known sizes are above 1000 bytes"
+        );
+        // A unit is not a word: `10MB` as a bare search must not silently become a size filter.
+        assert_eq!(uids(&cache, "larger:900KB").len(), 1);
+        assert!(
+            uids(&cache, "larger:big").is_empty(),
+            "an unreadable size is dropped, and the hint says so"
         );
     }
 
