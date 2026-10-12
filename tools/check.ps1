@@ -1417,6 +1417,59 @@ try {
         Write-Host 'history keeps the newest fifty, one row per query, and nothing is pushed until it ran'
         $global:LASTEXITCODE = 0
     }
+    Step 'sample headers are opt-in, and they are headers only' {
+        # Round 91 / design/16 §3.3. The option was in `DiagOptions` from round 84 and had no way to
+        # be set: both commands passed an empty string. Two things fail silently here, and only one of
+        # them is a leak:
+        #   * the check box missing — the option exists in the backend and is unreachable, which is a
+        #     feature that looks implemented in review and is not;
+        #   * a sample that contains bodies — the design is explicit that this needs an explicit tick
+        #     *because* it is user data, so the tick is the whole point of the flag.
+        # A third is smaller but real: writing with the box unticked after previewing with it ticked
+        # puts a file on disk that differs from what the user just agreed to.
+        $db = Get-Content 'crates/mail-core/src/diag.rs' -Raw -Encoding UTF8
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $problems = @()
+
+        if ($db -notmatch 'fn sample_headers_text') {
+            $problems += 'diag.rs must format the sample part (rows in, text out)'
+        }
+        if ($db -notmatch 'X-UID') { $problems += 'the sample is message headers, keyed by UID' }
+        if ($db -notmatch 'fn sender_of\|（无发件人）') {
+            $problems += 'a row with no sender must say so rather than print an empty line'
+        }
+        # The summaries carry no body — that is what makes "headers only" structural.
+        $shell = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        if ($shell -notmatch 'sample_headers_text\(') {
+            $problems += 'lib.rs must actually assemble the sample when the flag is set'
+        }
+        if ($shell -notmatch 'list_summaries') {
+            $problems += 'the sample comes from summaries — the type with no body field, so "headers only" is structural'
+        }
+        foreach ($cmd in @('diagnostics_preview', 'diagnostics_export')) {
+            $body = [regex]::Match($shell, ('(?s)async fn ' + $cmd + '\(.*?\n\}')).Value
+            if ($body -notmatch 'include_sample_headers') {
+                $problems += "$cmd must take the flag — round 84 left both commands unable to set it"
+            }
+        }
+        # The preview and the write must use the same tick, or the file differs from what was shown.
+        $preview = [regex]::Match($js, '(?s)invoke..diagnostics_preview.*?\);').Value
+        $write = [regex]::Match($js, '(?s)invoke..diagnostics_export.*?\);').Value
+        if ($preview -notmatch 'includeSampleHeaders' -or $write -notmatch 'includeSampleHeaders') {
+            $problems += 'the preview and the write must both read the check box, or the file differs from what the user approved'
+        }
+        if ($js -notmatch 'id="diag-headers"') { $problems += 'the about dialog must have the check box' }
+        if ($js -notmatch 'type="checkbox"') { $problems += '…and it must be a check box the user opts into' }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'sample headers need an explicit tick, and they can only ever be headers'
+        $global:LASTEXITCODE = 0
+    }
 
         Write-Host 'the bundle redacts every part, accounts off means omitted, and a preview writes nothing'
         $global:LASTEXITCODE = 0

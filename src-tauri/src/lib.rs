@@ -2322,17 +2322,22 @@ struct DiagPreview {
 /// list — and hands them to the pure assembler. **Nothing is written.** The renderer shows the
 /// result and asks, which is the entire point of `design/16` §3.3's `preview_only`.
 #[tauri::command]
-async fn diagnostics_preview(state: State<'_, AppState>) -> Result<DiagPreview, String> {
-    let (log_text, settings_text, dir) = {
+async fn diagnostics_preview(
+    state: State<'_, AppState>,
+    include_sample_headers: bool,
+) -> Result<DiagPreview, String> {
+    let (log_text, settings_text, dir, sample_headers_text) = {
         let state = &state;
         (
             read_log_text(state),
             read_settings_text(state),
             state.accounts_path.parent().map(|p| p.to_path_buf()),
+            read_sample_headers(state, include_sample_headers),
         )
     };
     let opts = mail_core::diag::DiagOptions {
         preview_only: true,
+        include_sample_headers,
         ..mail_core::diag::DiagOptions::default()
     };
     let now = now_secs();
@@ -2344,7 +2349,7 @@ async fn diagnostics_preview(state: State<'_, AppState>) -> Result<DiagPreview, 
         webview: "unknown".to_string(),
         log_text,
         settings_text,
-        sample_headers_text: String::new(),
+        sample_headers_text,
     };
     let bundle = mail_core::diag::build_bundle(&inputs, &opts, now);
     let planned_path = dir
@@ -2364,14 +2369,24 @@ async fn diagnostics_preview(state: State<'_, AppState>) -> Result<DiagPreview, 
 /// and the other must not be able to. Sharing an entry point would make "export" the easy typo away
 /// from putting an unconfirmed copy of someone's mailbox on disk.
 #[tauri::command]
-async fn diagnostics_export(state: State<'_, AppState>) -> Result<String, String> {
-    let (log_text, settings_text) = (read_log_text(&state), read_settings_text(&state));
+async fn diagnostics_export(
+    state: State<'_, AppState>,
+    include_sample_headers: bool,
+) -> Result<String, String> {
+    let (log_text, settings_text, sample_headers_text) = (
+        read_log_text(&state),
+        read_settings_text(&state),
+        read_sample_headers(&state, include_sample_headers),
+    );
     let dir = state
         .accounts_path
         .parent()
         .ok_or_else(|| "无法确定数据目录".to_string())?
         .to_path_buf();
-    let opts = mail_core::diag::DiagOptions::default();
+    let opts = mail_core::diag::DiagOptions {
+        include_sample_headers,
+        ..mail_core::diag::DiagOptions::default()
+    };
     let now = now_secs();
     let inputs = mail_core::diag::DiagInputs {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2379,7 +2394,7 @@ async fn diagnostics_export(state: State<'_, AppState>) -> Result<String, String
         webview: "unknown".to_string(),
         log_text,
         settings_text,
-        sample_headers_text: String::new(),
+        sample_headers_text,
     };
     let bundle = mail_core::diag::build_bundle(&inputs, &opts, now);
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建数据目录：{e}"))?;
@@ -2409,6 +2424,27 @@ fn read_log_text(_state: &AppState) -> String {
         return String::new();
     };
     mail_core::diag::recent_log_lines(&text, 3, now_secs())
+}
+
+/// A few message headers, for the bundle's sample part (`design/16` §3.3).
+///
+/// Summaries, never bodies — and that is structural: `MessageSummary` has no body field, so an edit
+/// that wanted to add one would have to change the cache first. INBOX rather than whatever folder
+/// the user is looking at, because it is the one every account has and the one that best shows what
+/// the mail looks like; eight rows is enough to see a provider's oddities without bloating the file.
+fn read_sample_headers(state: &AppState, include: bool) -> String {
+    if !include {
+        return String::new();
+    }
+    let Some(account) = state.snapshot().into_iter().next() else {
+        return String::new();
+    };
+    let rows = state
+        .cache
+        .clone()
+        .list_summaries(&account.id, "INBOX", 8, 0)
+        .unwrap_or_default();
+    mail_core::diag::sample_headers_text(&rows)
 }
 
 /// The account list, as stored. It goes through redaction like everything else.

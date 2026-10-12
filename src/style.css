@@ -783,6 +783,22 @@ textarea {
   margin-top: 8px;
 }
 
+/* The one check box in the about panel: "include sample headers, off until you ask for it". */
+.about-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.about-check input {
+  margin-top: 2px;
+}
+
 /* ---------------------------------------------------------------- saved searches */
 
 .saved-searches:empty {

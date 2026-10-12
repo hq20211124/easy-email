@@ -15,6 +15,7 @@
 //! dependency; one text file a user can open and read before sending is worth more than an archive
 //! they cannot inspect.
 
+use crate::model::MessageSummary;
 use crate::redact::redact;
 
 /// What to put in the bundle. The defaults are `design/16` §3.3's.
@@ -96,6 +97,45 @@ pub struct DiagInputs {
     /// Sample message headers, already selected by the caller. **Bodies are never accepted here** —
     /// there is deliberately no field for them.
     pub sample_headers_text: String,
+}
+
+/// Format a few message summaries as the bundle's sample part.
+///
+/// Headers only, and that is a **structural** property rather than a promise: the input is
+/// `MessageSummary`, which has no field for a body. A future edit that wanted to add one would have
+/// to change the cache first, which is a much louder change than a comment asking nicely.
+///
+/// Dates are unix seconds rather than a formatted date: this tree has no date-formatting dependency,
+/// and a diagnosis of "why does this provider's list render oddly" wants the raw number anyway.
+pub fn sample_headers_text(rows: &[MessageSummary]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&format!(
+            "X-UID: {}\nFrom: {}\nSubject: {}\nDate: {}\nX-Size: {}\nX-Seen: {}\nX-Flagged: {}\n\n",
+            row.uid,
+            sender_of(row),
+            row.subject,
+            row.date
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "未知".into()),
+            row.size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "未知".into()),
+            row.seen,
+            row.flagged,
+        ));
+    }
+    out
+}
+
+/// Who a row is from, in the order the renderer would show it: the display name when there is one,
+/// the address when there is not, and an explicit nothing when there is neither.
+fn sender_of(row: &MessageSummary) -> String {
+    match (row.from_name.as_deref(), row.from_addr.as_deref()) {
+        (Some(name), _) if !name.trim().is_empty() => name.to_string(),
+        (_, Some(addr)) if !addr.trim().is_empty() => addr.to_string(),
+        _ => "（无发件人）".into(),
+    }
 }
 
 /// Assemble a bundle from its inputs, redacting every part.
@@ -338,6 +378,76 @@ mod tests {
             !bundle.preview.is_empty(),
             "…and it must still show the content"
         );
+    }
+
+    /// A row of the kind `list_summaries` returns, for tests that need one without a database.
+    fn summary(
+        uid: u32,
+        from_name: Option<&str>,
+        from_addr: Option<&str>,
+        subject: &str,
+    ) -> MessageSummary {
+        MessageSummary {
+            uid,
+            subject: subject.to_string(),
+            from_name: from_name.map(String::from),
+            from_addr: from_addr.map(String::from),
+            date: Some(1_800_000_000),
+            size: Some(2048),
+            seen: true,
+            flagged: false,
+            thread_key: None,
+            subject_key: Some(subject.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_sample_of_headers_has_one_block_per_message_and_no_body() {
+        // Headers only is structural (the input type has no body field), so what a test can check is
+        // the shape a reader sees: one block per row, and nothing that looks like content.
+        let rows = vec![
+            summary(1, Some("Alice"), Some("a@example.com"), "订单"),
+            summary(2, None, None, ""),
+        ];
+        let text = sample_headers_text(&rows);
+        assert_eq!(text.matches("X-UID:").count(), 2, "one block per message");
+        assert!(text.contains("X-UID: 1"));
+        assert!(text.contains("From: Alice"));
+        assert!(text.contains("Subject: 订单"));
+        assert!(!text.to_lowercase().contains("body"), "no body line, ever");
+    }
+
+    #[test]
+    fn a_row_without_a_sender_still_says_something() {
+        // An empty "From:" line reads like a bug in the bundle; a row that says so is a row a
+        // maintainer can interpret.
+        let rows = vec![summary(9, None, None, "主题")];
+        let text = sample_headers_text(&rows);
+        assert!(text.contains("From: （无发件人）"), "got {text}");
+    }
+
+    #[test]
+    fn the_address_stands_in_when_there_is_no_display_name() {
+        let rows = vec![summary(3, None, Some("boss@example.com"), "对账单")];
+        assert!(sample_headers_text(&rows).contains("From: boss@example.com"));
+        // And the address is hidden by the bundle's redaction, same as everywhere else.
+        let (redacted, hidden) = redact(&sample_headers_text(&rows));
+        assert!(hidden >= 1);
+        assert!(!redacted.contains("boss@example.com"));
+    }
+
+    #[test]
+    fn an_empty_sample_is_empty_rather_than_a_broken_part() {
+        assert_eq!(sample_headers_text(&[]), "");
+    }
+
+    #[test]
+    fn a_long_subject_does_not_break_the_part() {
+        // A subject is user data and can be enormous; the bundle is a text file, and a runaway
+        // subject must not make it one.
+        let rows = vec![summary(1, Some("A"), Some("a@b.com"), &"标".repeat(4000))];
+        let text = sample_headers_text(&rows);
+        assert!(text.contains("Subject: "));
     }
 
     #[test]

@@ -3923,13 +3923,19 @@ async function wireDiagnostics(modal) {
   const button = modal.querySelector('#btn-diag');
   const preview = modal.querySelector('#diag-preview');
   const status = modal.querySelector('#diag-status');
+  const headers = modal.querySelector('#diag-headers');
   let plannedPath = '';
 
   button.addEventListener('click', async () => {
     button.disabled = true;
     status.hidden = false;
     status.textContent = '正在准备…';
-    const result = await run('生成诊断包', () => invoke('diagnostics_preview'));
+    // The tick is read when the bundle is assembled, not when it is written: the check box says
+    // "include this", and the preview is what shows what "this" turned out to be.
+    const sample = headers.checked;
+    const result = await run('生成诊断包', () =>
+      invoke('diagnostics_preview', { includeSampleHeaders: sample })
+    );
     if (result === null) {
       status.textContent = '准备失败，请看右下角提示。';
       button.disabled = false;
@@ -3948,7 +3954,11 @@ async function wireDiagnostics(modal) {
     button.onclick = async () => {
       button.disabled = true;
       status.textContent = '正在写入…';
-      const written = await run('写入诊断包', () => invoke('diagnostics_export'));
+      // The same tick the preview was built with: writing with the box unticked after previewing with
+      // it ticked would put a file on disk that differs from what the user agreed to.
+      const written = await run('写入诊断包', () =>
+        invoke('diagnostics_export', { includeSampleHeaders: headers.checked })
+      );
       button.disabled = false;
       if (written === null) {
         status.textContent = '写入失败，请看右下角提示。';
@@ -4006,6 +4016,15 @@ function openAbout() {
       <p id="about-update-status" class="about-note" hidden></p>
       <div class="about-diag">
         <button class="btn ghost small" id="btn-diag" type="button">生成诊断包（先预览）</button>
+        <!--
+          Sample message headers, off by default (design/16 §3.3: this needs an explicit tick).
+          Headers only — the summaries carry no body, which is why the checkbox can say so without
+          it being a promise.
+        -->
+        <label class="about-check">
+          <input id="diag-headers" type="checkbox" />
+          附带样本消息头（最近 8 封的收件箱摘要，只有头部、不含正文）
+        </label>
         <p class="about-note">
           诊断包 = 最近 3 天的日志 + 账号列表，<strong>全部脱敏</strong>（邮箱保留域名、
           授权码/手机号/路径用户名等整项掩掉）。先在这里给你看内容，<strong>确认后才写盘</strong>。
