@@ -12,9 +12,9 @@
 
 ---
 
-## 当前进度（v0.1.2 已发布：内部计划“v0.2”的全部六块已交付）
+## 当前进度（v0.1.3 已发布：内部计划“v0.2”的全部六块已交付）
 
-> 版本号口径：里程碑内部叫 v0.2， tag 是 `v0.1.2`（2026-10-10 发布，四类安装包 + 签名 + 更新清单齐全）。
+> 版本号口径：里程碑内部叫 v0.2， tag 是 `v0.1.3`（2026-10-16 发布，四类安装包 + 签名 + 更新清单齐全）。
 
 已完成：**单账号收发闭环** · 经过真实服务器验证的内置邮箱配置库 · **本地缓存与离线可读** · **本地全文搜索**。
 
@@ -62,9 +62,9 @@
 | 平台 | 下载 | 安装 |
 |---|---|---|
 | Windows | `Easy Email_x64-setup.exe` | 双击安装（需要系统有 WebView2 运行时，Win10/11 一般自带；安装时按需联网下载） |
-| Debian / Ubuntu | `Easy Email_0.1.2_amd64.deb` | `sudo dpkg -i Easy\ Email_0.1.2_amd64.deb`（依赖会自动提示） |
-| Fedora / RHEL | `Easy Email-0.1.2-1.x86_64.rpm` | `sudo dnf install ./Easy\ Email-0.1.2-1.x86_64.rpm` |
-| 任意 Linux（免安装） | `Easy Email_0.1.2_amd64.AppImage` | `chmod +x Easy\ Email_0.1.2_amd64.AppImage && ./Easy\ Email_0.1.2_amd64.AppImage` |
+| Debian / Ubuntu | `Easy Email_0.1.3_amd64.deb` | `sudo dpkg -i Easy\ Email_0.1.3_amd64.deb`（依赖会自动提示） |
+| Fedora / RHEL | `Easy Email-0.1.3-1.x86_64.rpm` | `sudo dnf install ./Easy\ Email-0.1.3-1.x86_64.rpm` |
+| 任意 Linux（免安装） | `Easy Email_0.1.3_amd64.AppImage` | `chmod +x Easy\ Email_0.1.3_amd64.AppImage && ./Easy\ Email_0.1.3_amd64.AppImage` |
 
 > 文件名里的版本号以 [Releases](https://github.com/hq20211124/easy-email/releases/latest) 页的实际资产为准；
 > 另外注意 CI 上传时空格会被换成点（`Easy Email` → `Easy.Email`），所以**资产名**可能和上面本地构建名不同。
