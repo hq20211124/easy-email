@@ -28,3 +28,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Agent scratch directory: working notes for a tool, not part of the project. Untracked so it cannot
+# be swept into a commit by `git add -A`.
+/.commandcode/
