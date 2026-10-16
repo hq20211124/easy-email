@@ -163,6 +163,29 @@ fn password_for(account_id: &str) -> Result<String, String> {
     }
 }
 
+/// The OAuth endpoints for one account, including the borrowed trial registration.
+///
+/// Which redirect host is right depends on *whose* client id is in play, not on the provider: a
+/// self-registered Microsoft app must be told `localhost` (the Azure portal refuses `127.0.0.1`),
+/// while Mozilla's borrowed one expects the IP literal. Deriving it from the stored client id means a
+/// relogin keeps using the registration the account was created with, without a second stored flag.
+fn oauth_provider_for(
+    provider_id: &str,
+    client_id: &str,
+) -> Option<mail_core::oauth::OAuthProvider> {
+    match provider_id {
+        "gmail" => Some(mail_core::oauth::GOOGLE),
+        "outlook" => Some(
+            if client_id == mail_core::oauth::TRIAL_MICROSOFT_CLIENT_ID {
+                mail_core::oauth::MICROSOFT_TRIAL
+            } else {
+                mail_core::oauth::MICROSOFT
+            },
+        ),
+        _ => None,
+    }
+}
+
 /// The secret a connection authenticates with: a password, or a freshly refreshed access token.
 ///
 /// The account says which (`cfg.auth`), so call sites keep passing one string and the protocols keep
@@ -184,13 +207,8 @@ async fn secret_for(state: &AppState, cfg: &AccountConfig) -> Result<String, Str
         ));
     };
 
-    let provider = match cfg.provider_id.as_str() {
-        "gmail" => mail_core::oauth::GOOGLE,
-        "outlook" => mail_core::oauth::MICROSOFT,
-        other => {
-            return Err(format!("{other} 不支持 OAuth2 登录。"));
-        }
-    };
+    let provider = oauth_provider_for(&cfg.provider_id, &settings.client_id)
+        .ok_or_else(|| format!("{} 不支持 OAuth2 登录。", cfg.provider_id))?;
 
     let store = token_store(state)?;
     let transport = http_tokens()?;
@@ -523,7 +541,10 @@ pub fn failure_kind(error: &mail_core::error::MailError) -> FailureKind {
         | MailError::Smtp(_)
         | MailError::Config(_)
         | MailError::Credential(_)
-        | MailError::Parse(_) => FailureKind::Server,
+        | MailError::Parse(_)
+        // Not a refresh failure — it only ever comes from the push watcher — but the match has to be
+        // exhaustive, and "the server refused a command" is the Server kind.
+        | MailError::IdleUnsupported(_) => FailureKind::Server,
     }
 }
 
@@ -1324,11 +1345,11 @@ async fn oauth_relogin(
             )
         })?;
 
-    let provider = match cfg.provider_id.as_str() {
-        "gmail" => mail_core::oauth::GOOGLE,
-        "outlook" => mail_core::oauth::MICROSOFT,
-        other => return Err(format!("{other} 不支持 OAuth2 登录。")),
-    };
+    // Which client id is stored decides the redirect host as well as the endpoints: an account created
+    // through the borrowed trial must keep using Mozilla's redirect, or the relogin fails with
+    // `redirect_uri_mismatch`.
+    let provider = oauth_provider_for(&cfg.provider_id, &settings.client_id)
+        .ok_or_else(|| format!("{} 不支持 OAuth2 登录。", cfg.provider_id))?;
 
     let tokens = mail_core::oauth::sign_in(
         &http_tokens()?,
@@ -1519,10 +1540,12 @@ fn http_tokens() -> std::result::Result<mail_core::oauth::HttpTokens, String> {
 }
 /// Which OAuth registration this installation should offer in the wizard.
 ///
-/// Read from the app's data directory (the user's own registration, dropped in as the JSON Google
-/// Cloud hands out), falling back to the published Thunderbird one — which is *borrowed*, revocable by
-/// Mozilla, and shows up on the consent screen as "Mozilla Thunderbird", so it comes with a notice the
-/// UI is expected to show (PROGRESS, M1a-63).
+/// The user's own registration, read from the app's data directory (dropped in as the JSON Google
+/// Cloud hands out), is used as-is. With none, every provider is asked to bring its own — except
+/// Microsoft, which may also be offered Mozilla's published Thunderbird registration behind an
+/// explicit button: borrowed, revocable by Mozilla, and shown on the consent screen as "Mozilla
+/// Thunderbird", so it comes with a notice the UI shows next to that button. Nothing is prefilled
+/// either way (2026-10-06 decision, plus the opt-in trial; see `oauth::NO_BUILT_IN_REGISTRATION`).
 #[tauri::command]
 fn oauth_client_default(
     state: State<'_, AppState>,
@@ -1557,13 +1580,28 @@ async fn oauth_sign_in(
     provider_id: String,
     client_id: String,
     client_secret: Option<String>,
+    trial: Option<bool>,
 ) -> Result<mail_core::oauth::TokenSet, String> {
-    let provider = match provider_id.as_str() {
-        "gmail" => mail_core::oauth::GOOGLE,
-        "outlook" => mail_core::oauth::MICROSOFT,
-        other => {
-            return Err(format!("{other} 不支持 OAuth 登录，请使用密码或授权码。"));
+    // The borrowed registration is a *different* client id and a *different* redirect, and it is only
+    // ever reached through the wizard's explicit "试用" button — never by typing in a field. So it is a
+    // flag rather than a value the renderer may pass: a client id that happened to match could
+    // otherwise switch the redirect out from under the user.
+    let trial = trial.unwrap_or(false);
+    let (provider, client_id, client_secret) = if trial {
+        if provider_id != "outlook" {
+            return Err(format!(
+                "{provider_id} 没有可试用的注册，请填你自己的客户端 ID。"
+            ));
         }
+        (
+            mail_core::oauth::MICROSOFT_TRIAL,
+            mail_core::oauth::TRIAL_MICROSOFT_CLIENT_ID.to_string(),
+            None,
+        )
+    } else {
+        let provider = oauth_provider_for(&provider_id, &client_id)
+            .ok_or_else(|| format!("{provider_id} 不支持 OAuth 登录，请使用密码或授权码。"))?;
+        (provider, client_id, client_secret)
     };
 
     // 120 seconds: the user has to find the browser, pick an account, and consent. Long enough to be
@@ -1572,16 +1610,23 @@ async fn oauth_sign_in(
     // a "Web application" client is refused with that word instead of failing later as a
     // redirect_uri_mismatch, and a registration pointing somewhere else (a test environment) is used
     // as written. Absent a file, the provider's built-in endpoints are what the flow runs against.
-    let (kind, provider) = match token_store(&state)
-        .ok()
-        .and_then(|_| state.accounts_path.parent())
-        .map(mail_core::oauthclient::client_registration)
-    {
-        Some(Ok(mail_core::oauthclient::Registration::Own { registration })) => (
-            registration.kind,
-            provider.with_registration_endpoints(&registration),
-        ),
-        _ => (mail_core::oauthclient::ClientKind::Desktop, provider),
+    let (kind, provider) = if trial {
+        // The borrowed registration is not ours, and a file in the data directory is not it either:
+        // letting a downloaded JSON redefine the endpoints here would point Mozilla's client id at
+        // somebody else's token endpoint.
+        (mail_core::oauthclient::ClientKind::Desktop, provider)
+    } else {
+        match token_store(&state)
+            .ok()
+            .and_then(|_| state.accounts_path.parent())
+            .map(mail_core::oauthclient::client_registration)
+        {
+            Some(Ok(mail_core::oauthclient::Registration::Own { registration })) => (
+                registration.kind,
+                provider.with_registration_endpoints(&registration),
+            ),
+            _ => (mail_core::oauthclient::ClientKind::Desktop, provider),
+        }
     };
 
     let tokens = mail_core::oauth::sign_in_as(
@@ -1753,6 +1798,19 @@ async fn range_cap_hint(
         return Ok(None);
     };
     if !provider.caps_third_party_range() {
+        return Ok(None);
+    }
+
+    // **Only when the mailbox actually looks cut short.** Without this the hint fired for every
+    // NetEase backfill that reached the bottom — including a mailbox read all the way back to 2018,
+    // i.e. *after* the user had already widened 收取范围. A hint that survives being acted on is worse
+    // than no hint: it says the app is still guessing (and sends them back to a setting they changed).
+    let floor = state
+        .cache
+        .clone()
+        .oldest_message_date(&account_id)
+        .map_err(describe)?;
+    if !mail_core::providers::looks_like_a_range_cap(floor, now_seconds()) {
         return Ok(None);
     }
 
@@ -3094,6 +3152,15 @@ async fn start_watcher(
                 }
                 PushEvent::Failed { reason } => {
                     log_line(&format!("[easy-email] 推送连接失败：{reason}"));
+                }
+                PushEvent::IdleUnsupported { mailbox, reason } => {
+                    // Once per watcher: the server refused IDLE and the watcher has switched to
+                    // polling. A log line rather than a toast — new mail still arrives, just on the
+                    // polling cadence, and a toast on every launch would be noise.
+                    log_line(&format!(
+                        "[easy-email] {} 的 {mailbox} 不支持即时推送（IDLE）：{reason}；已改为定时收取",
+                        cfg.id
+                    ));
                 }
             }
         }

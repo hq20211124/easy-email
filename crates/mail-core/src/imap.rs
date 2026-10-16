@@ -71,28 +71,18 @@ pub struct HeaderPage {
     pub summaries: Vec<MessageSummary>,
 }
 
-/// The `UID FETCH` set for an incremental pass.
+/// The `UID` set meaning "everything above the cursor": `after_uid + 1 : *`.
 ///
-/// Bounded on purpose: `UID FETCH <n>:*` asks for *everything* above the cursor, so a mailbox that
-/// jumped by more messages than one batch would make the server stream headers we are about to
-/// discard. With `limit > 0` we ask for exactly one batch; `limit == 0` keeps the old unbounded
-/// behaviour for callers that really do want the rest of the folder.
-///
-/// A range whose high end is past the last message is legal — the server answers with whatever
-/// exists in it (RFC 3501), which is what makes this safe on a small folder.
-pub fn since_range(after_uid: u32, limit: usize) -> String {
-    let low = after_uid.saturating_add(1);
-    if limit == 0 {
-        return format!("{low}:*");
-    }
-    // `low + limit - 1` cannot overflow in practice (UIDs are 32-bit and mailboxes are not 2^32
-    // messages), but `saturating` keeps the type checker and a hostile server both happy.
-    // Write it as `low + (limit - 1)` rather than `(low + limit) - 1`: the latter saturates the sum
-    // first and then subtracts, which can produce a *reversed* range such as `MAX:MAX-1`.
-    format!(
-        "{low}:{}",
-        low.saturating_add((limit as u32).saturating_sub(1))
-    )
+/// **Open-ended on purpose.** An earlier version bounded the high end as `after_uid + limit` to ask
+/// for "one batch" in a single round trip, which is not a page at all: IMAP UIDs are strictly
+/// ascending but **not dense**, so a mailbox whose UIDs do not start near 1 matches nothing in a
+/// small numeric window. NetEase hands out UIDs around 1.5e9, and `UID FETCH 1:500` on a 20-message
+/// inbox therefore returned nothing — the folder never synced and the cursor never moved, for ever
+/// (a full web inbox and an empty client). Bounding happens after the fact instead:
+/// [`ImapClient::fetch_headers_since`] asks `UID SEARCH` for what is above the cursor and fetches
+/// only the oldest `limit` of the answer.
+pub fn since_range(after_uid: u32) -> String {
+    format!("{}:*", after_uid.saturating_add(1))
 }
 
 /// Trim a fetched batch to one page, **keeping the oldest entries**.
@@ -180,6 +170,23 @@ fn imap_err(e: async_imap::error::Error) -> MailError {
     // Goes through the `From` impl so the server's own sentence is unwrapped from
     // async-imap's `no response: ... info: Some("...")` rendering.
     e.into()
+}
+
+/// Whether an `IDLE` attempt was refused because the server does not implement the command.
+///
+/// `async-imap` reports a tagged `BAD` answer to `IDLE` as an `io::Error` with kind
+/// `ConnectionRefused` (`extensions/idle.rs`), so the *kind* is the signal — the server's wording
+/// differs per server (`command not support` on 163) and matching on it would be fragile. A real
+/// I/O failure on the same call has a different kind (`ConnectionReset`, `BrokenPipe`, …) and is
+/// still treated as a dropped connection. The empty-message case is `async-imap`'s own "the stream
+/// ended" sentinel rather than a server sentence, so it is not a refusal either.
+fn idle_refused(error: &async_imap::error::Error) -> bool {
+    matches!(
+        error,
+        async_imap::error::Error::Io(source)
+            if source.kind() == std::io::ErrorKind::ConnectionRefused
+                && !source.to_string().is_empty()
+    )
 }
 
 fn io_err(host: &str, port: u16) -> impl Fn(std::io::Error) -> MailError + '_ {
@@ -554,14 +561,15 @@ impl ImapClient {
     /// Incremental header fetch: everything with a UID above `after_uid`, plus the folder's
     /// current `UIDVALIDITY`.
     ///
-    /// This is what makes the local cache cheap to keep current. It does one `SELECT` (so the
-    /// caller does not have to make a second one just to read `UIDVALIDITY`) and one `UID FETCH`.
+    /// This is what makes the local cache cheap to keep current: one `SELECT` (so the caller does not
+    /// have to make a second one just to read `UIDVALIDITY`), one `UID SEARCH` for what is above the
+    /// cursor, and one `UID FETCH` for at most one page of it.
     ///
-    /// **The `after_uid` filter is not redundant.** In IMAP, `UID FETCH <n>:*` is a *range*, and a
-    /// range whose start is past the end still matches the last message in the mailbox — so asking
-    /// for `101:*` on a folder whose highest UID is 50 returns UID 50, not nothing. Trusting the
-    /// server's range would re-insert an old message on every sync and, with a cached cursor, could
-    /// keep doing so forever.
+    /// **The search-then-fetch shape is what makes "one page" correct.** A single
+    /// `UID FETCH <after+1>:<after+limit>` looks bounded but is not a page — UIDs are not dense, so
+    /// on a server whose UIDs do not start near 1 the numeric window matches nothing and the folder
+    /// never syncs (see [`since_range`]). `SEARCH` is also *cheaper* in the ordinary case: when
+    /// nothing is new it returns an empty set and the fetch is skipped entirely.
     pub async fn fetch_headers_since(
         &mut self,
         mailbox: &str,
@@ -573,7 +581,46 @@ impl ImapClient {
             // A public field in async-imap, not an accessor.
             let uidvalidity = selected.uid_validity.unwrap_or(0);
 
-            let set = since_range(after_uid, limit);
+            let query = since_range(after_uid);
+            let mut uids: Vec<u32> = self
+                .session
+                .uid_search(&query)
+                .await
+                .map_err(imap_err)?
+                .into_iter()
+                .collect();
+            // **The filter is not redundant.** `low:*` is still a *range*, and RFC 3501 ranges are
+            // unordered — so when `after_uid` is the folder's highest UID, `after+1:*` resolves to
+            // that last message rather than to nothing, and every sync would re-store it for ever.
+            // (The loopback fixture is deliberately faithful to this; it is what caught the missing
+            // filter here.) Dropping the low ones also stops them wasting a slot of the page below.
+            uids.retain(|uid| *uid > after_uid);
+            uids.sort_unstable();
+            // **Keep the OLDEST `limit`, never the newest.** The cursor only advances to the highest
+            // UID we actually stored (`sync::advance_cursor`), so dropping the *old* end would move
+            // it past messages that were never stored and they could never be fetched again — a
+            // permanent hole in the mailbox. Keeping the oldest makes the next pass resume exactly
+            // where this one stopped.
+            //
+            // History: an earlier version kept the newest (`split_off`), which silently skipped every
+            // UID between `after_uid + 1` and the kept batch whenever more than `SYNC_BATCH` messages
+            // arrived at once (laptop offline for a week, a big label, a mail archive copy).
+            // See design/04-sync.md §5.3 and design/A2-final-review.md.
+            if limit > 0 && uids.len() > limit {
+                uids.truncate(limit);
+            }
+            if uids.is_empty() {
+                return Ok(HeaderPage {
+                    uidvalidity,
+                    summaries: Vec::new(),
+                });
+            }
+
+            let set = uids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
             let mut stream = self
                 .session
                 .uid_fetch(&set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])")
@@ -582,24 +629,9 @@ impl ImapClient {
 
             let mut summaries = Vec::new();
             while let Some(fetch) = stream.try_next().await.map_err(imap_err)? {
-                let summary = summarise(&fetch);
-                if summary.uid > after_uid {
-                    summaries.push(summary);
-                }
+                summaries.push(summarise(&fetch));
             }
             summaries.sort_by_key(|m| m.uid);
-
-            // **Keep the OLDEST `limit` of this batch, never the newest.** The cursor only advances
-            // to the highest UID we actually stored (`sync::advance_cursor`), so dropping the *old*
-            // end would move the cursor past messages that were never stored and they could never be
-            // fetched again — a permanent hole in the mailbox. Keeping the oldest makes the next
-            // pass start exactly where this one stopped.
-            //
-            // History: this used to keep the newest (`split_off`), which silently skipped every UID
-            // between `after_uid + 1` and the kept batch whenever more than `SYNC_BATCH` messages
-            // arrived at once (laptop offline for a week, a big label, a mail archive copy).
-            // See design/04-sync.md §5.3 and design/A2-final-review.md.
-            let summaries = keep_oldest_page(summaries, limit);
 
             Ok(HeaderPage {
                 uidvalidity,
@@ -975,9 +1007,17 @@ impl ImapClient {
         } = self;
 
         let mut handle = session.idle();
-        // Sends IDLE and waits for the `+` continuation; a server without IDLE answers BAD here,
-        // which is how the caller finds out polling is needed instead.
-        handle.init().await.map_err(imap_err)?;
+        // Sends IDLE and waits for the `+` continuation. A server without IDLE answers BAD here,
+        // which async-imap surfaces as a synthetic `io::Error`; that is turned into
+        // `MailError::IdleUnsupported` so the watcher can fall back to polling instead of
+        // reconnecting a command the server will refuse every time.
+        handle.init().await.map_err(|error| {
+            if idle_refused(&error) {
+                MailError::IdleUnsupported(host.clone())
+            } else {
+                imap_err(error)
+            }
+        })?;
 
         // The `StopSource` is deliberately kept alive for the duration of the await; dropping it
         // would cancel the wait. A pushed response that the library does surface ends the wait
@@ -1497,24 +1537,23 @@ mod tests {
     }
 
     #[test]
-    fn the_since_range_is_bounded_by_the_page_size() {
-        // 500 is SYNC_BATCH: asking for `501:1000` rather than `501:*` is what stops a big burst
-        // from streaming headers we are about to throw away.
-        assert_eq!(since_range(500, 500), "501:1000");
-        assert_eq!(since_range(0, 200), "1:200");
-    }
-
-    #[test]
-    fn the_since_range_stays_open_ended_without_a_limit() {
-        assert_eq!(since_range(500, 0), "501:*");
-        assert_eq!(since_range(0, 0), "1:*");
+    fn the_since_range_is_open_ended_so_sparse_uids_are_not_missed() {
+        // The bug this pins (found on a real 163 mailbox): the high end used to be
+        // `after_uid + limit`, i.e. a numeric window such as `1:500`. IMAP UIDs are not dense — that
+        // mailbox's UIDs were ~1.54e9 — so the window matched nothing, the folder never synced, and
+        // the cursor never moved: a full web inbox and an empty client. The range must be open-ended;
+        // the *page* is enforced afterwards by `fetch_headers_since` truncating the SEARCH result to
+        // the oldest `limit`.
+        assert_eq!(since_range(0), "1:*");
+        assert_eq!(since_range(500), "501:*");
+        assert_eq!(since_range(1_542_128_699), "1542128700:*");
     }
 
     #[test]
     fn the_since_range_does_not_overflow_at_the_top_of_the_uid_space() {
-        // A hostile or broken server could report UIDNEXT near u32::MAX; the range must stay a
-        // valid number rather than panicking in debug builds.
-        assert_eq!(since_range(u32::MAX, 10), "4294967295:4294967295");
-        assert_eq!(since_range(u32::MAX - 1, 10), "4294967295:4294967295");
+        // A hostile or broken server could report the cursor at u32::MAX; `+ 1` must saturate rather
+        // than panic in a debug build, and the range must stay a valid number.
+        assert_eq!(since_range(u32::MAX), "4294967295:*");
+        assert_eq!(since_range(u32::MAX - 1), "4294967295:*");
     }
 }

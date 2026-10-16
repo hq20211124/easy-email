@@ -68,11 +68,19 @@ pub struct ClientChoice {
     pub auth_endpoint: Option<String>,
     #[serde(default)]
     pub token_endpoint: Option<String>,
-    /// `own` when the user brought their own registration; `missing` when we have nothing to offer.
+    /// `own` when the user brought their own registration; `trial` when a borrowed one may be tried
+    /// behind an explicit button; `missing` when we have nothing to offer.
     pub source: String,
     /// Empty for one's own registration; the notice to show for a borrowed one.
     #[serde(default)]
     pub notice: String,
+    /// True when the wizard may offer the borrowed registration behind its own button.
+    ///
+    /// Never prefilled: `client_id` is empty either way, so the ordinary path stays "bring your own".
+    /// See [`trial_registration`] for why a borrowed value is offered at all, and
+    /// [`NO_BUILT_IN_REGISTRATION`] for why nothing is filled in silently.
+    #[serde(default)]
+    pub trial: bool,
 }
 
 /// There is **no** built-in OAuth client registration, on purpose.
@@ -96,7 +104,49 @@ pub struct ClientChoice {
 /// three available routes: own client ID, own client ID with a secret, or an app-specific password.
 pub const NO_BUILT_IN_REGISTRATION: &str = "这个服务商需要 OAuth 客户端 ID。请把你自己的注册填进来\
      （Google Cloud / Azure 门户里建一个「桌面应用」类型，把下载的 JSON 放进应用数据目录），\
-     或者改用应用专用密码。本应用不内置任何第三方注册。";
+      或者改用应用专用密码。本应用不内置任何第三方注册。";
+
+/// Mozilla's published Thunderbird registration for **Microsoft**, offered only behind an explicit
+/// button and never prefilled.
+///
+/// The 2026-10-06 decision removed every borrowed registration outright (see
+/// [`NO_BUILT_IN_REGISTRATION`]). This one comes back as an *opt-in* affordance: a personal
+/// outlook.com account cannot create an Azure application at all, so without something there is no way
+/// to read that mail, while every objection above is about a value being *silently used* — the consent
+/// screen naming Mozilla, and the registration being revocable. So it is a button whose label says
+/// whose registration it is, with the notice below it, and nothing typed into a field for the user.
+/// Gmail deliberately gets no such button: it has an app-password route that Microsoft does not.
+///
+/// The value is Mozilla's, from `OAuth2Providers.sys.mjs`; their own comment above it asks that it not
+/// be copied, which is exactly why this is opt-in and plainly labelled rather than baked in.
+pub const TRIAL_MICROSOFT_CLIENT_ID: &str = "9e5f94bc-e8a4-4e73-b8be-63364c29d753";
+
+/// The notice that goes with [`TRIAL_MICROSOFT_CLIENT_ID`].
+pub const TRIAL_MICROSOFT_NOTICE: &str = "试用会借用 Mozilla 公开发布的 Thunderbird 注册：\
+     授权页上会显示「Mozilla Thunderbird」，而不是本应用；Mozilla 可以随时撤销它，\
+     撤销后这条路就失效了。正式使用请换成你自己在 Azure 注册的客户端 ID（见「高级」）。";
+
+/// Microsoft's endpoints with the redirect Mozilla's registration expects.
+///
+/// The two routes differ in the redirect host, not only the client id: Mozilla's app is registered
+/// for the IP literal (Thunderbird's own flow advertises `http://127.0.0.1`), whereas a
+/// self-registered app must use `localhost`, because the Azure portal refuses to save `127.0.0.1`
+/// (measured 2026-10-04). Getting this backwards is a `redirect_uri_mismatch` that reads like a typo.
+pub const MICROSOFT_TRIAL: OAuthProvider = OAuthProvider {
+    redirect_host: "127.0.0.1",
+    ..MICROSOFT
+};
+
+/// The borrowed registration to offer behind a button, if this provider has one.
+///
+/// A function rather than a match at the call site so the wizard asks in one place, and so adding a
+/// second provider is a change here rather than in two languages.
+pub fn trial_registration(provider_id: &str) -> Option<(&'static str, &'static str)> {
+    match provider_id {
+        "outlook" => Some((TRIAL_MICROSOFT_CLIENT_ID, TRIAL_MICROSOFT_NOTICE)),
+        _ => None,
+    }
+}
 
 impl OAuthProvider {
     /// This provider's endpoints, overridden by the ones the client registration names.
@@ -131,10 +181,10 @@ impl OAuthProvider {
 
 /// Decide what to offer for one provider.
 ///
-/// `_provider_id` is kept in the signature because the answer used to depend on it (Gmail got the
-/// borrowed registration). It is now the same for every provider — ask the user — and the parameter
-/// stays so the call sites and the tests keep naming the provider they are asking about.
-pub fn client_choice(_provider_id: &str, own: crate::oauthclient::Registration) -> ClientChoice {
+/// `provider_id` decides only one thing since 2026-10-06: whether a **borrowed** registration may be
+/// offered behind an explicit button (`trial_registration`, Microsoft only). It never decides what is
+/// prefilled — nothing is — so the parameter is about the button, not the fields.
+pub fn client_choice(provider_id: &str, own: crate::oauthclient::Registration) -> ClientChoice {
     if let crate::oauthclient::Registration::Own { registration } = own {
         return ClientChoice {
             // Filled in by the command layer, which has the provider table at hand.
@@ -145,11 +195,27 @@ pub fn client_choice(_provider_id: &str, own: crate::oauthclient::Registration) 
             token_endpoint: registration.token_uri,
             source: "own".to_string(),
             notice: String::new(),
+            trial: false,
         };
     }
 
-    // No registration of the user's. Every provider is asked the same way — Gmail included, since
-    // 2026-10-06: the borrowed Thunderbird registration is gone (see `NO_BUILT_IN_REGISTRATION`).
+    // The user has no registration of their own. For Microsoft the wizard may still offer the borrowed
+    // one behind its own button; nothing is prefilled for it either. Every other provider is simply
+    // asked to bring its own — Gmail included, since the borrowed Thunderbird registration is gone
+    // (`NO_BUILT_IN_REGISTRATION`) and Gmail has an app-password route that Microsoft does not.
+    if let Some((_client_id, notice)) = trial_registration(provider_id) {
+        return ClientChoice {
+            oauth_available: false,
+            client_id: String::new(),
+            client_secret: None,
+            auth_endpoint: None,
+            token_endpoint: None,
+            source: "trial".to_string(),
+            notice: notice.to_string(),
+            trial: true,
+        };
+    }
+
     ClientChoice {
         oauth_available: false,
         client_id: String::new(),
@@ -158,6 +224,7 @@ pub fn client_choice(_provider_id: &str, own: crate::oauthclient::Registration) 
         token_endpoint: None,
         source: "missing".to_string(),
         notice: NO_BUILT_IN_REGISTRATION.to_string(),
+        trial: false,
     }
 }
 
@@ -1779,7 +1846,10 @@ mod tests {
         // This test used to assert the opposite: that Gmail fell back to Mozilla's published
         // Thunderbird registration. That fallback is gone (see `NO_BUILT_IN_REGISTRATION`), and the
         // assertion is inverted rather than deleted so the decision cannot be quietly undone.
-        for provider in ["gmail", "outlook", "qq", "163"] {
+        //
+        // Outlook is deliberately not in this list any more: since the opt-in trial it answers
+        // `trial`, and what it offers is still nothing *prefilled* — its own test below pins that.
+        for provider in ["gmail", "qq", "163"] {
             let choice = client_choice(provider, crate::oauthclient::Registration::Missing);
             assert!(
                 choice.client_id.is_empty(),
@@ -1799,12 +1869,48 @@ mod tests {
     }
 
     #[test]
-    fn microsoft_gets_no_invented_registration() {
-        // There is no published equivalent for Microsoft, and making one up would be worse than
-        // asking the user for theirs.
+    fn microsoft_offers_a_borrowed_registration_only_behind_an_explicit_button() {
+        // The 2026-10-06 decision was that nothing borrowed is *used*; the compromise is that one may
+        // be *offered*, opt-in. Both halves are asserted so neither drifts back:
         let choice = client_choice("outlook", crate::oauthclient::Registration::Missing);
-        assert!(choice.client_id.is_empty());
-        assert_eq!(choice.source, "missing");
+        assert!(
+            choice.client_id.is_empty(),
+            "the borrowed id must never be prefilled into the field"
+        );
+        assert!(choice.client_secret.is_none(), "and it brings no secret");
+        assert!(choice.trial, "but the wizard is told a trial exists");
+        assert_eq!(choice.source, "trial");
+        assert!(
+            choice.notice.contains("Mozilla") && choice.notice.contains("撤销"),
+            "the notice must name whose registration it is and that it can be revoked: {}",
+            choice.notice
+        );
+
+        // Every other provider is still simply asked to bring its own.
+        for provider in ["gmail", "qq", "163"] {
+            assert!(
+                !client_choice(provider, crate::oauthclient::Registration::Missing).trial,
+                "{provider} must not be offered a borrowed registration"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trial_registration_uses_the_redirect_mozilla_registered() {
+        // The two Microsoft routes differ in the redirect, not only the client id: Mozilla's app is
+        // registered for the IP literal, while a self-registered app must use `localhost` because the
+        // Azure portal refuses `127.0.0.1` (measured 2026-10-04). Getting it backwards fails with a
+        // `redirect_uri_mismatch` that reads like a typo, so it is pinned here.
+        assert_eq!(MICROSOFT.redirect_host, "localhost");
+        assert_eq!(MICROSOFT_TRIAL.redirect_host, "127.0.0.1");
+        // Everything else about the two is identical, scope included.
+        assert_eq!(MICROSOFT_TRIAL.auth_endpoint, MICROSOFT.auth_endpoint);
+        assert_eq!(MICROSOFT_TRIAL.token_endpoint, MICROSOFT.token_endpoint);
+        assert_eq!(MICROSOFT_TRIAL.scope, MICROSOFT.scope);
+        assert_eq!(
+            MICROSOFT_TRIAL.needs_offline_params,
+            MICROSOFT.needs_offline_params
+        );
     }
 
     // ---------------------------------------------------------------- the loopback callback

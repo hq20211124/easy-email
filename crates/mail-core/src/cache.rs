@@ -27,7 +27,16 @@ use crate::error::{MailError, Result};
 use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 
 /// Bumped whenever the schema below changes; [`Cache::migrate`] reacts to it.
-pub const SCHEMA_VERSION: i64 = 7;
+///
+/// **`migrate` returns early when the stored version equals this one — so adding a statement to the
+/// migration body without bumping this constant silently skips it** for every file that already
+/// reached the current version. That is exactly what happened to the `bodies.index_version` column:
+/// it was added to the v7 body after some files were already at 7, so those files kept a `bodies`
+/// table with no such column, and every query that reads it (`bodies_pending`, the index coverage)
+/// failed with `no such column: index_version` the moment an account actually had a message to index
+/// — a dead end that only shows up once mail arrives. Bumping to 8 runs the (idempotent)
+/// `add_column_if_missing` calls once more and repairs those files.
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Which index shape a `bodies` row was last written by.
 ///
@@ -860,6 +869,22 @@ impl Cache {
             },
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The date of the oldest message cached for this account, across all its folders.
+    ///
+    /// What "how far back can this account see" means in practice. Used to decide whether a
+    /// server-side range cap plausibly explains a folder with no older mail
+    /// (`providers::looks_like_a_range_cap`) — a mailbox whose floor is years old has simply been read
+    /// to its bottom, and telling the user to widen a setting then would be wrong.
+    pub fn oldest_message_date(&self, account_id: &str) -> Result<Option<i64>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn.query_row(
+            "select min(date) from messages where account_id = ?1 and date is not null",
+            params![account_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// Every cached message that belongs to one conversation, oldest first.
@@ -3417,6 +3442,56 @@ mod tests {
         );
         cache.rebuild_with_auto_vacuum().expect("rebuild");
         assert!(!cache.needs_auto_vacuum_rebuild().expect("check"));
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A column added to the migration body **without a version bump** never reaches a file already
+    /// at that version, because `migrate` returns early on `version == SCHEMA_VERSION`.
+    ///
+    /// That is a real failure, not a hypothetical: `bodies.index_version` was added to the v7 body
+    /// after some files were already at 7, so those files kept a `bodies` table without the column
+    /// and every index query failed with `no such column: index_version` the first time an account
+    /// had a message to index — a dead end that only shows up once mail arrives. The bump to 8 is
+    /// what re-runs the (idempotent) column adds; this test is the proof that it does.
+    #[test]
+    fn a_file_at_the_previous_version_gains_a_column_added_without_a_later_bump() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-stale-column-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        {
+            // A v7-shaped file whose `bodies` table predates `index_version` — the `messages` table is
+            // present so the only thing the query can trip over is the missing column itself.
+            let conn = Connection::open(&path).expect("legacy open");
+            conn.execute_batch(
+                "pragma user_version = 7;
+                 create table messages (
+                     account_id text not null, folder text not null, uid integer not null,
+                     subject text not null default '', from_name text, from_addr text, to_addrs text,
+                     date integer, size integer, seen integer not null default 0,
+                     flagged integer not null default 0,
+                     primary key (account_id, folder, uid)
+                 );
+                 create table bodies (
+                     account_id text not null, folder text not null, uid integer not null,
+                     detail text not null, fetched_at integer not null,
+                     primary key (account_id, folder, uid)
+                 );",
+            )
+            .expect("legacy schema");
+        }
+
+        let cache = Cache::open(&path).expect("open must migrate a v7 file");
+        // The whole point: the query that reads the column now runs instead of erroring.
+        cache
+            .bodies_pending_count("acc")
+            .expect("the index query must run, not fail with 'no such column: index_version'");
+        assert_eq!(cache.schema_version().expect("version"), SCHEMA_VERSION);
         drop(cache);
         let _ = std::fs::remove_file(&path);
     }

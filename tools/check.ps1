@@ -335,6 +335,44 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the borrowed Microsoft registration is offered, never prefilled' {
+        # The compromise the user chose: Mozilla's published registration may be *offered* behind an
+        # explicit button, but nothing goes into the fields and nothing is used without a click. The
+        # value has to live in exactly one place, or the button and the flow drift apart silently.
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $core = Get-Content 'crates/mail-core/src/oauth.rs' -Raw -Encoding UTF8
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+
+        $problems = @()
+        # Written as a fragment so this file stays ASCII (a Chinese literal here would need a BOM).
+        $borrowed = '9e5f94bc-e8a4-4e73-b8be-63364c29d753'
+        $inCore = ([regex]::Matches($core, [regex]::Escape($borrowed))).Count
+        $inLib = ([regex]::Matches($lib, [regex]::Escape($borrowed))).Count
+        if ($inCore -ne 1 -or $inLib -ne 0) {
+            $problems += "the borrowed Microsoft client id must be defined exactly once, in crates/mail-core/src/oauth.rs (oauth.rs=$inCore, lib.rs=$inLib)"
+        }
+        if ($core -notmatch 'fn trial_registration\(') {
+            $problems += 'oauth.rs: trial_registration is missing'
+        }
+        if ($core -notmatch 'pub const MICROSOFT_TRIAL' -or $lib -notmatch 'MICROSOFT_TRIAL') {
+            $problems += 'the trial provider (MICROSOFT_TRIAL) is missing from the core or the command layer'
+        }
+        if ($js -notmatch 'wiz-oauth-trial') {
+            $problems += 'app.js: the trial affordance (#wiz-oauth-trial) is missing'
+        }
+        if ($js -notmatch 'trial:') {
+            $problems += 'app.js: oauth_sign_in must be told whether this is the trial'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the borrowed Microsoft registration is offered behind a button and never prefilled'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'the update chain is signed, and the key is content rather than a path' {
         # V2-C2. Three properties that must all hold, because each one alone is worthless:
         #   * signature verification is the updater's own and cannot be disabled (official docs), so
@@ -818,6 +856,58 @@ try {
             return
         }
         Write-Host 'the list renders a window, and the row height has one home'
+        $global:LASTEXITCODE = 0
+    }
+
+    Step 'every frontend module global is actually reached from app.js' {
+        # A module can be loaded, unit-tested, and never wired up: `vlist.js` exported
+        # `__easyEmailVList` while `app.js` used a bare `vlist` that nothing defined, so the app died
+        # at boot with "vlist is not defined" while every test and the rest of this gate stayed green.
+        # No test can see a name that is never bound, so the contract is checked here: every
+        # `__easyEmail<Name>` a module exposes must be referenced from app.js somewhere.
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $problems = @()
+        foreach ($file in (Get-ChildItem 'src/*.js')) {
+            if ($file.Name -eq 'app.js') { continue }
+            $text = Get-Content $file.FullName -Raw -Encoding UTF8
+            foreach ($m in [regex]::Matches($text, '__easyEmail[A-Za-z]+')) {
+                if ($js -notmatch [regex]::Escape($m.Value)) {
+                    $problems += "src/$($file.Name) exposes $($m.Value) but app.js never references it"
+                }
+            }
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'every module global is reached from app.js'
+        $global:LASTEXITCODE = 0
+    }
+
+    Step 'the mail list keeps the backend date order, not a UID sort' {
+        # UIDs ascend with *arrival*, not with the `Date:` header, so sorting the list by UID puts
+        # backdated mail (a newsletter, a forwarded copy) in the wrong place and the list reads as
+        # "not sorted by time". Measured on a real cache: QQ's INBOX had 17 such rows, 163 and Gmail
+        # one each. The backend already orders by `date desc, uid desc` (`cache::list_summaries`),
+        # which is what the renderer must keep rather than override.
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $problems = @()
+        if ($js -match '=>\s*[ab]\.uid\s*-\s*[ba]\.uid') {
+            $problems += 'app.js sorts the mail list by UID — UID order is arrival order, not date order'
+        }
+        if ($cache -notmatch 'order by date desc, uid desc') {
+            $problems += 'cache.rs no longer orders the list by date desc, uid desc'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the list keeps the backend date order'
         $global:LASTEXITCODE = 0
     }
 

@@ -256,6 +256,9 @@ enum Idle {
     /// Push an `EXISTS` and then hang up, which is how a server ends an idle session it no longer
     /// wants. Needed to exercise the reconnect path without waiting for a real timeout.
     AnnounceThenHangUp,
+    /// Refuse `IDLE` with a tagged `BAD` — what a server without RFC 2177 does. 163 answers
+    /// `command not support`, which is the wording used so the fixture matches the real response.
+    Reject,
 }
 
 /// Knobs the fake server needs.
@@ -609,8 +612,16 @@ async fn serve_imap(
                 }
             }
             "IDLE" => {
-                write.write_all(b"+ idling\r\n").await?;
                 let behaviour = *idle.lock().unwrap();
+
+                // A server without RFC 2177 refuses the command and the connection stays open. The
+                // client must read this as "poll instead", not as "the connection dropped".
+                if behaviour == Idle::Reject {
+                    bad(&mut write, &tag, "command not support").await?;
+                    continue;
+                }
+
+                write.write_all(b"+ idling\r\n").await?;
 
                 if behaviour != Idle::Quiet {
                     // Let the client actually be idling before pushing, then announce one more
@@ -3185,6 +3196,18 @@ fn saw_command(log: &Transcript, command: &str) -> bool {
     })
 }
 
+/// How many times a command was sent, for tests that care about *not* repeating one.
+fn command_count(log: &Transcript, command: &str) -> usize {
+    transcript(log)
+        .iter()
+        .filter(|line| {
+            line.split(' ')
+                .nth(1)
+                .is_some_and(|verb| verb.eq_ignore_ascii_case(command))
+        })
+        .count()
+}
+
 #[tokio::test]
 async fn the_pool_reuses_an_idle_connection_instead_of_handshaking_again() {
     let (addr, log) = spawn_imap(true).await;
@@ -3369,6 +3392,101 @@ async fn idle_recovers_after_the_server_drops_the_connection() {
     assert!(
         matches!(seen.get(2), Some(PushEvent::Changed { .. })),
         "and the message that arrived meanwhile must still be reported. got {seen:?}"
+    );
+}
+
+/// Round 97 — a server that refuses `IDLE` must be polled, not reconnected forever.
+///
+/// 163 answers a tagged `BAD command not support`. Treating that as a dropped connection (which is
+/// what the watcher did until this round) made it reconnect without end — 420 attempts on a real
+/// profile — and never deliver a push. The refusal has to switch the watcher to polling, once.
+#[tokio::test]
+async fn a_server_that_refuses_idle_is_polled_instead_of_retried() {
+    let (addr, log) = spawn_server(Server {
+        uidplus: true,
+        idle: Arc::new(Mutex::new(Idle::Reject)),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+    let watcher = tokio::spawn(watch_every(
+        cfg.clone(),
+        "app-password".to_string(),
+        "INBOX".to_string(),
+        Duration::from_millis(150),
+        tx,
+    ));
+
+    // Reported once, so the caller can tell that push is off for this account.
+    let event = within(async { rx.recv().await })
+        .await
+        .expect("the refusal must be reported");
+    assert!(
+        matches!(event, PushEvent::IdleUnsupported { .. }),
+        "got {event:?}"
+    );
+
+    // Several windows' worth of time for the reconnect storm to show up if it still existed.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    watcher.abort();
+
+    assert_eq!(
+        command_count(&log, "IDLE"),
+        1,
+        "the refused IDLE must not be retried — the retry is the infinite reconnect loop this fix removes"
+    );
+    assert!(
+        saw_command(&log, "SELECT"),
+        "the watcher must fall back to polling with SELECT"
+    );
+}
+
+/// The fallback has to keep delivering mail, not merely stop the storm: a message that arrives while
+/// the watcher is polling must still produce a change.
+#[tokio::test]
+async fn polling_still_reports_an_arrival_after_idle_is_refused() {
+    let extra = Arc::new(AtomicU32::new(0));
+    let (addr, _log) = spawn_server(Server {
+        uidplus: true,
+        idle: Arc::new(Mutex::new(Idle::Reject)),
+        extra: Arc::clone(&extra),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+    let watcher = tokio::spawn(watch_every(
+        cfg.clone(),
+        "app-password".to_string(),
+        "INBOX".to_string(),
+        Duration::from_millis(150),
+        tx,
+    ));
+
+    let first = within(async { rx.recv().await })
+        .await
+        .expect("the refusal must be reported");
+    assert!(
+        matches!(first, PushEvent::IdleUnsupported { .. }),
+        "got {first:?}"
+    );
+
+    // A message arrives after the watcher has fallen back to polling.
+    extra.fetch_add(1, Ordering::SeqCst);
+    let next = within(async { rx.recv().await })
+        .await
+        .expect("the arrival must be reported by a poll");
+    watcher.abort();
+
+    assert_eq!(
+        next,
+        PushEvent::Changed {
+            mailbox: "INBOX".to_string()
+        },
+        "polling must still deliver new mail"
     );
 }
 

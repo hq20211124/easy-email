@@ -184,6 +184,26 @@ impl Provider {
     }
 }
 
+/// How fresh the oldest visible message has to be for a range cap to be the *likely* explanation.
+///
+/// Only decides whether to say anything at all (see [`looks_like_a_range_cap`]). A NetEase mailbox
+/// whose oldest cached message is years old has simply been read to its bottom — the user widened the
+/// setting, or was never capped — and pointing at a setting then is worse than saying nothing.
+pub const RANGE_CAP_FLOOR_DAYS: i64 = 60;
+
+/// Whether "the server only hands us the most recent stretch" plausibly explains what we can see.
+///
+/// The signal is the observed floor. If the oldest message we can read anywhere in the account is
+/// recent, something is probably cutting the mailbox short; if it is old, we are simply at the end.
+/// `None` (nothing cached) says nothing: an empty mailbox is not evidence of a cap, and a hint there
+/// would be the "go change a setting that does not exist" mistake this rule exists to avoid.
+pub fn looks_like_a_range_cap(oldest_visible: Option<i64>, now: i64) -> bool {
+    match oldest_visible {
+        Some(date) => now.saturating_sub(date) <= RANGE_CAP_FLOOR_DAYS * 24 * 60 * 60,
+        None => false,
+    }
+}
+
 use AuthKind::{AppPassword, OAuth2, Password};
 use Security::{Plain, Ssl, StartTls};
 
@@ -898,6 +918,29 @@ mod tests {
                 .range_cap_is_enterprise_policy()
         );
         assert!(!by_id("163").expect("163").range_cap_is_enterprise_policy());
+    }
+
+    #[test]
+    fn the_range_cap_hint_needs_evidence_not_just_a_netease_account() {
+        // The hint is a sentence telling the user to go and change a setting, so it must not appear
+        // merely because the account is NetEase and a folder has no older mail. That is exactly what
+        // it used to do: it kept appearing *after* the setting had been widened, on a mailbox that had
+        // been read all the way back to 2018 — a hint that survives being acted on teaches people to
+        // ignore hints.
+        let now = 1_700_000_000i64;
+        let day = 24 * 60 * 60;
+
+        // A floor inside the window: something is plausibly cutting the mailbox short.
+        assert!(looks_like_a_range_cap(Some(now - 20 * day), now));
+        assert!(looks_like_a_range_cap(
+            Some(now - RANGE_CAP_FLOOR_DAYS * day),
+            now
+        ));
+        // A floor well outside it: this is simply the end of the mailbox.
+        assert!(!looks_like_a_range_cap(Some(now - 300 * day), now));
+        assert!(!looks_like_a_range_cap(Some(now - 8 * 365 * day), now));
+        // Nothing cached is not evidence of anything.
+        assert!(!looks_like_a_range_cap(None, now));
     }
 
     #[test]

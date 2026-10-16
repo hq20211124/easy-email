@@ -11,6 +11,183 @@
   `tools/check.ps1` **全绿**：**15 步**（8 项前端/契约不变量 + "命令共享一个数据库句柄" +
   "回填不得推进增量游标" + fmt + clippy -D warnings + build + test + PE=2）。
 
+### 网易 163 的推送把日志刷爆：服务器不支持 IDLE，却被当成「连接断了」（第 97 轮）🐞
+
+**现象**（用户真实日志 `startup-error.log`）：163 账号下反复出现
+`推送连接失败：IMAP 协议错误 — io: command not support` 紧跟着
+`INBOX 的推送连接已重连（第 N 次尝试）`，N 一直往上走，共 **420 条**。
+
+**根因**：163 的 IMAP 不实现 `IDLE`（RFC 2177），对 `IDLE` 回一个 tagged
+`BAD command not support`。`async-imap` 把这条 BAD 包成 `io::Error`（kind = `ConnectionRefused`，
+见其 `extensions/idle.rs`），而 `idle.rs` 一律把它当成「连接丢了」⇒ **无限重连**，去重试一个
+服务器已经明确拒绝、永远不可能成功的命令。推送从未生效，日志却一直在涨。收信不受影响
+（163 走的是定时同步）。这也解释了为什么这批失败**紧跟在**「已开始监听 …@163.com 的 INBOX」之后。
+
+**修法**：认出这条拒绝信号并**降级为轮询**（设计里的 L3，`design/04` §5.4）：
+- `crates/mail-core/src/error.rs`：新增 `MailError::IdleUnsupported`。**单独一个变体**是关键——
+  `Imap` 的语义是「连接丢了、要重试」，而「服务器说不支持」重试一万次也没用。
+- `crates/mail-core/src/imap.rs`：`idle_refused()` 按 **error kind**（`ConnectionRefused` 且带
+  服务器原文）判定，**不匹配服务器措辞**（各服务商说法不同）；`idle_then_count` 的 `init()`
+  失败转成这个变体。
+- `crates/mail-core/src/idle.rs`：首次被拒后把 `poll_only` **锁住**，此后每个窗口做一次 `SELECT`
+  比对（复用 `announce_if_changed`），并只上报一次 `PushEvent::IdleUnsupported`。
+- `src-tauri/src/lib.rs`：记一行日志（不再算 `Failed`，也不再刷屏）。
+
+**轮询节奏**：复用同一个窗口参数（生产的 120 s），不另设一个常量——设计写的是"默认 3 分钟"，
+120 s 更勤、不会更慢，而且**只有一个旋钮**，不会和 IDLE 心跳漂移。
+
+**验证**：loopback 夹具新增 `Idle::Reject`（回 `BAD command not support`，连接不关）；两个新测试——
+`a_server_that_refuses_idle_is_polled_instead_of_retried`（断言 `IDLE` **只发了 1 次**、之后走
+`SELECT`）和 `polling_still_reports_an_arrival_after_idle_is_refused`（断言降级后仍能收到新邮件）。
+既有 IDLE 测试（推送、服务器断开重连）不受影响。
+
+### 「还在提示只收 30 天」：提示只认服务商，不认证据（第 96 轮）🐞
+
+用户改完网易「收取范围＝全部」、邮件也全拉下来了（回填到 2018），却**仍然**看到
+"该邮箱只允许第三方客户端读取最近约 30 天"。原因：`range_cap_hint`（src-tauri）只看了一件事——
+`provider.caps_third_party_range()`（是不是网易系），**没有任何证据判据**。于是只要网易账号的回填
+走到"没有更早的"，它就把这句话当事实抛出来，包括"设置已经改好、邮箱真的到底了"的情况。
+一句**改完设置还在的提示**比不提示更糟：它教人忽略提示，还把人赶回一个已经改过的地方。
+
+**修法**：加证据判据 `providers::looks_like_a_range_cap(oldest_visible, now)` —— 只有**账号可见的
+最旧一封**落在最近 `RANGE_CAP_FLOOR_DAYS`（=60）天内时，才可能真是被截断；最旧一封是好几年以前的，
+就是邮箱到头了，什么都不说。`None`（没有缓存）同样不说：空邮箱不是证据。
+下界由 `cache::oldest_message_date(account_id)` 提供（跨该账号所有文件夹取 `min(date)`）。
+
+**验证**（用户真实 cache）：163 下界 2018-11-13（2894 天）⇒ **不再提示**；Gmail 2021 ⇒ 不提示；
+QQ 的 60 天判据为真但**不是网易系**，本来就被 `caps_third_party_range` 挡掉。新增单测
+`the_range_cap_hint_needs_evidence_not_just_a_netease_account`。
+
+### 列表"不按时间排"：前端把后端的时间序又按 UID 重排了一遍（第 96 轮）🐞
+
+用户："邮件排序好像不是按照时间先后的，可能不是全部都是这样。" —— "不是全部" 正是线索。
+
+后端 `list_messages` / `message_page` 走 `cache::list_summaries`，本来就是
+`order by date desc, uid desc`（**时间序**）。但 `app.js` 拿到第一页后又排了一次：
+`state.messages = messages.slice().sort((a, b) => b.uid - a.uid)`，注释写着
+"服务器返回递增 UID，人们想新的在上面"。
+
+**这个假设是错的**：UID 随**到达**递增，不随 `Date:` 头递增。一封"日期很旧、刚到"的邮件
+（改期发送的简报、转发的副本）拿到大 UID，就被排到前面 —— 看上去就是"没按时间排"，且只有
+**部分**行不对。它还会和分页打架：`加载更多` 是**追加**后端顺序（不重排），接缝处最明显。
+
+**测量**（真实 cache；按 UID desc 排后统计相邻行的日期逆序）：QQ INBOX **17 行**、Gmail 1、
+163 1。163 恰好几乎单调，所以看到问题的多半是 QQ 那个账号。
+
+**修法**：删掉那次重排，直接用后端顺序（`state.messages = messages.slice()`）。
+**新门禁**：`app.js` 不得再出现 `a.uid - b.uid` 这类列表排序，且 `cache.rs` 必须保留
+`order by date desc, uid desc`。
+
+**顺带记**：`state.messages = messages.slice().sort(...)` 早年是必要的（那时命令返回的确实是
+UID 升序）；`list_summaries` 改成按日期排之后，这一行就变成了**反过来覆盖**正确顺序的 bug，
+注释却还停在旧假设上。
+
+### 网易 163 收不到邮件：UID 区间不是"一页"，外加一处从没跑过的迁移（第 96 轮）🐞🐞
+
+用户："网易我登陆了，但是收件有问题，没收到，说是只收 30 天，但我看收件箱有新邮件。"
+日志给出真相（`%APPDATA%\com.easyemail.desktop\startup-error.log`）：
+
+```
+已开始监听 [..]@163.com 的 INBOX
+推送连接失败：IMAP 协议错误 — io: command not support
+同步 INBOX：新增 0 封，缓存共 0 封
+回填到窗口边界 years:2：0 页 / 0 封 / 0 字节
+```
+
+**两个 bug：**
+
+1. **增量取件把"一页"写成了 UID 数值区间。** `since_range(after_uid, limit)` 产出
+   `{after+1}:{after+limit}`（冷启动就是 `1:500`）。但 **IMAP 的 UID 不连续**：实测这个 163 邮箱的
+   UID 是 **1542128680…1542128699**（时间戳量级），`UID FETCH 1:500` 一条都匹配不到 ⇒
+   每次同步 0 封、游标永远停在 0 ⇒ **永久死锁**。修法：`since_range` 只产出开区间 `{after+1}:*`，
+   先 `UID SEARCH` 拿 UID，再把**最旧的 `limit` 条** `UID FETCH` 回来（有界靠这次截断，不是 UID 算术）；
+   没新邮件时还省掉一次 FETCH。
+   > 修复中途 loopback 测试当场抓到我删掉了老的 `summary.uid > after_uid` 过滤：`low:*` 仍是**区间**，
+   > RFC 3501 规定区间无序，所以"游标 = 最高 UID"时它会解析成最后一封 ⇒ 每轮重复存同一封。
+   > 过滤已放回。
+
+2. **`bodies.index_version` 那列从来没被加上。** `Cache::migrate` 在 `version == SCHEMA_VERSION` 时
+   **直接 return**，所以"往 v7 迁移体里加一句、却没升版本号"的改动，对已经到 7 的库**永远不执行**。
+   用户的 `cache.db` 正是这个状态（`user_version=7`、`bodies` 无该列），于是
+   `bodies_pending_count` / 索引覆盖率一跑就 `no such column: index_version`——而这条错误直到
+   **账号真的有邮件要索引**时才显形。修法：`SCHEMA_VERSION` 7 → **8**（`add_column_if_missing`
+   幂等，跑一遍即修好旧库）。
+
+**为什么之前的检查没抓到：** ① 假服务器用稠密 UID（1..N），数值区间恰好成立，测不到稀疏 UID；
+② 迁移测试里没有"已在当前版本、却缺后来加的列"这种形状的库。
+
+**新增测试（先看着它红）**：`since_range` 单测钉住开区间（含真实量级）；
+`a_file_at_the_previous_version_gains_a_column_added_without_a_later_bump` 造一个
+`user_version=7`、`bodies` 无 `index_version` 的库，打开后索引查询必须能跑——把 `SCHEMA_VERSION`
+临时改回 7 时它报的正是用户日志里那句 `no such column: b.index_version`。
+
+**真机验证（同一台机器、同一个 163 账号）**：修后经 CDP 调 `list_messages(163, INBOX)` 返回
+**20 封**（UID 1542128680…1542128699），cache 20 行、游标推到 1542128699。
+
+**仍未修（已知，另案）**：163 不支持 `IDLE`，推送 watcher 会以 `command not support`
+**无限重连**（日志每 1–30 秒一行）。这不是"收不到"的原因，但该修：要么探测 CAPABILITY 后不启动
+watcher，要么退化成轮询——后者是产品取舍，留待拍板。
+
+### 修掉"启动失败：vlist is not defined"——模块导出了，却没人绑定（第 96 轮）🐞
+
+用户装上包后报"启动失败：vlist is not defined"。定位：虚拟列表模块 `src/vlist.js`（第 75/76 轮）
+导出的是 `global.__easyEmailVList`，而 `src/app.js` 在 2380/2385/2425 行用的是**裸名 `vlist`**——
+全仓没有任何地方定义它。列表在 `boot()` 里就被渲染，于是 `renderListWindow()` 抛 `ReferenceError`，
+整个应用起不来（错误经 `boot().catch` 变成那条 toast）。
+
+**为什么一直没被发现**：`tools/vlist_test.mjs` 测的是 `vlist.js` 的纯函数（它读 `__easyEmailVList`，
+所以模块本身是对的），`node --check` 只看语法，而门禁只钉了"`vlist.js` 存在且导出三个符号、
+`index.html` 加载它"——**没有一条检查 app.js 是否真的把这个名字绑上了**。模块被加载、被测过、
+却从没接上线，这正是"检查全绿、应用却起不来"的那一类洞。
+
+**修法**：在 app.js 的模块绑定块里补一行 `const vlist = window.__easyEmailVList;`
+（与 `payload`/`threads`/`reply`/`history` 同一处、同一形状）。
+
+**新门禁**：每个 `src/*.js` 暴露的 `__easyEmail<Name>` 都必须能在 `src/app.js` 里被引用到——
+补上这一条，"导出了但没接"就不能再悄悄过关。
+
+**验证**：修前该判据会对 `vlist.js` 报错；修后 `tools/check.ps1` **57 步全绿**（含新步）。
+
+### Outlook / M365 的「试用」入口：借用注册从"绝不内置"改成"显式的按钮"（第 96 轮）✅
+
+背景：用户要求"参考开源成功案例给 Outlook/M365 定稿，不做真机验证"。查证结果两条：
+- 我们的实现**已经**逐条匹配微软官方契约
+  （`the_microsoft_flow_matches_the_published_imap_smtp_oauth_contract`：`common` v2 端点、
+  三个资源 scope、`offline_access`、PKCE S256、公共客户端不带 secret、回调用 `localhost`
+  且匹配时忽略端口、XOAUTH2 串逐字节比对）；
+- 每个开源成功案例（Thunderbird / Mailspring / FairEmail / Evolution）都是**内置自己的注册**。
+  Thunderbird 的微软注册 `9e5f94bc-…` 用的回调是 **`http://127.0.0.1`**（`OAuth2.sys.mjs` 里
+  `redirectionEndpoint` 的默认值），与"自注册必须用 `localhost`（Azure 门户拒收 `127.0.0.1`，
+  2026-10-04 实测）"**不是同一个 host**。
+
+**这一轮把 2026-10-06 的"绝不内置"改成"可显式试用"**（用户拍板的折中，不是悄悄推翻）：
+- `oauth.rs`：新增 `TRIAL_MICROSOFT_CLIENT_ID`（Mozilla 的值，全仓唯一出处）、
+  `TRIAL_MICROSOFT_NOTICE`、`MICROSOFT_TRIAL`（与 `MICROSOFT` 只差 `redirect_host`：`127.0.0.1`）、
+  以及 `trial_registration(provider_id)`。`client_choice` 对 `outlook` 且无自有注册时返回
+  `source:"trial"`、`trial:true`，**`client_id` 仍为空（不预填）**。
+- `lib.rs`：`oauth_sign_in` 多一个 `trial: Option<bool>`；**只有显式按钮**会走借用注册
+  （客户端 ID 不由渲染层传，避免"碰巧匹配"就换掉回调）；`oauth_provider_for(provider_id, client_id)`
+  由**存下来的 client_id** 决定用哪个回调 host，所以 `oauth_relogin` 沿用同一条注册，
+  不需要多存一个标志。
+- `app.js`：`#wiz-oauth-trial` 按钮 + 旁边的提示；`beginOauth(trial)` 是两条路径**共用**的一段
+  （避免试用长出第二份错误处理）。
+- `check.ps1` 新增一步：借用的 client id 必须**恰好出现一次**且在 `oauth.rs`；
+  `trial_registration` / `MICROSOFT_TRIAL` / `#wiz-oauth-trial` / `trial:` 都在。
+- 测试：把两条钉住 2026-10-06 决定的测试**改写成新决定的形状**（不是删掉）——
+  `no_provider_gets_a_registration_we_do_not_own`（outlook 移出该列表）+
+  新的 `microsoft_offers_a_borrowed_registration_only_behind_an_explicit_button` +
+  `the_trial_registration_uses_the_redirect_mozilla_registered`。
+
+**验证**：`cargo check --workspace` 通过；`cargo test -p mail-core --lib` **405 passed / 0 failed**；
+`node --check src/app.js` 通过；新门禁的每条判据手工跑过（inCore=1 / inLib=0）。
+
+**未验**（如实记）：这条试用路由**没有在真实 Outlook 账号上走过**（用户明确"不做验证"）；
+借用注册可被 Mozilla 随时撤销；回调 `127.0.0.1` 与抛出的尾斜杠是否被 Azure 视为匹配
+**未经真机确认**，失败时页面会给出 `redirect_uri_mismatch`（已写进 README）。
+
+**顺带**：修了 README 一处文档漂移——已知限制里还写着"配额清理还没有 UI"，实际第 95 轮已接；
+并把 Outlook 那条已知限制改写成"推荐 BYO + 可试用"。
+
 ### 存储与清理的界面：先干跑、看懂了才动手（03 第三片，第 95 轮）✅
 
 第 93/94 轮做好了库层与命令，本轮接上**最后这一米**——`design/03` §5.4 的整条流程

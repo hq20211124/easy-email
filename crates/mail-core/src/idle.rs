@@ -16,11 +16,19 @@
 //! The watcher only *reports*. It deliberately does no fetching on its own connection — the whole
 //! point of IDLE is that this connection is otherwise idle, and doing work here would delay the next
 //! notification. Fetching is the caller's job, over a pooled connection.
+//!
+//! **A server that does not implement `IDLE` is polled, not retried.** RFC 2177 is optional, and a
+//! server that answers `BAD` to `IDLE` will answer `BAD` to every `IDLE` — reconnecting and trying
+//! again is a loop that can never succeed. NetEase's 163 does exactly this (`command not support`,
+//! round 97: 420 reconnect attempts, no push, no end). The watcher latches onto polling the first
+//! time it is refused and does one `SELECT` per window from then on, which is the design's L3
+//! fallback (`design/04-sync.md` §5.4).
 
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::error::MailError;
 use crate::imap::ImapClient;
 use crate::model::AccountConfig;
 
@@ -57,6 +65,9 @@ pub enum PushEvent {
     Reconnected { mailbox: String, attempt: u32 },
     /// An attempt failed. The watcher keeps retrying; this is for logging and for the UI.
     Failed { reason: String },
+    /// The server refused `IDLE`, so the watcher switched this mailbox to polling. Reported **once**;
+    /// every later cycle is a poll, not an `IDLE`.
+    IdleUnsupported { mailbox: String, reason: String },
 }
 
 /// Watch `mailbox` and report changes until the receiver is dropped.
@@ -81,32 +92,46 @@ pub async fn watch_every(
     events: mpsc::Sender<PushEvent>,
 ) {
     let mut backoff = BACKOFF_START;
-    let mut attempt = 0u32;
-    // The size last reported by the server, carried across reconnects: without that, a message that
-    // arrived while the connection was down would become the new baseline and never be announced.
-    let mut known: Option<u32> = None;
+    let mut watch = Watch {
+        known: None,
+        attempt: 0,
+        poll_only: false,
+    };
 
     loop {
         if events.is_closed() {
             return;
         }
 
-        match session_loop(
-            &cfg, &password, &mailbox, window, &events, attempt, &mut known,
-        )
-        .await
-        {
+        match session_loop(&cfg, &password, &mailbox, window, &events, &mut watch).await {
             // The receiver went away, i.e. the app is shutting this account down.
             Outcome::Stopped => return,
+            Outcome::IdleUnsupported { reason } => {
+                if events
+                    .send(PushEvent::IdleUnsupported {
+                        mailbox: mailbox.clone(),
+                        reason,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // Polling is the steady state now, not a retry: reset the backoff so the first poll
+                // waits one window instead of the longest one.
+                watch.poll_only = true;
+                watch.attempt = 0;
+                backoff = BACKOFF_START;
+            }
             Outcome::Lost { reason, cycles } => {
-                attempt += 1;
+                watch.attempt += 1;
                 let _ = events.send(PushEvent::Failed { reason }).await;
 
                 // A session that idled successfully before dying is an ordinary dropped connection,
                 // not a server that is down: start the backoff over.
                 if cycles > 0 {
                     backoff = BACKOFF_START;
-                    attempt = 1;
+                    watch.attempt = 1;
                 }
 
                 tokio::time::sleep(backoff).await;
@@ -116,11 +141,28 @@ pub async fn watch_every(
     }
 }
 
+/// What a watcher carries across sessions.
+struct Watch {
+    /// The size the server last reported. Carried across reconnects: without it, a message that
+    /// arrived while the connection was down would become the new baseline and never be announced.
+    known: Option<u32>,
+    /// Reconnects since a session last managed a full idle window. Reset when one did, which is how
+    /// an ordinary dropped connection is told apart from a server that is down.
+    attempt: u32,
+    /// Latched the first time the server refuses `IDLE`. Every later `IDLE` would be refused too, so
+    /// the watcher polls from then on. Without this latch the refusal is treated as a dropped
+    /// connection and the watcher reconnects forever — the round-97 bug: 163 answered
+    /// `command not support` and the log filled with reconnect attempts that could never succeed.
+    poll_only: bool,
+}
+
 enum Outcome {
     /// The receiver closed; stop entirely.
     Stopped,
     /// The connection was lost, after `cycles` completed idle windows.
     Lost { reason: String, cycles: u32 },
+    /// The server refused `IDLE` (`MailError::IdleUnsupported`). The watcher must switch to polling.
+    IdleUnsupported { reason: String },
 }
 
 async fn session_loop(
@@ -129,8 +171,7 @@ async fn session_loop(
     mailbox: &str,
     window: Duration,
     events: &mpsc::Sender<PushEvent>,
-    attempt: u32,
-    known: &mut Option<u32>,
+    watch: &mut Watch,
 ) -> Outcome {
     let mut client = match ImapClient::connect(cfg, password).await {
         Ok(client) => client,
@@ -154,11 +195,11 @@ async fn session_loop(
 
     // Announced only once the connection has actually selected the mailbox, so a reconnect is never
     // reported for a connection that then turns out to be useless.
-    if attempt > 0
+    if watch.attempt > 0
         && events
             .send(PushEvent::Reconnected {
                 mailbox: mailbox.to_string(),
-                attempt,
+                attempt: watch.attempt,
             })
             .await
             .is_err()
@@ -169,8 +210,13 @@ async fn session_loop(
     // The first sighting is the baseline, not a change: mail that was already there when the watcher
     // started is not news. `known` survives reconnects, so a message that arrived while the
     // connection was down is still reported once it comes back.
-    if !announce_if_changed(known, selected.exists, mailbox, events).await {
+    if !announce_if_changed(&mut watch.known, selected.exists, mailbox, events).await {
         return Outcome::Stopped;
+    }
+
+    // A server that already refused `IDLE` is never asked again.
+    if watch.poll_only {
+        return poll_loop(client, mailbox, window, events, &mut watch.known).await;
     }
 
     let mut cycles = 0u32;
@@ -180,14 +226,49 @@ async fn session_loop(
                 client = returned;
                 cycles += 1;
 
-                if !announce_if_changed(known, exists, mailbox, events).await {
+                if !announce_if_changed(&mut watch.known, exists, mailbox, events).await {
+                    return Outcome::Stopped;
+                }
+            }
+            Err(MailError::IdleUnsupported(reason)) => {
+                return Outcome::IdleUnsupported { reason };
+            }
+            Err(error) => {
+                return Outcome::Lost {
+                    reason: error.to_string(),
+                    cycles,
+                };
+            }
+        }
+    }
+}
+
+/// Poll a mailbox every `window` for a server that does not implement `IDLE`.
+///
+/// The design's L3 fallback (`design/04-sync.md` §5.4): a server that cannot push is asked instead.
+/// `SELECT` already reports `EXISTS`, so one round trip per window is all it takes to notice new
+/// mail — coarser than a push (a change shows up within a window, not within a second), but correct,
+/// and it never re-issues a command the server has refused. The cadence is the same `window` the
+/// IDLE heartbeat uses, so there is one knob rather than two that can drift apart.
+async fn poll_loop(
+    mut client: ImapClient,
+    mailbox: &str,
+    window: Duration,
+    events: &mpsc::Sender<PushEvent>,
+    known: &mut Option<u32>,
+) -> Outcome {
+    loop {
+        tokio::time::sleep(window).await;
+        match client.select(mailbox).await {
+            Ok(selected) => {
+                if !announce_if_changed(known, selected.exists, mailbox, events).await {
                     return Outcome::Stopped;
                 }
             }
             Err(error) => {
                 return Outcome::Lost {
                     reason: error.to_string(),
-                    cycles,
+                    cycles: 0,
                 };
             }
         }

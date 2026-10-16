@@ -40,6 +40,17 @@ const reply = window.__easyEmailReply;
  */
 const history = window.__easyEmailHistory;
 
+/**
+ * Window arithmetic for the message list — which rows are in the DOM and where the window sits.
+ *
+ * Pure, in vlist.js, because "only the viewport is rendered" is a claim no snapshot can check, so
+ * `tools/vlist_test.mjs` pins the arithmetic instead. This binding is what makes the bare `vlist` at
+ * the render site work: without it that name is a `ReferenceError`, and because the list is built
+ * during boot the whole app fails to start ("启动失败：vlist is not defined") rather than showing a
+ * short list.
+ */
+const vlist = window.__easyEmailVList;
+
 const PAGE_SIZE = 50;
 
 /** How many local search hits to ask for. Higher than a page because results span all folders. */
@@ -2152,8 +2163,15 @@ async function loadMessages({ reset = false } = {}) {
     return;
   }
 
-  // Newest first: the server returns ascending UIDs and people want the latest on top.
-  state.messages = messages.slice().sort((a, b) => b.uid - a.uid);
+  // The list keeps the backend's order. `list_messages` and `message_page` already return newest-first
+  // (`cache::list_summaries`: `order by date desc, uid desc`), and that is the *date* order.
+  //
+  // This used to re-sort by UID on the assumption that "the server returns ascending UIDs and people
+  // want the latest on top" — which is wrong: UIDs ascend with *arrival*, not with the `Date:` header,
+  // so a message delivered with an older date (a backdated newsletter, a forwarded copy) lands in the
+  // wrong place. Measured on the real cache, QQ's INBOX had 17 rows out of date order under the UID
+  // sort. It also fought the paging below, which appends the backend's order rather than re-sorting.
+  state.messages = messages.slice();
   renderMessages();
   // Tell the user whether this list is fresh or cached, and why. The refresh just ran, so this is
   // the one moment the answer is current; doing it before the list would paint a stale banner over
@@ -4407,13 +4425,15 @@ function openAccountWizard() {
         不需要你自己去开浏览器。
       </p>
       <button id="wiz-oauth-go" class="btn primary" type="button">打开浏览器登录</button>
+      <button id="wiz-oauth-trial" class="btn" type="button" hidden>试用（借助 Mozilla 的注册）</button>
+      <div id="wiz-oauth-trial-notice" class="hint" hidden></div>
       <div id="wiz-oauth-status" class="oauth-status" hidden></div>
 
       <details id="wiz-oauth-advanced" class="advanced">
         <summary>高级：使用你自己的 OAuth 客户端 ID</summary>
         <p class="hint">
-          已经为你填好了默认值，通常不用改。如果你有自己的 Google Cloud 注册，把下载的 JSON
-          放进应用数据目录即可（会优先使用它），或直接在这里替换。
+          本应用不内置任何第三方注册。如果你有自己的 Google Cloud / Azure 注册，把下载的 JSON
+          放进应用数据目录即可（会优先使用它），或直接在这里填 client_id。
         </p>
         <input id="wiz-client-id" placeholder="client_id" autocomplete="off" spellcheck="false" />
         <input id="wiz-client-secret" placeholder="client_secret（服务商要求时才有）" autocomplete="off" spellcheck="false" />
@@ -4816,6 +4836,17 @@ function openAccountWizard() {
             client?.source === 'own'
               ? '正在使用你自己放进应用数据目录的注册（oauth-client.json）—— 这里不用改。'
               : client?.notice ?? '';
+          // The borrowed registration is *offered*, never used on its own: the button is the only way
+          // to it and its label names whose registration it is. Nothing goes into the fields, so the
+          // ordinary path stays "bring your own".
+          const trialButton = modal.querySelector('#wiz-oauth-trial');
+          const trialNotice = modal.querySelector('#wiz-oauth-trial-notice');
+          const trialOffered = Boolean(client?.trial);
+          trialButton.hidden = !trialOffered;
+          trialNotice.hidden = !trialOffered;
+          if (trialOffered) {
+            trialNotice.textContent = client.notice ?? '';
+          }
         })
         .catch(() => {});
     }
@@ -4830,66 +4861,77 @@ function openAccountWizard() {
     // The provider is therefore resolved at *click* time rather than captured here, because the
     // closure that attaches first is the one that survives, and it would otherwise hold whatever
     // provider was selected before the address was typed.
+    // One code path for both buttons: the ordinary "bring your own" sign-in and the opt-in borrowed
+    // trial differ only in whether a client id is required and what is sent to the backend. Sharing
+    // it is what stops the trial quietly growing its own copy of the error handling — the messages
+    // here ("浏览器里授权的账号是 X，但你填的是 Y") are the ones users have to read.
+    const beginOauth = async (trial) => {
+      const address = emailInput.value.trim();
+      if (!address) {
+        toast('先填邮箱地址', 'err');
+        return;
+      }
+      const chosen = state.providers.find((p) => p.id === providerSelect.value);
+      if (!chosen) return;
+      if (!oauthEligible()) {
+        toast('这个服务商不走浏览器登录，请用密码 / 授权码。', 'err', 9000);
+        return;
+      }
+      const clientId = modal.querySelector('#wiz-client-id').value.trim();
+      if (!trial && !clientId) {
+        toast('这类邮箱需要一个 OAuth 客户端 ID（见「高级」里的说明）', 'err', 9000);
+        return;
+      }
+      const secret = modal.querySelector('#wiz-client-secret').value.trim();
+      const status = modal.querySelector('#wiz-oauth-status');
+      status.hidden = false;
+      status.className = 'oauth-status';
+      status.innerHTML = '<span class="spinner"></span>已打开浏览器，请在那里点「允许」（两分钟内）…';
+
+      const tokens = await (async () => {
+        try {
+          return await invoke('oauth_sign_in', {
+            email: address,
+            providerId: chosen.id,
+            clientId,
+            clientSecret: secret || null,
+            trial: Boolean(trial),
+          });
+        } catch (error) {
+          // In the status box *and* as a toast: this is where the user is looking, and some of these
+          // messages ("浏览器里授权的账号是 X，但你填的是 Y") are ones they have to read rather than
+          // catch out of the corner of an eye before a toast fades.
+          const reason = errText(error);
+          status.className = 'oauth-status bad';
+          status.textContent = reason;
+          toast(`OAuth 登录：${reason}`, 'err', 20000);
+          return null;
+        }
+      })();
+      if (!tokens) {
+        if (!status.textContent) {
+          status.className = 'oauth-status bad';
+          status.textContent = '没有完成授权。可以再点一次「打开浏览器登录」。';
+        }
+        return;
+      }
+
+      modal.dataset.oauthAuthorized = '1';
+      status.className = 'oauth-status ok';
+      status.textContent = tokens.refresh_token
+        ? '✓ 已授权，授权已保存在本机。现在点下面的「验证并保存」即可。'
+        : '✓ 已登录，但服务商没有返回刷新令牌 —— 下次启动可能需要重新登录。';
+      applyPath();
+    };
     const go = modal.querySelector('#wiz-oauth-go');
     if (!go.dataset.wired) {
       go.dataset.wired = '1';
-      go.addEventListener('click', async () => {
-        const address = emailInput.value.trim();
-        if (!address) {
-          toast('先填邮箱地址', 'err');
-          return;
-        }
-        const chosen = state.providers.find((p) => p.id === providerSelect.value);
-        if (!chosen) return;
-        if (!oauthEligible()) {
-          toast('这个服务商不走浏览器登录，请用密码 / 授权码。', 'err', 9000);
-          return;
-        }
-        const clientId = modal.querySelector('#wiz-client-id').value.trim();
-        if (!clientId) {
-          toast('这类邮箱需要一个 OAuth 客户端 ID（见「高级」里的说明）', 'err', 9000);
-          return;
-        }
-        const secret = modal.querySelector('#wiz-client-secret').value.trim();
-        const status = modal.querySelector('#wiz-oauth-status');
-        status.hidden = false;
-        status.className = 'oauth-status';
-        status.innerHTML = '<span class="spinner"></span>已打开浏览器，请在那里点「允许」（两分钟内）…';
-
-        const tokens = await (async () => {
-          try {
-            return await invoke('oauth_sign_in', {
-              email: address,
-              providerId: chosen.id,
-              clientId,
-              clientSecret: secret || null,
-            });
-          } catch (error) {
-            // In the status box *and* as a toast: this is where the user is looking, and some of these
-            // messages ("浏览器里授权的账号是 X，但你填的是 Y") are ones they have to read rather than
-            // catch out of the corner of an eye before a toast fades.
-            const reason = errText(error);
-            status.className = 'oauth-status bad';
-            status.textContent = reason;
-            toast(`OAuth 登录：${reason}`, 'err', 20000);
-            return null;
-          }
-        })();
-        if (!tokens) {
-          if (!status.textContent) {
-            status.className = 'oauth-status bad';
-            status.textContent = '没有完成授权。可以再点一次「打开浏览器登录」。';
-          }
-          return;
-        }
-
-        modal.dataset.oauthAuthorized = '1';
-        status.className = 'oauth-status ok';
-        status.textContent = tokens.refresh_token
-          ? '✓ 已授权，授权已保存在本机。现在点下面的「验证并保存」即可。'
-          : '✓ 已登录，但服务商没有返回刷新令牌 —— 下次启动可能需要重新登录。';
-        applyPath();
-      });
+      go.addEventListener('click', () => beginOauth(false));
+    }
+    const trialGo = modal.querySelector('#wiz-oauth-trial');
+    if (!trialGo.dataset.wired) {
+      trialGo.dataset.wired = '1';
+      trialGo.addEventListener('click', () => beginOauth(true));
     }
 
     detected.hidden = false;

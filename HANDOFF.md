@@ -76,6 +76,28 @@ README「已知限制」是 Issue 级清单。~~候选里最小最独立的是�
 （见 `design/09` 顶部那张实现状态表，它按目标逐条标了 ✅/❌，别再从已完成的那几项起步）。
 `design/19` §4 有各块验收。另有三件卡在外部条件的真机验证（Outlook / 163·126 / 自建服务器，
 清单见 §7 ④），不拦发版但每次接手时值得催一次。
+**Outlook / M365 的契约已"定稿"**（第 96 轮：逐条对照微软官方文档 + Thunderbird / Mailspring /
+FairEmail / email-oauth2-proxy 的开源实现），并加了**显式「试用」按钮**（借用 Mozilla 的注册；
+`MICROSOFT_TRIAL` 的回调是 `127.0.0.1`，与自注册必须用的 `localhost` 不同）。**用户明确不做真机
+验证**，所以 README 仍标「未走通过」——别把它当"已验证"。
+
+**网易（163/126）收不到邮件的两个真 bug 已修**（第 96 轮，真机验证：163 INBOX 收到 20 封）：
+① `since_range` 曾把"一页"写成 **UID 数值区间**（`1:500`），而 IMAP UID **不连续**（163 是 1.54e9
+量级），于是每次同步 0 封、游标永远卡在 0；现在是 `UID SEARCH {after+1}:*` + 只取最旧 `limit` 条，
+并且**必须保留 `uid > after_uid` 过滤**（`low:*` 仍是区间，区间无序 ⇒ 游标=最高 UID 时会解析成最后一封）。
+② `Cache::migrate` 在 `version == SCHEMA_VERSION` 时**直接 return**，所以**往迁移体里加语句必须同时升
+`SCHEMA_VERSION`**，否则已在当前版本的库永远拿不到那一列——`bodies.index_version` 就是这么漏的，
+版本已 7→8。**163 不支持 `IDLE` 已修（第 97 轮，另见那条）**：原先被当成"连接丢了"而无限重连
+（`command not support`，日志 420 条），现在首次被拒即**降级为轮询**（design/04 的 L3），只上报一次。
+
+**列表排序**（第 96 轮）：`app.js` 曾把后端返回的**时间序**又按 `uid` 重排一遍，而 UID 随**到达**
+递增、不随 `Date:` 头递增 ⇒ 改期/转发的旧日期邮件被排到前面，看着"没按时间排"（实测 QQ INBOX
+有 17 行逆序）。已删掉那次重排，直接用 `list_summaries` 的 `order by date desc, uid desc`；
+门禁会拦住再写回去。
+
+**"只收 30 天"提示**（第 96 轮）：`range_cap_hint` 原先只看"是不是网易系"，不看证据，所以
+**改完设置、邮箱真的到底了也照样提示**。现在多一条判据 `providers::looks_like_a_range_cap`——
+只有"账号可见的最旧一封"落在最近 60 天内才提示（`cache::oldest_message_date` 提供下界）。
 
 **03 存储配额清理的库层已做**（第 93 轮：`crates/mail-core/src/quota.rs`——report/plan/apply，
 **干跑与实跑共用一条谓词**所以数字必然一致，apply 删前再量一次；未读与旗标永不清；

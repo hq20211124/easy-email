@@ -106,6 +106,17 @@ pub enum MailError {
 
     #[error("操作超时（{0} 秒）")]
     Timeout(u64),
+
+    /// The server does not implement `IDLE` (RFC 2177), so new mail cannot be pushed down a quiet
+    /// connection and has to be polled for.
+    ///
+    /// Deliberately **not** an [`Imap`](Self::Imap) error. An `Imap` failure is treated as a lost
+    /// connection and retried, but retrying `IDLE` on a server that answers `BAD` to it can never
+    /// succeed: the watcher uses this variant to switch to polling once instead of reconnecting a
+    /// command the server has already refused. NetEase's 163 answers `command not support` here,
+    /// and the reconnect loop that produced was 420 log lines long (round 97).
+    #[error("服务器不支持即时推送（IDLE）— {0}")]
+    IdleUnsupported(String),
 }
 
 /// So cache code can use `?` instead of mapping at every call site.
@@ -269,6 +280,10 @@ impl MailError {
                  缓存文件（cache.db）可以删，代价只是重新同步一次。",
             ),
             MailError::Credential(_) => Some("无法读写 Windows 凭据管理器，请检查账户权限。"),
+            MailError::IdleUnsupported(_) => Some(
+                "这个邮箱服务器不支持即时推送（IMAP IDLE），新邮件改为定时自动收取，\
+                 延迟从「秒级」变成「最多几分钟」。",
+            ),
             _ => None,
         }
     }
@@ -437,6 +452,9 @@ mod tests {
         assert!(!MailError::Imap("NO".into()).is_network());
         assert!(!MailError::Busy("busy".into()).is_network());
         assert!(!MailError::Cache("disk".into()).is_network());
+        // A server that does not implement IDLE is a capability fact, not a network blip: replaying
+        // an intent because of it would be as wrong as replaying one after a refusal.
+        assert!(!MailError::IdleUnsupported("imap.163.com".into()).is_network());
     }
 
     /// The exact shape async-imap produced for QQ, minus the truncation.

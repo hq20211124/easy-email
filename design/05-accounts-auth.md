@@ -133,6 +133,13 @@ pub struct Provider {
 ```
 > 为什么把这一步写进设计：BYO 是**没有内置注册号时唯一的合规出路**（A1-F37 禁止借用别人的 client_id），
 > 而"要不要填 secret"不能靠猜 —— 它是 M0-8 的探测结论，探测完这条流程才算定稿。
+>
+> **修订（2026-10-15，第 96 轮）**：上一句仍是**默认**，但 Microsoft 加了一个**显式的「试用」按钮**：
+> 个人 outlook.com 账号没有 Azure 目录、注册不了应用，于是允许用户**主动**用 Mozilla 公开发布的
+> Thunderbird 注册（`oauth::TRIAL_MICROSOFT_CLIENT_ID`）——授权页会显示 "Mozilla Thunderbird"、
+> Mozilla 可随时撤销，所以**绝不预填、绝不默认**（借用值只出现在那个按钮后面）。Gmail 不提供这条路
+> （它有应用专用密码）；其余服务商仍只有 BYO。实现、理由与真机未验的边界见 `PROGRESS` 第 96 轮与
+> `oauth::MICROSOFT_TRIAL`。
 
 #### 3.1.1 矩阵必须回答两个不同的问题（第二轮评审修正）
 
