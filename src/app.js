@@ -643,7 +643,13 @@ async function selectAccount(accountId) {
 }
 
 async function removeAccount(account) {
-  if (!confirm(`移除账号 ${account.email}？\n保存在 Windows 凭据管理器中的密码也会被删除。`)) {
+  if (
+    !confirm(
+      `移除账号 ${account.email}？\n` +
+        '这台电脑上保存的密码或授权码、浏览器授权、发件箱里未发出的信、以及本地缓存都会被删除。' +
+        '服务器上的邮件不受影响，重新添加账号后会再同步下来。',
+    )
+  ) {
     return;
   }
   const ok = await run('移除账号', async () => {
