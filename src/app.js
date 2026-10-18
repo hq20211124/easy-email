@@ -4570,6 +4570,8 @@ function openAccountWizard() {
       // making the user re-enter everything tempts them into retrying faster, not slower.
       // If they give up and close the dialog, `closeModal` cleans up.
       const accountId = email.toLowerCase();
+      // Re-adding an existing account must not let `closeModal` delete it (and its cache).
+      const existed = state.accounts.some((a) => a.id === accountId);
       let verified = false;
       // Read outside the `try` because the decision below needs it: "the server refused" and "the
       // server said nothing" both leave `verified` false and lead to opposite conclusions.
@@ -4637,7 +4639,7 @@ function openAccountWizard() {
 
       if (!verified) {
         if (verdict === 'reject-address') {
-          pendingWizardAccountId = accountId;
+          if (!existed) pendingWizardAccountId = accountId;
           report.innerHTML =
             '<div class="report bad"><strong>服务器拒绝了这次登录</strong><br>' +
             '浏览器授权成功了，但邮件服务器明确拒绝了这些凭据。最可能的原因是：' +
@@ -4662,7 +4664,7 @@ function openAccountWizard() {
         }
 
         // 'retry': a password account, where a failure is usually a wrong authorization code.
-        pendingWizardAccountId = accountId;
+        if (!existed) pendingWizardAccountId = accountId;
         const retry = modal.querySelector('[data-role="confirm"]');
         if (retry) retry.textContent = '重试';
         return false;
