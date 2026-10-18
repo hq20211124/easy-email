@@ -2345,8 +2345,12 @@ async fn cleanup_apply(
     let report = state
         .cache
         .clone()
-        .apply_plan(plan, policy, now_secs())
+        .apply_plan(plan, policy)
         .map_err(describe)?;
+    // incremental_vacuum cannot run inside a transaction; the delete is already committed.
+    if let Err(error) = state.cache.vacuum_into_freelist() {
+        log_line(&format!("[easy-email] 清理后 vacuum 失败：{error}"));
+    }
     state
         .user
         .clone()
@@ -2759,6 +2763,32 @@ async fn body_index_pass(
         ));
     }
     Ok(report)
+}
+
+/// Run any pending full-text index rebuild in the background.
+///
+/// `migrate` drops and recreates the search table when its shape changes, leaving
+/// `messages.search_rowid` stale. Rebuilding inside the startup transaction would freeze the UI,
+/// so this task finishes the job in bounded batches after the window is already showing.
+fn start_search_rebuild_worker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let cache = app.state::<AppState>().cache.clone();
+        loop {
+            match cache.rebuild_search_step(500) {
+                Ok(progress) if progress.done == 0 => break,
+                Ok(progress) => {
+                    if progress.remaining == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => {
+                    log_line(&format!("[easy-email] 索引重建失败：{error}"));
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Keep the body index moving on its own tick (`design/20-v0.2-plan.md` V2-A).
@@ -3920,6 +3950,7 @@ pub fn run() {
             // sent before flags are fixed.
             start_pending_replay_worker(app.handle().clone());
             start_body_index_worker(app.handle().clone());
+            start_search_rebuild_worker(app.handle().clone());
 
             // The tray icon. Built here rather than in config so the menu can drive the app.
             let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
