@@ -279,7 +279,12 @@ impl MailError {
                 "本地数据库读写失败。**不要**删除 user.db：草稿和发件箱都在那里，删了就找不回来。\
                  缓存文件（cache.db）可以删，代价只是重新同步一次。",
             ),
-            MailError::Credential(_) => Some("无法读写 Windows 凭据管理器，请检查账户权限。"),
+            MailError::Credential(_) => Some(
+                "本地保存的凭据或授权取不出来。这个账号若用浏览器登录（Gmail、Outlook），\
+                 一般是授权已失效——点账号旁的「↻」重新登录一次；若是授权码账号，\
+                 重新填一次授权码。只有当上面的原文提到 Windows 凭据管理器或令牌解密时，\
+                 才需要去查凭据管理器的权限。",
+            ),
             MailError::IdleUnsupported(_) => Some(
                 "这个邮箱服务器不支持即时推送（IMAP IDLE），新邮件改为定时自动收取，\
                  延迟从「秒级」变成「最多几分钟」。",
@@ -598,6 +603,21 @@ mod tests {
         let text = error.user_hint().expect("hint");
         assert!(text.contains("SMTP AUTH"), "got: {text}");
         assert!(!text.contains("授权码"), "got: {text}");
+    }
+
+    #[test]
+    fn an_expired_oauth_token_is_not_blamed_on_the_credential_manager() {
+        // What a real Gmail account produced on 2026-10-18: Google rejected the refresh token, the
+        // sentence naming that was already in the message — and the hint underneath told the user to
+        // go check Windows credential-manager permissions, which is not where this failure lives.
+        // `Credential` covers the vault, the DPAPI token file *and* an expired authorization, so the
+        // hint has to offer the two routes rather than assert one of them.
+        let error = MailError::Credential(
+            "授权已失效，请重新登录这个账号。Token has been expired or revoked.".into(),
+        );
+        let text = error.user_hint().expect("hint");
+        assert!(text.contains("重新登录"), "got: {text}");
+        assert!(text.contains("授权码"), "got: {text}");
     }
 
     #[test]
