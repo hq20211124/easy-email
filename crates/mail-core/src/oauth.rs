@@ -696,6 +696,17 @@ impl HttpTokens {
             .map_err(|error| MailError::Config(format!("无法创建 HTTP 客户端：{error}")))?;
         Ok(HttpTokens { client })
     }
+
+    /// Test-only: no proxy, so loopback servers are not hijacked by a local HTTP proxy.
+    #[cfg(test)]
+    pub fn test_client() -> Result<HttpTokens> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .map_err(|error| MailError::Config(format!("无法创建 HTTP 客户端：{error}")))?;
+        Ok(HttpTokens { client })
+    }
 }
 
 impl TokenTransport for HttpTokens {
@@ -2176,7 +2187,7 @@ mod tests {
     #[tokio::test]
     async fn the_real_transport_posts_a_form_and_returns_the_body() {
         let url = serve_once("200 OK", r#"{"access_token":"at","expires_in":10}"#).await;
-        let tokens = HttpTokens::new().expect("client");
+        let tokens = HttpTokens::test_client().expect("client");
         let answer = tokens
             .post_form(
                 &url,
@@ -2200,7 +2211,7 @@ mod tests {
         // Called at the transport/classifier seam rather than through `refresh`: `refresh` posts to
         // the *provider's* endpoint, and a test suite must never reach accounts.google.com. The seam
         // is what matters anyway — a 400 body in, an actionable error out.
-        let tokens = HttpTokens::new().expect("client");
+        let tokens = HttpTokens::test_client().expect("client");
         let body = tokens
             .post_form(
                 &url,
@@ -2218,7 +2229,7 @@ mod tests {
     #[tokio::test]
     async fn a_5xx_is_a_provider_problem_not_a_credential_problem() {
         let url = serve_once("503 Service Unavailable", "<html>down</html>").await;
-        let tokens = HttpTokens::new().expect("client");
+        let tokens = HttpTokens::test_client().expect("client");
         let error = tokens
             .post_form(
                 &url,
@@ -2241,7 +2252,7 @@ mod tests {
         let url = format!("http://{}/token", listener.local_addr().expect("addr"));
         drop(listener);
 
-        let tokens = HttpTokens::new().expect("client");
+        let tokens = HttpTokens::test_client().expect("client");
         let error = tokens
             .post_form(&url, vec![("a".to_string(), "b".to_string())])
             .await
