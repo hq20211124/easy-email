@@ -1261,7 +1261,14 @@ fn collect_inline_images(
         };
 
         let mime = mime_of(part);
-        if !mime.starts_with("image/") {
+        let Some(subtype) = mime.strip_prefix("image/") else {
+            continue;
+        };
+        if subtype.is_empty()
+            || !subtype
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '+' || c == '-')
+        {
             continue;
         }
 

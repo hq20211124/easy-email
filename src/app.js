@@ -3315,6 +3315,7 @@ function resolveInlineImages(html, inlineImages) {
   if (!inlineImages.length || !html.includes('cid:')) return html;
 
   const byId = new Map(inlineImages.map((img) => [img.content_id, img]));
+  const SAFE_MIME_RE = /^image\/[a-zA-Z0-9.+-]+$/;
 
   return html.replace(
     /(<img\b[^>]*?\bsrc\s*=\s*)(["']?)cid:([^"'\s>]+)\2/gi,
@@ -3327,7 +3328,7 @@ function resolveInlineImages(html, inlineImages) {
         /* keep the raw form */
       }
       const image = byId.get(id) || byId.get(rawId);
-      if (!image) return whole;
+      if (!image || !SAFE_MIME_RE.test(image.mime)) return whole;
       return `${prefix}${quote}data:${image.mime};base64,${image.data_base64}${quote}`;
     }
   );
