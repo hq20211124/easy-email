@@ -22,7 +22,7 @@ use crate::sync::SyncWindow;
 ///
 /// 2 added `quota_ledger` (`design/04` §5.7). Additive: `migrate` runs `create table if not
 /// exists` for every table it owns, so an existing file picks the new one up on the next open.
-pub const USER_SCHEMA_VERSION: i64 = 3;
+pub const USER_SCHEMA_VERSION: i64 = 4;
 
 /// How long a quota window lasts.
 ///
@@ -206,6 +206,7 @@ pub struct OutboxItem {
     pub created_at: i64,
     pub sent_at: Option<i64>,
     pub sent_message_id: Option<String>,
+    pub submitted_at: i64,
 }
 
 impl OutboxItem {
@@ -974,7 +975,7 @@ pub struct NewOutbox {
 
 const OUTBOX_COLUMNS: &str = "id, account_id, draft_id, payload_json, state, attempts, \
      next_attempt_at, last_error, undo_until, scheduled_at, spool_path, spool_bytes, created_at, \
-     sent_at, sent_message_id";
+     sent_at, sent_message_id, submitted_at";
 
 fn row_to_outbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxItem> {
     Ok(OutboxItem {
@@ -993,6 +994,7 @@ fn row_to_outbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxItem> {
         created_at: row.get(12)?,
         sent_at: row.get(13)?,
         sent_message_id: row.get(14)?,
+        submitted_at: row.get(15)?,
     })
 }
 
@@ -1083,6 +1085,15 @@ impl UserStore {
                  on conflict(key) do update set value = excluded.value",
                 rusqlite::params![key, value],
             )?;
+            Ok(())
+        })
+    }
+
+    /// Remove a small value.
+    pub fn kv_delete(&self, key: &str) -> Result<()> {
+        let key = key.to_string();
+        self.db.write_blocking(move |conn| {
+            conn.execute("delete from kv where key = ?1", rusqlite::params![key])?;
             Ok(())
         })
     }
@@ -1208,6 +1219,13 @@ impl UserStore {
             Some(secret) => self.kv_set(&oauth_client_secret_key(account_id), secret),
         }
     }
+
+    /// Remove the stored OAuth registration for an account.
+    pub fn delete_oauth_settings(&self, account_id: &str) -> Result<()> {
+        self.kv_delete(&oauth_client_id_key(account_id))?;
+        self.kv_delete(&oauth_client_secret_key(account_id))?;
+        Ok(())
+    }
     // ------------------------------------------------------------------ notification preference
 
     /// Whether this account shows a system notification when new mail arrives.
@@ -1293,6 +1311,12 @@ impl UserStore {
     /// Returns the ledger as it stands afterwards, so the caller can decide to stop without another
     /// read. Called after every network batch — a path that skips it is a path that blows through
     /// the provider's limit, which is why the gate is asserted in tests.
+    ///
+    /// **The debit carries the window roll-over with it.** A plain `bytes_today = bytes_today + n`
+    /// against a ledger left from yesterday adds to yesterday's total, and the `quota()` read that
+    /// follows then resets the day to zero — which silently erases the batch that crossed midnight.
+    /// Under-counting is the dangerous direction: the daily budget is what keeps 163 and QQ from
+    /// banning the account, so the number has to be a floor, not an estimate.
     pub fn quota_add_bytes(
         &self,
         account_id: &str,
@@ -1306,8 +1330,12 @@ impl UserStore {
                 conn.execute(
                     "insert into quota_ledger (account_id, bytes_today, window_start)
                      values (?1, ?2, ?3)
-                     on conflict(account_id) do update set bytes_today = bytes_today + ?2",
-                    rusqlite::params![account, bytes, now],
+                     on conflict(account_id) do update set
+                         bytes_today = case when ?3 - window_start < ?4
+                                            then bytes_today + ?2 else ?2 end,
+                         window_start = case when ?3 - window_start < ?4
+                                             then window_start else ?3 end",
+                    rusqlite::params![account, bytes, now, QUOTA_WINDOW_SECS],
                 )?;
                 Ok(())
             })?;
@@ -1513,27 +1541,37 @@ impl UserStore {
         Ok(items)
     }
 
-    /// The sends whose turn has come.
+    /// The sends whose turn has come, **for one account**.
     ///
     /// `queued` is the only state the worker may pick up, and it means "waiting for its turn" — the
     /// undo window, a scheduled time, or a backoff delay, all expressed in the three time columns.
     /// `failed` and `needs_attention` are terminal and stay out of here on purpose: a permanent
     /// failure that stayed eligible would be retried forever.
     ///
+    /// **`account_id` is required, not optional.** The outbox is one table shared by every account,
+    /// but a pass runs with one account's configuration and one account's SMTP credential — so a
+    /// query that spanned accounts would let A's credential send B's queued mail. The filter is the
+    /// whole of that guarantee, which is why it is a parameter rather than something the caller may
+    /// forget.
+    ///
     /// The three time columns are compared directly rather than through `is null or`: they are NOT
     /// NULL by schema precisely because `null <= now` is NULL in SQL, which would make a row
     /// unreachable forever (`design/07` §5.3).
-    pub fn due_outbox(&self, now: i64, limit: usize) -> Result<Vec<OutboxItem>> {
+    pub fn due_outbox(&self, account_id: &str, now: i64, limit: usize) -> Result<Vec<OutboxItem>> {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
         let mut stmt = conn.prepare(&format!(
             "select {OUTBOX_COLUMNS} from outbox
-             where state = 'queued'
-               and undo_until <= ?1 and scheduled_at <= ?1 and next_attempt_at <= ?1
+             where account_id = ?1
+               and state = 'queued'
+               and undo_until <= ?2 and scheduled_at <= ?2 and next_attempt_at <= ?2
              order by created_at asc, id asc
-             limit ?2"
+             limit ?3"
         ))?;
-        let rows = stmt.query_map(rusqlite::params![now, limit as i64], row_to_outbox_item)?;
+        let rows = stmt.query_map(
+            rusqlite::params![account_id, now, limit as i64],
+            row_to_outbox_item,
+        )?;
         let mut items = Vec::new();
         for row in rows {
             items.push(row?);
@@ -1541,18 +1579,24 @@ impl UserStore {
         Ok(items)
     }
 
-    /// Rows a previous run left mid-flight.
+    /// Rows a previous run left mid-flight, **for one account**.
     ///
     /// A crash between "we are sending" and "we recorded the outcome" leaves these, and they are the
     /// reason startup checks the Sent folder before requeueing (`design/07` §5.3.1): the message may
     /// well have been delivered.
-    pub fn outbox_in_flight(&self) -> Result<Vec<OutboxItem>> {
+    ///
+    /// Scoped by account for the same reason [`Self::due_outbox`] is: the answer to "did it go out?"
+    /// is looked up in **this** account's Sent folder, so deciding another account's row here would
+    /// search the wrong mailbox and could conclude "delivered" (or "not delivered") from the wrong
+    /// copy.
+    pub fn outbox_in_flight(&self, account_id: &str) -> Result<Vec<OutboxItem>> {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
         let mut stmt = conn.prepare(&format!(
-            "select {OUTBOX_COLUMNS} from outbox where state = 'sending' order by created_at asc"
+            "select {OUTBOX_COLUMNS} from outbox
+             where account_id = ?1 and state = 'sending' order by created_at asc"
         ))?;
-        let rows = stmt.query_map([], row_to_outbox_item)?;
+        let rows = stmt.query_map([account_id], row_to_outbox_item)?;
         let mut items = Vec::new();
         for row in rows {
             items.push(row?);
@@ -1589,22 +1633,26 @@ impl UserStore {
         })
     }
 
-    /// Sends that are delivered but whose Sent copy has not been filed yet.
+    /// Sends that are delivered but whose Sent copy has not been filed yet, **for one account**.
     ///
     /// The spool file **is** the marker: a successful send keeps it, and the filing pass removes it
     /// once the copy is in the folder. Which makes "the bytes are still here" and "this has not been
     /// archived yet" the same statement — so a crash in between needs no extra bookkeeping, the next
     /// pass simply does it. Searching before appending is what keeps that from producing two copies
     /// (`design/07` §5.4).
-    pub fn sent_awaiting_copy(&self) -> Result<Vec<OutboxItem>> {
+    ///
+    /// Scoped by account because the copy is `APPEND`ed into **this** account's Sent folder: filing
+    /// another account's delivered message here would put it in the wrong mailbox, and the record of
+    /// where it landed would point at a folder that account cannot see.
+    pub fn sent_awaiting_copy(&self, account_id: &str) -> Result<Vec<OutboxItem>> {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
         let mut stmt = conn.prepare(&format!(
             "select {OUTBOX_COLUMNS} from outbox
-             where state = 'sent' and spool_path is not null
+             where account_id = ?1 and state = 'sent' and spool_path is not null
              order by sent_at asc, id asc"
         ))?;
-        let rows = stmt.query_map([], row_to_outbox_item)?;
+        let rows = stmt.query_map([account_id], row_to_outbox_item)?;
         let mut items = Vec::new();
         for row in rows {
             items.push(row?);
@@ -1619,6 +1667,20 @@ impl UserStore {
             conn.execute(
                 "update outbox set spool_path = null, spool_bytes = 0 where id = ?1",
                 [id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record that the send has begun, before the SMTP conversation is even opened.
+    ///
+    /// Crash recovery reads this marker: a row left in `sending` with a non-zero `submitted_at` had
+    /// already started to go out, so the answer is to ask, never to send again (`design/07` §5.3.1).
+    pub fn set_outbox_submitted(&self, id: i64, now: i64) -> Result<()> {
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "update outbox set submitted_at = ?2 where id = ?1",
+                rusqlite::params![id, now],
             )?;
             Ok(())
         })
@@ -1723,6 +1785,16 @@ impl UserStore {
     pub fn delete_outbox(&self, id: i64) -> Result<bool> {
         self.db.write_blocking(move |conn| {
             Ok(conn.execute("delete from outbox where id = ?1", [id])? > 0)
+        })
+    }
+
+    /// Remove every outbox row belonging to one account.
+    pub fn delete_outbox_for_account(&self, account_id: &str) -> Result<u32> {
+        let account_id = account_id.to_string();
+        self.db.write_blocking(move |conn| {
+            let changed =
+                conn.execute("delete from outbox where account_id = ?1", [&account_id])?;
+            Ok(changed as u32)
         })
     }
 
@@ -1878,7 +1950,8 @@ impl UserStore {
                      spool_bytes     integer not null default 0,
                      created_at      integer not null,
                      sent_at         integer,
-                     sent_message_id text
+                     sent_message_id text,
+                     submitted_at    integer not null default 0
                  );
                  create index if not exists outbox_pending on outbox(state, next_attempt_at);
 
@@ -1971,6 +2044,7 @@ impl UserStore {
             // mirror probe (M1a-59). The tests had never seen it because they all start from a fresh
             // schema, which is exactly the blind spot this kind of migration exists to cover.
             add_column_if_missing(conn, "draft_mirrors", "account_id", "text not null default ''")?;
+            add_column_if_missing(conn, "outbox", "submitted_at", "integer not null default 0")?;
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2168,7 +2242,7 @@ mod tests {
         assert!(store.claim_outbox(second, 0).expect("claim"));
         assert_eq!(store.outbox_count().expect("count"), 1);
         assert!(
-            store.due_outbox(9_999, 10).expect("due").is_empty(),
+            store.due_outbox("acc", 9_999, 10).expect("due").is_empty(),
             "an in-flight row is not due, whatever the clock says"
         );
 
@@ -2195,7 +2269,7 @@ mod tests {
         // as well, so a bare count would pass for the wrong reason.
         let due = |now: i64| -> Vec<i64> {
             store
-                .due_outbox(now, 10)
+                .due_outbox("acc", now, 10)
                 .expect("due")
                 .into_iter()
                 .map(|item| item.id)
@@ -2234,13 +2308,65 @@ mod tests {
         item.undo_until = 1_005;
         let id = store.enqueue_outbox(&item).expect("enqueue");
 
-        assert!(store.due_outbox(1_004, 10).expect("due").is_empty());
+        assert!(store.due_outbox("acc", 1_004, 10).expect("due").is_empty());
         assert!(
             !store.claim_outbox(id, 1_004).expect("claim"),
             "claiming inside the undo window would be the 'not really cancellable' lie"
         );
-        assert_eq!(store.due_outbox(1_005, 10).expect("due").len(), 1);
+        assert_eq!(store.due_outbox("acc", 1_005, 10).expect("due").len(), 1);
         assert!(store.claim_outbox(id, 1_005).expect("claim"));
+    }
+
+    #[test]
+    fn every_outbox_pass_query_is_scoped_to_one_account() {
+        // The outbox is one table for every account, but a pass runs with one account's config and
+        // one account's credential. A query that spanned accounts let A's SMTP password send B's
+        // queued mail, answer for B's message from A's Sent folder, and file B's copy into A's Sent.
+        // The filter is the whole guarantee, so it is pinned here rather than assumed.
+        let store = UserStore::open_in_memory().expect("open");
+        let a = store.enqueue_outbox(&queued_send("a", 1)).expect("a");
+        let b = store.enqueue_outbox(&queued_send("b", 2)).expect("b");
+
+        let due_a: Vec<i64> = store
+            .due_outbox("a", 9_999, 10)
+            .expect("due a")
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(due_a, vec![a], "A's pass must not see B's queue");
+        assert_eq!(
+            store.due_outbox("b", 9_999, 10).expect("due b").len(),
+            1,
+            "and B still sees its own"
+        );
+
+        // In flight: A asks about its own crash, never B's.
+        assert!(store.claim_outbox(b, 0).expect("claim b"));
+        assert!(
+            store.outbox_in_flight("a").expect("in flight a").is_empty(),
+            "A must not decide whether B's message already went out"
+        );
+        assert_eq!(store.outbox_in_flight("b").expect("in flight b").len(), 1);
+
+        // Delivered-but-not-filed: the copy belongs to the account that sent it.
+        store
+            .mark_outbox_sent(b, Some("<b@example.com>"), 5)
+            .expect("sent b");
+        store
+            .set_outbox_spool(b, "/tmp/b.eml", 10)
+            .expect("spool b");
+        assert!(
+            store
+                .sent_awaiting_copy("a")
+                .expect("awaiting a")
+                .is_empty(),
+            "A's filing pass must not archive B's delivered message"
+        );
+        assert_eq!(
+            store.sent_awaiting_copy("b").expect("awaiting b").len(),
+            1,
+            "B still files its own copy"
+        );
     }
 
     #[test]
@@ -2297,6 +2423,29 @@ mod tests {
             carried.allows_download(999_999),
             "and stops mattering when it expires"
         );
+    }
+
+    /// **The midnight batch.** A debit landing on a ledger left from yesterday used to add to
+    /// yesterday's total, and the read that follows it rolled the day to zero — so the bytes that
+    /// crossed the boundary were never counted at all. Under-counting is the dangerous direction:
+    /// the daily budget is what keeps a provider from banning the account.
+    #[test]
+    fn a_debit_that_crosses_the_window_boundary_is_not_lost() {
+        let store = UserStore::open_in_memory().expect("open");
+        let budget = Some(1_000);
+
+        store
+            .quota_add_bytes("acc", 300, 1_000, budget)
+            .expect("yesterday");
+
+        let today = store
+            .quota_add_bytes("acc", 400, 1_000 + QUOTA_WINDOW_SECS + 1, budget)
+            .expect("the batch that crossed midnight");
+        assert_eq!(
+            today.bytes_today, 400,
+            "the new window opens at this batch, not at zero"
+        );
+        assert_eq!(today.remaining(), Some(600));
     }
 
     #[test]

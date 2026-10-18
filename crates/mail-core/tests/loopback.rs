@@ -984,6 +984,7 @@ async fn a_queued_message_from_an_oauth_account_is_sent_with_xoauth2() {
         OutboxRun {
             store: &store,
             spool: &spool,
+            account_id: &cfg.id,
             cfg: &cfg,
             // What `secret_for` hands over for an OAuth account: an access token, not a password.
             password: "an-access-token",
@@ -1069,6 +1070,7 @@ async fn a_queued_message_reaches_smtp_through_the_worker() {
         OutboxRun {
             store: &store,
             spool: &spool,
+            account_id: &cfg.id,
             cfg: &cfg,
             password: "authorization-code",
             now: 1_000,
@@ -1117,7 +1119,7 @@ async fn a_queued_message_reaches_smtp_through_the_worker() {
         "the bytes stay until the Sent copy is filed (design/07 §5.4)"
     );
     assert_eq!(
-        store.sent_awaiting_copy().expect("awaiting").len(),
+        store.sent_awaiting_copy(&cfg.id).expect("awaiting").len(),
         1,
         "the row is queued up for the filing pass"
     );
@@ -1183,6 +1185,7 @@ async fn a_send_cancelled_inside_its_undo_window_never_opens_a_connection() {
         OutboxRun {
             store: &store,
             spool: &spool,
+            account_id: &cfg.id,
             cfg: &cfg,
             password: "authorization-code",
             now: 1_003,
@@ -1204,6 +1207,7 @@ async fn a_send_cancelled_inside_its_undo_window_never_opens_a_connection() {
         OutboxRun {
             store: &store,
             spool: &spool,
+            account_id: &cfg.id,
             cfg: &cfg,
             password: "authorization-code",
             now: 9_999,
@@ -1292,12 +1296,13 @@ async fn crash_recovery_finds_the_message_in_the_sent_folder_and_does_not_resend
         .expect("record spool");
     // The crash: the row was claimed and never resolved.
     assert!(store.claim_outbox(id, 1_000).expect("claim"));
-    assert_eq!(store.outbox_in_flight().expect("in flight").len(), 1);
+    assert_eq!(store.outbox_in_flight(&cfg.id).expect("in flight").len(), 1);
 
     let report = within(recover_in_flight(
         RecoveryRun {
             store: &store,
             spool: &spool,
+            account_id: &cfg.id,
             now: 2_000,
             max_auto_bytes: mail_core::DEFAULT_CRASH_RESEND_LIMIT,
         },
@@ -1324,7 +1329,10 @@ async fn crash_recovery_finds_the_message_in_the_sent_folder_and_does_not_resend
         "a delivered message must not queue again"
     );
     assert!(
-        store.due_outbox(i64::MAX / 2, 10).expect("due").is_empty(),
+        store
+            .due_outbox(&cfg.id, i64::MAX / 2, 10)
+            .expect("due")
+            .is_empty(),
         "the row must not be eligible for another send"
     );
     let item = store.outbox_item(id).expect("item").expect("present");

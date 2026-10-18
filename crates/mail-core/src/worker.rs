@@ -27,6 +27,9 @@ use crate::userdb::{OutboxItem, UserStore};
 pub struct OutboxRun<'a> {
     pub store: &'a UserStore,
     pub spool: &'a Spool,
+    /// The account this pass runs as. The queue is one table across accounts, so this is what keeps
+    /// the pass from picking up — and sending, with `cfg`'s credential — another account's mail.
+    pub account_id: &'a str,
     pub cfg: &'a AccountConfig,
     pub password: &'a str,
     pub now: i64,
@@ -133,7 +136,7 @@ where
 {
     let mut report = RunReport::default();
 
-    for item in run.store.due_outbox(run.now, run.limit)? {
+    for item in run.store.due_outbox(run.account_id, run.now, run.limit)? {
         // Claim first: two windows, or a tick racing a manual "send now", must not both send it.
         if !run.store.claim_outbox(item.id, run.now)? {
             continue;
@@ -167,6 +170,11 @@ where
                 continue;
             }
         };
+
+        // Record that we started the send before opening the SMTP conversation.
+        // If the app crashes or the connection times out after this, recovery knows
+        // the message may already be at the recipient and refuses to auto-resend.
+        run.store.set_outbox_submitted(item.id, run.now)?;
 
         match deliver(run.cfg.clone(), run.password.to_string(), bytes, recipients).await {
             Ok(()) => {
@@ -240,6 +248,9 @@ pub enum RecoveryQuestion {
     NoMessageId,
     /// Big enough that re-sending it silently is the wrong default.
     LargeAttachment,
+    /// We started the DATA phase before a crash or timeout, so the message may already be at the
+    /// recipient. Re-sending without asking is exactly the duplicate we are trying to avoid.
+    AlreadySubmitted,
 }
 
 impl RecoveryQuestion {
@@ -254,6 +265,10 @@ impl RecoveryQuestion {
                 "这封信带了大附件，崩溃恢复时默认不自动重发（避免收件人收到两封）。\
                  确认没有发出后，点「重试」即可。"
             }
+            Self::AlreadySubmitted => {
+                "这封信在崩溃前已经开始发送，可能已经到达对方邮箱。\
+                 请先确认对方有没有收到，再决定重试还是删除。"
+            }
         }
     }
 }
@@ -261,13 +276,15 @@ impl RecoveryQuestion {
 /// Decide what to do with a row that a crash left in `sending`.
 ///
 /// The order matters. Knowing it *was* sent settles the question whatever else is true — including
-/// the size pause, which exists only to avoid a guess. After that the size check comes before the
-/// "not found" answer, because "not found" is the case where a wrong guess duplicates somebody's
-/// mail. An unanswered question is never a licence to send.
+/// the size pause and `submitted_at`, which exist only to avoid a guess. After the server's answer,
+/// a send that had already started outranks the size pause: both ask, but this one says why. Then
+/// the size check comes before the "not found" answer, because "not found" is the case where a wrong
+/// guess duplicates somebody's mail. An unanswered question is never a licence to send.
 pub fn recovery_verdict(
     message_id: Option<&str>,
     spool_bytes: i64,
     max_auto_bytes: i64,
+    submitted_at: i64,
     found_in_sent: Option<bool>,
 ) -> Recovery {
     if message_id.is_none() {
@@ -275,10 +292,17 @@ pub fn recovery_verdict(
     }
     match found_in_sent {
         Some(true) => Recovery::AlreadySent,
+        // The server was asked and does not have it, but we recorded that the DATA phase had begun
+        // before the crash, so a copy may still be on its way or have landed in a Sent folder this
+        // search could not see. Only the user can settle that; guessing wrong duplicates
+        // somebody's mail.
+        Some(false) if submitted_at > 0 => Recovery::AskUser(RecoveryQuestion::AlreadySubmitted),
         Some(false) if spool_bytes > max_auto_bytes => {
             Recovery::AskUser(RecoveryQuestion::LargeAttachment)
         }
         Some(false) => Recovery::Resend,
+        // The server could not be asked. Nothing had started, so nothing can have arrived — and
+        // asking the user a question the server can answer next time is not a decision, it is noise.
         None => Recovery::RetryLater,
     }
 }
@@ -287,6 +311,9 @@ pub fn recovery_verdict(
 pub struct RecoveryRun<'a> {
     pub store: &'a UserStore,
     pub spool: &'a Spool,
+    /// The account this pass runs as. `find_in_sent` asks **this** account's Sent folder, so only
+    /// this account's in-flight rows may be decided here.
+    pub account_id: &'a str,
     pub now: i64,
     /// Messages larger than this wait for the user; see [`DEFAULT_CRASH_RESEND_LIMIT`].
     pub max_auto_bytes: i64,
@@ -323,7 +350,7 @@ where
 {
     let mut report = RecoveryReport::default();
 
-    for item in run.store.outbox_in_flight()? {
+    for item in run.store.outbox_in_flight(run.account_id)? {
         // The frozen bytes are the only place the Message-ID is recorded before a send succeeds, and
         // reading it out of them is what ties this row to the message that may already be at the
         // recipient.
@@ -345,6 +372,7 @@ where
             message_id.as_deref(),
             item.spool_bytes,
             run.max_auto_bytes,
+            item.submitted_at,
             found,
         ) {
             Recovery::AlreadySent => {
@@ -376,6 +404,9 @@ where
 pub struct FilingRun<'a> {
     pub store: &'a UserStore,
     pub spool: &'a Spool,
+    /// The account this pass runs as. `file_one` appends into **this** account's Sent folder, so
+    /// only this account's delivered messages may be filed here.
+    pub account_id: &'a str,
     /// Where the resulting link to the copy is recorded (`design/07` §5.4). Derived data, so it
     /// lives in the rebuildable cache: losing it costs the "查看已发送副本" link and nothing else.
     pub cache: &'a Cache,
@@ -408,7 +439,7 @@ where
 {
     let mut report = FilingReport::default();
 
-    for item in run.store.sent_awaiting_copy()? {
+    for item in run.store.sent_awaiting_copy(run.account_id)? {
         let Some(path) = item.spool_path.clone() else {
             continue;
         };
@@ -570,6 +601,7 @@ mod tests {
         OutboxRun {
             store,
             spool,
+            account_id: &cfg.id,
             cfg,
             password: "pw",
             now,
@@ -628,7 +660,7 @@ mod tests {
         let path = item.spool_path.expect("path");
         assert!(Path::new(&path).exists(), "the spool is kept for the copy");
         assert_eq!(
-            store.sent_awaiting_copy().expect("awaiting").len(),
+            store.sent_awaiting_copy("t").expect("awaiting").len(),
             1,
             "and the row is queued up for the filing pass"
         );
@@ -666,6 +698,7 @@ mod tests {
             FilingRun {
                 store: &store,
                 spool: &spool,
+                account_id: &cfg.id,
                 cache: &cache,
                 now: 1_000,
             },
@@ -701,7 +734,7 @@ mod tests {
         assert_eq!(recorded.local_at, 1_000);
         assert!(!Path::new(&path).exists(), "the bytes are gone once filed");
         assert!(
-            store.sent_awaiting_copy().expect("awaiting").is_empty(),
+            store.sent_awaiting_copy("t").expect("awaiting").is_empty(),
             "and the row is not picked up again"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -725,6 +758,7 @@ mod tests {
             FilingRun {
                 store: &store,
                 spool: &spool,
+                account_id: &cfg.id,
                 cache: &cache,
                 now: 1_000,
             },
@@ -734,7 +768,7 @@ mod tests {
         .expect("file");
 
         assert_eq!(report.deferred, 1, "{report:?}");
-        assert_eq!(store.sent_awaiting_copy().expect("awaiting").len(), 1);
+        assert_eq!(store.sent_awaiting_copy("t").expect("awaiting").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -755,6 +789,7 @@ mod tests {
             FilingRun {
                 store: &store,
                 spool: &spool,
+                account_id: &cfg.id,
                 cache: &cache,
                 now: 1_000,
             },
@@ -765,7 +800,7 @@ mod tests {
 
         assert_eq!(report.skipped, 1, "{report:?}");
         assert!(
-            store.sent_awaiting_copy().expect("awaiting").is_empty(),
+            store.sent_awaiting_copy("t").expect("awaiting").is_empty(),
             "there is nowhere to file it, so retrying forever would be a loop with nothing in it"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -839,10 +874,10 @@ mod tests {
         assert_eq!(item.next_attempt_at, 1_000 + 30, "the first backoff step");
         assert!(item.spool_path.is_some(), "a retry reuses the frozen bytes");
         assert!(
-            store.due_outbox(1_029, 5).expect("due").is_empty(),
+            store.due_outbox("t", 1_029, 5).expect("due").is_empty(),
             "not yet"
         );
-        assert_eq!(store.due_outbox(1_030, 5).expect("due").len(), 1);
+        assert_eq!(store.due_outbox("t", 1_030, 5).expect("due").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -863,7 +898,10 @@ mod tests {
         let item = store.outbox_item(id).expect("item").expect("present");
         assert_eq!(item.parsed_state(), crate::outbox::OutboxState::Failed);
         assert!(
-            store.due_outbox(i64::MAX / 2, 5).expect("due").is_empty(),
+            store
+                .due_outbox("t", i64::MAX / 2, 5)
+                .expect("due")
+                .is_empty(),
             "a permanent failure that stayed eligible would be retried forever"
         );
         // The draft stays, so the user can fix the address and try again.
@@ -904,7 +942,7 @@ mod tests {
             "two passes must not both take the same message"
         );
         assert!(
-            store.due_outbox(1_000, 5).expect("due").is_empty(),
+            store.due_outbox("t", 1_000, 5).expect("due").is_empty(),
             "an in-flight row is not due"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -956,6 +994,7 @@ mod tests {
             RecoveryRun {
                 store: &store,
                 spool: &spool,
+                account_id: "t",
                 now: 2_000,
                 max_auto_bytes: DEFAULT_CRASH_RESEND_LIMIT,
             },
@@ -993,7 +1032,7 @@ mod tests {
         assert_eq!(back.parsed_state(), crate::outbox::OutboxState::Queued);
         assert!(
             store
-                .due_outbox(2_000, 10)
+                .due_outbox("t", 2_000, 10)
                 .expect("due")
                 .iter()
                 .any(|i| i.id == owed),
@@ -1016,6 +1055,7 @@ mod tests {
             RecoveryRun {
                 store: &store,
                 spool: &spool,
+                account_id: "t",
                 now: 2_000,
                 max_auto_bytes: DEFAULT_CRASH_RESEND_LIMIT,
             },
@@ -1051,6 +1091,7 @@ mod tests {
             RecoveryRun {
                 store: &store,
                 spool: &spool,
+                account_id: "t",
                 now: 2_000,
                 max_auto_bytes: DEFAULT_CRASH_RESEND_LIMIT,
             },
@@ -1081,7 +1122,7 @@ mod tests {
         // mailbox, so "found in Sent" must win over every other consideration — including the size
         // pause, which exists only to avoid a guess.
         assert_eq!(
-            recovery_verdict(Some("<id@x>"), 99_999_999, 5 * 1024 * 1024, Some(true)),
+            recovery_verdict(Some("<id@x>"), 99_999_999, 5 * 1024 * 1024, 0, Some(true)),
             Recovery::AlreadySent
         );
     }
@@ -1090,7 +1131,7 @@ mod tests {
     fn an_uncertain_message_is_never_sent_unattended() {
         // Nothing to search for.
         assert_eq!(
-            recovery_verdict(None, 10, i64::MAX, Some(false)),
+            recovery_verdict(None, 10, i64::MAX, 0, Some(false)),
             Recovery::AskUser(RecoveryQuestion::NoMessageId)
         );
         // Big, and not in Sent: the exposure window was long, so the user decides.
@@ -1099,13 +1140,14 @@ mod tests {
                 Some("<id@x>"),
                 6 * 1024 * 1024,
                 5 * 1024 * 1024,
+                0,
                 Some(false)
             ),
             Recovery::AskUser(RecoveryQuestion::LargeAttachment)
         );
         // The server could not be asked at all — offline at startup is the normal case.
         assert_eq!(
-            recovery_verdict(Some("<id@x>"), 10, 5 * 1024 * 1024, None),
+            recovery_verdict(Some("<id@x>"), 10, 5 * 1024 * 1024, 0, None),
             Recovery::RetryLater
         );
     }
@@ -1113,7 +1155,7 @@ mod tests {
     #[test]
     fn a_small_message_the_server_does_not_have_is_sent() {
         assert_eq!(
-            recovery_verdict(Some("<id@x>"), 10, 5 * 1024 * 1024, Some(false)),
+            recovery_verdict(Some("<id@x>"), 10, 5 * 1024 * 1024, 0, Some(false)),
             Recovery::Resend
         );
         // Exactly at the limit is fine: the constant is "above this, ask".
@@ -1122,9 +1164,30 @@ mod tests {
                 Some("<id@x>"),
                 5 * 1024 * 1024,
                 5 * 1024 * 1024,
+                0,
                 Some(false)
             ),
             Recovery::Resend
+        );
+    }
+
+    #[test]
+    fn a_submitted_message_never_resends_unattended() {
+        assert_eq!(
+            recovery_verdict(Some("<id@x>"), 10, 5 * 1024 * 1024, 1, Some(false)),
+            Recovery::AskUser(RecoveryQuestion::AlreadySubmitted)
+        );
+        // The server has the copy: that is an answer, not a question, and it outranks the fact that
+        // the send had started — otherwise every recovered message makes the user go and look.
+        assert_eq!(
+            recovery_verdict(Some("<id@x>"), 10, 5 * 1024 * 1024, 1, Some(true)),
+            Recovery::AlreadySent
+        );
+        // Offline, there is nothing to compare the record against. Asking now would be a question
+        // the server can answer on the next start, so this stays a retry rather than a dialog.
+        assert_eq!(
+            recovery_verdict(Some("<id@x>"), 10, 5 * 1024 * 1024, 1, None),
+            Recovery::RetryLater
         );
     }
 
