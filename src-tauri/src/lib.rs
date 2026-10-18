@@ -3589,6 +3589,10 @@ fn safe_file_name(raw: &str, part: u32) -> String {
 }
 
 /// `directory/name`, or `directory/name (2)` and so on if that already exists.
+///
+/// **Never a name that is already taken.** The caller writes with `std::fs::write`, which truncates,
+/// so returning an existing path means losing a document the user may not have looked at yet — and
+/// the numbered search has to end somewhere, which is where [`spill_path`] and the clock come in.
 fn unique_path(directory: &Path, name: &str) -> PathBuf {
     let candidate = directory.join(name);
     if !candidate.exists() {
@@ -3602,16 +3606,30 @@ fn unique_path(directory: &Path, name: &str) -> PathBuf {
         .unwrap_or("attachment");
     let extension = path.extension().and_then(|s| s.to_str());
 
-    for index in 2..1000 {
-        let candidate = match extension {
-            Some(extension) => directory.join(format!("{stem} ({index}).{extension}")),
-            None => directory.join(format!("{stem} ({index})")),
-        };
+    for index in 2..UNIQUE_NAME_TRIES {
+        let candidate = numbered(stem, extension, index);
+        let candidate = directory.join(candidate);
         if !candidate.exists() {
             return candidate;
         }
     }
-    candidate
+
+    // Out of polite numbers. A name nobody asked for is kinder than a file nobody meant to lose.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    directory.join(numbered(stem, extension, UNIQUE_NAME_TRIES + stamp))
+}
+
+/// How far the ` (2)`…` (n)` search goes before the clock takes over.
+const UNIQUE_NAME_TRIES: u64 = 1_000;
+
+fn numbered(stem: &str, extension: Option<&str>, index: u64) -> String {
+    match extension {
+        Some(extension) => format!("{stem} ({index}).{extension}"),
+        None => format!("{stem} ({index})"),
+    }
 }
 
 // ---------------------------------------------------------------- send
@@ -4094,7 +4112,93 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureKind, SyncFailure, app_version, failure_kind, safe_file_name};
+    use super::{
+        FailureKind, SyncFailure, UNIQUE_NAME_TRIES, account_id_for, app_version, failure_kind,
+        safe_file_name, unique_path,
+    };
+
+    /// **A1-F34 regression.** The OAuth flow stores the refresh token and the client settings under
+    /// `account_id_for(email)`, and every later read keys off the saved account's `id`. If the two
+    /// ever drift (they did: the token was written under the raw address, the settings under the
+    /// lowercased one), a user who typed `User@Gmail.com` gets a token file the app cannot find — a
+    /// permanent "please sign in again" that retrying never fixes.
+    #[test]
+    fn the_oauth_account_key_matches_the_saved_account_id() {
+        for email in ["User@Gmail.com", "  user@gmail.com ", "user@gmail.com"] {
+            let cfg = mail_core::account_from_provider("gmail", email, "")
+                .expect("a gmail address with no login override is valid");
+            assert_eq!(
+                account_id_for(email),
+                cfg.id,
+                "the OAuth key and the saved account id must be the same key: {email:?}"
+            );
+        }
+    }
+
+    /// A directory of our own, removed afterwards. `unique_path` is about files that exist, so the
+    /// test has to make them exist.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "easy-email-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_taken_attachment_name_moves_to_the_next_number() {
+        let dir = scratch("unique-path");
+        std::fs::write(dir.join("报告.txt"), b"first").expect("write");
+        let second = unique_path(&dir, "报告.txt");
+        assert!(
+            second.ends_with("报告 (2).txt"),
+            "the second copy goes to a numbered name: {}",
+            second.display()
+        );
+        std::fs::write(&second, b"second").expect("write");
+        assert!(unique_path(&dir, "报告.txt").ends_with("报告 (3).txt"));
+        // A name with no extension keeps none: `note (2)`, not `note (2).`.
+        std::fs::write(dir.join("note"), b"x").expect("write");
+        assert!(unique_path(&dir, "note").ends_with("note (2)"));
+
+        assert_eq!(
+            std::fs::read(dir.join("报告.txt")).expect("read"),
+            b"first",
+            "the file that was already there is the one thing this must not touch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The overwrite the 2026-10-18 review found.** When the numbered search ran out it handed back
+    /// the *original* path, and the caller writes with `std::fs::write` — which truncates. The
+    /// thousandth attachment with the same name silently replaced the first one, in a directory the
+    /// app does not own and cannot undo.
+    #[test]
+    fn running_out_of_numbers_never_lands_on_an_existing_file() {
+        let dir = scratch("unique-path-full");
+        std::fs::write(dir.join("a.txt"), b"original").expect("write");
+        for index in 2..UNIQUE_NAME_TRIES {
+            std::fs::write(dir.join(format!("a ({index}).txt")), b"taken").expect("fill");
+        }
+
+        let answer = unique_path(&dir, "a.txt");
+        assert!(
+            !answer.exists(),
+            "a path that already exists is an attachment about to be overwritten: {}",
+            answer.display()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("a.txt")).expect("read"),
+            b"original",
+            "and the original is still the original"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Hostile attachment names, table-driven.
     ///
