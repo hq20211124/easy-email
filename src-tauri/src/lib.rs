@@ -400,6 +400,20 @@ async fn delete_account(state: State<'_, AppState>, account_id: String) -> Resul
     }
     // Best effort: a missing vault entry must not prevent removing the account.
     let _ = secret::delete_password(&account_id);
+    // OAuth registration and refresh token belong to the account too.
+    let _ = state.user.delete_oauth_settings(&account_id);
+    if let Ok(store) = token_store(&state) {
+        let _ = store.delete(&account_id);
+    }
+    // Outbox rows and their frozen bytes: leaving them means "forever undeliverable".
+    if let Ok(rows) = state.user.list_outbox(Some(&account_id)) {
+        for item in rows {
+            if let Some(path) = item.spool_path {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    let _ = state.user.delete_outbox_for_account(&account_id);
     // And stop its IDLE watcher, or a task would keep a connection open for a deleted account.
     stop_watcher(state.inner(), &account_id);
     state.pool.clear(&account_id);
@@ -1565,6 +1579,18 @@ fn oauth_client_default(
         .unwrap_or(false);
     Ok(choice)
 }
+
+/// The key every per-account store is written under.
+///
+/// `mail_core::account_with_endpoints` (and `account_from_provider`) derive the saved account's `id`
+/// as exactly this, and every later read — `secret_for`, `oauth_settings`, the token store — looks
+/// the account up by that `id`. The OAuth flow must therefore use the *same* key when it writes the
+/// refresh token and the client settings, or a single capital letter in the typed address strands
+/// the token under a name nothing ever reads back.
+fn account_id_for(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
 /// Sign in with OAuth and stow the refresh token.
 ///
 /// The wizard calls this when the address belongs to a provider that requires OAuth (Google, Microsoft)
@@ -1689,12 +1715,20 @@ async fn oauth_sign_in(
         ),
     }
 
+    // **One key for everything that is stored per account.** The account id is exactly what
+    // `mail_core::account_with_endpoints` derives (`email.trim().to_ascii_lowercase()`), and every
+    // read — `oauth_settings`, the token store, `secret_for` — keys off it. Writing the token under
+    // the raw address while the settings went under the lowercased one meant a user who typed any
+    // capital (`User@Gmail.com`) saved a refresh token the app could never find again: a permanent
+    // "please sign in again" that no amount of retrying fixes (M1a-82's exact failure class).
+    let account_id = account_id_for(&email);
+
     // The registration is stored with the token: a refresh needs both, and asking the user for the
     // client id a second time would be asking them to remember something we already know.
     state
         .user
         .set_oauth_settings(
-            &email.to_ascii_lowercase(),
+            &account_id,
             &mail_core::userdb::OAuthSettings {
                 client_id: client_id.clone(),
                 client_secret: client_secret.clone(),
@@ -1707,7 +1741,7 @@ async fn oauth_sign_in(
     match tokens.refresh_token.as_deref() {
         Some(refresh) => {
             token_store(&state)?
-                .save(&email, refresh)
+                .save(&account_id, refresh)
                 .map_err(describe)?;
             log_line(&format!("[easy-email] {email} 的 OAuth 刷新令牌已保存"));
         }
@@ -1903,17 +1937,26 @@ async fn outbox_pass(app: &AppHandle) -> Result<(RunReport, FilingReport), Strin
     let mut total = RunReport::default();
     let mut filed = FilingReport::default();
     for account in accounts {
-        // No credential means no send, and the row must stay queued rather than be marked failed:
-        // the user may simply not have typed the authorization code yet.
-        let password = match secret::load_password(&account.id) {
-            Ok(Some(password)) => password,
-            _ => continue,
+        // OAuth accounts have no password in the vault — the refresh token is fetched here.
+        let state = app.state::<AppState>();
+        let password = match secret_for(&state, &account).await {
+            Ok(pw) => pw,
+            Err(error) => {
+                log_line(&format!(
+                    "[easy-email] {} 发件箱取不到凭据：{error}",
+                    account.id
+                ));
+                continue;
+            }
         };
 
         let report = run_due(
             OutboxRun {
                 store: &store,
                 spool: &spool,
+                // The queue is one table for every account; this is what scopes the pass to the one
+                // whose credential `password` is.
+                account_id: &account.id,
                 cfg: &account,
                 password: &password,
                 now: now_seconds(),
@@ -1939,6 +1982,7 @@ async fn outbox_pass(app: &AppHandle) -> Result<(RunReport, FilingReport), Strin
             FilingRun {
                 store: &store,
                 spool: &spool,
+                account_id: &account.id,
                 cache: &cache,
                 now: now_seconds(),
             },
@@ -2081,26 +2125,35 @@ async fn recover_outbox(app: &AppHandle) -> Result<RecoveryReport, String> {
 
     let mut total = RecoveryReport::default();
     for account in accounts {
-        let in_flight = store
-            .outbox_in_flight()
+        // Scoped to this account: the Sent folder `sent_folder_has` asks is this account's, so
+        // deciding another account's row here would search the wrong mailbox.
+        let in_flight = !store
+            .outbox_in_flight(&account.id)
             .map_err(describe)?
-            .into_iter()
-            .any(|item| item.account_id == account.id);
+            .is_empty();
         if !in_flight {
             continue;
         }
 
         // Without the credential we cannot ask, and the rows stay exactly as they are for the next
         // attempt — including one that runs after the user re-enters their authorization code.
-        let password = match secret::load_password(&account.id) {
-            Ok(Some(password)) => password,
-            _ => continue,
+        let state = app.state::<AppState>();
+        let password = match secret_for(&state, &account).await {
+            Ok(pw) => pw,
+            Err(error) => {
+                log_line(&format!(
+                    "[easy-email] {} 崩溃恢复取不到凭据：{error}",
+                    account.id
+                ));
+                continue;
+            }
         };
 
         let report = recover_in_flight(
             RecoveryRun {
                 store: &store,
                 spool: &spool,
+                account_id: &account.id,
                 now: now_seconds(),
                 max_auto_bytes: CRASH_RESEND_LIMIT,
             },
@@ -2797,9 +2850,15 @@ async fn pending_replay_pass(app: &AppHandle) -> Result<(), String> {
         if outstanding == 0 {
             continue;
         }
-        let password = match secret::load_password(&account.id) {
-            Ok(Some(password)) => password,
-            _ => continue,
+        let password = match secret_for(&app.state::<AppState>(), &account).await {
+            Ok(pw) => pw,
+            Err(error) => {
+                log_line(&format!(
+                    "[easy-email] {} 离线重放取不到凭据：{error}",
+                    account.id
+                ));
+                continue;
+            }
         };
 
         struct AccountApplier<'a> {
