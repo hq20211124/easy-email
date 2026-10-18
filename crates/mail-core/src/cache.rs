@@ -36,7 +36,12 @@ use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 /// failed with `no such column: index_version` the moment an account actually had a message to index
 /// — a dead end that only shows up once mail arrives. Bumping to 8 runs the (idempotent)
 /// `add_column_if_missing` calls once more and repairs those files.
-pub const SCHEMA_VERSION: i64 = 8;
+///
+/// **9** adds the `cc_addrs` column to the FTS index so `cc:` can answer a real question (`query.rs`
+/// used to fold `cc:` onto `to_addrs`). FTS5 tables cannot gain a column, so the migration drops the
+/// index table and lets the create-if-not-exists below rebuild it with the new shape, then re-indexes
+/// every cached message — the index is derived data, so this loses nothing.
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Which index shape a `bodies` row was last written by.
 ///
@@ -443,11 +448,27 @@ impl Cache {
         // One transaction: the whole schema appears or none of it does, which is what makes
         // "the version says v3" a statement about a complete schema.
         self.db.write_blocking(move |conn: &Connection| {
-
-
             let version: i64 = conn
                 .query_row("pragma user_version", [], |row| row.get(0))?;
-            if version == SCHEMA_VERSION {
+
+            // **The shape of `search`, read from the schema rather than from the recorded version.**
+            // An FTS5 table cannot gain a column, and the version number is a promise a dev build can
+            // break: a file can be stamped `user_version = 9` and still hold the old 5-column index,
+            // after which every `insert into search(cc_addrs)` fails and new mail silently stops
+            // being cached. Only asking the schema tells the two apart.
+            let search_exists: i64 = conn.query_row(
+                "select count(*) from pragma_table_list where name = 'search'",
+                [],
+                |row| row.get(0),
+            )?;
+            let search_has_cc: i64 = conn.query_row(
+                "select count(*) from pragma_table_info('search') where name = 'cc_addrs'",
+                [],
+                |row| row.get(0),
+            )?;
+            let search_is_stale = search_exists == 1 && search_has_cc == 0;
+
+            if version == SCHEMA_VERSION && !search_is_stale {
                 return Ok(());
             }
 
@@ -458,9 +479,16 @@ impl Cache {
                     "缓存数据库版本 {version} 比程序支持的 {SCHEMA_VERSION} 更新，请升级程序"
                 )));
             }
-            // Some steps below are only needed for databases that predate a version, and they cannot
-            // be inferred from the schema after the fact.
-            let previous_version = version;
+
+            // v9 adds `cc_addrs` to the search index: throw the old index away and let the
+            // `create virtual table if not exists` below build it with the new shape. The index is
+            // derived data, so nothing is lost — but which rows need re-indexing is recorded further
+            // down, *after* the `search_rowid` column exists. A file older than v6 has no such column
+            // yet, and marking it here fails the whole upgrade on `no such column`; a file with no
+            // index at all gets one column that is NULL everywhere, which needs no marking.
+            if search_is_stale {
+                conn.execute("drop table if exists search", [])?;
+            }
 
             conn.execute_batch(
                 "create table if not exists folders (
@@ -506,7 +534,7 @@ impl Cache {
                  -- Standalone (not external-content) on purpose: it stores the tokenised text, which is
                  -- not the same text as in `messages`. Independent of `unicode61`'s defaults.
                  create virtual table if not exists search using fts5(
-                     subject, from_name, from_addr, to_addrs, body,
+                     subject, from_name, from_addr, to_addrs, cc_addrs, body,
                      account_id unindexed, folder unindexed, uid unindexed,
                      tokenize = 'unicode61'
                  );
@@ -561,6 +589,12 @@ impl Cache {
             // Before this the delete scanned the entire index on every single message — see the
             // comment in `refresh_search_row`; the benchmark measured the difference.
             add_column_if_missing(conn, "messages", "search_rowid", "integer")?;
+            if search_is_stale {
+                // Every row is now un-indexed, which is exactly what the background rebuild walks
+                // (`rebuild_search_step` selects `search_rowid is null`). Not rebuilt here: a 50 000
+                // message mailbox rebuilt inside this transaction would freeze startup.
+                conn.execute("update messages set search_rowid = null", [])?;
+            }
             // The search query joins `messages.search_rowid` to the FTS rowid, and without this index
             // that join is a scan of `messages` per match — which is the second half of the same
             // performance bug and was measured at 769 ms P50 on a 20 000-message fixture.
@@ -576,18 +610,10 @@ impl Cache {
             // (`design/09` §5.4: rebuilding belongs in bounded background batches, never in the
             // startup transaction).
             add_column_if_missing(conn, "bodies", "index_version", "integer not null default 0")?;
-            if previous_version < 7 {
-                // v7 changed the tokenisation (ASCII words are whole tokens now), so an index built
-                // by an older version is not just stale, it is built on different rules and can never
-                // match a query from this version. Rebuilding is the only repair, and it is cheap:
-                // the index is derived data, rebuilt from `messages` + `bodies` in one pass.
-                //
-                // The same rebuild covers v6's rowid change, so one condition serves both.
-                rebuild_search_index(conn)?;
-            }
+            // Rebuilding the full-text index belongs in bounded background batches too
+            // (`rebuild_search_step`, driven by `start_search_rebuild_worker`).
             backfill_subject_keys(conn)?;
             Ok(())
-
         })
     }
 
@@ -1470,9 +1496,9 @@ impl Cache {
     /// the same reason it must not happen inside one long transaction here: every other command
     /// would queue behind it on the single write thread.
     ///
-    /// Not to be confused with the migration's own one-shot `rebuild_search_index`, which runs once
-    /// inside `migrate` for a v5 file that had no `search_rowid` to delete by. The two look alike and
-    /// are deliberately separate — do not "merge" them.
+    /// Not to be confused with the migration's own drop-and-null, which runs once inside `migrate`
+    /// for a file whose `search` table had the wrong shape. The two look alike and are deliberately
+    /// separate — do not "merge" them.
     pub fn rebuild_search_begin(&self) -> Result<()> {
         self.db.write_blocking(|conn: &Connection| {
             conn.execute("delete from search", [])?;
@@ -1576,8 +1602,9 @@ impl Cache {
     ) -> Result<(crate::quota::CleanupPlan, crate::quota::CleanupReport)> {
         self.with_connection(move |conn| {
             let plan = crate::quota::plan(conn, &policy, now)?;
-            let report = crate::quota::apply(conn, &policy, &plan, now)?;
-            Self::refresh_stale_index_rows(conn)?;
+            let doomed = crate::quota::bodies_matching(conn, &policy, &plan)?;
+            let report = crate::quota::apply(conn, &policy, &plan)?;
+            Self::refresh_after_delete(conn, &doomed)?;
             Ok((plan, report))
         })
     }
@@ -1591,44 +1618,42 @@ impl Cache {
         &self,
         plan: crate::quota::CleanupPlan,
         policy: crate::quota::CleanupPolicy,
-        now: i64,
     ) -> Result<crate::quota::CleanupReport> {
         self.with_connection(move |conn| {
-            let report = crate::quota::apply(conn, &policy, &plan, now)?;
-            Self::refresh_stale_index_rows(conn)?;
+            let doomed = crate::quota::bodies_matching(conn, &policy, &plan)?;
+            let report = crate::quota::apply(conn, &policy, &plan)?;
+            Self::refresh_after_delete(conn, &doomed)?;
             Ok(report)
         })
     }
 
-    /// Header-only index rows for every message whose body is gone.
+    /// Header-only index rows for exactly the messages whose bodies this cleanup took.
     ///
-    /// In the same write as the delete, so a crash mid-way cannot leave an index that answers for a
-    /// body that is still there.
-    fn refresh_stale_index_rows(conn: &Connection) -> rusqlite::Result<()> {
-        let stale: Vec<(String, String, u32)> = {
-            let mut stmt = conn.prepare(
-                "select m.account_id, m.folder, m.uid from messages m
-                 where m.search_rowid is not null
-                   and not exists (select 1 from bodies b
-                                    where b.account_id = m.account_id
-                                      and b.folder = m.folder
-                                      and b.uid = m.uid)",
+    /// Bounded to that set on purpose. The obvious query — "every message with no body" — is true of
+    /// every message the user never opened, so a cleanup that deleted ten rows used to rewrite the
+    /// whole index, in the same transaction as the delete.
+    ///
+    /// The set is read **before** the delete, in the same write: afterwards the bodies are gone and
+    /// there is nothing left to ask which ones went.
+    fn refresh_after_delete(
+        conn: &Connection,
+        doomed: &[(String, String, u32)],
+    ) -> rusqlite::Result<()> {
+        for (account_id, folder, uid) in doomed {
+            let indexed: i64 = conn.query_row(
+                "select count(*) from messages
+                 where account_id = ?1 and folder = ?2 and uid = ?3 and search_rowid is not null",
+                rusqlite::params![account_id, folder, uid],
+                |row| row.get(0),
             )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? as u32,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (account_id, folder, uid) in stale {
+            if indexed == 0 {
+                continue;
+            }
             Self::refresh_search_row(
                 conn,
-                &account_id,
-                &folder,
-                uid,
+                account_id,
+                folder,
+                *uid,
                 crate::index::DEFAULT_BODY_INDEX_CHARS,
             )
             .map_err(|e| {
@@ -2016,16 +2041,22 @@ impl Cache {
             format!("{} {}", to_tokens(body), to_tokens(&names))
         };
 
+        // Carbon-copy recipients, like the body, live only inside the stored detail (a header summary
+        // does not carry them), so they are pulled from the same parse. Empty until the body has been
+        // fetched — which is correct: we genuinely do not know the Cc before reading the message.
+        let cc_addrs = detail.as_ref().map(|d| d.cc.join(" ")).unwrap_or_default();
+
         conn.execute(
             "insert into search
-                 (rowid, subject, from_name, from_addr, to_addrs, body, account_id, folder, uid)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (rowid, subject, from_name, from_addr, to_addrs, cc_addrs, body, account_id, folder, uid)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 rowid,
                 to_tokens(&source.subject),
                 to_tokens(source.from_name.as_deref().unwrap_or_default()),
                 to_tokens(source.from_addr.as_deref().unwrap_or_default()),
                 to_tokens(source.to_addrs.as_deref().unwrap_or_default()),
+                to_tokens(&cc_addrs),
                 indexed_body,
                 account_id,
                 folder,
@@ -2054,41 +2085,6 @@ impl Cache {
     }
 }
 
-/// Throw the index away and build it again from `messages` (and `bodies`).
-///
-/// Used by the v6 migration, whose whole point is that old rows had no `search_rowid` to delete by.
-/// One pass, one transaction: the identities are collected first because the loop writes to
-/// `messages` while a statement over it would still be open.
-fn rebuild_search_index(conn: &Connection) -> Result<()> {
-    conn.execute("delete from search", [])?;
-    conn.execute("update messages set search_rowid = null", [])?;
-
-    let rows: Vec<(String, String, u32)> = {
-        let mut stmt = conn.prepare("select account_id, folder, uid from messages")?;
-        let mapped = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u32,
-            ))
-        })?;
-        mapped.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    for (account_id, folder, uid) in rows {
-        Cache::refresh_search_row(
-            conn,
-            &account_id,
-            &folder,
-            uid,
-            crate::index::DEFAULT_BODY_INDEX_CHARS,
-        )?;
-    }
-    Ok(())
-}
-
-/// Add a column to an existing table, once.
-///
 /// How far apart two messages under the same subject may be and still read as one conversation.
 ///
 /// The heuristic needs a bound, and a real mailbox says why: the case that asked for it is four
@@ -2673,6 +2669,121 @@ mod tests {
         assert_eq!(uids(&cache, "subject:对账"), vec![1]);
         // An ASCII term through a scoped column behaves like the unscoped one.
         assert_eq!(uids(&cache, "from:example.com").len(), 2);
+    }
+
+    #[test]
+    fn cc_search_answers_about_the_carbon_copy_not_the_recipient() {
+        // The regression: `cc:` used to be folded onto `to_addrs`, so it answered "who was this sent
+        // to" and never read the carbon copy. A wrong answer is worse than a missing one.
+        let cache = Cache::open_in_memory().unwrap();
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[
+                    summary(1, "通报", "boss@example.com", 100),
+                    summary(2, "通报", "boss@example.com", 200),
+                ],
+            )
+            .unwrap();
+
+        // Message 1 carries zhangsan only in the Cc; message 2 only in the To.
+        let mut with_cc = detail(1, "通报", "正文一");
+        with_cc.cc = vec!["zhangsan@example.com".to_string()];
+        cache.put_detail("acc", "INBOX", &with_cc).unwrap();
+
+        let mut with_to = detail(2, "通报", "正文二");
+        with_to.to = vec!["zhangsan@example.com".to_string()];
+        cache.put_detail("acc", "INBOX", &with_to).unwrap();
+
+        assert_eq!(
+            uids(&cache, "cc:zhangsan"),
+            vec![1],
+            "cc: must find the message whose carbon copy it is"
+        );
+        assert_eq!(
+            uids(&cache, "to:zhangsan"),
+            vec![2],
+            "to: must find the message it was addressed to"
+        );
+    }
+
+    /// **The file a version number cannot describe.** A dev build stamped `user_version = 9` over a
+    /// `search` table that still has the old 5 columns, and an FTS5 table cannot gain a column. Trust
+    /// the number and that file stays broken forever: every `insert into search (… cc_addrs …)`
+    /// fails, so new mail stops reaching the index — a silence that looks like "nothing to search".
+    /// Asking the schema for its shape is what makes the repair happen once and only where needed.
+    #[test]
+    fn a_current_file_with_the_old_index_shape_is_repaired_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-stale-search-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        {
+            let conn = Connection::open(&path).expect("stale open");
+            conn.execute_batch(&format!(
+                "pragma user_version = {SCHEMA_VERSION};
+                     create table messages (
+                         account_id text not null, folder text not null, uid integer not null,
+                         subject text not null default '', from_name text, from_addr text,
+                         to_addrs text, date integer, size integer,
+                         seen integer not null default 0, flagged integer not null default 0,
+                         thread_key text, subject_key text, search_rowid integer,
+                         primary key (account_id, folder, uid)
+                     );
+                     create virtual table search using fts5(
+                         subject, from_name, from_addr, to_addrs, body,
+                         account_id unindexed, folder unindexed, uid unindexed,
+                         tokenize = 'unicode61'
+                     );
+                     insert into messages (account_id, folder, uid, subject, search_rowid)
+                         values ('acc', 'INBOX', 1, '通报', 7);"
+            ))
+            .expect("stale schema");
+        }
+
+        let cache = Cache::open(&path).expect("open");
+
+        let has_cc: i64 = cache
+            .with_connection(|conn| {
+                conn.query_row(
+                    "select count(*) from pragma_table_info('search') where name = 'cc_addrs'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .expect("probe");
+        assert_eq!(has_cc, 1, "the index must come back with the cc column");
+
+        // The stale pointer is cleared rather than followed, which is what hands the work to the
+        // bounded background pass instead of the startup transaction.
+        let rowids: Vec<Option<i64>> = cache
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare("select search_rowid from messages")?;
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("read rowids");
+        assert_eq!(rowids, vec![None], "the row must be marked for re-indexing");
+
+        let progress = cache.rebuild_search_step(500).expect("rebuild step");
+        assert_eq!(progress.done, 1, "{progress:?}");
+        assert_eq!(progress.remaining, 0, "{progress:?}");
+
+        // And the write that used to fail now lands: the carbon copy is searchable.
+        let mut with_cc = detail(1, "通报", "正文一");
+        with_cc.cc = vec!["zhangsan@example.com".to_string()];
+        cache
+            .put_detail("acc", "INBOX", &with_cc)
+            .expect("put detail");
+        assert_eq!(uids(&cache, "cc:zhangsan"), vec![1]);
+
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

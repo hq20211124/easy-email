@@ -16,6 +16,11 @@ pub enum QueryColumn {
     /// The FTS keeps the display name and the address apart; both are "who sent it" to a user.
     From,
     To,
+    /// Carbon-copy recipients. A separate column from [`QueryColumn::To`] because `cc:` asking about
+    /// the recipient is a different question from `cc:` asking about the carbon copy — folding the
+    /// two together makes `cc:张三` silently answer "who did this go *to*", which is a wrong result
+    /// rather than a missing one.
+    Cc,
     /// Body text — and the attachment names, which are indexed into the same column (round 71).
     Body,
 }
@@ -27,6 +32,7 @@ impl QueryColumn {
             QueryColumn::Subject => "{subject}",
             QueryColumn::From => "{from_name from_addr}",
             QueryColumn::To => "{to_addrs}",
+            QueryColumn::Cc => "{cc_addrs}",
             QueryColumn::Body => "{body}",
         }
     }
@@ -64,7 +70,9 @@ pub fn known_prefixes() -> Vec<&'static str> {
     vec![
         "subject",
         "from",
+        "sender",
         "to",
+        "cc",
         "body",
         "filename",
         "has:attachment",
@@ -83,7 +91,8 @@ fn column_of(head: &str) -> Option<QueryColumn> {
     match head.to_ascii_lowercase().as_str() {
         "subject" => Some(QueryColumn::Subject),
         "from" | "sender" => Some(QueryColumn::From),
-        "to" | "cc" => Some(QueryColumn::To),
+        "to" => Some(QueryColumn::To),
+        "cc" => Some(QueryColumn::Cc),
         // Attachment names are indexed in the body column (round 71), so this maps there on purpose.
         "body" | "filename" => Some(QueryColumn::Body),
         _ => None,
@@ -455,6 +464,32 @@ mod tests {
         let issues = query_issues("after:昨天");
         assert_eq!(issues.len(), 1);
         assert!(issues[0].contains("看不懂"));
+    }
+
+    #[test]
+    fn cc_is_its_own_scope_not_a_synonym_for_to() {
+        // The bug this pins: `cc:` used to map to the `to_addrs` column, so it answered "who did
+        // this go to" and never looked at the carbon copy at all — a silently wrong result.
+        assert_eq!(
+            parse_query("cc:张三"),
+            vec![QueryTerm::Text {
+                column: Some(QueryColumn::Cc),
+                text: "张三".to_string(),
+            }]
+        );
+        assert_eq!(
+            parse_query("to:张三"),
+            vec![QueryTerm::Text {
+                column: Some(QueryColumn::To),
+                text: "张三".to_string(),
+            }]
+        );
+        assert_ne!(
+            QueryColumn::Cc.filter(),
+            QueryColumn::To.filter(),
+            "the two scopes must not resolve to the same FTS column"
+        );
+        assert!(known_prefixes().contains(&"cc"), "the hint must offer it");
     }
 
     #[test]

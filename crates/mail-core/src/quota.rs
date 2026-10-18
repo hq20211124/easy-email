@@ -83,6 +83,7 @@ pub struct CleanupReport {
 pub fn report(conn: &Connection) -> rusqlite::Result<StorageReport> {
     let page_size: i64 = conn.query_row("pragma page_size", [], |row| row.get(0))?;
     let page_count: i64 = conn.query_row("pragma page_count", [], |row| row.get(0))?;
+    let freelist_count: i64 = conn.query_row("pragma freelist_count", [], |row| row.get(0))?;
     let messages: u32 = conn.query_row("select count(*) from messages", [], |row| {
         row.get::<_, i64>(0).map(|n| n as u32)
     })?;
@@ -99,7 +100,7 @@ pub fn report(conn: &Connection) -> rusqlite::Result<StorageReport> {
         .optional()?
         .flatten();
     Ok(StorageReport {
-        cache_bytes: page_size as u64 * page_count as u64,
+        cache_bytes: page_size as u64 * (page_count - freelist_count).max(0) as u64,
         messages,
         bodies,
         bodies_bytes,
@@ -153,7 +154,10 @@ pub fn plan(conn: &Connection, policy: &CleanupPolicy, now: i64) -> rusqlite::Re
     };
     // Nothing over the limit and no age rule: this cache is someone else's decision.
     if !over_limit && policy.max_age_days.is_none() {
-        return Ok(CleanupPlan::default());
+        return Ok(CleanupPlan {
+            approved_at: now,
+            ..CleanupPlan::default()
+        });
     }
 
     let predicate = cleanup_predicate(policy, now);
@@ -172,6 +176,7 @@ pub fn plan(conn: &Connection, policy: &CleanupPolicy, now: i64) -> rusqlite::Re
         over_limit,
         freed_bytes: freed,
         steps: Vec::new(),
+        approved_at: now,
     };
     if rows > 0 {
         plan.steps.push(CleanupStep {
@@ -191,13 +196,47 @@ pub struct CleanupPlan {
     pub steps: Vec<CleanupStep>,
     /// The sum of the steps, which is the number the user is shown before anything happens.
     pub freed_bytes: u64,
+    /// **The clock the plan was measured against**, carried into `apply`.
+    ///
+    /// An age predicate is monotone in `now`: re-evaluating it later matches a superset of what the
+    /// user was shown. The dry run is the consent, so the apply runs on the dry run's clock — the
+    /// number in the struct is what makes that un-forgettable, rather than a parameter a future
+    /// caller can pass wrong.
+    pub approved_at: i64,
+}
+
+/// Which bodies a cleanup takes, as the message identities the caller can hand to the index.
+///
+/// Same predicate, same clock, same answer as [`apply`] — which is the point: the index has to be
+/// told about exactly the rows that go. "Everything that currently has no body" is not that set, it
+/// is every message the user never opened.
+pub fn bodies_matching(
+    conn: &Connection,
+    policy: &CleanupPolicy,
+    plan: &CleanupPlan,
+) -> rusqlite::Result<Vec<(String, String, u32)>> {
+    if !plan.steps.iter().any(|s| s.target == CleanupTarget::Bodies) {
+        return Ok(Vec::new());
+    }
+    let predicate = cleanup_predicate(policy, plan.approved_at);
+    let mut stmt = conn.prepare(&format!(
+        "select account_id, folder, uid from bodies where {predicate}"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u32,
+        ))
+    })?;
+    rows.collect()
 }
 
 /// Run a plan: delete the bodies it names, and report what actually went.
 ///
-/// The predicate is rebuilt from the **same policy** that made the plan, and the number is measured
-/// **again immediately before the delete** — so what the user is told is what went, not what was
-/// promised a moment ago (a body may have been fetched in between).
+/// The predicate is rebuilt from the **same policy** that made the plan and on the **clock the plan
+/// was made at** ([`CleanupPlan::approved_at`]), and the number is measured again immediately before
+/// the delete — so what the user is told is what went, and what goes is never more than was shown.
 ///
 /// **This deletes bodies and nothing else.** The search index is a separate concern that belongs to
 /// the cache, and `Cache::cleanup` is where the two meet: a quota pass that also rewrites the index
@@ -206,13 +245,13 @@ pub fn apply(
     conn: &Connection,
     policy: &CleanupPolicy,
     plan: &CleanupPlan,
-    now: i64,
 ) -> rusqlite::Result<CleanupReport> {
     let wants_bodies = plan.steps.iter().any(|s| s.target == CleanupTarget::Bodies);
     if !wants_bodies {
         return Ok(CleanupReport::default());
     }
 
+    let now = plan.approved_at;
     let predicate = cleanup_predicate(policy, now);
     // Measured again, immediately before the delete: the report to the user is what actually went,
     // not what was promised a moment ago.
@@ -302,7 +341,7 @@ mod tests {
         let plan = plan(&conn, &policy, now).expect("plan");
         assert_eq!(plan.freed_bytes, total, "the plan measures what is there");
 
-        let report = apply(&conn, &policy, &plan, now).expect("apply");
+        let report = apply(&conn, &policy, &plan).expect("apply");
         assert_eq!(
             report.freed_bytes, plan.freed_bytes,
             "same predicate, same answer"
@@ -319,9 +358,7 @@ mod tests {
     fn an_empty_plan_deletes_nothing() {
         // The failure that would be worst: a stale or empty plan applied as if it were full.
         let (conn, _) = cache();
-        let now = 1_700_000_000 + 10 * 86_400;
-        let report =
-            apply(&conn, &policy_all(), &CleanupPlan::default(), now).expect("apply nothing");
+        let report = apply(&conn, &policy_all(), &CleanupPlan::default()).expect("apply nothing");
         assert_eq!((report.bodies_deleted, report.freed_bytes), (0, 0));
         assert_eq!(super::report(&conn).expect("still there").bodies, 6);
     }
@@ -354,7 +391,7 @@ mod tests {
         assert_eq!(planned.freed_bytes, expected);
         assert!(planned.freed_bytes < total, "some of it is spared");
 
-        let applied = super::apply(&conn, &policy, &planned, now).expect("apply");
+        let applied = super::apply(&conn, &policy, &planned).expect("apply");
         assert_eq!(applied.bodies_deleted, 3, "only the plain ones");
         assert_eq!(applied.freed_bytes, planned.freed_bytes);
         let kept = super::report(&conn).expect("after");
@@ -366,9 +403,63 @@ mod tests {
         let (conn, _) = cache();
         let now = 1_700_000_000;
         let policy = CleanupPolicy::default();
+        let planned = plan(&conn, &policy, now).expect("plan");
+        assert!(
+            planned.steps.is_empty() && !planned.over_limit && planned.freed_bytes == 0,
+            "an empty plan is a legitimate answer: {planned:?}"
+        );
         assert_eq!(
-            plan(&conn, &policy, now).expect("plan"),
-            CleanupPlan::default()
+            planned.approved_at, now,
+            "even an empty plan carries its clock"
+        );
+    }
+
+    /// **The plan is the consent.** An age predicate re-evaluated later matches a superset: mail
+    /// that arrived after the dry run, or a body the user read in the meantime, would be deleted by
+    /// an `apply` that used its own clock. The user agreed to the number on the screen, so the delete
+    /// runs on the clock that number was measured against.
+    #[test]
+    fn apply_runs_on_the_plan_clock_not_on_the_clock_of_the_moment() {
+        let (conn, _) = cache();
+        let planned_at = 1_700_000_000 + 10 * 86_400;
+        let policy = CleanupPolicy {
+            max_bytes: None,
+            max_age_days: Some(8),
+            keep_unread: false,
+            keep_flagged: false,
+        };
+        let planned = plan(&conn, &policy, planned_at).expect("plan");
+        assert_eq!(planned.steps[0].rows, 2, "the two oldest of six");
+
+        // A day passes, and a body that was too young for the plan is now old enough.
+        conn.execute(
+            "insert into bodies (account_id, folder, uid, detail, fetched_at)
+             values ('acc', 'INBOX', 99, '{\"body_text\":\"late\"}', ?1)",
+            [1_700_000_000 + 9 * 86_400],
+        )
+        .expect("late body");
+        conn.execute(
+            "insert into messages (account_id, folder, uid, subject, from_addr, date, size)
+             values ('acc', 'INBOX', 99, '迟到的', 'a@example.com', 1700000000, 100)",
+            [],
+        )
+        .expect("late message");
+
+        let mut doomed = bodies_matching(&conn, &policy, &planned).expect("matching");
+        doomed.sort();
+        assert_eq!(
+            doomed,
+            vec![
+                ("acc".to_string(), "INBOX".to_string(), 0),
+                ("acc".to_string(), "INBOX".to_string(), 1),
+            ],
+            "the set handed to the index is the set the plan counted"
+        );
+
+        let applied = apply(&conn, &policy, &planned).expect("apply");
+        assert_eq!(
+            applied.bodies_deleted, 2,
+            "the plan said two, so two go — even though a third has aged into the window"
         );
     }
 
@@ -398,7 +489,7 @@ mod tests {
             ..policy
         };
         let planned = super::plan(&conn, &strict, now).expect("strict plan");
-        let applied = super::apply(&conn, &strict, &planned, now).expect("strict apply");
+        let applied = super::apply(&conn, &strict, &planned).expect("strict apply");
         assert!(
             applied.bodies_deleted >= 4,
             "the old ones went: {}",
