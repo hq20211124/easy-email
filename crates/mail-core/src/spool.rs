@@ -44,8 +44,15 @@ impl Spool {
     /// Write the frozen bytes and report where they went, plus their size.
     pub fn write(&self, id: i64, bytes: &[u8]) -> Result<(PathBuf, u64)> {
         let path = self.path_for(id);
-        std::fs::write(&path, bytes)
-            .map_err(|e| MailError::Config(format!("无法写入发件暂存 {}：{e}", path.display())))?;
+        let tmp = path.with_extension("eml.tmp");
+        std::fs::write(&tmp, bytes)
+            .map_err(|e| MailError::Config(format!("无法写入发件暂存 {}：{e}", tmp.display())))?;
+        // Crash between write and rename must not leave a truncated .eml visible.
+        if let Ok(f) = std::fs::File::open(&tmp) {
+            let _ = f.sync_all();
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| MailError::Config(format!("无法提交发件暂存 {}：{e}", path.display())))?;
         Ok((path, bytes.len() as u64))
     }
 
