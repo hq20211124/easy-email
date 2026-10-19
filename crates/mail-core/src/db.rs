@@ -317,13 +317,6 @@ impl Db {
             tx.commit()?;
             return Ok(out);
         }
-        if let Some(direct) = &self.shared.direct {
-            let conn = direct.lock().expect("direct connection");
-            let tx = conn.unchecked_transaction()?;
-            let out = f(&tx)?;
-            tx.commit()?;
-            return Ok(out);
-        }
         // `unchecked_transaction` (rather than `transaction`) because it takes `&Connection`: a
         // `Transaction` only implements `Deref`, not `DerefMut`, so a `&mut Connection` closure
         // cannot be handed one. "Unchecked" only means it does not verify that a transaction is
@@ -350,13 +343,6 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        if let Some(direct) = &self.shared.direct {
-            let conn = direct.lock().expect("direct connection");
-            let tx = conn.unchecked_transaction()?;
-            let out = f(&tx)?;
-            tx.commit()?;
-            return Ok(out);
-        }
         if let Some(direct) = &self.shared.direct {
             let conn = direct.lock().expect("direct connection");
             let tx = conn.unchecked_transaction()?;

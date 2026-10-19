@@ -308,11 +308,29 @@ async function run(label, fn) {
 
 /* ---------------------------------------------------------------- boot */
 
+/*
+  Stage marks on the road to the first row. P1's「页面腿 ~866 ms」was one number that no step could
+  be blamed for, and the fix has to be chosen from the attribution, not from how many awaits the boot
+  chain happens to contain. Epoch milliseconds on the page's own clock — an outside watcher would have
+  to line them up with the process start anyway, and its own connect latency must not leak in.
+*/
+const bootTrace = (window.__easyEmailBoot ??= { stages: [] });
+function markBoot(name) {
+  bootTrace.stages.push({ name, at: Math.round(performance.timeOrigin + performance.now()) });
+}
+
 async function boot() {
+  markBoot('boot');
   state.readerMode = loadReaderMode();
+  markBoot('providers:ask');
   state.providers = (await run('读取内置邮箱配置', () => invoke('list_providers'))) ?? [];
+  markBoot('providers:done');
+  markBoot('syncWindow:ask');
   await refreshSyncWindow();
+  markBoot('syncWindow:done');
+  markBoot('accounts:ask');
   await refreshAccounts();
+  markBoot('accounts:done');
   wireGlobalEvents();
   syncThemeButton();
   syncAccentButton();
@@ -719,22 +737,49 @@ async function loadMailboxes() {
   const accountId = state.accountId;
   if (!accountId) return;
 
-  const mailboxes = await run('读取文件夹', () =>
-    invoke('list_mailboxes', { accountId })
-  );
-  state.mailboxes = (mailboxes ?? []).filter((box) => box.selectable);
+  // The folders come off the disk first. `list_mailboxes` asks the server, and at cold start that
+  // question also pays for a fresh IMAP connection: measured at 461 ms sitting in front of a first row
+  // that SQLite answers in 7–12 ms (eight launches each side, `tools/bench-p1-repeat.mjs`, 2026-10-19
+  // and 2026-10-20).
+  const cached = (await run('读取本地文件夹', () => invoke('cached_mailboxes', { accountId }))) ?? [];
+  const known = cached.filter((box) => box.selectable);
+  markBoot('cachedFolders:done');
+
+  if (firstPaint.folderStep({ folderCount: known.length }) === 'cache') {
+    state.mailboxes = known;
+  } else {
+    // Nothing local to show, so the server genuinely is the only source — and the spinner stays while
+    // it is asked. An empty folder table has never once meant an account with no folders.
+    const listed = await run('读取文件夹', () => invoke('list_mailboxes', { accountId }));
+    state.mailboxes = (listed ?? []).filter((box) => box.selectable);
+    markBoot('mailboxes:done');
+  }
   renderMailboxes();
 
   // Badges come from the cache, so an offline start still shows what was unread when the app was
   // last online. Best effort: a failure here must not stop the folder list from rendering.
   await loadUnreadCounts();
+  markBoot('unread:done');
 
+  await openDefaultFolder();
+
+  // The server's own answer, taken only once rows are on screen — after the message refresh, so the
+  // two network legs never compete for the account's connection budget.
+  if (known.length > 0) void refreshFolderList();
+}
+
+/**
+ * Land on INBOX (or on whatever this account does have) and paint its first page.
+ *
+ * Shared by both folder-list sources because the pane must not behave differently depending on where
+ * the sidebar's rows came from.
+ */
+async function openDefaultFolder() {
   if (state.mailboxes.length === 0) {
     state.messages = [];
     renderMessages();
     return;
   }
-
   const inbox = state.mailboxes.find((box) => box.name.toUpperCase() === 'INBOX');
   selectMailbox(inbox ?? state.mailboxes[0]);
   renderMailboxes();
@@ -742,6 +787,31 @@ async function loadMailboxes() {
   // After the first page is on screen, and never before: the top-up is worth a round trip only when
   // there is a list to add to.
   backfillColdStart();
+}
+
+/**
+ * The server's folder list, taken *after* the first paint, and what to do when it disagrees.
+ *
+ * A failure changes nothing on screen: the folders already drawn came from this machine, and reading
+ * mail that is here has nothing to do with the connection that just failed — `src/first-paint.js`
+ * decision 2, applied one level up from the rows.
+ */
+async function refreshFolderList() {
+  const accountId = state.accountId;
+  if (!accountId) return;
+
+  const listed = await run('读取文件夹', () => invoke('list_mailboxes', { accountId }));
+  if (firstPaint.folderRefreshStep({ failed: listed === null }) === 'keep') return;
+
+  state.mailboxes = listed.filter((box) => box.selectable);
+  renderMailboxes();
+  await loadUnreadCounts();
+
+  // Checked against the folder on screen *now*, not the one this request started on: the user may have
+  // moved while the server was answering, and following them back to INBOX would be the bug.
+  if (state.mailbox && !state.mailboxes.some((box) => box.name === state.mailbox)) {
+    await openDefaultFolder();
+  }
 }
 
 /**
@@ -2223,6 +2293,7 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
       limit: PAGE_SIZE,
     })
   );
+  markBoot('cachePage:done');
   if (seq !== state.listLoadSeq) return;
 
   // Zero cached rows is not an empty folder, so the spinner stays and the refresh gets to answer.
@@ -2407,6 +2478,7 @@ function renderMessages() {
   paint.paints += 1;
   if (paint.firstRowsAt === null) paint.firstRowsAt = paintedAt;
   paint.lastRowsAt = paintedAt;
+  if (paint.paints === 1) markBoot('firstPaint');
 
   $('list-footer').hidden = state.historyDone;
 }

@@ -23,6 +23,9 @@
  * long as that is true — not `#sync-banner`, whose meaning is "the last refresh *failed*", and nothing
  * has failed yet.
  *
+ * `folderStep` is the same trade one level up, applied to the folder list that must be chosen before any
+ * row can be painted; see its own comment.
+ *
  * `tools/first_paint_test.mjs` pins both, and the case that is only wrong occasionally — a response
  * for a folder the user has already left.
  */
@@ -54,5 +57,35 @@
     return 'rows';
   }
 
-  global.__easyEmailFirstPaint = { cacheStep, freshStep };
+  /**
+   * Where the *folder* list should come from on the way to the first row — the same rule one level up.
+   *
+   * `list_mailboxes` asks the server for `LIST`, and at cold start that question pays for a fresh IMAP
+   * connection too: measured at 461 ms sitting in front of the first row, while `cached_mailboxes`
+   * answered the same thing off this machine in 7–12 ms. Zero cached folders is the
+   * one case where the server genuinely is the only source, and that is also the only case where the
+   * pane may still be a spinner.
+   *
+   * @param {{folderCount: number}} input — selectable folders the cache knows for this account
+   * @returns {'cache' | 'server'}
+   */
+  function folderStep({ folderCount }) {
+    return Number(folderCount) > 0 ? 'cache' : 'server';
+  }
+
+  /**
+   * What the deferred `LIST` should do to a sidebar that is already showing folders.
+   *
+   * Same rule as `freshStep`, one level up: once rows are on screen, a network failure has destroyed
+   * nothing. The folders the user can click are still the ones from the last sync — and `run()` answers
+   * with `null` rather than a list, so the failure has to be read from that, not from a length.
+   *
+   * @param {{failed: boolean}} input — whether the server answered at all
+   * @returns {'keep' | 'replace'}
+   */
+  function folderRefreshStep({ failed }) {
+    return failed ? 'keep' : 'replace';
+  }
+
+  global.__easyEmailFirstPaint = { cacheStep, freshStep, folderStep, folderRefreshStep };
 })(typeof window === 'undefined' ? globalThis : window);

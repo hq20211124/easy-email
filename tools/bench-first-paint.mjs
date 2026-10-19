@@ -143,6 +143,12 @@ const FIRST_PAINT = `(async () => {
     refreshingMark: title().includes('正在收取'),
     bannerVisible: !document.querySelector('#sync-banner')?.hidden,
     watcherAttachedMsAfterPageStart: Math.round(started),
+    // Where the page-leg time actually went: the stage marks src/app.js pushes on the road to the
+    // first row, as absolute epoch ms. Empty means this binary predates them — say so rather than
+    // silently reporting a boot with no steps in it.
+    bootStagesPresent: Array.isArray(window.__easyEmailBoot?.stages),
+    bootStages: (window.__easyEmailBoot?.stages ?? []).slice(0, 60),
+    pageOriginEpoch: Math.round(performance.timeOrigin),
   };
 })()`;
 

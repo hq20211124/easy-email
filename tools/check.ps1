@@ -1986,6 +1986,77 @@ try {
         Write-Host 'the list paints from the cache, and a failed refresh leaves those rows up'
         $global:LASTEXITCODE = 0
     }
+    Step 'the folder list is read from the cache before the server is asked' {
+        # Measured on the real window (2026-10-19, eight launches): the first paint was 1 508 ms and 461 ms
+        # of it was one `list_mailboxes` — an IMAP LIST which at cold start also pays for a fresh
+        # connection. The folders it asked for were already in SQLite, answering the same question in
+        # single-digit ms. `cached_mailboxes` is the local half of that trade, and the order between the
+        # two is what this step owns: the command-name contract belongs to `every command the frontend
+        # calls is registered`, and a cache-first folder list that never refreshes is the bug to prevent.
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        $start = $js.IndexOf('async function loadMailboxes(')
+        $end = if ($start -ge 0) { $js.IndexOf("`n}", $start) } else { -1 }
+        $body = if ($end -gt $start) { $js.Substring($start, $end - $start) } else { '' }
+        $cacheRead = $body.IndexOf("invoke('cached_mailboxes'")
+        $serverRead = $body.IndexOf("invoke('list_mailboxes'")
+        if ($start -lt 0) {
+            $problems += 'app.js no longer has loadMailboxes — the folder list needs one owner for both legs'
+        } elseif ($cacheRead -lt 0) {
+            $problems += "loadMailboxes must read cached_mailboxes first — the server LIST was 461 ms of the 1 508 ms first paint"
+        } elseif ($serverRead -lt 0) {
+            $problems += 'loadMailboxes no longer asks the server at all — with nothing cached, the server is the only source'
+        } elseif ($cacheRead -gt $serverRead) {
+            $problems += 'the cache read must come before the server read, otherwise the first paint still waits on the network'
+        }
+        # The rule lives in first-paint.js with the other two, so that zero cached folders cannot quietly
+        # become "this account has no folders".
+        if ($js -notmatch 'firstPaint\.folderStep') {
+            $problems += 'app.js must ask first-paint.js whether the cache has folders to show — painting an empty sidebar claims the account has none'
+        }
+        # And the sidebar must still converge on the server: the refresh is deferred, never dropped.
+        if ($js -notmatch 'void refreshFolderList\(\)') {
+            $problems += 'loadMailboxes must still refresh the folder list after painting — cache-first is not never-fresh'
+        }
+        $rfStart = $js.IndexOf('async function refreshFolderList(')
+        $rfEnd = if ($rfStart -ge 0) { $js.IndexOf("`n}", $rfStart) } else { -1 }
+        $rfBody = if ($rfEnd -gt $rfStart) { $js.Substring($rfStart, $rfEnd - $rfStart) } else { '' }
+        if ($rfStart -lt 0) {
+            $problems += 'app.js no longer has refreshFolderList — the deferred server read needs its own function'
+        } else {
+            if ($rfBody -notmatch "invoke\('list_mailboxes'") {
+                $problems += 'refreshFolderList no longer asks the server, so a folder added elsewhere never appears'
+            }
+            # The whole point of deferring is that the rows already on screen survive a dead network, and
+            # that decision is `folderRefreshStep`'s — asked here because the node test cannot see wiring.
+            if ($js -notmatch 'firstPaint\.folderRefreshStep') {
+                $problems += 'refreshFolderList must ask first-paint.js what a failed folder refresh does — clearing the sidebar is the bug'
+            }
+        }
+
+        $cmdStart = $lib.IndexOf('async fn cached_mailboxes(')
+        if ($cmdStart -ge 0) {
+            $cmdEnd = $lib.IndexOf("`n}", $cmdStart)
+            $cmdBody = if ($cmdEnd -gt $cmdStart) { $lib.Substring($cmdStart, $cmdEnd - $cmdStart) } else { $lib.Substring($cmdStart) }
+            foreach ($forbidden in @('refresh_folder', 'pool_op', 'secret_for', 'list_mailboxes')) {
+                if ($cmdBody -match $forbidden) {
+                    # `$forbidden:` parses as a drive-qualified variable name, so the message is built by
+                    # concatenation — same reason as in the message_page step.
+                    $problems += ('cached_mailboxes reaches for ' + $forbidden + ': reading the cached folders must not cost a connection')
+                }
+            }
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the sidebar paints from SQLite, and the server LIST follows it instead of blocking it'
+        $global:LASTEXITCODE = 0
+    }
     Step 'a conversation reply reaches the counterpart and joins the thread' {
         # Two silent failures, both loud in a real mailbox: "answer the newest message" addresses the
         # user themselves whenever they replied last, and a reply without the References chain arrives

@@ -702,6 +702,22 @@ async fn list_mailboxes(
     }
 }
 
+/// The folder list as the cache last saw it: no network, no credential lookup.
+///
+/// [`list_mailboxes`] asks the server for `LIST` and only falls back to this when the server does not
+/// answer — right for a refresh, wrong for a first paint. At cold start the server question also pays
+/// for a fresh IMAP connection, and it was measured sitting **in front of the first row**: 461 ms of a
+/// 1 508 ms P1 (eight launches, 2026-10-19), against 7–12 ms for the same answer read off this machine
+/// (two batches of eight, 2026-10-20; `tools/bench-p1-repeat.mjs`).
+#[tauri::command]
+async fn cached_mailboxes(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<MailboxInfo>, String> {
+    let cache = state.cache.clone();
+    cache.list_folders(&account_id).map_err(describe)
+}
+
 #[tauri::command]
 async fn list_messages(
     state: State<'_, AppState>,
@@ -4107,6 +4123,7 @@ pub fn run() {
             delete_account,
             verify_account,
             list_mailboxes,
+            cached_mailboxes,
             app_version,
             check_update,
             index_bodies,
