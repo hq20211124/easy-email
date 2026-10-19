@@ -66,16 +66,20 @@ if ($DebugProfile) {
 #     Measured 170% of indexed text at the -Quick shape on both platforms. `design/09` §8's 65.1% came
 #     from a bigram shape we do not use. Either the budget row moves or the index shape does; until
 #     someone decides, the honest thing is to print the number and say this.
-#   * P1/P5/P6 have a harness (`tools\bench-app.ps1`) that needs the running desktop shell built with
-#     a CDP port; it was not run, so they stay "未测". P3 has no harness at all — the script's header
-#     mentions scrolling, its body does not do it.
+#   * P1/P3/P5/P6 have a harness and it has been run: `tools\bench-app.ps1` (with
+#     `tools\bench-first-paint.mjs` and `tools\bench-scroll.mjs`) measured all four against the real
+#     desktop shell on 2026-10-19 — the numbers are `reports/performance.md` §9 and
+#     `target\bench-app-history.jsonl`, **not this table's**. This script still cannot print them,
+#     because they come from a running GUI process that this one does not start, so they stay
+#     "未测 —— 本轮未测" here and point at where they were measured. P2 keeps its fixture row, which
+#     measures the storage half of a folder switch (the 50-row cache query), not the window.
 $Budgets = @(
-    @{ Id = 'P1';  Name = '冷启动到列表可见';        Budget = '1.5 s';        Where = '需要跑起来的桌面壳（tools\bench-app.ps1 是那台测量仪；本轮未跑）' }
+    @{ Id = 'P1';  Name = '冷启动到列表可见';        Budget = '1.5 s';        Where = '本轮不测（要跑起来的桌面壳）。应用侧已量 2026-10-19：中位 1 858 ms ❌，见 reports/performance.md §9.1' }
     @{ Id = 'P2';  Name = '切文件夹';                Budget = '200 ms';       Where = '' }
-    @{ Id = 'P3';  Name = '列表滚动 60 fps';         Budget = '60 fps';       Where = '需要跑起来的桌面壳（tools\bench-scroll.mjs + bench-app.ps1；本轮未跑）' }
+    @{ Id = 'P3';  Name = '列表滚动 60 fps';         Budget = '60 fps';       Where = '本轮不测（要跑起来的桌面壳）。应用侧已量 2026-10-19：58.6–60.2 fps ✅ / 每帧变更曾 52 行 > 40，**同日修完复测 22–35 ⇒ ✅**，见 §9.3 与 §9.8' }
     @{ Id = 'P4';  Name = '本地搜索 P95';            Budget = '100 ms';       Where = '' }
-    @{ Id = 'P5';  Name = '常驻内存';                Budget = '300 MB';       Where = '需要跑起来的桌面壳（tools\bench-app.ps1；本轮未跑）' }
-    @{ Id = 'P6';  Name = '空闲 CPU';                Budget = '0.5%';         Where = '需要跑起来的桌面壳（tools\bench-app.ps1；本轮未跑）' }
+    @{ Id = 'P5';  Name = '常驻内存';                Budget = '300 MB';       Where = '本轮不测（要跑起来的桌面壳）。应用侧已量 2026-10-19：私有 226–253 MB ✅（口径已定为私有字节；同一批工作集 372–474 MB 在那个口径下超），见 §9.4' }
+    @{ Id = 'P6';  Name = '空闲 CPU';                Budget = '0.5%';         Where = '本轮不测（要跑起来的桌面壳）。应用侧已量 2026-10-19：五次 0.21–0.43 % 单核 ✅、第六次 0.82 % ❗ 待复测，见 §9.5' }
     @{ Id = 'P7';  Name = '首同步吞吐（头部）';        Budget = '300 封/秒';     Where = '' }
     @{ Id = 'P8';  Name = '正文预取吞吐';            Budget = '20 封/秒';     Where = '需要真实 IMAP 取件（P9 只测入库，不测取件）' }
     @{ Id = 'P9';  Name = '索引吞吐';                Budget = '20 封/秒';     Where = '' }

@@ -534,10 +534,18 @@ try {
         if ($cache -notmatch 'truncate_chars\(&body, body_limit\)') {
             $problems += 'cache.rs: the body must be truncated only where the FTS row is written'
         }
-        # `put_detail` writes the reader's copy; it must not mention the cap.
+        # `put_detail` writes the reader's copy; it must not mention the cap. Since the 2026-10-19
+        # P9 bench the statements live one level down in `write_detail`, so the pin follows the code —
+        # checking only `put_detail` there would let a cap sneak into the stored body unnoticed.
         $putDetail = [regex]::Match($cache, '(?s)pub fn put_detail.*?\n    \}').Value
+        $writeDetail = [regex]::Match($cache, '(?s)fn write_detail.*?\n    \}').Value
         if ($putDetail -match 'body_limit|truncate_chars') {
             $problems += 'put_detail must store the whole body — truncating it loses mail the user is reading'
+        }
+        if ($writeDetail.Length -eq 0) {
+            $problems += 'cache.rs: write_detail is gone — put_detail and the P9 bench share it, and the gate must see it'
+        } elseif ($writeDetail -match 'body_limit|truncate_chars') {
+            $problems += 'write_detail must store the whole body — only refresh_search_row may cap the index copy'
         }
         if ($problems.Count -gt 0) {
             $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
@@ -720,6 +728,54 @@ try {
         $global:LASTEXITCODE = 0
     }
 
+    Step 'the first-paint sampler exists, and it judges P1/P2 instead of printing them' {
+        # Round 98. design/15 §4 names `t_first_paint` and `t_folder_switch` as the instrumentation for
+        # P1 (1.5 s to a visible row) and P2 (200 ms to switch folders) — and neither has ever existed
+        # in code. So the two budgets a user actually feels had no ruler at all: "缓存先画快了多少" could
+        # only be argued, and `bench-app.ps1` was reporting the time until the debugging port answered
+        # under the label P1, which is a different and earlier thing.
+        $problems = @()
+        if (-not (Test-Path 'tools/bench-first-paint.mjs')) {
+            $problems += 'tools/bench-first-paint.mjs is missing: P1/P2 have no instrument, so the first-paint claim would be unfalsifiable again'
+        } else {
+            $paint = Get-Content 'tools/bench-first-paint.mjs' -Raw -Encoding UTF8
+            # Judging, not reporting: the budgets have to appear next to a comparison that can fail.
+            foreach ($budget in @('1500', '200')) {
+                if ($paint -notmatch [regex]::Escape($budget)) {
+                    $problems += "bench-first-paint.mjs never mentions $budget — it would be printing numbers, not judging them"
+                }
+            }
+            if ($paint -notmatch 'process\.exit\(1\)') {
+                $problems += 'bench-first-paint.mjs must exit non-zero when a budget is missed'
+            }
+            # A spinner and 「这个文件夹里还没有邮件。」 are both states on screen and neither is a row.
+            if ($paint -notmatch '#message-list \[data-uid\]') {
+                $problems += 'bench-first-paint.mjs must count [data-uid] rows inside #message-list — "visible" means a row you can read'
+            }
+            # The cache-leg evidence is a UI string. Rename 「（正在收取…）」 in app.js and every round
+            # silently reports "the cache leg did not paint" — a false negative that looks like data.
+            $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+            if ($js -notmatch '正在收取' -or $paint -notmatch '正在收取') {
+                $problems += 'the 「正在收取」 title mark must appear in both src/app.js and bench-first-paint.mjs: it is how the sampler proves the first paint came from the cache'
+            }
+        }
+        $app = Get-Content 'tools/bench-app.ps1' -Raw -Encoding UTF8
+        if ($app -notmatch 'bench-first-paint\.mjs') {
+            $problems += 'bench-app.ps1 must run the first-paint sampler — P1/P2 are app-level budgets and this is the app-level runner'
+        }
+        if ($app -notmatch 'P1_first_visible_row_ms') {
+            $problems += 'bench-app.ps1 must collect the first-visible-row number into its results; the port-answer timing is not P1'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'P1/P2 have an instrument that judges both budgets, and it is tied to the UI string it reads'
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'the list pages by offset instead of growing a limit' {
         # Round 75. The load-more path used to ask for `limit = shown + PAGE_SIZE`, i.e. re-read the
         # entire visible window on every press (payload and re-sort both grew with the screen), and it
@@ -801,7 +857,7 @@ try {
         }
         if (Test-Path 'src/vlist.js') {
             $v = Get-Content 'src/vlist.js' -Raw -Encoding UTF8
-            foreach ($needed in @('DEFAULT_ROW_HEIGHT', 'computeWindow', 'windowChanged')) {
+            foreach ($needed in @('DEFAULT_ROW_HEIGHT', 'computeWindow', 'windowChanged', 'planWindowPatch')) {
                 if ($v -notmatch [regex]::Escape($needed)) {
                     $problems += "vlist.js no longer defines $needed"
                 }
@@ -841,6 +897,17 @@ try {
         }
         if ($js -notmatch 'listWindowEl\.replaceChildren\(') {
             $problems += 'the window element must be the single commit point for mail rows (replaceChildren)'
+        }
+        # Rows already on screen must be *kept* while scrolling, not rebuilt. Measured on the real
+        # window: a full rebuild costs 52 DOM changes per scroll frame against the 40-row budget in
+        # `design/15` §4 (P3), 3 times out of 3 — and nothing but a scroll in a live window can see it,
+        # so the contract is pinned here instead. `planWindowPatch` is the arithmetic; `listWindowRows`
+        # is the guard that stops a reused row from belonging to a list the window no longer shows.
+        if ($js -notmatch 'planWindowPatch') {
+            $problems += 'renderListWindow no longer reuses the rows already in the DOM (design/15 §4 P3: 52 changes per scroll frame > 40)'
+        }
+        if ($js -notmatch 'listWindowRows') {
+            $problems += 'row reuse has no check that the DOM was built from the rows it is being asked to show'
         }
         # Exactly one home for the row height, and the CSS must actually use it.
         if ($css -notmatch '--msg-height:\s*\d+px') {
@@ -1856,6 +1923,69 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'the first paint comes from the cache, and a failed refresh keeps it' {
+        # The folder view used to await `list_messages` alone — refresh over IMAP, then read the cache —
+        # so 「正在收取邮件…」 covered rows that were already on this machine. Painting the cache first
+        # adds two ways to be wrong that no screenshot shows: an unsynced folder rendered as an empty
+        # one, and a dead network wiping a list the user could already read. `src/first-paint.js` owns
+        # both decisions, so the rule is pinned by the node test and the wiring by the checks below.
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/first_paint_test.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'the first paint either waits for the network or destroys rows the user could read' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+
+        # The cache leg must exist *inside loadMessages* and precede the refresh leg. Searching the
+        # whole file would pass on `loadOlder`'s message_page call alone, so the function is cut out
+        # first the way the message_page step cuts out the command.
+        $js = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $html = Get-Content 'src/index.html' -Raw -Encoding UTF8
+        $problems = @()
+        $start = $js.IndexOf('async function loadMessages(')
+        $end = if ($start -ge 0) { $js.IndexOf("`n}", $start) } else { -1 }
+        $body = if ($end -gt $start) { $js.Substring($start, $end - $start) } else { '' }
+        $cacheRead = $body.IndexOf("invoke('message_page'")
+        $refresh = $body.IndexOf("invoke('list_messages'")
+        if ($start -lt 0) {
+            $problems += 'app.js no longer has loadMessages — the folder view needs one owner for both legs'
+        } elseif ($cacheRead -lt 0) {
+            $problems += "loadMessages must read the cache first with message_page(offset: 0), before it asks the network"
+        } elseif ($refresh -lt 0) {
+            $problems += "loadMessages no longer refreshes with list_messages — cache-first must not mean never-fresh"
+        } elseif ($cacheRead -gt $refresh) {
+            $problems += 'the cache read must come before the refresh, otherwise nothing is painted early'
+        }
+        if ($body -notmatch 'offset:\s*0') {
+            $problems += 'the cache leg must ask for the first page (offset: 0) — a non-zero offset paints the middle of the folder'
+        }
+        if ($js -notmatch 'firstPaint\.cacheStep') {
+            $problems += 'app.js must ask first-paint.js whether the cache leg has anything to show — painting 0 rows says "this folder is empty"'
+        }
+        if ($js -notmatch 'firstPaint\.freshStep') {
+            $problems += 'app.js must ask first-paint.js what a failed refresh should do — it must not wipe cached rows'
+        }
+        # Scripts are classic (no async/defer), so a module loaded after app.js is not loaded yet when
+        # app.js runs: the binding is undefined at boot, which is how "vlist is not defined" happened.
+        $loadHere = $html.IndexOf('src="first-paint.js"')
+        $loadApp = $html.IndexOf('src="app.js"')
+        if ($loadHere -lt 0 -or $loadApp -lt 0 -or $loadHere -gt $loadApp) {
+            $problems += 'index.html must load first-paint.js before app.js'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the list paints from the cache, and a failed refresh leaves those rows up'
+        $global:LASTEXITCODE = 0
+    }
     Step 'a conversation reply reaches the counterpart and joins the thread' {
         # Two silent failures, both loud in a real mailbox: "answer the newest message" addresses the
         # user themselves whenever they replied last, and a reply without the References chain arrives
@@ -1986,13 +2116,25 @@ try {
         # back when you are done". It was left in and committed anyway — and that port lets *any* local
         # process drive the webview, which is a bigger hole than the probes are worth. Making the rule
         # mechanical is the only version of it that holds.
-        $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw -Encoding UTF8
-        if ($conf -match 'remote-debugging-port') {
-            Write-Host 'src-tauri/tauri.conf.json: remove --remote-debugging-port before shipping' -ForegroundColor Red
+        #
+        # It has to read **both** config files. Tauri merges them per platform, and on Windows the
+        # shipped `additionalBrowserArgs` live in `tauri.windows.conf.json` — so the first version of
+        # this step, which only looked at `tauri.conf.json`, stayed green while the flag was live in
+        # the file the app actually starts from.
+        $problems = @()
+        foreach ($name in @('src-tauri/tauri.conf.json', 'src-tauri/tauri.windows.conf.json')) {
+            if (-not (Test-Path $name)) { continue }
+            $conf = Get-Content $name -Raw -Encoding UTF8
+            if ($conf -match 'remote-debugging-port') {
+                $problems += "${name}: remove --remote-debugging-port before shipping (any local process can drive the webview)"
+            }
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
             $global:LASTEXITCODE = 1
             return
         }
-        Write-Host 'webview arguments carry no remote debugging port'
+        Write-Host 'webview arguments carry no remote debugging port (both config files)'
         $global:LASTEXITCODE = 0
     }
 
@@ -2042,6 +2184,61 @@ try {
             return
         }
         Write-Host "cache opened once at startup, shared by $($clones.Count) call sites"
+        $global:LASTEXITCODE = 0
+    }
+
+    Step 'the read-path watchdog measures the reads production actually performs' {
+        # `DbStats.slow_queries` has existed since `design/15` §4 named it as the P4 measurement
+        # source, and it sat at zero for a whole release: only `Db::read` was timed, and that is two
+        # diagnostic pragmas, while the 40 reads that actually answer the user (the `read_guard()`
+        # call sites in `cache.rs` and `userdb.rs`) borrow a pooled
+        # connection through `read_guard`. "有测量不等于被测量" — the same class of failure this gate
+        # keeps catching elsewhere, so it is a pin and not a comment.
+        #
+        # Three halves, each of which fails silently:
+        #   * the guard must still be the timing type (a revert to a bare `MutexGuard` un-instruments
+        #     every mail read at once, and nothing else would notice);
+        #   * exactly one place must do the counting — if `Db::read` times again on top of delegating
+        #     to `read_blocking`, `reads` doubles and the slow ratio becomes meaningless;
+        #   * the watchdog must be **started** and must speak into the app log, because `eprintln!`
+        #     from a released Windows GUI process goes nowhere and an unstarted loop is invisible.
+        $db = Get-Content 'crates/mail-core/src/db.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $problems = @()
+
+        if ($db -notmatch 'pub fn read_guard\(&self\) -> ReadGuard') {
+            $problems += 'db.rs: read_guard no longer returns the timing guard — the pooled reads that answer the user are unmeasured again'
+        }
+        $drop = [regex]::Match($db, '(?s)impl Drop for ReadGuard.*?\n    \}').Value
+        if ($drop -notmatch 'record_read') {
+            $problems += 'db.rs: ReadGuard::drop must charge the hold time, or reads counted via the guard stay at zero'
+        }
+        $readBlocking = [regex]::Match($db, '(?s)pub fn read_blocking.*?\n    \}').Value
+        if ($readBlocking -notmatch 'record_read') {
+            $problems += 'db.rs: read_blocking must charge its own elapsed time — Db::read reaches the counter only through it'
+        }
+        $readAsync = [regex]::Match($db, '(?s)pub async fn read<.*?\n    \}').Value
+        if ($readAsync -match 'record_read|reads \+= 1') {
+            $problems += 'db.rs: Db::read must not time itself any more — it delegates to read_blocking, and timing twice makes the read total a lie'
+        }
+
+        if ($lib -notmatch 'start_db_watchdog\(app\.handle\(\)\.clone\(\)\)') {
+            $problems += 'src-tauri/src/lib.rs: the watchdog is defined but never started — the counter moves and no one sees it'
+        }
+        $watchdog = [regex]::Match($lib, '(?s)fn start_db_watchdog.*?\n\}').Value
+        if ($watchdog.Length -eq 0) {
+            $problems += 'src-tauri/src/lib.rs: start_db_watchdog is gone — slow reads have no user-visible surface'
+        } elseif ($watchdog -notmatch 'log_line\(&line\)') {
+            $problems += 'src-tauri/src/lib.rs: the watchdog must write through log_line (查看日志 and the diagnostics bundle read that file)'
+        } elseif ($watchdog -match 'eprintln!') {
+            $problems += 'src-tauri/src/lib.rs: eprintln! is invisible in a released GUI app — the watchdog must not use it'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'slow reads are timed on both pooled paths, counted once, and reach the app log'
         $global:LASTEXITCODE = 0
     }
 

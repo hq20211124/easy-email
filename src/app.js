@@ -41,6 +41,15 @@ const reply = window.__easyEmailReply;
 const history = window.__easyEmailHistory;
 
 /**
+ * What the list shows before the network has answered, and what a failed refresh may destroy.
+ *
+ * Pure, in first-paint.js, because both wrongs are invisible once the loading finishes: painting the
+ * cache's zero rows says 「这个文件夹里还没有邮件」 about a folder that was never synced, and a dead
+ * network wiping a list the user could already read throws away the mail that made the screen useful.
+ */
+const firstPaint = window.__easyEmailFirstPaint;
+
+/**
  * Window arithmetic for the message list — which rows are in the DOM and where the window sits.
  *
  * Pure, in vlist.js, because "only the viewport is rendered" is a claim no snapshot can check, so
@@ -110,6 +119,14 @@ const state = {
   unreadCounts: {},
   messages: [],
   /**
+   * Bumped by every load of the mail list, and compared against by each of its awaits.
+   *
+   * `loadMessages` now has two legs (cache, then network) and the user can switch folders between
+   * them. Whatever answered for the folder they left must not paint over the one they are on —
+   * which is a one-in-a-while flicker no screenshot of a finished screen can show.
+   */
+  listLoadSeq: 0,
+  /**
    * The list's windowed content: one descriptor per conversation row, plus one per message of each
    * expanded conversation (`design/15` §6 — only the viewport ± 8 rows is ever in the DOM).
    *
@@ -121,6 +138,13 @@ const state = {
   listOwner: null,
   /** The window currently in the DOM, so a scroll can be skipped when it changes nothing. */
   listWindow: null,
+  /**
+   * The `listRows` array the DOM rows were built from, compared by identity.
+   *
+   * It is what makes reusing those rows safe: two different arrays can describe the same mailbox,
+   * and a reused row from the older one would show a message the list no longer has.
+   */
+  listWindowRows: null,
   /**
    * Set once the server says there is nothing older than what we already have.
    *
@@ -291,6 +315,7 @@ async function boot() {
   await refreshAccounts();
   wireGlobalEvents();
   syncThemeButton();
+  syncAccentButton();
   syncViewModeButton();
   // The saved-search rows are part of the sidebar from the first paint: on a fresh install they are
   // the empty-state line that tells the user the feature exists, rather than an absence.
@@ -342,9 +367,10 @@ async function wirePushEvents() {
     const where = folderLabel(update.mailbox);
 
     if (update.account_id === state.accountId && update.mailbox === state.mailbox) {
-      // The folder on screen: pull it in. `loadMessages` re-reads the cache, which the backend has
-      // already updated, so this costs no extra network round trip.
-      loadMessages();
+      // The folder on screen: pull it in from the cache, which the backend updated before it emitted
+      // this event. `refresh: false` is what makes that the whole story — asking the folder again over
+      // IMAP would re-check a mailbox that has not changed since the sync that just told us about it.
+      loadMessages({ refresh: false });
     }
 
     toast(
@@ -381,6 +407,22 @@ function syncThemeButton() {
   const theme = window.__easyEmailTheme.current();
   const label = window.__easyEmailTheme.labelFor(theme);
   button.textContent = window.__easyEmailTheme.iconFor(theme);
+  button.title = label;
+  button.setAttribute('aria-label', label);
+}
+
+/**
+ * The accent button cycles (默认蓝 → 薰衣草 → 天蓝), so its tooltip has to name both the current
+ * colour and the next one — a cycling control that only says the current value reads as a dead button
+ * after the first click. The palette glyph stays put; the label is what communicates the state.
+ */
+function syncAccentButton() {
+  const button = $('btn-accent');
+  const api = window.__easyEmailTheme;
+  const accents = api.accents();
+  const current = api.accent();
+  const next = accents[(accents.indexOf(current) + 1) % accents.length];
+  const label = `主题色：${api.accentLabel(current)}（点击切换到 ${api.accentLabel(next)}）`;
   button.title = label;
   button.setAttribute('aria-label', label);
 }
@@ -449,6 +491,10 @@ function wireGlobalEvents() {
   $('btn-theme').addEventListener('click', () => {
     window.__easyEmailTheme.toggle();
     syncThemeButton();
+  });
+  $('btn-accent').addEventListener('click', () => {
+    window.__easyEmailTheme.cycleAccent();
+    syncAccentButton();
   });
   $('btn-add-account').addEventListener('click', () => openAccountWizard());
   $('btn-view-mode').addEventListener('click', toggleReaderMode);
@@ -2125,7 +2171,19 @@ function renderHistoryButton() {
   button.textContent = state.historyDone ? '没有更早的邮件了' : '加载更多';
 }
 
-async function loadMessages({ reset = false } = {}) {
+/**
+ * Show a folder. Two legs, in this order: what is already on this machine, then what the server says.
+ *
+ * The order is the change (2026-10-19, `design/15` §4's P2). This used to await `list_messages` alone,
+ * which refreshes over IMAP *before* reading the cache — so a screen full of rows that were already
+ * downloaded sat behind a network round trip, and the spinner was the only thing on screen. Now
+ * `message_page` (cache only, no network) paints first and the refresh repaints. The price is that for
+ * the first moment the rows are as old as the last sync, which is the trade that was accepted.
+ *
+ * `refresh: false` is the 「新邮件」push path: the backend has already stored the mail that woke the
+ * event, so a second round trip there would re-check a folder nothing has touched since.
+ */
+async function loadMessages({ reset = false, refresh = true } = {}) {
   if (!state.accountId || !state.mailbox) return;
   // The local lists are not backed by the server: fetching a folder here would both waste a round
   // trip and paint mail over the list the user is looking at.
@@ -2152,7 +2210,41 @@ async function loadMessages({ reset = false } = {}) {
   $('mailbox-title').textContent = state.mailboxLabel || state.mailbox;
 
   const list = $('message-list');
-  list.innerHTML = '<div class="empty"><span class="spinner"></span>正在收取邮件…</div>';
+  const seq = ++state.listLoadSeq;
+  list.innerHTML = '<div class="empty"><span class="spinner"></span>正在读取本地缓存…</div>';
+
+  const cached = await run('读取本地缓存', () =>
+    invoke('message_page', {
+      accountId: state.accountId,
+      mailbox: state.mailbox,
+      // The first page, from the disk. `state.historyDone` is left alone: this says nothing about
+      // whether the server has anything older.
+      offset: 0,
+      limit: PAGE_SIZE,
+    })
+  );
+  if (seq !== state.listLoadSeq) return;
+
+  // Zero cached rows is not an empty folder, so the spinner stays and the refresh gets to answer.
+  const cacheShown = firstPaint.cacheStep({ pageCount: (cached ?? []).length }) === 'rows';
+  if (cacheShown) {
+    state.messages = cached.slice();
+    renderMessages();
+  }
+
+  if (!refresh) {
+    // The list on screen is what the backend just stored; only the sidebar counts are behind.
+    void loadUnreadCounts();
+    return;
+  }
+
+  const title = $('mailbox-title');
+  if (cacheShown) {
+    // Rows taken from disk must not read as the server's current state — `design/20` V2-B names that
+    // as the failure this cache exists to avoid. Said where the user reads "what am I looking at",
+    // and only while the list is provisional: before any row is up, the spinner already says it.
+    title.textContent = `${state.mailboxLabel || state.mailbox}（正在收取…）`;
+  }
 
   const messages = await run('收取邮件', () =>
     invoke('list_messages', {
@@ -2164,8 +2256,26 @@ async function loadMessages({ reset = false } = {}) {
     })
   );
 
-  if (messages === null) {
+  const step = firstPaint.freshStep({
+    stale: seq !== state.listLoadSeq,
+    failed: messages === null,
+    cacheShown,
+  });
+  if (step === 'drop') return;
+  // Restored only for the load that still owns the screen; a newer one has put up its own title.
+  title.textContent = state.mailboxLabel || state.mailbox;
+
+  if (step === 'error') {
     list.innerHTML = '<div class="empty">收取失败，请查看右下角提示。</div>';
+    void refreshSyncBanner();
+    return;
+  }
+
+  if (step === 'keep-cache') {
+    // Rows the user can read stay up: whether mail on this machine can be shown has nothing to do with
+    // the connection that just failed. The banner is what says why the list did not move.
+    void refreshSyncBanner();
+    void loadUnreadCounts();
     return;
   }
 
@@ -2260,6 +2370,7 @@ function renderMessages() {
     state.listOwner = null;
     state.listRows = [];
     state.listWindow = null;
+    state.listWindowRows = null;
     $('list-footer').hidden = true;
     return;
   }
@@ -2285,6 +2396,17 @@ function renderMessages() {
   state.listSizer = sizer;
   state.listWindowEl = window_;
   renderListWindow();
+
+  // `t_first_paint` / `t_folder_switch` (`design/15` §4) — the two instrumentation points the budget
+  // table names and that this repo never had. Rows are in the DOM at this line and nowhere earlier, so
+  // this is the only place that can answer "when was a row on screen". `tools/bench-first-paint.mjs`
+  // reads it instead of timing when it happens to notice: measuring from outside the page would add
+  // the CDP connect latency to the number it is supposed to be checking.
+  const paint = (window.__easyEmailPaint ??= { paints: 0, firstRowsAt: null, lastRowsAt: null });
+  const paintedAt = performance.timeOrigin + performance.now();
+  paint.paints += 1;
+  if (paint.firstRowsAt === null) paint.firstRowsAt = paintedAt;
+  paint.lastRowsAt = paintedAt;
 
   $('list-footer').hidden = state.historyDone;
 }
@@ -2390,12 +2512,23 @@ function buildChildRow(row) {
   return child;
 }
 
+/** Which builder a row descriptor needs — the two kinds are built the same way everywhere. */
+function buildListRow(row) {
+  return row.kind === 'child' ? buildChildRow(row) : buildConversationRow(row);
+}
+
 /**
  * Render the current window of the mail list.
  *
  * Called from a `requestAnimationFrame` after a scroll (one commit per frame, `design/15` §6) and
  * directly whenever the rows change. The cheap exit matters: a wheel gesture fires more scroll events
  * than there are frames, and most of them land in a window that is already on screen.
+ *
+ * Rows already in the DOM are **kept**, not rebuilt. The window element holds exactly the contiguous
+ * slice `[start, end)` it was last told to show, so a scroll only ever drops rows at one end and adds
+ * the same number at the other: the ~600 px step `tools/bench-scroll.mjs` sweeps is 11 rows a frame,
+ * which is 22 DOM changes instead of the 52 that rebuilding all 26 rows cost (`design/15` §4 P3
+ * budgets 40, and 52 was measured 3 times out of 3).
  */
 function renderListWindow() {
   if (state.listOwner !== 'mail' || !state.listSizer || !state.listWindowEl) return;
@@ -2406,18 +2539,47 @@ function renderListWindow() {
     viewportHeight: list.clientHeight,
     count: rows.length,
   });
-  if (!vlist.windowChanged(state.listWindow, next)) return;
+  const previous = state.listWindow;
+  if (!vlist.windowChanged(previous, next)) return;
   state.listWindow = next;
 
   state.listSizer.style.height = `${next.totalHeight}px`;
   state.listWindowEl.style.top = `${next.offsetTop}px`;
 
-  const built = [];
-  for (let index = next.start; index < next.end; index += 1) {
-    const row = rows[index];
-    built.push(row.kind === 'child' ? buildChildRow(row) : buildConversationRow(row));
+  const buildRange = (from, to) => {
+    const built = [];
+    for (let index = from; index < to; index += 1) built.push(buildListRow(rows[index]));
+    return built;
+  };
+
+  // Reuse is only allowed for a scroll within the *same* rows. Anything else rebuilds: the first
+  // paint after `renderMessages` (which leaves `listWindow` null), a different array of rows behind
+  // the same window number, or a jump with not one row in common.
+  const keep =
+    previous !== null && state.listWindowRows === rows
+      ? vlist.planWindowPatch(previous, next)
+      : null;
+  if (keep === null) {
+    state.listWindowRows = rows;
+    state.listWindowEl.replaceChildren(...buildRange(next.start, next.end));
+    return;
   }
-  state.listWindowEl.replaceChildren(...built);
+
+  const window_ = state.listWindowEl;
+  // The rows that fell outside the new window go from whichever end they hang on. The survivors keep
+  // their order, their fold state and their click handlers — which is the whole reason this is
+  // cheaper than a rebuild.
+  for (let index = 0; index < keep.dropFront; index += 1) {
+    if (window_.firstElementChild !== null) window_.firstElementChild.remove();
+  }
+  for (let index = 0; index < keep.dropBack; index += 1) {
+    if (window_.lastElementChild !== null) window_.lastElementChild.remove();
+  }
+
+  const head = buildRange(next.start, keep.keepStart);
+  if (head.length > 0) window_.prepend(...head);
+  const tail = buildRange(keep.keepEnd, next.end);
+  if (tail.length > 0) window_.append(...tail);
 }
 
 /** How many rows the scroll handler produced since it was armed (one edit per frame, not per event). */

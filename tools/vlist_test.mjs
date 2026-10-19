@@ -20,7 +20,14 @@ if (!vlist || typeof vlist.computeWindow !== 'function') {
   process.exit(1);
 }
 
-const { computeWindow, windowChanged, scrollTopForRow, DEFAULT_ROW_HEIGHT, DEFAULT_OVERSCAN } = vlist;
+const {
+  computeWindow,
+  windowChanged,
+  planWindowPatch,
+  scrollTopForRow,
+  DEFAULT_ROW_HEIGHT,
+  DEFAULT_OVERSCAN,
+} = vlist;
 
 const failures = [];
 const eq = (label, actual, expected) => {
@@ -106,6 +113,76 @@ const H = DEFAULT_ROW_HEIGHT;
   eq('a row above the viewport scrolls to its top', scrollTopForRow(10, { scrollTop: 20 * H, viewportHeight: 600, rowHeight: H }), 10 * H);
   eq('a row below the viewport scrolls to its bottom', scrollTopForRow(40, { scrollTop: 0, viewportHeight: 600, rowHeight: H }), 41 * H - 600);
   eq('a row already visible is left alone', scrollTopForRow(3, { scrollTop: 0, viewportHeight: 600, rowHeight: H }), 0);
+}
+
+// ---------------------------------------------------------------- keeping rows between frames
+{
+  const a = computeWindow({ scrollTop: 100 * H, viewportHeight: 600, count: 1000 });
+  eq('no previous window means nothing to keep', planWindowPatch(null, a), null);
+  eq('no new window means nothing to keep', planWindowPatch(a, null), null);
+
+  // A scroll of two rows: the rows still on screen stay, and the only work is at the two ends.
+  const down = computeWindow({ scrollTop: 102 * H, viewportHeight: 600, count: 1000 });
+  const patch = planWindowPatch(a, down);
+  eq('scrolling down keeps everything it can', [patch.keepStart, patch.keepEnd], [down.start, a.end]);
+  eq('and drops only the rows that left, from the front', patch.dropFront, down.start - a.start);
+  eq('adds only the rows that entered, at the back', [patch.dropBack, patch.addFront, patch.addBack], [0, 0, down.end - a.end]);
+
+  const up = computeWindow({ scrollTop: 98 * H, viewportHeight: 600, count: 1000 });
+  const back = planWindowPatch(a, up);
+  eq('scrolling up is the mirror image', [back.dropFront, back.dropBack, back.addFront, back.addBack], [
+    0,
+    a.end - up.end,
+    a.start - up.start,
+    0,
+  ]);
+
+  // A jump past the end shares no row: the caller rebuilds rather than pretending to patch.
+  eq('a jump with nothing in common is not a patch', planWindowPatch(a, computeWindow({ scrollTop: 500 * H, viewportHeight: 600, count: 1000 })), null);
+}
+{
+  // The identity the DOM update depends on: after the patch, the window element holds exactly the
+  // new window's rows — survivors plus what was added at either end, and nothing left over.
+  let checked = 0;
+  for (let from = 0; from < 900; from += 7) {
+    const previous = computeWindow({ scrollTop: from * H, viewportHeight: 600, count: 1000 });
+    for (const step of [-3, -1, 0, 1, 4]) {
+      const next = computeWindow({ scrollTop: Math.max(0, (from + step) * H), viewportHeight: 600, count: 1000 });
+      const patch = planWindowPatch(previous, next);
+      if (patch === null) continue;
+      const survivors = previous.end - previous.start - patch.dropFront - patch.dropBack;
+      if (survivors !== patch.keepEnd - patch.keepStart) failures.push(`patch at ${from}/${step}: survivors miscounted`);
+      if (patch.addFront + survivors + patch.addBack !== next.end - next.start) {
+        failures.push(`patch at ${from}/${step}: would leave the wrong rows on screen`);
+      }
+      if (patch.addFront !== patch.keepStart - next.start || patch.addBack !== next.end - patch.keepEnd) {
+        failures.push(`patch at ${from}/${step}: added rows are not the ones outside the overlap`);
+      }
+      checked += 1;
+    }
+  }
+  ok('the patch arithmetic holds across a whole list', checked > 500);
+}
+{
+  // The budget P3 exists to catch, judged against the shape `design/15` §6 describes: a sweep at the
+  // step `tools/bench-scroll.mjs` uses (600 px per frame), counting what the page's MutationObserver
+  // counts — one change per row added or removed.
+  const viewport = 600;
+  const stepPx = 600;
+  let patchWorst = 0;
+  let rebuildWorst = 0;
+  let previous = computeWindow({ scrollTop: 0, viewportHeight: viewport, count: 1000 });
+  for (let top = stepPx; top < 1000 * H; top += stepPx) {
+    const next = computeWindow({ scrollTop: top, viewportHeight: viewport, count: 1000 });
+    if (!windowChanged(previous, next)) continue;
+    const patch = planWindowPatch(previous, next);
+    const churn = patch === null ? 2 * (next.end - next.start) : patch.dropFront + patch.dropBack + patch.addFront + patch.addBack;
+    patchWorst = Math.max(patchWorst, churn);
+    rebuildWorst = Math.max(rebuildWorst, 2 * (next.end - next.start));
+    previous = next;
+  }
+  ok(`a scroll stays under the 40-row budget (worst frame: ${patchWorst})`, patchWorst <= 40);
+  ok(`and rebuilding the window is what broke it (worst frame: ${rebuildWorst})`, rebuildWorst > 40);
 }
 
 // ---------------------------------------------------------------- the two must not drift apart

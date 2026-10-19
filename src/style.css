@@ -57,6 +57,82 @@
   color-scheme: dark;
 }
 
+/*
+  Accent colours: a second axis, `data-accent`, that composes with `data-theme`. Each accent
+  overrides only colour tokens — radius, row height and font stay the shared `:root` values above, so
+  a new accent can never change the list density. `color-scheme` is left to the light/dark blocks
+  because it belongs to that axis, not this one.
+
+  The `:not([data-theme='dark'])` guard is what makes the two axes independent rather than
+  order-dependent. Both a plain accent block and the `:root[data-theme='dark']` block are the same
+  specificity (0,2,0), so without the guard a lavender+dark document could pick up the lavender
+  *light* values purely from source order. Scoping each light block to "not dark" removes that
+  entirely; the `[data-theme='dark']` variant then owns dark.
+
+  Mail bodies are NOT touched by any of this: the reading pane is a fixed white document
+  (`buildSandboxedDocument` in src/app.js), so the actual message keeps the sender's own colours under
+  every accent and mode. These blocks only recolour the application shell around it.
+
+  In the dark variants the lavender accent sits toward violet (#b38af0) rather than the light mode's
+  pink (#c56bb5): a warm pink next to a warm red is hard to tell apart on a dark surface, and danger
+  is the one colour that must stay unambiguous.
+*/
+:root[data-accent='lavender'] {
+  --bg: #fbf3f1;
+  --surface: #fffaf8;
+  --surface-2: #f6e8ee;
+  --border: #ecdbe4;
+  --text: #3a2f42;
+  --text-muted: #8a7a93;
+  --accent: #c56bb5;
+  --accent-soft: #f6e4f3;
+  --danger: #cf4d5f;
+  --danger-soft: #fbe6e8;
+  --unread: #c56bb5;
+}
+
+:root[data-accent='lavender'][data-theme='dark'] {
+  --bg: #14121c;
+  --surface: #1d1a28;
+  --surface-2: #262233;
+  --border: #342f45;
+  --text: #e7e3f0;
+  --text-muted: #a99fc0;
+  --accent: #b38af0;
+  --accent-soft: #2a2444;
+  --danger: #ff8a7a;
+  --danger-soft: #3a2330;
+  --unread: #b38af0;
+}
+
+:root[data-accent='sky'] {
+  --bg: #eef4fa;
+  --surface: #ffffff;
+  --surface-2: #e6f0f8;
+  --border: #cfe0ee;
+  --text: #1f2b36;
+  --text-muted: #5f7688;
+  --accent: #2f9fe0;
+  --accent-soft: #dceefb;
+  --danger: #e0555f;
+  --danger-soft: #fdeaea;
+  --unread: #2f9fe0;
+}
+
+:root[data-accent='sky'][data-theme='dark'] {
+  --bg: #0f151b;
+  --surface: #161d25;
+  --surface-2: #1e2833;
+  --border: #2a3846;
+  --text: #e2eaf2;
+  --text-muted: #8fa3b6;
+  --accent: #57b6ee;
+  --accent-soft: #15283a;
+  --danger: #ff8a7a;
+  --danger-soft: #33201f;
+  --unread: #57b6ee;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -177,17 +253,23 @@ textarea {
 #sidebar {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 10px 8px;
+  gap: 7px;
+  padding: 8px 8px;
+  font-size: 12px;
   background: var(--surface);
   border-right: 1px solid var(--border);
-  overflow: hidden;
+  /* The whole panel is the scroll container. The folder list is shown in full and only scrolls
+     when the sidebar genuinely overflows, instead of being squeezed into its own mini-scrollbar by
+     the fixed 本地/保存的搜索/关于/写邮件 stack below it. */
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 8px;
+  font-size: 13px;
   font-weight: 650;
   letter-spacing: 0.2px;
   padding: 2px 4px 6px;
@@ -197,7 +279,9 @@ textarea {
   width: 18px;
   height: 18px;
   border-radius: 5px;
-  background: linear-gradient(160deg, #2563eb, #1d4ed8);
+  /* Driven by `--accent` so the logo dot follows the chosen accent instead of staying corporate blue
+     under lavender/sky. The gradient's dark end is a shade of the accent itself, not a fixed hex. */
+  background: linear-gradient(160deg, var(--accent), color-mix(in srgb, var(--accent) 72%, #1a1420));
   box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.85);
 }
 
@@ -210,15 +294,28 @@ textarea {
   line-height: 1;
 }
 
+/* With two icon buttons (accent + theme), only the first should absorb the free space; the second
+   would otherwise split it and the pair would drift apart. Ids so this wins over the `.icon` rule. */
+#btn-accent {
+  margin-left: auto;
+}
+
+#btn-theme {
+  margin-left: 0;
+}
+
 .section {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   min-height: 0;
+  flex: 0 0 auto;
 }
 
 .section.grow {
-  flex: 1;
+  /* Grows to fill slack so the bottom sections stay pinned, but never shrinks below its content —
+     every folder stays visible. */
+  flex: 1 0 auto;
 }
 
 .section-title {
@@ -235,8 +332,13 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  overflow-y: auto;
-  min-height: 0;
+}
+
+/* Sidebar rows are denser than the message-list rows: smaller vertical padding so a mailbox with
+   many folders still fits without the panel scrolling. */
+#sidebar .row {
+  padding: 2px 6px;
+  gap: 5px;
 }
 
 /* ---------------------------------------------------------------- buttons */

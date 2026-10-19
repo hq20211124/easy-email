@@ -294,25 +294,31 @@ fn optimize_and_measure(path: &Path) -> u64 {
     file_bytes(path)
 }
 
-/// The 4x gap: the application's own path against the same SQL through a raw handle.
+/// The 4x gap: the application's own path against the same SQL through another handle.
 ///
 /// Five variants, so the difference can be attributed rather than guessed:
 ///
 /// | # | connection | binding | columns |
 /// |---|---|---|---|
 /// | 1 | the `Cache` handle (pooled reader) | bound `?1/?2/?3` | the seven the UI renders |
-/// | 2 | a fresh raw handle | literal | narrow (`uid` only) |
-/// | 3 | a fresh raw handle | literal | the seven the UI renders |
-/// | 4 | a fresh raw handle | bound | narrow |
-/// | 5 | a fresh raw handle | bound | the seven the UI renders |
+/// | 2 | a fresh handle | literal | narrow (`uid` only) |
+/// | 3 | a fresh handle | literal | the seven the UI renders |
+/// | 4 | a fresh handle | bound | narrow |
+/// | 5 | a fresh handle | bound | the seven the UI renders |
 ///
 /// If 5 lands near 175 ms and 3 near 44 ms, the parameter binding is the difference; if 5 lands near
 /// 44 ms, the difference is the connection the application reads through.
+///
+/// **Variant 2–5 is not a control for a per-connection setting.** "Raw handle" used to imply one, but
+/// it is `Db::open`, so it gets the same writer thread, the same read pool and the same pragmas —
+/// which is how a 2026-10-19 `cache_size` change appeared to make both arms 6x faster at once, when
+/// in fact both arms had been treated. Attribute a connection-level change by building the code twice
+/// (two worktrees, run back to back) and normalising by this run's P7, never by comparing 1 against 2.
 fn compare_search_paths(cache: &Cache, path: &Path) {
     use mail_core::db::{Db, DbKind, DbOptions};
 
     let db = Db::open(path, DbKind::Cache, DbOptions::for_kind(DbKind::Cache))
-        .expect("raw handle for the search-path comparison");
+        .expect("second handle for the search-path comparison");
 
     const ROUNDS: usize = 20;
 
@@ -765,6 +771,10 @@ fn bench_storage_path() {
     // 35% of messages are inside the prefetch window (design/15 §3).
     let with_body = generated.len() * 35 / 100;
     let body_start = Instant::now();
+    // The region below also *makes* the message: RNG body, JSON recipients, two full tokenisations.
+    // Timing only the store call inside it is what lets the P9 line say how much of its own number is
+    // the storage layer — without this split the line reads as "正文入库 = 300 封/秒" forever.
+    let mut put_only = std::time::Duration::ZERO;
     for (folder, summary) in generated.iter().take(with_body) {
         let text = body(&mut rng, spec.body_bytes);
         let to_json = serde_json::to_string(&[ACCOUNT.to_string()]).expect("recipients");
@@ -798,9 +808,11 @@ fn bench_storage_path() {
             },
             inline_images: Vec::new(),
         };
+        let store_start = Instant::now();
         cache
             .put_detail(ACCOUNT, folder, &detail)
             .expect("put detail");
+        put_only += store_start.elapsed();
     }
     let bodies = body_start.elapsed();
 
@@ -954,6 +966,12 @@ fn bench_storage_path() {
         with_body as f64 / bodies.as_secs_f64(),
         ms(bodies),
         with_body
+    );
+    println!(
+        "    └ 其中真正写库（put_detail） {:.0} ms，占 {:.0}%；其余是夹具自己造正文 + 分词。  {:>9.0} 封/秒",
+        ms(put_only),
+        ms(put_only) / ms(bodies) * 100.0,
+        with_body as f64 / put_only.as_secs_f64()
     );
     println!(
         "P2  列表分页 50 行      P50 {:>6.2} ms  P95 {:>6.2} ms  max {:>6.2} ms",
@@ -1305,4 +1323,192 @@ fn bench_message_build() {
     );
 
     let _ = std::fs::remove_dir_all(&spec.dir);
+}
+
+/// 打开一封信（读正文）花在哪 —— **这一项没有预算行**。
+///
+/// `design/15` §4 的 16 项里没有"打开邮件"：P1 是冷启动、P2 是切文件夹、P4 是搜索，正文那条路（
+/// `Cache::get_detail` → 读 blob → 反序列化 → 每次重新净化 HTML）从未被量过。所以这里的每一行都以
+/// `D1` 开头而不是 `P` —— 让它进那张覆盖率表就是冒充有一条并不存在的预算（`tools\bench.ps1`
+/// 按 `^P\d+` 认领测到的行，`D1` 天然进不去）。
+///
+/// 夹具其余部分存的是 `body_html: None`（纯文本），而纯文本正好是净化器的**最快路径**：整个输入里没有
+/// `<`，一次 `push_str` 就结束。拿那种正文来量净化是量不到东西的，所以这里单独造 HTML。
+///
+/// **第一次跑出来的结论（2026-10-19，两次背靠背跑互相差 2%）：这条重复成本不值得为它动安全边界。**
+/// 整条 `get_detail`：8 KB 0.14 ms、64 KB 1.25 ms、512 KB 8.15–8.31 ms，其中"读时再净化"占 65–90%
+/// （512 KB 那档是 6.5–6.6 ms）。所以把它整个省掉能让**这一次调用**快 5–7 倍 —— 但绝对值是省下
+/// 0.12 / 0.9 / 6.6 ms，而典型邮件（10–30 KB 的 HTML）不到 1 ms，一帧以内，还要和 WebView 渲染、
+/// 正文没缓存时的网络取回叠在同一个感知延迟里。
+/// 要省它就得让"这行的 HTML 已经净过"变成可查的事实（新增列 + 一次有界后台回填），那是往 XSS 防线上
+/// 加一条需要永远维护正确的推理，收益撑不起这个风险。数字与被否掉的方案记在 `reports/performance.md` §7。
+///
+/// Run it: `cargo test --release -p mail-core --test bench_fixture bench_open_message -- --ignored --nocapture`
+#[test]
+#[ignore = "performance fixture; run explicitly, see the module docs"]
+fn bench_open_message() {
+    use mail_core::sanitize::sanitize_mail_html;
+
+    let spec = Spec::from_env();
+    let dir = spec.dir.join("openmsg");
+    let _ = std::fs::remove_dir_all(&spec.dir);
+    std::fs::create_dir_all(&dir).expect("open-message dir");
+    let db_path = dir.join("cache.db");
+    let cache = Cache::open(&db_path).expect("open cache");
+
+    // Three shapes, because "a mail" is not one size: the fixture's own 8 KB, a typical marketing
+    // mail, and a heavy one. The 24 MB case is P10's job (sending), not this one.
+    for size_kb in [8usize, 64, 512] {
+        let target = size_kb * 1024;
+        let mut rng = Rng(0x51ED_2701_9C01_2345 + size_kb as u64);
+        let html = html_body(&mut rng, target);
+        let text = body(&mut rng, target / 2);
+        let detail = MessageDetail {
+            uid: 4_242,
+            subject: "基准：打开一封信".into(),
+            from_name: Some("基准".into()),
+            from_addr: Some(ACCOUNT.into()),
+            to: vec![ACCOUNT.into()],
+            cc: Vec::new(),
+            reply_to: None,
+            date: Some(1_700_000_000),
+            message_id: Some("<bench-open@example.com>".into()),
+            in_reply_to: None,
+            references: Vec::new(),
+            body_text: Some(text),
+            body_html: Some(html.clone()),
+            attachments: Vec::new(),
+            inline_images: Vec::new(),
+        };
+        cache
+            .put_detail(ACCOUNT, "INBOX", &detail)
+            .expect("put detail");
+
+        // Prove the path being measured is the path that costs: the stored row holds the sender's
+        // raw HTML, and the guard runs on the way *out*. If `<script>` ever came back, this whole
+        // benchmark would be timing a no-op.
+        let opened = cache
+            .get_detail(ACCOUNT, "INBOX", 4_242)
+            .expect("get_detail")
+            .expect("the row exists");
+        assert!(
+            !opened
+                .body_html
+                .clone()
+                .unwrap_or_default()
+                .contains("<script"),
+            "读回来的正文里还有 <script —— 净化没有在输出路径上跑，下面量的就不是真东西"
+        );
+        assert!(
+            html.contains("<script"),
+            "夹具生成的 HTML 里没有 <script —— 那这组数字量的是纯文本，最快路径"
+        );
+
+        let iterations = (4_000_000 / target).clamp(40, 400);
+        let json = serde_json::to_string(&detail).expect("json");
+
+        // The four costs that add up to opening a message, each on its own so a fix can be aimed.
+        let mut whole = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let t = Instant::now();
+            let _ = cache
+                .get_detail(ACCOUNT, "INBOX", 4_242)
+                .expect("get")
+                .unwrap();
+            whole.push(t.elapsed());
+        }
+        let mut sql = Vec::with_capacity(iterations);
+        {
+            let raw = rusqlite::Connection::open(&db_path).expect("raw read");
+            for _ in 0..iterations {
+                let t = Instant::now();
+                let s: String = raw
+                    .query_row(
+                        "select detail from bodies where account_id = ?1 and folder = ?2 and uid = ?3",
+                        rusqlite::params![ACCOUNT, "INBOX", 4_242i64],
+                        |r| r.get(0),
+                    )
+                    .expect("blob");
+                assert_eq!(s.len(), json.len());
+                sql.push(t.elapsed());
+            }
+        }
+        let mut parse = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let t = Instant::now();
+            let _: MessageDetail = serde_json::from_str(&json).expect("parse");
+            parse.push(t.elapsed());
+        }
+        let mut clean = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let t = Instant::now();
+            let _ = sanitize_mail_html(&html);
+            clean.push(t.elapsed());
+        }
+        let mut encode = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let t = Instant::now();
+            let _ = serde_json::to_string(&opened).expect("encode");
+            encode.push(t.elapsed());
+        }
+
+        let (w50, w95, wmax) = percentiles(whole.clone());
+        let (_, s95, _) = percentiles(sql);
+        let (_, p95, _) = percentiles(parse);
+        let (c50, c95, _) = percentiles(clean);
+        let (_, e95, _) = percentiles(encode);
+        println!(
+            "D1 打开邮件 正文 {size_kb:>3} KB × {iterations:>3} 次：整条 P50 {:>6.2} / P95 {:>6.2} / max {:>6.2} ms  \
+             | 读 blob {:>5.2} | JSON 解析 {:>5.2} | 净化 {:>5.2} / {:>5.2} | 回传序列化 {:>5.2} ms",
+            ms(w50),
+            ms(w95),
+            ms(wmax),
+            ms(s95),
+            ms(p95),
+            ms(c50),
+            ms(c95),
+            ms(e95)
+        );
+    }
+    println!(
+        "D1 说明：整条 = `Cache::get_detail`（读 blob + 反序列化 + 再净化一次）。那一次再净化是**重复劳动**：\
+         正文在 imap.rs 解析时已经净化过、存进 bodies 的就是净过的 HTML（sanitize 幂等），读路径这一次\
+         只为兜住\"净化器存在之前写的老行\"。"
+    );
+    println!(
+        "D1 分解各列是各自循环量的，不要当严格加法：小正文那行的\"净化\"会**高于**\"整条\"，因为独立循环里的\
+         输入是缓存冷的，而 get_detail 的输入刚被 serde 写热。迭代数也要管：同一份代码每档 30 次时 512 KB\
+         量过 13.3 与 17.3 ms（两跑相差 30%），把每档提到 40 次以上之后两跑只差 2%。所以这几行用来判量级和\
+         占比，不拿来算倍数。"
+    );
+
+    drop(cache);
+    let _ = std::fs::remove_dir_all(&spec.dir);
+}
+
+/// HTML in the shape real mail arrives in: a `<style>` block, nested tables, inline styles, links,
+/// and a `<script>` plus an `on*` attribute so the sanitiser has work to do (and so the benchmark can
+/// prove it did it).
+fn html_body(rng: &mut Rng, target: usize) -> String {
+    let mut out = String::with_capacity(target + 4096);
+    out.push_str(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <style>body{font-family:sans-serif}.row{padding:4px}a{color:#06c}</style></head><body>",
+    );
+    while out.len() < target {
+        let words = 6 + rng.below(10) as usize;
+        let cjk = rng.chance(40);
+        let text = sentence(rng, words, cjk);
+        let link = sentence(rng, 2, false);
+        out.push_str(&format!(
+            "<table class=\"row\" style=\"border:1px solid #eee\"><tr>\
+             <td style=\"color:#333\">{text}</td>\
+             <td><a href=\"https://example.com/x?id={}\" target=\"_blank\" onclick=\"track()\">{link}</a></td>\
+             </tr></table>",
+            rng.below(1_000_000)
+        ));
+    }
+    out.push_str("<script>document.write('x')</script><div onmouseover=\"p()\">footer</div>");
+    out.push_str("</body></html>");
+    out
 }

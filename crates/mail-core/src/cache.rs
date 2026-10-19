@@ -375,6 +375,12 @@ impl Cache {
         Ok(cache)
     }
 
+    /// Underlying handle, for the callers that need the database itself rather than a query — the
+    /// watchdog that reads [`crate::db::DbStats`] being the one that exists today.
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
     /// In-memory cache, for tests.
     pub fn open_in_memory() -> Result<Self> {
         let cache = Self {
@@ -1368,43 +1374,57 @@ impl Cache {
         let account_id = account_id.to_string();
         let folder = folder.to_string();
         let detail = detail.clone();
-        self.db.write_blocking(move |conn: &Connection| {
-            let detail_json = serde_json::to_string(&detail)
-                .map_err(|e| MailError::Cache(format!("序列化正文失败：{e}")))?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+        self.db
+            .write_blocking(move |conn| Self::write_detail(conn, &account_id, &folder, &detail))
+    }
 
+    /// The statements `put_detail` runs, without the transaction around them.
+    ///
+    /// Separate because `design/15` §4's P9 asks whether the **transaction boundary** is where the
+    /// ingest time goes — and that question can only be asked by running the same statements with the
+    /// boundary in two places. Copied SQL would answer it for a version of the write path that does
+    /// not exist.
+    fn write_detail(
+        conn: &Connection,
+        account_id: &str,
+        folder: &str,
+        detail: &MessageDetail,
+    ) -> Result<()> {
+        let detail_json = serde_json::to_string(&detail)
+            .map_err(|e| MailError::Cache(format!("序列化正文失败：{e}")))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        conn.execute(
+            "insert into bodies (account_id, folder, uid, detail, fetched_at)
+             values (?1, ?2, ?3, ?4, ?5)
+             on conflict(account_id, folder, uid) do update set
+                 detail = excluded.detail, fetched_at = excluded.fetched_at",
+            params![account_id, folder, i64::from(detail.uid), detail_json, now],
+        )?;
+
+        // The summary table may not carry `to_addrs` yet (headers alone do not include it), and
+        // the body is where we learn it. Write it back so recipient search works.
+        if !detail.to.is_empty() {
+            let to_json = serde_json::to_string(&detail.to)
+                .map_err(|e| MailError::Cache(format!("序列化收件人失败：{e}")))?;
             conn.execute(
-                "insert into bodies (account_id, folder, uid, detail, fetched_at)
-                 values (?1, ?2, ?3, ?4, ?5)
-                 on conflict(account_id, folder, uid) do update set
-                     detail = excluded.detail, fetched_at = excluded.fetched_at",
-                params![account_id, folder, i64::from(detail.uid), detail_json, now],
+                "update messages set to_addrs = ?4
+                 where account_id = ?1 and folder = ?2 and uid = ?3",
+                params![account_id, folder, i64::from(detail.uid), to_json],
             )?;
+        }
 
-            // The summary table may not carry `to_addrs` yet (headers alone do not include it), and
-            // the body is where we learn it. Write it back so recipient search works.
-            if !detail.to.is_empty() {
-                let to_json = serde_json::to_string(&detail.to)
-                    .map_err(|e| MailError::Cache(format!("序列化收件人失败：{e}")))?;
-                conn.execute(
-                    "update messages set to_addrs = ?4
-                     where account_id = ?1 and folder = ?2 and uid = ?3",
-                    params![account_id, folder, i64::from(detail.uid), to_json],
-                )?;
-            }
-
-            Self::refresh_search_row(
-                conn,
-                &account_id,
-                &folder,
-                detail.uid,
-                crate::index::DEFAULT_BODY_INDEX_CHARS,
-            )?;
-            Ok(())
-        })
+        Self::refresh_search_row(
+            conn,
+            account_id,
+            folder,
+            detail.uid,
+            crate::index::DEFAULT_BODY_INDEX_CHARS,
+        )?;
+        Ok(())
     }
 
     pub fn get_detail(
@@ -2279,6 +2299,16 @@ mod tests {
         assert_eq!(hits.len(), 1, "2-char CJK search must work");
         assert_eq!(hits[0].uid, 1);
         assert_eq!(hits[0].folder, "INBOX");
+
+        // The query the app actually ran has to be visible to the watchdog. `search` borrows a pooled
+        // connection rather than going through `Db::read`, so before 2026-10-19 a search could run
+        // thousands of times without `reads` moving — a detector that only counts the diagnostic
+        // pragmas cannot report a drift in the thing it was written to watch.
+        let stats = cache.db().stats();
+        assert!(
+            stats.reads > 0,
+            "一次真实搜索必须被记进 reads，否则看门狗又只剩诊断 pragma：{stats:?}"
+        );
     }
 
     #[test]
@@ -4476,5 +4506,221 @@ mod tests {
             (1, 0),
             "the messages count holds and the index count drops — which is the whole signal"
         );
+    }
+
+    /// Where does P9's ingest time actually go: the **transaction boundary**, or the statements?
+    ///
+    /// `design/15` §4's P9 line has been read as "入库慢是因为每封一个事务，合并成批量事务就能快", and
+    /// the only way to test that reading is to run the *same* statements with the boundary in two
+    /// places. Hand-copied SQL would measure a write path the application does not have — the same
+    /// mistake `reports/performance.md` §0 calls "有测量不等于被测量".
+    ///
+    /// A first single-round run said two things that cannot both be true: "batching 100 messages is
+    /// 2.80× faster" and "the empty transaction is 0.3 % of the per-message cost". Either the 2.80× is
+    /// this machine drifting (A's own two repetitions differed by 29.7 %), or the boundary hides a cost
+    /// that is not the BEGIN/COMMIT marker itself — WAL re-appending every dirty page on each commit.
+    /// So the arms now run **three rounds** each, and batching is measured at three chunk sizes: a flat
+    /// curve across chunk sizes means drift, a rising one means the WAL.
+    ///
+    /// Arms, each on its own fresh file database (so WAL, `synchronous = normal`, the real pragmas),
+    /// 3 000 messages with 2 048-byte bodies — the fixture's default shape:
+    ///   A               one transaction per message: what `put_detail` does today.
+    ///   B(10/100/1000)  the same `write_detail`, one transaction per N messages.
+    ///   C               an empty transaction per message: the boundary with no statement inside it.
+    ///
+    /// A multiple is only quotable if A's own three rounds agree; the run prints the spread so the
+    /// conclusion can't quietly outlive the measurement that supports it (§6.1's 2.5–3× lesson).
+    #[test]
+    #[ignore = "P9 基准：几十秒、要真实文件库；结论写在 reports/performance.md 的 P9 那一节"]
+    fn p9_time_is_not_in_the_transaction_boundary() {
+        const MESSAGES: u32 = 3_000;
+        const BODY_BYTES: usize = 2_048;
+        const ROUNDS: usize = 3;
+
+        let details: Vec<MessageDetail> = (1..=MESSAGES)
+            .map(|uid| {
+                // A distinct token per message: identical bodies would let the FTS tree share pages
+                // and make the batched arm look better than an archive ever does.
+                let mut text = format!("第 {uid} 封 报表 发票 对账单 会议 通知 ");
+                while text.len() < BODY_BYTES {
+                    text.push_str("季度营收与成本中心分析，附件明细见下，请核对金额与税额。 ");
+                }
+                detail(uid, &format!("主题 {uid}"), &text)
+            })
+            .collect();
+        let summaries: Vec<MessageSummary> = (1..=MESSAGES)
+            .map(|uid| {
+                summary(
+                    uid,
+                    &format!("主题 {uid}"),
+                    "a@example.com",
+                    1_700_000_000 + i64::from(uid),
+                )
+            })
+            .collect();
+
+        let fresh = |name: &str| -> (Cache, std::path::PathBuf) {
+            let (cache, path) = temp_cache(name);
+            cache
+                .upsert_summaries("acc", "INBOX", &summaries)
+                .expect("seed summaries");
+            (cache, path)
+        };
+        let rows = |cache: &Cache| -> (i64, i64) {
+            let conn = cache.db.read_guard();
+            (
+                conn.query_row("select count(*) from bodies", [], |r| r.get::<_, i64>(0))
+                    .expect("count bodies"),
+                conn.query_row("select count(*) from search", [], |r| r.get::<_, i64>(0))
+                    .expect("count search"),
+            )
+        };
+
+        #[derive(Clone, Copy)]
+        enum Arm {
+            PerMessage,
+            Batch(usize),
+            BoundaryOnly,
+        }
+        let arms: Vec<(&str, Arm)> = vec![
+            ("A 每封一个事务", Arm::PerMessage),
+            ("B 每 10 封一个事务", Arm::Batch(10)),
+            ("B 每 100 封一个事务", Arm::Batch(100)),
+            ("B 每 1000 封一个事务", Arm::Batch(1000)),
+            ("C 空事务，每封一次", Arm::BoundaryOnly),
+        ];
+
+        let mut rates: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+        let mut cleanup: Vec<std::path::PathBuf> = Vec::new();
+        let mut counted: Vec<(i64, i64)> = Vec::new();
+
+        for round in 1..=ROUNDS {
+            for (index, (label, arm)) in arms.iter().enumerate() {
+                let (cache, path) = fresh(&format!("p9-{}", index));
+                cleanup.push(path);
+                let start = std::time::Instant::now();
+                match *arm {
+                    // Today's write path, unchanged.
+                    Arm::PerMessage => {
+                        for detail in &details {
+                            cache
+                                .put_detail("acc", "INBOX", detail)
+                                .expect("put_detail");
+                        }
+                    }
+                    // The same statements, with the boundary moved outside the message loop.
+                    Arm::Batch(chunk) => {
+                        for chunk in details.chunks(chunk) {
+                            let chunk = chunk.to_vec();
+                            cache
+                                .db
+                                .write_blocking(move |conn: &Connection| {
+                                    for detail in &chunk {
+                                        Cache::write_detail(conn, "acc", "INBOX", detail)?;
+                                    }
+                                    Ok(())
+                                })
+                                .expect("batched put_detail");
+                        }
+                    }
+                    Arm::BoundaryOnly => {
+                        for _ in 0..MESSAGES {
+                            cache
+                                .db
+                                .write_blocking(|_conn: &Connection| Ok(()))
+                                .expect("empty transaction");
+                        }
+                    }
+                }
+                let seconds = start.elapsed().as_secs_f64();
+                rates[index].push(f64::from(MESSAGES) / seconds);
+                if !matches!(arm, Arm::BoundaryOnly) {
+                    counted.push(rows(&cache));
+                }
+                println!(
+                    "  第 {round} 轮   {label:<22} {:>7.0} 封/秒   每封 {:>5.2} ms",
+                    f64::from(MESSAGES) / seconds,
+                    seconds / f64::from(MESSAGES) * 1000.0
+                );
+            }
+        }
+
+        // Fidelity, not speed: every batching arm must have written exactly what A did.
+        assert!(
+            counted.windows(2).all(|w| w[0] == w[1]),
+            "an arm wrote a different number of rows — it is not the same write path: {counted:?}"
+        );
+        assert!(
+            counted.len() == ROUNDS * (arms.len() - 1) && counted[0].0 == i64::from(MESSAGES),
+            "bodies: {counted:?}"
+        );
+
+        let median = |v: &[f64]| {
+            let mut sorted = v.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).expect("rate"));
+            sorted[sorted.len() / 2]
+        };
+        let medians: Vec<f64> = rates.iter().map(|v| median(v)).collect();
+        let spread = |v: &[f64]| {
+            let lo = v.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            let hi = v.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            (hi - lo) / lo * 100.0
+        };
+
+        println!(
+            "P9 事务边界基准（{MESSAGES} 封 × {BODY_BYTES} 字节正文，真实文件库 WAL+normal，{ROUNDS} 轮）"
+        );
+        for (index, (label, _)) in arms.iter().enumerate() {
+            println!(
+                "  {label:<22} 中位 {:>7.0} 封/秒   每封 {:>5.2} ms   三轮相差 {:>4.1}%   {}",
+                medians[index],
+                1000.0 / medians[index],
+                spread(&rates[index]),
+                rates[index]
+                    .iter()
+                    .map(|r| format!("{r:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            );
+        }
+        for (offset, chunk) in [(1usize, 10usize), (2, 100), (3, 1000)] {
+            // Paired, not medians-against-medians: A and B ran inside the same round, on the same
+            // machine state, so their per-round ratio is the reading that survives a noisy disk.
+            let paired: Vec<String> = (0..ROUNDS)
+                .map(|round| format!("{:.2}", rates[offset][round] / rates[0][round]))
+                .collect();
+            let median_pair = median(
+                &(0..ROUNDS)
+                    .map(|round| rates[offset][round] / rates[0][round])
+                    .collect::<Vec<f64>>(),
+            );
+            println!(
+                "  批量 {chunk:>4} 封 ÷ 今天      = {median_pair:.2}×   逐轮 {}",
+                paired.join(" / ")
+            );
+        }
+        println!(
+            "  边界本身占每封的比例 = {:.1}%（C 中位 {:.2} ms 对 A 中位 {:.2} ms）",
+            (1000.0 / medians[4]) / (1000.0 / medians[0]) * 100.0,
+            1000.0 / medians[4],
+            1000.0 / medians[0]
+        );
+        println!(
+            "  能不能报倍数看 A 自己：三轮相差 {:.1}% —— 超过 15 % 就是这台机器在动，不是代码在动",
+            spread(&rates[0])
+        );
+
+        for path in cleanup {
+            let stem = path
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .to_string();
+            for suffix in ["", "-wal", "-shm"] {
+                let mut candidate = path.clone();
+                candidate.set_file_name(format!("{stem}{suffix}"));
+                let _ = std::fs::remove_file(candidate);
+            }
+        }
     }
 }

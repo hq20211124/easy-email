@@ -78,6 +78,35 @@
     return previous.start !== next.start || previous.end !== next.end;
   }
 
+  /**
+   * Which rows a window change may keep in the DOM, and which ends the rest arrive at.
+   *
+   * The window element always holds exactly the contiguous slice of rows its last window named, in
+   * that order. So two windows of the same list share the rows in their overlap and differ only at
+   * their ends — which is why a scroll can cost a handful of DOM changes instead of a rebuild of
+   * every row on screen. `design/15` §4 P3 budgets ≤ 40 rows of change per frame; rebuilding the
+   * whole window measured 52, three times out of three.
+   *
+   * Returns `null` when nothing may be reused: no previous window (the first paint after a new list),
+   * or no row in common (a jump, not a scroll). The caller rebuilds in that case.
+   */
+  function planWindowPatch(previous, next) {
+    if (!previous || !next) return null;
+    const keepStart = Math.max(previous.start, next.start);
+    const keepEnd = Math.min(previous.end, next.end);
+    if (keepEnd <= keepStart) return null;
+    return {
+      keepStart,
+      keepEnd,
+      /** Rows to drop from the front / the back of what is currently in the DOM. */
+      dropFront: keepStart - previous.start,
+      dropBack: previous.end - keepEnd,
+      /** Rows to add before the kept ones / after them, taken from the new window. */
+      addFront: keepStart - next.start,
+      addBack: next.end - keepEnd,
+    };
+  }
+
   /** Scroll offset that brings a row fully into view, given where the viewport starts and ends. */
   function scrollTopForRow(index, { scrollTop, viewportHeight, rowHeight = DEFAULT_ROW_HEIGHT }) {
     const height = Math.max(1, Number(rowHeight) || DEFAULT_ROW_HEIGHT);
@@ -96,6 +125,7 @@
     DEFAULT_OVERSCAN,
     computeWindow,
     windowChanged,
+    planWindowPatch,
     scrollTopForRow,
   };
 

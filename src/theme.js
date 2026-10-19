@@ -17,24 +17,43 @@ const THEME_KEY = 'easy-email.theme';
 const THEMES = ['light', 'dark'];
 const DEFAULT_THEME = 'light';
 
+/*
+  The accent colour is a second, independent axis: `data-theme` picks light or dark, `data-accent`
+  picks which palette sits on top of it. Keeping them separate is why `style.css` needs only four
+  small overrides (lavender and sky, each with a light and a dark variant) rather than a full
+  cross-product of six hand-written blocks — and it means adding a seventh accent later touches one
+  attribute, not the light/dark logic. `original` is deliberately given no override: it is what the
+  bare `:root` already is.
+*/
+const ACCENT_KEY = 'easy-email.accent';
+const ACCENTS = ['original', 'lavender', 'sky'];
+const DEFAULT_ACCENT = 'original';
+const ACCENT_LABEL = { original: '默认蓝', lavender: '薰衣草', sky: '天蓝' };
+
 /** Icon shows where the button takes you, not where you are: a light UI offers the moon. */
 const ICON_FOR = { light: '🌙', dark: '☀️' };
 const LABEL_FOR = { light: '切换到深色模式', dark: '切换到浅色模式' };
 
-function readStored() {
+function readStored(key, allowed, fallback) {
   try {
-    const value = localStorage.getItem(THEME_KEY);
-    return THEMES.includes(value) ? value : null;
+    const value = localStorage.getItem(key);
+    return allowed.includes(value) ? value : fallback;
   } catch {
     // Private mode or a locked-down profile: fall through to the default rather than break boot.
-    return null;
+    return fallback;
   }
 }
 
 function currentTheme() {
   const applied = document.documentElement.dataset.theme;
   if (THEMES.includes(applied)) return applied;
-  return readStored() ?? DEFAULT_THEME;
+  return readStored(THEME_KEY, THEMES, DEFAULT_THEME);
+}
+
+function currentAccent() {
+  const applied = document.documentElement.dataset.accent;
+  if (ACCENTS.includes(applied)) return applied;
+  return readStored(ACCENT_KEY, ACCENTS, DEFAULT_ACCENT);
 }
 
 /**
@@ -54,6 +73,28 @@ function applyTheme(theme, { persist = true } = {}) {
   return next;
 }
 
+/** The accent half, mirroring `applyTheme`: the same no-persist-on-bootstrap rule applies. */
+function applyAccent(accent, { persist = true } = {}) {
+  const next = ACCENTS.includes(accent) ? accent : DEFAULT_ACCENT;
+  document.documentElement.dataset.accent = next;
+  if (persist) {
+    try {
+      localStorage.setItem(ACCENT_KEY, next);
+    } catch {
+      /* same as the theme: forgetting the choice is not worth failing the launch over */
+    }
+  }
+  return next;
+}
+
+/** Advance to the next accent in `ACCENTS`; the button cycles rather than opens a menu to stay one
+    icon wide in the compact brand row. */
+function cycleAccent() {
+  const from = currentAccent();
+  const next = ACCENTS[(ACCENTS.indexOf(from) + 1) % ACCENTS.length];
+  return applyAccent(next);
+}
+
 /*
   Bootstrap. Deliberately applies without persisting: writing the resolved default back to
   localStorage would erase the difference between "never chose" and "chose light", which is exactly
@@ -61,6 +102,7 @@ function applyTheme(theme, { persist = true } = {}) {
   every single launch. The theme is applied either way, so the visible behaviour is identical.
 */
 applyTheme(currentTheme(), { persist: false });
+applyAccent(currentAccent(), { persist: false });
 
 window.__easyEmailTheme = {
   current: currentTheme,
@@ -68,4 +110,9 @@ window.__easyEmailTheme = {
   toggle: () => applyTheme(currentTheme() === 'dark' ? 'light' : 'dark'),
   iconFor: (theme) => ICON_FOR[theme],
   labelFor: (theme) => LABEL_FOR[theme],
+  accent: currentAccent,
+  setAccent: applyAccent,
+  cycleAccent,
+  accentLabel: (accent) => ACCENT_LABEL[accent] || accent,
+  accents: () => ACCENTS.slice(),
 };

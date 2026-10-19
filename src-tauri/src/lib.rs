@@ -742,12 +742,14 @@ async fn list_messages(
 /// This is the paging endpoint the list moved to in round 75, and it is deliberately *not* the same
 /// command as [`Self::list_messages`]:
 ///
-/// * `list_messages` is the **first page** loader — it refreshes the folder first, because arriving
-///   at a mailbox should show something fresh even when the network is the slow part;
-/// * `message_page` is what 「加载更多」 calls, and it only reads what is already cached. It used to
-///   call `list_messages`, which meant every press re-read the *entire* visible window (so both the
-///   IPC payload and the frontend's re-sort grew with what was on screen) and triggered a full IMAP
-///   refresh before it could show anything older.
+/// * `message_page` is the **first paint** and every 「加载更多」 press after it: it reads what is
+///   already cached, so the rows on disk are on screen after one SQLite query instead of after an IMAP
+///   round trip. As of 2026-10-19 the renderer asks this one first (`src/first-paint.js`) — the price
+///   being that the first moment shows the last sync rather than the server.
+/// * [`Self::list_messages`] is the refresh that follows it. It used to be the first-page loader on its
+///   own, which meant the spinner covered mail already downloaded, and every press of 「加载更多」 used
+///   to call it too (so both the IPC payload and the frontend's re-sort grew with what was on screen,
+///   and asking to see older mail cost a full IMAP refresh before anything older could show).
 ///
 /// `offset` is a row offset in the cached ordering (newest first), not a UID: it is the number of
 /// rows the list already shows. `limit` is capped at `design/15` §6's IPC bound (≤ 200 rows per
@@ -2829,6 +2831,72 @@ fn start_body_index_worker(app: AppHandle) {
     });
 }
 
+/// The read-path watchdog's line for one database, or `None` when nothing slow happened.
+///
+/// Pure so "stay quiet unless the count moved" — the rule that decides whether anyone ever reads
+/// this file — is testable without a database, a runtime or a clock.
+///
+/// It reports a **delta** because [`DbStats`] counts for the life of the handle: a bare "12 slow
+/// reads" would be a number the reader cannot place in time, which is how the same log line ends up
+/// read as an alarm on the 400th tick when the four slow reads happened on the first.
+fn slow_query_delta(
+    previous: &mail_core::db::DbStats,
+    now: &mail_core::db::DbStats,
+    label: &str,
+    threshold_ms: u64,
+    window_secs: u64,
+) -> Option<String> {
+    if now.slow_queries <= previous.slow_queries {
+        return None;
+    }
+    Some(format!(
+        "[easy-email] 慢查询 {label}：最近 {window_secs} 秒新增 {} 次（阈值 {threshold_ms} ms，\
+         最近一次 {} ms，本次运行最慢 {} ms），期间共读 {} 次",
+        now.slow_queries - previous.slow_queries,
+        now.slow_last_ms,
+        now.slow_max_ms,
+        now.reads - previous.reads,
+    ))
+}
+
+/// Write slow reads into the app log, where a human can actually see them.
+///
+/// `design/15` §4 named `DbStats.slow` as the source for the P4 budget back in the planning, and the
+/// counter had never moved since — two reasons, both fixed here. First it was only timed on
+/// [`mail_core::db::Db::read`], which two diagnostic pragmas call, while every mail read goes through
+/// the pooled guard; that is `db.rs`'s problem. Second, even a moving counter was unreadable:
+/// `eprintln!` from a released Windows GUI process goes nowhere, and `DbStats` had no consumer at
+/// all. The log written here is the file the user opens with 查看日志 **and** the file the diagnostics
+/// bundle already carries, so a drift in P4 reaches a person instead of sitting in a struct.
+///
+/// Deliberately silent while nothing is slow: a line every 30 seconds is the thing that teaches
+/// people to skip the log.
+fn start_db_watchdog(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        const WINDOW_SECS: u64 = 30;
+        // Handles, not the state: the loop must not hold the `State` guard across a sleep.
+        let cache = app.state::<AppState>().cache.db().clone();
+        let user = app.state::<AppState>().user.db().clone();
+        let mut last = (cache.stats(), user.stats());
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(WINDOW_SECS)).await;
+            for (db, previous) in [(&cache, &mut last.0), (&user, &mut last.1)] {
+                let now = db.stats();
+                if let Some(line) = slow_query_delta(
+                    previous,
+                    &now,
+                    db.label(),
+                    db.slow_query_threshold_ms(),
+                    WINDOW_SECS,
+                ) {
+                    log_line(&line);
+                }
+                *previous = now;
+            }
+        }
+    });
+}
+
 /// The offline intent queue's tick.
 ///
 /// Slower than the outbox tick on purpose: the queue is compensation for a period of being offline,
@@ -3969,6 +4037,7 @@ pub fn run() {
             start_pending_replay_worker(app.handle().clone());
             start_body_index_worker(app.handle().clone());
             start_search_rebuild_worker(app.handle().clone());
+            start_db_watchdog(app.handle().clone());
 
             // The tray icon. Built here rather than in config so the menu can drive the app.
             let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
@@ -4114,8 +4183,79 @@ pub fn run() {
 mod tests {
     use super::{
         FailureKind, SyncFailure, UNIQUE_NAME_TRIES, account_id_for, app_version, failure_kind,
-        safe_file_name, unique_path,
+        safe_file_name, slow_query_delta, unique_path,
     };
+    use mail_core::db::DbStats;
+
+    /// **The watchdog is only a detector if it stays quiet when there is nothing to detect.**
+    ///
+    /// The failure this pins is the one that makes an always-on log useless: a line written every
+    /// tick whatever happened trains everyone to skip it. Here the read count grew by 412 and the
+    /// slow count did not move at all — that is a healthy half-minute and must produce nothing.
+    #[test]
+    fn a_window_with_no_new_slow_read_writes_no_line() {
+        let before = DbStats {
+            reads: 1_000,
+            slow_queries: 3,
+            ..DbStats::default()
+        };
+        let after = DbStats {
+            reads: 1_412,
+            slow_queries: 3,
+            ..DbStats::default()
+        };
+        assert_eq!(
+            slow_query_delta(&before, &after, "cache.db", 100, 30),
+            None,
+            "a quiet window must not add a line to a file people read only when something is wrong"
+        );
+        assert_eq!(
+            slow_query_delta(
+                &DbStats::default(),
+                &DbStats::default(),
+                "cache.db",
+                100,
+                30
+            ),
+            None,
+            "and neither must the very first window, where everything is zero"
+        );
+    }
+
+    /// A slow read is worth a line, and the line has to carry the four numbers that make it
+    /// checkable: how many, against what bar, how slow, out of how much read traffic. Without the
+    /// threshold a reader cannot tell a watchdog tuned at 100 ms from one tuned at 5 000 ms, and
+    /// without the read total they cannot tell "2 of 2 reads" from "2 of 200 000".
+    #[test]
+    fn the_slow_query_line_names_the_count_the_threshold_and_the_magnitude() {
+        let before = DbStats {
+            reads: 1_000,
+            slow_queries: 3,
+            ..DbStats::default()
+        };
+        let after = DbStats {
+            reads: 1_412,
+            slow_queries: 5,
+            slow_max_ms: 412,
+            slow_last_ms: 173,
+            ..DbStats::default()
+        };
+        let line = slow_query_delta(&before, &after, "cache.db", 100, 30).expect("a line");
+        for expected in [
+            "cache.db",
+            "新增 2",
+            "阈值 100 ms",
+            "173 ms",
+            "412 ms",
+            "共读 412 次",
+        ] {
+            assert!(line.contains(expected), "{expected:?} missing from: {line}");
+        }
+        assert!(
+            line.starts_with("[easy-email]"),
+            "log lines carry the app tag: {line}"
+        );
+    }
 
     /// **A1-F34 regression.** The OAuth flow stores the refresh token and the client settings under
     /// `account_id_for(email)`, and every later read keys off the saved account's `id`. If the two

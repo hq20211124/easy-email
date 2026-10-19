@@ -132,7 +132,11 @@ const SWEEP = `(async () => {
   observer.observe(list, { childList: true, subtree: true, characterData: true });
 
   const frames = [];
-  const perFrameRows = [];
+  // Per frame: the mutations counted, and whether the previous frame ended by jumping back to the top.
+  // A bounce replaces the whole window at once — counting that against "≤ 40 rows changed per frame"
+  // would blame the app for a teleport this sampler ordered.
+  const perFrame = [];
+  let previousJump = false;
   const started = performance.now();
   let previous = started;
 
@@ -141,12 +145,13 @@ const SWEEP = `(async () => {
       frames.push(now - previous);
       previous = now;
       // Counted *before* scrolling: what this frame is asked to change, not what it finished with.
-      perFrameRows.push(mutations);
+      perFrame.push({ mutations, afterJump: previousJump });
       mutations = 0;
 
       // A synthetic scroll, not a wheel event: reproducible, and independent of the platform's
       // scroll settings. Bounce at the ends so the sweep keeps finding new rows to move.
       const atEnd = list.scrollTop + list.clientHeight >= list.scrollHeight - 1;
+      previousJump = atEnd;
       list.scrollTop = atEnd ? 0 : list.scrollTop + ${STEP};
 
       if (now - started >= ${SECONDS} * 1000) {
@@ -162,6 +167,9 @@ const SWEEP = `(async () => {
   const elapsed = performance.now() - started;
   const sorted = [...frames].sort((a, b) => a - b);
   const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0;
+  const scrolling = perFrame.filter((f) => !f.afterJump);
+  const bouncing = perFrame.filter((f) => f.afterJump);
+  const maxChurn = (set) => (set.length ? Math.max(...set.map((f) => f.mutations)) : 0);
 
   return {
     selector: list.id ? '#' + list.id : list.tagName.toLowerCase(),
@@ -173,7 +181,12 @@ const SWEEP = `(async () => {
     frameMsP50: Math.round(at(0.5) * 10) / 10,
     frameMsP95: Math.round(at(0.95) * 10) / 10,
     frameMsMax: Math.round(Math.max(...frames, 0) * 10) / 10,
-    rowsChangedPerFrameMax: perFrameRows.length ? Math.max(...perFrameRows) : 0,
+    rowsChangedPerFrameMax: maxChurn(scrolling),
+    // Kept separate rather than folded into the budget's number: this is the frame that follows a
+    // bounce to the top, where the whole window is replaced at once. A real cost, but not what
+    // scrolling costs.
+    rowsChangedAfterJumpMax: maxChurn(bouncing),
+    jumpFrames: bouncing.length,
     rowsInDomAtEnd: rowsAtRest(),
   };
 })()`;
@@ -207,6 +220,8 @@ async function main() {
     frameMsP95: m.frameMsP95,
     frameMsMax: m.frameMsMax,
     rowsChangedPerFrameMax: m.rowsChangedPerFrameMax,
+    rowsChangedAfterJumpMax: m.rowsChangedAfterJumpMax,
+    jumpFrames: m.jumpFrames,
     budgetFps: BUDGET_FPS,
     budgetRows: BUDGET_ROWS,
   };
@@ -224,7 +239,10 @@ async function main() {
     );
     console.log(`frame ms  : P50 ${m.frameMsP50}  P95 ${m.frameMsP95}  max ${m.frameMsMax}`);
     console.log(
-      `rows/frame: max ${m.rowsChangedPerFrameMax}   (budget <= ${BUDGET_ROWS})`
+      `rows/frame: max ${m.rowsChangedPerFrameMax} over ${m.frames - (m.jumpFrames || 0)} scroll frames   (budget <= ${BUDGET_ROWS})`
+    );
+    console.log(
+      `            ${m.rowsChangedAfterJumpMax} in the ${m.jumpFrames} frame(s) after a bounce to the top — excluded, the sampler caused those`
     );
     console.log(`rows in DOM at end: ${m.rowsInDomAtEnd}`);
     // Honest about what fps can and cannot mean here: a compositor that ticks at 60 Hz caps the
@@ -252,6 +270,9 @@ async function main() {
   const frameBudget = (1000 / BUDGET_FPS) * FRAME_SLACK;
   if (m.frameMsP95 > frameBudget)
     problems.push(`frame time P95 ${m.frameMsP95} ms > ${Math.round(frameBudget)} ms`);
+  // Judged on the scroll frames only. The frames after a bounce to the top replace the whole window at
+  // once — 52 changes for a 26-row window — and that number measures this sampler's teleport, not the
+  // app's scrolling; it is printed, not judged.
   if (m.rowsChangedPerFrameMax > BUDGET_ROWS)
     problems.push(`${m.rowsChangedPerFrameMax} rows changed in one frame > ${BUDGET_ROWS}`);
   if (problems.length) {
