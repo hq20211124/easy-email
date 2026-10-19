@@ -149,6 +149,40 @@ const FIRST_PAINT = `(async () => {
     bootStagesPresent: Array.isArray(window.__easyEmailBoot?.stages),
     bootStages: (window.__easyEmailBoot?.stages ?? []).slice(0, 60),
     pageOriginEpoch: Math.round(performance.timeOrigin),
+    // The same leg split by *whose* clock it is: the boot stage cannot say whether the page waited on the host
+    // serving index.html, on twelve sequential script fetches, or on executing app.js, and those have
+    // three different fixes. These are the browser's own timing entries, read after the fact, so nothing
+    // here perturbs the load — and no rebuild either, since this file is a tool and not embedded JS.
+    // (No backticks anywhere below: this whole expression is one template literal.)
+    nav: (() => {
+      const n = performance.getEntriesByType('navigation')[0];
+      if (!n) return null;
+      return {
+        respEnd: Math.round(n.responseEnd),
+        domInteractive: Math.round(n.domInteractive),
+        dclStart: Math.round(n.domContentLoadedEventStart),
+      };
+    })(),
+    // Path without the origin, so the table reads "app.js" not "http://tauri.localhost/app.js".
+    // Deliberately no regex here: this expression lives inside a template literal, where a backslash in
+    // a pattern is eaten by the string and the page receives broken syntax ("Uncaught", 2026-10-20).
+    assets: performance
+      .getEntriesByType('resource')
+      .map((r) => {
+        const s = r.name.indexOf('://') >= 0 ? r.name.slice(r.name.indexOf('://') + 3) : r.name;
+        const slash = s.indexOf('/');
+        const file = (slash >= 0 ? s.slice(slash + 1) : s).split('?')[0];
+        return {
+          file,
+          isJs: file.endsWith('.js'),
+          isCss: file.endsWith('.css'),
+          start: Math.round(r.startTime),
+          respEnd: Math.round(r.responseEnd),
+          dur: Math.round(r.duration),
+          kb: Math.round(r.encodedBodySize / 1024),
+        };
+      })
+      .filter((r) => r.isJs || r.isCss),
   };
 })()`;
 

@@ -308,17 +308,27 @@
     <div id="modal-root" class="modal-root" hidden></div>
     <div id="toast-root" class="toast-root"></div>
 
-    <!-- Before app.js: it owns the payload shapes app.js sends (see the header of payload.js). -->
-    <script src="window.js"></script>
-    <script src="payload.js"></script>
-    <script src="threads.js"></script>
-    <script src="reply.js"></script>
-    <script src="history.js"></script>
-    <script src="first-paint.js"></script>
-    <script src="saved-search.js"></script>
-    <script src="storage.js"></script>
-    <script src="vlist.js"></script>
-    <script src="wizard.js"></script>
-    <script src="app.js"></script>
+    <!--
+      Before app.js: it owns the payload shapes app.js sends (see the header of payload.js).
+
+      All twelve are `defer`, which keeps their execution order (deferred scripts run in document order,
+      before DOMContentLoaded) but lets the fetches overlap: a blocking `<script>` is only discovered when
+      the parser reaches it, so over the embedded-asset protocol the twelve transfers serialize. Measured
+      2026-10-20, eight launches each way in one session: the last asset lands 284 ms after the page origin
+      instead of 439 ms, but the leg up to `boot` only moves 445 → 417 ms — the ~130 ms of *executing* these
+      modules was already on the critical path, and overlapping their transfer does not remove it.
+      theme.js stays synchronous in <head> — it must stamp `data-theme` before the first paint.
+    -->
+    <script defer src="window.js"></script>
+    <script defer src="payload.js"></script>
+    <script defer src="threads.js"></script>
+    <script defer src="reply.js"></script>
+    <script defer src="history.js"></script>
+    <script defer src="first-paint.js"></script>
+    <script defer src="saved-search.js"></script>
+    <script defer src="storage.js"></script>
+    <script defer src="vlist.js"></script>
+    <script defer src="wizard.js"></script>
+    <script defer src="app.js"></script>
   </body>
 </html>

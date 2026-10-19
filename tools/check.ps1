@@ -852,7 +852,10 @@ try {
             $problems += 'src/vlist.js is missing: the window arithmetic must be a pure, testable module'
         }
         # Loaded, not merely present: a script that index.html never references cannot be anything.
-        if ($html -notmatch '<script src="vlist\.js"></script>') {
+        # Attributes are allowed between `script` and `src` — these tags carry `defer` on purpose (the
+        # fetches of twelve blocking scripts serialize otherwise), so pinning the exact tag shape would
+        # be asserting a formatting choice instead of the loading.
+        if ($html -notmatch '<script[^>]*\bsrc="vlist\.js"') {
             $problems += 'index.html does not load vlist.js — a module nobody imports is not a list'
         }
         if (Test-Path 'src/vlist.js') {
