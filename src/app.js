@@ -2414,8 +2414,18 @@ async function refreshSyncBanner() {
   banner.hidden = false;
 }
 
-function renderMessages() {
+/**
+ * Paint the mail list into `#message-list`.
+ *
+ * `keepScroll` is for a re-render that changes **nothing about which rows exist** — a message was
+ * opened, one became read — and so must not put the list back at the top. The container is emptied
+ * below, which is exactly what loses the offset, so the offset has to be written back on purpose.
+ * Callers that swap the rows out (switching folders, deleting) leave it false: starting a different
+ * list at the top is what the user expects.
+ */
+function renderMessages({ keepScroll = false } = {}) {
   const list = $('message-list');
+  const keepAt = keepScroll ? list.scrollTop : 0;
   list.innerHTML = '';
 
   // While searching, the same list element shows hits from every folder instead of one folder.
@@ -2466,6 +2476,18 @@ function renderMessages() {
   list.replaceChildren(sizer);
   state.listSizer = sizer;
   state.listWindowEl = window_;
+  if (keepAt > 0) {
+    // One pass, not two: the sizer gets the height the restored offset needs *before* the window is
+    // computed, because an empty container clamps any scrollTop back to 0. Writing the offset after
+    // `renderListWindow` would first paint the rows at the top and throw that window away.
+    const restored = vlist.computeWindow({
+      scrollTop: keepAt,
+      viewportHeight: list.clientHeight,
+      count: state.listRows.length,
+    });
+    sizer.style.height = `${restored.totalHeight}px`;
+    list.scrollTop = keepAt;
+  }
   renderListWindow();
 
   // `t_first_paint` / `t_folder_switch` (`design/15` §4) — the two instrumentation points the budget
@@ -2774,7 +2796,9 @@ async function openMessage(message, folder = state.mailbox) {
   state.threadFocus = null;
   state.threadKey = null;
   state.threadBodies = new Map();
-  renderMessages();
+  // Opening a letter changes which row is highlighted, not which rows exist — so the list stays where
+  // the user put it (task #10, round 100: it used to snap back to the top, 2 200 px → 0).
+  renderMessages({ keepScroll: true });
 
   $('reader-placeholder').hidden = true;
   $('reader-body').hidden = false;
@@ -2886,7 +2910,9 @@ function mountBodySurface(host) {
 function markSeen(summary, folder) {
   if (!summary || summary.seen) return;
   summary.seen = true;
-  renderMessages();
+  // Same rows, one less unread dot: this re-render follows opening the message, so it must not be the
+  // one that throws the list back to the top.
+  renderMessages({ keepScroll: true });
   // One fewer unread in this folder. Re-read rather than decrement: the same message could be open
   // from a conversation that spans folders, and the count belongs to the folder it was fetched in.
   void loadUnreadCounts();
@@ -3130,7 +3156,8 @@ async function toggleBubble(key) {
 
   state.detail = detail;
   renderThreadReader();
-  renderMessages();
+  // Opening one message of a conversation is the same case as opening any message: the rows did not change.
+  renderMessages({ keepScroll: true });
   markSeen(member.summary, member.folder);
 }
 

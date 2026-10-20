@@ -887,7 +887,9 @@ try {
         # append rows to the same element — they are short lists and windowing them would buy nothing.
         # An unscoped "no appendChild anywhere" was the first version of this check and it failed a
         # correct tree, which is how a gate starts ignoring its own greens.
-        $render = [regex]::Match($js, '(?s)function renderMessages\(\) \{.*?\n\}').Value
+        # The signature may carry parameters (round 100 added `keepScroll`): this captures the *body* to
+        # check what it does, and pinning the exact parameter list would assert a formatting choice.
+        $render = [regex]::Match($js, '(?s)function renderMessages\([^\)]*\) \{.*?\n\}').Value
         if ($render.Length -eq 0) {
             $problems += 'renderMessages is gone — the list entry point must stay a named function'
         } else {

@@ -237,10 +237,10 @@ async function probePage(steps) {
         problems.push(`reused row ${wantedUid} ("${wantedSubject}") opened a reader that does not contain that subject`);
       }
     }
-    // Opening a message re-renders the list, and the re-render rebuilds the scroll container, which
-    // puts the list back at the top: the clicked row is usually no longer on screen here. Recording
-    // that rather than asserting on it — it is what the app has done all along, not what this change
-    // claims — and only checking the highlight when the row did survive.
+    // Since 2026-10-20 (round 100, item 8B) opening a message keeps the list where the user put it, so
+    // this offset *should* survive; the jump it used to make is what `tools/probe-open-keeps-scroll.mjs`
+    // now measures and asserts. Here it is still only recorded, because this probe's claim is about rows
+    // being reused, and a note keeps that claim honest if the scroll behaviour changes again.
     scrolledAway = { before: scrollBefore, after: list.scrollTop };
     selected = [...win().children].filter((el) => el.classList.contains('selected')).map((el) => el.dataset.uid);
     const stillInWindow = [...win().children].some((el) => el.dataset.uid === wantedUid);
@@ -318,7 +318,7 @@ async function main() {
     console.log(`reuse          : rows kept across each scroll step: ${(m.reusedPerStep||[]).join(', ')} (the last step is the one the clicks below use)`);
     console.log(`coverage       : ${m.distinctRowsSeen} of ${m.totalRows} rows visited${m.sweepCoveredWholeList ? '' : ' (the sweep stopped at --steps)'}`);
     console.log(`click          : opened row ${m.clicked}, highlighted ${JSON.stringify(m.highlighted)}`);
-    if (m.listMovedAfterOpen) console.log(`note           : opening it moved the list from scrollTop ${m.listMovedAfterOpen.before} to ${m.listMovedAfterOpen.after} — renderMessages rebuilds the scroll container, so the highlight check above may have had nothing left to check`);
+    if (m.listMovedAfterOpen) console.log(`note           : opening it moved the list from scrollTop ${m.listMovedAfterOpen.before} to ${m.listMovedAfterOpen.after} — that is item 8B's bug, measured and asserted by tools/probe-open-keeps-scroll.mjs; the highlight check above may have had nothing left to check`);
   }
   if (problems.length) {
     for (const problem of problems) console.error(`- ${problem}`);
