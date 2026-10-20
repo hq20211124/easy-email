@@ -2135,6 +2135,33 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step 'the OAuth path and the protocol paths read the same certificate store' {
+        # reqwest's plain `rustls-tls` feature is an *alias* for `rustls-tls-webpki-roots`: a fixed
+        # list of root CAs compiled into the binary, which never gains a certificate an administrator
+        # installs and never loses one that expires. IMAP and SMTP use the operating system's store
+        # (Schannel), so that alias made the OAuth token exchange the only part of the program that
+        # rejects a certificate the rest of it accepts: behind an enterprise CA or a TLS-inspecting
+        # gateway the consent screen completes in the browser and the app then fails, which reads as
+        # our bug. Asserted on the **resolved** graph rather than on a string in Cargo.toml, because
+        # the two are not the same thing — another crate in the tree can add a feature, and
+        # `default-features = false` can silently drop one.
+        $lock = Get-Content 'Cargo.lock' -Raw -Encoding UTF8
+        $problems = @()
+        if ($lock -notmatch '(?m)^name = "rustls-native-certs"$') {
+            $problems += 'Cargo.lock has no rustls-native-certs: the OAuth path is not reading the system trust store'
+        }
+        if ($lock -match '(?m)^name = "webpki-roots"$') {
+            $problems += 'Cargo.lock still carries webpki-roots: a hard-coded root list is back in the binary'
+        }
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Write-Host 'keep reqwest on rustls-tls-native-roots (crates/mail-core/Cargo.toml)' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'native roots in, webpki-roots out: one trust store for the whole program'
+        $global:LASTEXITCODE = 0
+    }
     Step 'the installer configuration points at files that exist' {
         # `installerHooks` is a path inside a JSON file: a typo there does not fail anything until
         # somebody runs `tauri build`, which needs the Tauri CLI and a network — so it would be found
@@ -2350,6 +2377,194 @@ try {
             return
         }
         Write-Host 'backfill reads oldest_uid and never writes the cursor'
+        $global:LASTEXITCODE = 0
+    }
+
+    Step 'the body-on-disk decision is one place, and an unreadable preference fails closed' {
+        # design/A3 选项 1 ("正文不落盘") as built. The mode is only worth what it claims if two
+        # things hold, and both are the kind that rot quietly:
+        #   * exactly ONE production statement can put a body in `cache.db`, and it is behind the flag.
+        #     A second writer added later — a migration, a backfill, a "just this once" copy — makes
+        #     the sentence on the screen false while every existing test still passes.
+        #   * the fallback direction is the safe one. An unreadable preference must stop bodies rather
+        #     than allow them: refusing to write costs a re-download and deletes nothing, while writing
+        #     puts secret text in a file on a machine the user has not proven is encrypted.
+        $cache = Get-Content 'crates/mail-core/src/cache.rs' -Raw -Encoding UTF8
+        $quota = Get-Content 'crates/mail-core/src/quota.rs' -Raw -Encoding UTF8
+        $index = Get-Content 'crates/mail-core/src/index.rs' -Raw -Encoding UTF8
+        $db = Get-Content 'crates/mail-core/src/userdb.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $app = Get-Content 'src/app.js' -Raw -Encoding UTF8
+        $problems = @()
+
+        # Strip whole test modules (a `#[cfg(test)] mod name { … }` ends at its column-0 brace; every
+        # line inside is indented), so what is left is the code that actually ships.
+        $strip = {
+            param($src)
+            [regex]::Replace($src, '(?sm)^\#\[cfg\(test\)\]\s*\bmod\b.*?^\}', '')
+        }
+        $writers = 0
+        foreach ($pair in @(@('cache.rs', $cache), @('quota.rs', $quota), @('index.rs', $index))) {
+            $prod = & $strip $pair[1]
+            # The leading quote is what makes this a count of statements rather than of sentences: a
+            # doc comment that names the SQL must not be able to fail the gate (round 87's trap).
+            $writers += ([regex]::Matches($prod, '"insert into bodies')).Count
+        }
+        if ($writers -ne 1) {
+            $problems += "exactly one production statement may write a body, found $writers — a writer that forgets the flag makes the mode a lie"
+        }
+        $writeDetail = [regex]::Match($cache, '(?s)fn write_detail\(.*?\n    \}').Value
+        if ($writeDetail -notmatch 'insert into bodies') {
+            $problems += 'the single body writer must be inside write_detail, where the flag is applied'
+        } else {
+            $guard = $writeDetail.IndexOf('if store_body')
+            $insert = $writeDetail.IndexOf('insert into bodies')
+            if ($guard -lt 0 -or $insert -lt $guard) {
+                $problems += 'write_detail must test store_body before it inserts — the flag is the whole feature'
+            }
+        }
+        if ($cache -notmatch 'let store_body = matches!\(self\.body_storage\(\), BodyStorage::Cached\)') {
+            $problems += 'put_detail must read the mode off the handle, not take it from the caller — one rule per handle'
+        }
+        # The background indexer must ask too: fetching a body it may not store is a round trip for
+        # nothing, forever, because the pending list can never empty.
+        if ($index -notmatch 'run\.cache\.body_storage\(\)') {
+            $problems += 'index.rs must consult the mode before fetching bodies for the backfill pass'
+        }
+
+        # Startup: the decision is only real if the live handle is told. The production call site is
+        # the one that passes the "did user.db open" flag — the tests call it too, so counting
+        # mentions would not notice its removal.
+        if ($lib -notmatch 'apply_stored_body_storage\(&cache, &user, user_store_error\.is_none\(\)\)') {
+            $problems += 'setup must call apply_stored_body_storage with whether user.db opened — deciding and forgetting to apply is the same bug'
+        }
+        $decide = [regex]::Match($lib, '(?s)fn startup_body_storage\(.*?\n\}').Value
+        if ($decide -notmatch 'Some\(Err') {
+            $problems += 'startup_body_storage must handle the unreadable-preference case at all'
+        } elseif (([regex]::Matches($decide, 'BodyStorage::OnlineOnly')).Count -ne 2) {
+            $problems += 'both failure arms (no user.db, unreadable row) must choose OnlineOnly — fail closed, not open'
+        }
+        # The clear is honoured only on the way into the mode; elsewhere it would be an erasure the
+        # screen cannot explain, and caching back on would refill it on the next pass.
+        if ($lib -notmatch 'purge_existing && mode == BodyStorage::OnlineOnly') {
+            $problems += 'set_body_storage must purge only when entering OnlineOnly'
+        }
+        # The preference belongs to the user, not to the cache it controls: "delete the cache" is an
+        # action a user takes precisely to stop bodies accumulating, and it must not switch the rule off.
+        if ($db -notmatch 'BODY_STORAGE_KEY') {
+            $problems += 'userdb.rs must persist the body-storage mode (it is the one setting that must survive a cleared cache)'
+        }
+        if ($cache -match 'BODY_STORAGE_KEY') {
+            $problems += 'cache.rs must not persist the mode — a persisted setting in the discardable store is the bug this replaces'
+        }
+        # And the user has to be able to reach it.
+        foreach ($call in @('get_body_storage', 'set_body_storage')) {
+            if ($app -notmatch ("invoke\('" + $call + "'")) {
+                $problems += "app.js must call $call — a mode nobody can read or set is not a setting"
+            }
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'one body writer behind one flag, the mode fails closed, the clear only runs entering it'
+        $global:LASTEXITCODE = 0
+    }
+    Step 'the disk-encryption self-check reads numbers from CIM, never a localized sentence' {
+        # design/A3 选项 2: OS encryption is a *deployment precondition*, so the app has to be able to
+        # say whether the machine it is running on meets it. Three properties, all of them load-bearing
+        # for a sentence that a security reviewer will read:
+        #   * it reads the two documented integers, not the text `manage-bde` prints — that text is
+        #     localized, and a match on it silently becomes "unknown" on a Chinese or English machine;
+        #   * an unrecognised value is `Unknown`, never a reassuring state;
+        #   * nothing it does can change a protector — one read-only `Get-CimInstance`, no input.
+        $dp = Get-Content 'src-tauri/src/diskprotect.rs' -Raw -Encoding UTF8
+        $lib = Get-Content 'src-tauri/src/lib.rs' -Raw -Encoding UTF8
+        $ps1 = Get-Content 'tools/disk-protection-check.ps1' -Raw -Encoding UTF8
+        $problems = @()
+
+        foreach ($need in @('Win32_EncryptableVolume', 'ConversionStatus', 'ProtectionStatus')) {
+            if ($dp -notmatch $need) { $problems += "diskprotect.rs must read $need — that is the class the answer comes from" }
+        }
+        # The ban is on the *command line*, not the word: the module comment explains in prose why
+        # `manage-bde` is not used, and a gate that fails on that sentence is a gate someone will widen.
+        $query = [regex]::Match($dp, '(?s)pub const QUERY:.*?"\#;').Value
+        if ($query -match 'manage-bde') {
+            $problems += 'the query must not shell out to manage-bde: its output is localized text'
+        }
+        if ($query -notmatch 'Get-CimInstance') {
+            $problems += 'probe must run one read-only Get-CimInstance of a status class — nothing that could change a protector'
+        }
+        # `Protected` may only ever come from the (fully encrypted, protection on) pair.
+        foreach ($line in ([regex]::Matches($dp, '.*=> VolumeState::Protected.*'))) {
+            if ($line.Value -notmatch '\(1, 1\)') {
+                $problems += "a state other than (1,1) maps to Protected: $($line.Value.Trim()) — protection off must never read as protected"
+            }
+        }
+        $stateOf = [regex]::Match($dp, '(?s)pub fn state_of\(.*?\n\}').Value
+        if ($stateOf -notmatch '_ => VolumeState::Unknown') {
+            $problems += 'state_of must end in Unknown — a protection value this code has not seen is not evidence'
+        }
+        $parsed = [regex]::Match($dp, '(?s)pub fn parse_volumes\(.*?\n\}').Value
+        if ($parsed -notmatch 'looks_like_drive') {
+            $problems += 'parse_volumes must reject lines whose first field is not a drive letter: a stray line must not become a volume in a security report'
+        }
+        # Every way the probe can fail has to land in Unknown. The three arms are: spawn failed,
+        # nonzero exit with nothing readable, and nothing readable with a clean exit.
+        $probe = [regex]::Match($dp, '(?s)#\[cfg\(windows\)\]\r?\npub fn probe\(.*?\n\}').Value
+        if ($probe -notmatch '"-Command", QUERY\]') {
+            $problems += 'probe must hand PowerShell the one constant query verbatim — assembling the arguments here is where a parameter could sneak in'
+        }
+        if ($probe -notmatch 'powershell\.exe') {
+            $problems += 'probe must name the interpreter it starts, so the failure arms are about this query and not about guessing'
+        }
+        if (([regex]::Matches($probe, 'Verdict::Unknown')).Count -lt 2) {
+            $problems += 'every failure of the probe must report Unknown, not a verdict guessed from an empty result'
+        }
+
+        # The elevated tool a deployment runs to produce the archival report. Same class, and the
+        # three-way answer the acceptance asks for has to be *exit codes* — a deployment records the
+        # code, and the sentence next to it must be the one that code means. Checked as pairs rather
+        # than as "the file contains exit 2": four of the arms print 无法判定, and any one of them
+        # would satisfy a word-existence assertion while the real one exited 0.
+        if ($ps1 -notmatch 'Win32_EncryptableVolume') {
+            $problems += 'disk-protection-check.ps1 must read the same CIM class the in-app self-check reads'
+        }
+        $psLines = $ps1 -split "`r?`n"
+        $verdicts = @{ '结论：前置条件成立' = 'exit 0'; '结论：前置条件不成立' = 'exit 1'; '结论：无法判定' = 'exit 2' }
+        foreach ($k in $verdicts.Keys) {
+            $want = $verdicts[$k]
+            $seen = 0
+            for ($i = 0; $i -lt $psLines.Count; $i++) {
+                if ($psLines[$i] -notlike ('*' + $k + '*')) { continue }
+                $seen++
+                $first = $null
+                for ($j = $i; $j -lt $psLines.Count; $j++) {
+                    $t = $psLines[$j].Trim()
+                    if ($t -like 'exit *') { $first = $t; break }
+                }
+                if ($first -ne $want) {
+                    $problems += "「$k」 is followed by ``$first``, not ``$want`` — the exit code is what a deployment archives"
+                }
+            }
+            if ($seen -eq 0) { $problems += "disk-protection-check.ps1 must print 「$k」" }
+        }
+        # Startup runs it once, off the async runtime, and the panel reads the stored answer.
+        if (([regex]::Matches($lib, 'start_disk_protection_check')).Count -ne 2) {
+            $problems += 'the startup self-check must both exist and be called — a report nobody triggers shows pending forever'
+        }
+        if ($lib -notmatch 'async fn disk_protection_status\(') {
+            $problems += 'the panel needs a command that returns the report the self-check already found'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'the precondition is read from documented integers, and an unread answer stays Unknown'
         $global:LASTEXITCODE = 0
     }
 

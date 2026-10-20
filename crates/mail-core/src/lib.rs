@@ -57,7 +57,8 @@ pub use backfill::{
     BackfillBudget, BackfillReport, BackfillStop, backfill_older, fill_thread_keys,
 };
 pub use cache::{
-    BodyCoverage, Cache, FolderState, HealReport, IndexHealth, RebuildProgress, SearchHit, to_query,
+    BodyCoverage, BodyStorage, Cache, FolderState, HealReport, IndexHealth, RebuildProgress,
+    SearchHit, to_query,
 };
 pub use error::{AuthHint, MailError, Result};
 pub use idle::{PushEvent, watch, watch_every};

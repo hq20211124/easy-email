@@ -69,10 +69,68 @@
     };
   }
 
+  /**
+   * What the 正文存储 row says, given what the running app reports.
+   *
+   * Two facts, never one: the mode this process is honouring, and how many bodies are already on
+   * disk. Showing only the mode would let "正文不落盘" sit next to three thousand stored bodies and
+   * read as though the file were clean — the count is what turns 清空 into a decision instead of a
+   * guess. A report we cannot read is reported as the default mode with the count unknown, because
+   * the panel must still render.
+   */
+  function bodyStorageSummary(report) {
+    const raw = Number(report?.stored_bodies);
+    const stored = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 0;
+    const online = report?.mode === 'online';
+    return {
+      online,
+      stored,
+      label: online ? '正文不落盘' : '正文缓存在本地',
+      // Nothing to clear when the file holds no bodies; the button would be a lie.
+      canPurge: stored > 0,
+      note: online
+        ? '正文只在打开这封信时下载到内存，不写进本地缓存文件。代价要说清楚：没读过的邮件离线打不开，' +
+          '按正文里的词搜索也只覆盖清空之前存下的部分。'
+        : '读过的邮件会把正文写进本地缓存文件，之后离线可读、按正文词可搜。',
+    };
+  }
+
+  /**
+   * The disk-encryption self-check, in the words the panel prints.
+   *
+   * The backend sends the state as a machine word (`protected`, `not_encrypted`, …) and the note as
+   * its own sentence; this maps only the words. A state that is not in the table shows as 无法判定
+   * rather than as the raw identifier, because the one reading that must never appear on this screen
+   * is an unknown new value rendered like a known good one.
+   */
+  const DISK_STATE_LABELS = {
+    protected: '已加密且保护已开启',
+    encrypted_unprotected: '已加密但保护已关闭',
+    not_encrypted: '未加密',
+    converting: '加密进行中',
+    unknown: '无法判定',
+  };
+
+  function diskProtectionSummary(report) {
+    const labelOf = (state) => DISK_STATE_LABELS[state] ?? '无法判定';
+    return {
+      verdict: labelOf(report?.verdict),
+      // Whether every volume the query saw is encrypted *with protection on*. Anything else —
+      // including a status we could not read — is not "yes", and the panel says so in one colour.
+      allProtected: report?.verdict === 'protected',
+      note: typeof report?.note === 'string' ? report.note : '',
+      volumes: (Array.isArray(report?.volumes) ? report.volumes : []).map(
+        (v) => `${v.drive}：${labelOf(v.state)}`
+      ),
+    };
+  }
+
   globalThis.__easyEmailStorage = {
     DEFAULT_LIMIT_MB,
     suggestStorageLimit,
     formatBytes,
     cleanupSummary,
+    bodyStorageSummary,
+    diskProtectionSummary,
   };
 })();

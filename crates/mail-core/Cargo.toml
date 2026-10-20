@@ -41,6 +41,19 @@ getrandom = "0.3"
 # The OAuth token endpoints are HTTPS POSTs of a form. rustls (not native-tls) because only its
 # crate set is available in this environment's offline registry (M1a-38 measured that).
 #
+# `rustls-tls-native-roots`, **not** `rustls-tls`: the plain feature is an alias for
+# `rustls-tls-webpki-roots`, i.e. a fixed list of roots compiled into the binary. IMAP and SMTP use
+# the operating system's store (Schannel through `async-native-tls`/lettre), so `rustls-tls` made the
+# OAuth request the only part of the app that rejected a certificate the rest of the app accepts — an
+# enterprise CA, or a corporate TLS-inspecting gateway added by an administrator who put its CA in
+# the system store like every other application reads it, logs the user in at the consent screen and
+# then fails at the token exchange. One trust store for the whole program is the property: which root
+# CAs are trusted now changes with the operating system, exactly as it does for the two protocol
+# paths. Revocation stays asymmetric and is *not* what this feature buys: Schannel calls
+# `CertGetCertificateChain` with `CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY | ..._CHAIN_EXCLUDE_ROOT`
+# (`schannel-0.1.29/src/tls_stream.rs:679`) while rustls does not consult revocation at all, and that
+# was true before this change as well.
+#
 # `system-proxy` is **not optional here**, and it is the one feature a `default-features = false`
 # build silently loses. Without it reqwest ignores the system proxy entirely — including the
 # `HTTPS_PROXY` environment variable — and connects directly. On a machine behind a local proxy
@@ -51,7 +64,7 @@ getrandom = "0.3"
 # `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` the browser obeys.
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
-    "rustls-tls",
+    "rustls-tls-native-roots",
     "system-proxy",
 ] }
 # Needed to set SO_EXCLUSIVEADDRUSE *before* bind: the option cannot be applied to a socket that is

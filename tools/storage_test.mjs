@@ -87,6 +87,61 @@ const many = cleanupSummary({
 checkTrue('rows add up', many.text.includes('10 封邮件'));
 checkTrue('and so do the bytes', many.text.includes('6 MB'));
 
+// ---------------------------------------------------------------- the body-storage row
+const { bodyStorageSummary } = sandbox.__easyEmailStorage ?? {};
+checkTrue('bodyStorageSummary exists', typeof bodyStorageSummary === 'function');
+
+const cached = bodyStorageSummary({ mode: 'cached', stored_bodies: 412 });
+check('the default names what it does', cached.label, '正文缓存在本地');
+check('and reports how many bodies are on disk', cached.stored, 412);
+check('so there is something to clear', cached.canPurge, true);
+checkTrue('the cost of the default is not hidden', cached.note.includes('离线可读'));
+
+const online = bodyStorageSummary({ mode: 'online', stored_bodies: 412 });
+check('the protected mode says so', online.label, '正文不落盘');
+check('turning the mode on does not mean the disk is empty', online.stored, 412);
+checkTrue(
+  'and the two things the user loses are both named',
+  online.note.includes('离线') && online.note.includes('搜索')
+);
+
+const clean = bodyStorageSummary({ mode: 'online', stored_bodies: 0 });
+check('nothing to clear is nothing to clear', clean.canPurge, false);
+
+// A report the shell could not produce must still render, and must not invent a count.
+check('no report is the default mode', bodyStorageSummary(null).label, '正文缓存在本地');
+check('with no claim about the disk', bodyStorageSummary(null).stored, 0);
+check('a negative count is zero, not a typo', bodyStorageSummary({ stored_bodies: -5 }).stored, 0);
+check(
+  'an unknown mode is the mode the app is actually running',
+  bodyStorageSummary({ mode: 'from-the-future', stored_bodies: 3 }).label,
+  '正文缓存在本地'
+);
+
+const { diskProtectionSummary } = sandbox.__easyEmailStorage ?? {};
+checkTrue('diskProtectionSummary exists', typeof diskProtectionSummary === 'function');
+
+const good = diskProtectionSummary({
+  verdict: 'protected',
+  note: '系统盘已加密且保护已开启（C:）。',
+  volumes: [{ drive: 'C:', state: 'protected' }],
+});
+check('a protected machine reads as protected', good.verdict, '已加密且保护已开启');
+check('and that is the only verdict that counts as yes', good.allProtected, true);
+check('the per-volume line carries the drive', good.volumes[0], 'C:：已加密且保护已开启');
+
+const off = diskProtectionSummary({ verdict: 'encrypted_unprotected', volumes: [] });
+check('encrypted with the protector off is its own words', off.verdict, '已加密但保护已关闭');
+check('and it is not a yes', off.allProtected, false);
+
+// The fail-safe direction: a state this build does not know must not be rendered as a known one.
+const future = diskProtectionSummary({ verdict: 'quantum_sealed', volumes: [{ drive: 'D:', state: 'sealed' }] });
+check('an unknown verdict is 无法判定, not the raw identifier', future.verdict, '无法判定');
+check('and so is an unknown volume state', future.volumes[0], 'D:：无法判定');
+check('a missing report is 无法判定 too', diskProtectionSummary(null).verdict, '无法判定');
+check('with nothing claimed about volumes', diskProtectionSummary(null).volumes.length, 0);
+check('and a note that is not text is dropped', diskProtectionSummary({ note: 42 }).note, '');
+
 // ---------------------------------------------------------------- report
 if (failures.length > 0) {
   console.error(`storage_test: ${failures.length} failing`);

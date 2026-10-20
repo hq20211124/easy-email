@@ -27,9 +27,15 @@ credit if you want it. Reports are handled privately until a fix is released.
 ## What Is Protected by Design
 
 - **Credentials never touch disk in plaintext.** Windows: passwords live in the Credential
-  Manager, refresh tokens in DPAPI-encrypted files (user scope, per-account entropy).
-  Linux: passwords go to the D-Bus Secret Service; refresh tokens are files encrypted with a
-  key derived from the machine id, mode `0600` in a `0700` directory.
+  Manager; OAuth refresh tokens *and* OAuth client secrets live in DPAPI-encrypted files
+  (user scope, per-account entropy). Linux: passwords go to the D-Bus Secret Service; those
+  secrets are files encrypted with a key derived from the machine id, mode `0600` in a `0700`
+  directory. Nothing secret is a row in `user.db` — a gate in `tools/auth_axis_check.py` fails
+  the build if code writes an OAuth client secret into the database again.
+- **Every TLS connection validates against one trust anchor: the OS certificate store.**
+  IMAP/SMTP/POP3 go through Schannel, OAuth and other HTTPS through rustls configured with
+  native roots, so an enterprise CA or a TLS-inspecting gateway certificate is trusted
+  everywhere or nowhere — no path silently keeps a private, compiled-in root list.
 - **Nothing secret is written to logs.** `startup-error.log` and the console diagnostics
   never carry tokens or passwords; a gate in `tools/check.ps1` fails the build if a token is
   ever logged.
@@ -39,13 +45,34 @@ credit if you want it. Reports are handled privately until a fix is released.
   **for that one message**, which is what stops tracking pixels from reporting a read.
 - **OAuth uses PKCE S256 with a state check, a system browser, and an exclusively-bound
   loopback listener.** No OOB, no embedded webview, no client secrets baked into any build.
+- **Message bodies can be kept off the disk entirely.** *Settings → Storage → 正文不落盘* stops
+  the cache from ever writing a body: the text is downloaded into memory when a message is
+  opened and re-downloaded the next time. Turning it on can also clear the bodies already
+  stored, and the clear rebuilds the file rather than only deleting rows, because a delete
+  leaves the text on a freed page. The preference lives in `user.db`, not in the cache it
+  controls — "delete the cache" is an action a user takes to stop bodies accumulating, and it
+  must not switch the rule off — and an *unreadable* preference fails **closed**: no preference
+  read is not permission to put secret text in a file. What the mode costs is stated on the
+  same screen: unread mail is not available offline, and body-text search only covers what was
+  stored before the clear.
 
 ## Known Limitations (stated, not hidden)
 
 - The on-disk protection does **not** stop malware running as the same OS user — that is a
   property of every user-scope secret store, including DPAPI.
 - The cache database is not encrypted: it holds message metadata and bodies of mail the user
-  has already downloaded. It never holds passwords or refresh tokens.
-- Attachments are fetched whole into memory before being written; a very large message costs
-  memory proportional to that message.
+  has already downloaded. It never holds passwords or refresh tokens. `design/A3-local-store-
+  protection.md` explains why no mainstream desktop client treats local-store encryption as
+  the security boundary, and what to do instead: the body-storage mode above, plus
+  **full-volume encryption as a written deployment precondition** — the app checks it
+  (read-only, one `Get-CimInstance Win32_EncryptableVolume` at startup, its answer shown in the
+  storage panel) but does not enforce it, and a non-elevated check honestly reports 无法判定
+  because Windows returns Access Denied. `tools/disk-protection-check.ps1` is the elevated,
+  archivable form for the deployment record: exit 0 precondition holds, 1 does not, 2 unknown.
+  The remaining protection is not encryption either: a saved draft is mirrored to the server's
+  Drafts folder and a sent message gets its server copy, so losing the machine does not lose the
+  mail.
+- Outgoing mail is spooled as plaintext `.eml` files until it is accepted by the SMTP server,
+  and attachments are fetched whole into memory before being written; a very large message
+  costs memory proportional to that message.
 - Not yet audited by a third party.

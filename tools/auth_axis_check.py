@@ -12,6 +12,9 @@ than a behaviour:
      exclusive-address option.
   4. **No embedded WebView for OAuth**: the UI must never create one for the authorization step
      (A1-F32: Google answers `disallowed_useragent`).
+  5. **No credential in `user.db`**: the OAuth client secret is written only to the sealed token store
+     (see `crates/mail-core/src/tokenstore.rs` — what is being closed is a row that can leave the
+     machine inside a copied database file, not the strength of any cipher).
 
 Exit code 0 means all three hold.
 """
@@ -97,9 +100,26 @@ for path in list(sources(["src"], (".js",))) + list(sources(["src-tauri"], (".rs
                 f"{needle} — OAuth must use the system browser (A1-F32)"
             )
 
+# ---------------------------------------------------------------- 5. the client secret stays out of the database
+# `user.db` is the file a user copies into a backup and carries to another machine, so the OAuth client
+# secret now lives in the sealed token store beside the refresh token. The old `kv` row is still *read*,
+# once per account, as the migration for files an older version wrote. What must not come back is a
+# **writer**: a unit test of the current path cannot see one, because it is a new call in new code.
+for path in sources(["crates", "src-tauri"], (".rs",)):
+    text = read(path)
+    for index, line in enumerate(text.splitlines(), start=1):
+        if "kv_set" in line and "oauth_client_secret" in line:
+            problems.append(
+                f"{os.path.relpath(path, ROOT)}:{index} writes an OAuth client secret into the "
+                f"database; it belongs in the token store — {line.strip()}"
+            )
+
 if problems:
     for problem in problems:
         print(f"- {problem}")
     sys.exit(1)
 
-print("auth axis: no token in any log, PKCE + exclusive loopback present, no embedded webview")
+print(
+    "auth axis: no token in any log, PKCE + exclusive loopback present, no embedded webview, "
+    "no OAuth client secret written to the database"
+)

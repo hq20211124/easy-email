@@ -3148,6 +3148,331 @@ async fn a_server_that_refuses_sets_still_indexes_every_message() {
     );
 }
 
+/// **P8b 步骤 3 的让路（第 100 轮）.** The backfill must stop when the user is already on a
+/// connection, and must lose nothing by stopping.
+///
+/// This is the half the cadence cannot be reviewed from a unit test: `should_yield` is answered by the
+/// *pool*, so only a real checked-out connection proves the count means what it says. Two things are
+/// pinned, and they fail independently:
+///   * the pass **gives way** — it must not send a single `UID FETCH` while another connection is out;
+///   * giving way **costs nothing** — everything still pending stays pending, and the next pass after
+///     the other client is dropped indexes all of it. A "polite" version that dropped rows on the way
+///     out would look identical in the log and lose the user's search results.
+#[tokio::test]
+async fn the_backfill_gives_way_while_another_connection_is_in_use() {
+    let (addr, _transcript) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        extra: Arc::new(AtomicU32::new(6)),
+        filler_body_chars: Arc::new(AtomicU32::new(60)),
+        ..Server::default()
+    })
+    .await;
+    let mut cfg = account(addr, addr);
+    cfg.max_connections = 2;
+    let pool = ConnectionPool::new();
+    let cache = Cache::open_in_memory().expect("cache");
+
+    let mut seed = pool
+        .acquire(&cfg, "app-password")
+        .await
+        .expect("first connection");
+    within(sync_once(&mut seed, &cache, &cfg.id, &inbox())).await;
+    drop(seed);
+
+    let pending = cache.bodies_pending_count(&cfg.id).expect("pending");
+    assert!(pending > 0, "the sync must leave bodies to index");
+
+    // The user's side: one connection checked out and held, exactly what a command in flight is.
+    let _user = pool
+        .acquire(&cfg, "app-password")
+        .await
+        .expect("the user's connection");
+    let mut backfill = pool
+        .acquire(&cfg, "app-password")
+        .await
+        .expect("the backfill's connection");
+
+    let run = || mail_core::index::BodyIndexRun {
+        cache: &cache,
+        cfg: &cfg,
+        limit: mail_core::index::DEFAULT_PASS_LIMIT,
+    };
+
+    let report = within(index_bodies_pass(run(), &mut backfill))
+        .await
+        .expect("pass");
+    assert!(
+        report.yielded,
+        "with another connection in use the pass must say it gave way"
+    );
+    assert_eq!(report.indexed, 0, "and it must not have fetched");
+    assert_eq!(
+        report.remaining, pending,
+        "giving way must not lose anything — {pending} were pending"
+    );
+
+    // The user is done. The same connection can now do the work it declined.
+    drop(_user);
+    let report = within(index_bodies_pass(run(), &mut backfill))
+        .await
+        .expect("second pass");
+    assert!(!report.yielded, "nothing is in the way now");
+    assert_eq!(report.remaining, 0, "the backlog must drain");
+    assert_eq!(report.indexed, pending);
+    assert_eq!(report.failed, 0);
+}
+
+/// **P8b 步骤 3 的另一半：用户点名要索引时不让路（第 100 轮）.**
+///
+/// The background worker steps aside when a connection is already out. The search box's "建立索引"
+/// button is *not* the background — it is the user asking, in this second, for the thing that makes
+/// search work, and a button that reports success while having fetched nothing because a sync happened
+/// to hold a socket is worse than a slow button. Both halves are asserted on **one connection under
+/// one contention**, so the wrapper is the only difference between the two outcomes:
+///   * the plain pass gives way, exactly as the test above says it must;
+/// * [`mail_core::index::OnDemand`] wrapped around the *same* client fetches the whole backlog.
+///
+/// The second arm also has to really fetch: `indexed == 0, remaining == 0` would be a lie the cache
+/// could not tell, so `failed == 0` and the bodies themselves are checked.
+#[tokio::test]
+async fn a_pass_the_user_asked_for_does_not_give_way() {
+    let (addr, _transcript) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        extra: Arc::new(AtomicU32::new(6)),
+        filler_body_chars: Arc::new(AtomicU32::new(60)),
+        ..Server::default()
+    })
+    .await;
+    let mut cfg = account(addr, addr);
+    cfg.max_connections = 2;
+    let pool = ConnectionPool::new();
+    let cache = Cache::open_in_memory().expect("cache");
+
+    let mut seed = pool
+        .acquire(&cfg, "app-password")
+        .await
+        .expect("first connection");
+    within(sync_once(&mut seed, &cache, &cfg.id, &inbox())).await;
+    drop(seed);
+
+    let pending = cache.bodies_pending_count(&cfg.id).expect("pending");
+    assert!(
+        pending > 1,
+        "the sync must leave more than one body: {pending}"
+    );
+
+    // One message to check bytes on afterwards. A filler message, not a rich template: only the
+    // filler carries text naming its own UID.
+    let probe = cache
+        .bodies_pending(&cfg.id, 500)
+        .expect("pending list")
+        .into_iter()
+        .find(|p| p.uid > RICH_MESSAGES)
+        .expect("a filler message with no body");
+
+    let _user = pool
+        .acquire(&cfg, "app-password")
+        .await
+        .expect("the user's connection");
+    let mut asked = pool
+        .acquire(&cfg, "app-password")
+        .await
+        .expect("the on-demand pass's connection");
+
+    let run = || mail_core::index::BodyIndexRun {
+        cache: &cache,
+        cfg: &cfg,
+        limit: mail_core::index::DEFAULT_PASS_LIMIT,
+    };
+
+    // Same connection, same contention: without the wrapper this pass declines.
+    let declined = within(index_bodies_pass(run(), &mut asked))
+        .await
+        .expect("plain pass");
+    assert!(
+        declined.yielded && declined.indexed == 0,
+        "the point of this test is that the plain pass yields here — got {declined:?}"
+    );
+
+    let report = within(index_bodies_pass(
+        run(),
+        &mut mail_core::index::OnDemand(&mut asked),
+    ))
+    .await
+    .expect("on-demand pass");
+    assert!(!report.yielded, "a pass the user named must not step aside");
+    assert_eq!(report.remaining, 0, "it must clear the whole backlog");
+    assert_eq!(report.indexed, pending, "{pending} were pending");
+    assert_eq!(report.failed, 0);
+
+    // Not merely "the queue says done": the body must really be in the cache, with the bytes of the
+    // message it belongs to. A pass that marked rows finished without storing them would satisfy
+    // every assertion above.
+    let stored = cache
+        .get_detail(&cfg.id, &probe.folder, probe.uid)
+        .expect("read back")
+        .unwrap_or_else(|| panic!("UID {} in {} has no cached body", probe.uid, probe.folder));
+    let text = stored.body_text.clone().unwrap_or_default();
+    assert!(
+        text.contains(&format!("第 {} 封", probe.uid)),
+        "UID {}'s body says {text:?} — the pass stored the wrong bytes behind this key",
+        probe.uid
+    );
+}
+
+/// **P8b 步骤 3 的尺子：持续速率（第 100 轮）.** The other bottleneck — how *often* a pass runs — and
+/// the only one the user's "how long until my mail is searchable" question is actually about.
+///
+/// Run it with:
+/// `cargo test --release -p mail-core --test loopback bench_p8b_sustained_backfill_rate -- --ignored --nocapture`
+///
+/// **Why this is a separate bench and not an extra column on the throughput one**: §16.3 measured that
+/// a pass is round-trip-bound, and the throughput bench therefore drains the queue as fast as the
+/// server can answer — which is exactly the thing that hides a tick. Two arms here differ in the whole
+/// production shape, not in one line of it:
+///   * **改之前** — 每轮 20 封、每封一次 `UID FETCH`、轮间固定等 60 秒（`DEFAULT_PASS_LIMIT` 与 tick
+///     在 2026-10-20 之前的值）；
+///   * **改之后** — 每轮 `DEFAULT_PASS_LIMIT`（一批一条命令）、轮间按 `backfill_wait` 的占空比等。
+///
+/// The paired multiple is therefore the whole P8b change (2b + 3) read against the budget's own unit,
+/// and it is printed from two arms that ran in one process on the same fixture. The "before" arm is
+/// only run at 150 ms: its rate is `20 封 ÷ 60 秒`, which the tick sets, not the latency — the same
+/// reason §16.3's 0 ms arm could not see any of this.
+#[tokio::test]
+#[ignore = "sustained-rate bench: the before-arm really waits out 60 s between passes (~2 min)"]
+async fn bench_p8b_sustained_backfill_rate() {
+    const MESSAGES: u32 = 60;
+    const BODY_CHARS: u32 = 600;
+
+    let (before_msgs, before_secs, before_passes) =
+        run_p8_sustained_arm(150, false, MESSAGES, BODY_CHARS).await;
+    assert_eq!(before_msgs, MESSAGES);
+    println!(
+        "P8b 持续  往返 150 ms · 改之前 · {before_msgs} 封 / {before_secs:>6.2} s = {:>5.2} 封/秒 · {before_passes} 轮（每轮 20 封 · 每封 1 次 FETCH · 轮间 60 s）",
+        before_msgs as f64 / before_secs
+    );
+
+    for latency_ms in [0u32, 150, 400] {
+        let (msgs, secs, passes) =
+            run_p8_sustained_arm(latency_ms, true, MESSAGES, BODY_CHARS).await;
+        assert_eq!(
+            msgs, MESSAGES,
+            "the adaptive shape must still drain the queue"
+        );
+        let rate = msgs as f64 / secs;
+        println!(
+            "P8b 持续  往返 {latency_ms:>3} ms · 改之后 · {msgs} 封 / {secs:>6.2} s = {rate:>6.1} 封/秒 · {passes} 轮（每轮 {} 封 · 占空比 {} ‰）",
+            mail_core::index::DEFAULT_PASS_LIMIT,
+            mail_core::index::BACKFILL_DUTY_PERMILLE,
+        );
+        if latency_ms > 0 {
+            // The budget, asserted rather than admired: 20 封/秒 = "10 万封 ≤ 1.5 小时全部可搜".
+            assert!(
+                rate >= 20.0,
+                "at {latency_ms} ms round trip the sustained rate is {rate:.1} 封/秒, under the 20 封/秒 budget"
+            );
+        }
+        println!(
+            "P8b 持续  往返 {latency_ms:>3} ms · 配对倍数 = {rate:>6.1} ÷ {:>5.2} = {:>6.1} 倍（相对改之前 150 ms 那臂）",
+            before_msgs as f64 / before_secs,
+            rate / (before_msgs as f64 / before_secs),
+        );
+    }
+    println!(
+        "口径：这两臂比的是**持续速率**（含轮间等待），与 bench_p8_body_prefetch_throughput 的\"一轮能吞多少\"是两件事。         让路（should_yield）不在这条数里 —— 它由 the_backfill_gives_way_while_another_connection_is_in_use 那条测试管。"
+    );
+}
+
+/// One arm of the sustained-rate bench: drain the queue the way production would, waits included.
+async fn run_p8_sustained_arm(
+    latency_ms: u32,
+    adaptive: bool,
+    messages: u32,
+    body_chars: u32,
+) -> (u32, f64, u32) {
+    let (addr, _transcript) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        extra: Arc::new(AtomicU32::new(messages - RICH_MESSAGES)),
+        fetch_latency_ms: Arc::new(AtomicU32::new(latency_ms)),
+        filler_body_chars: Arc::new(AtomicU32::new(body_chars)),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+    within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    assert_eq!(
+        cache.bodies_pending_count(&cfg.id).expect("pending"),
+        messages,
+        "a sync stores headers only"
+    );
+
+    let cadence = mail_core::index::BackfillCadence::default();
+    // The old shape's own numbers, hard-coded rather than imported: this arm is the thing being
+    // compared against, and if it read the current constants it would compare nothing.
+    const OLD_LIMIT: usize = 20;
+    const OLD_TICK: Duration = Duration::from_secs(60);
+    let limit = if adaptive {
+        mail_core::index::DEFAULT_PASS_LIMIT
+    } else {
+        OLD_LIMIT
+    };
+
+    let started = std::time::Instant::now();
+    let mut indexed = 0u32;
+    let mut passes = 0u32;
+    loop {
+        let pass_started = std::time::Instant::now();
+        let report = if adaptive {
+            one_bounded_pass(&cache, &cfg, &mut client, limit).await
+        } else {
+            let mut one_by_one = PerMessage(&mut client);
+            one_bounded_pass(&cache, &cfg, &mut one_by_one, limit).await
+        };
+        passes += 1;
+        indexed += report.indexed;
+        if report.remaining == 0 {
+            break;
+        }
+        let wait = if adaptive {
+            mail_core::index::backfill_wait(&cadence, &report, pass_started.elapsed()).after()
+        } else {
+            OLD_TICK
+        };
+        tokio::time::sleep(wait).await;
+    }
+    // One pass can index at most `limit`, so a drain that took fewer passes than the queue needs
+    // would mean the loop exited without really finishing.
+    assert!(
+        passes * limit as u32 >= messages,
+        "{passes} passes × {limit} cannot have indexed {messages}"
+    );
+    (indexed, started.elapsed().as_secs_f64(), passes)
+}
+
+/// One pass, wrapped in a timeout so a fake server that stops answering fails the bench loudly rather
+/// than hanging a `--ignored` run that nobody is watching.
+async fn one_bounded_pass<S: mail_core::index::BodySource>(
+    cache: &Cache,
+    cfg: &AccountConfig,
+    source: &mut S,
+    limit: usize,
+) -> mail_core::index::IndexReport {
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        index_bodies_pass(mail_core::index::BodyIndexRun { cache, cfg, limit }, source),
+    )
+    .await
+    .expect("a pass must finish")
+    .expect("pass")
+}
+
 /// **P8b 尺子的 A/B 两臂（第 9 项步骤 1 建、步骤 2b 配对）。** 一轮正文预取能吞多少封，
 /// 每封花几次往返，以及同一进程里"逐封"与"批量"两臂的配对倍数。
 ///

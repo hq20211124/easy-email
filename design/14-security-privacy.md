@@ -13,7 +13,8 @@
 
 **目标**
 1. **默认安全**：正文默认不加载任何远程内容；默认不信任附件；默认不执行任何来自邮件的脚本。
-2. **凭据与令牌**：密码/授权码进 Windows 凭据管理器；OAuth refresh token 进 **DPAPI 用户级加密文件**（A1-F35）；日志/诊断包/缓存库零明文。
+2. **凭据与令牌**：密码/授权码进 Windows 凭据管理器；OAuth refresh token 与 **OAuth client_secret** 进 **DPAPI 用户级加密文件**（A1-F35；client_secret 曾在 `user.db` 明文落行，第 101 轮移入同一密封存储，旧行首次读取时迁移并删除）；日志/诊断包/缓存库零明文。
+2b. **信任根只有一个**：IMAP/SMTP/POP3 走 Schannel、OAuth 与其余 HTTPS 走 rustls 的 **系统证书库**（`rustls-tls-native-roots`，不再用编译进二进制的 `webpki-roots`）。企业自签 CA 或 TLS 中间人网关的证书要么在所有路径都受信任、要么都没有，不存在"只有登录这条路拒绝"的分裂。
 3. **可解释的安全**：每一条拦截都说清"拦了什么、为什么、怎么放行"，并且放行是**按发件人/按封**可控的。
 4. **透明**：应用内可查看"我们访问过的外部端点清单"（本地记录，不上传）。
 5. **专业能力**：OpenPGP（v1 范围内做扎实）与 S/MIME（尽力而为）——**并诚实标注能力边界**。
@@ -50,13 +51,16 @@
 | 想发加密邮件 | 收件人旁边有钥匙图标（有密钥=绿、无密钥=灰并提示"无法加密，需要先取得对方的公钥"）；主题栏下方提示"**主题与头部不会被加密**" |
 | 查看"网络活动" | 设置 → 隐私：`本应用访问过的外部端点`（主机名 + 用途 + 次数 + 最近时间，本地记录）；以及一句"本应用没有遥测、没有账号体系" |
 | 导出诊断包 | 导出前可**预览**内容（脱敏后的日志/配置/同步状态）；明确写"不含邮件正文与凭据" |
+| 打开"存储与清理" | "正文存储"两选一：`正文缓存在本地（读过的邮件离线可打开，正文里的词可搜）` / `正文不落盘（每次打开都重新下载，本地文件里不留邮件正文）`，当前状态与"本地已存 N 封正文"同屏显示；选后者时给一个**只在这条路上可勾**的复选框"同时清空已下载的正文（现在 N 封）"（清空会重建缓存文件，正文文字不留在已删除页上）；面板上方另有"本机磁盘加密（部署前置条件）"一行 |
+| 启动时的磁盘加密自检 | 后台线程里一条只读的 `Get-CimInstance Win32_EncryptableVolume`，只看两个数字字段（`ConversionStatus`/`ProtectionStatus`），不解析 `manage-bde` 的本地化文字。结论写进"存储与清理"：`已加密且保护已开启` / `加密进行中` / `已加密但保护已关闭` / `未加密` / `无法判定`；未提权时 Windows 返回 Access Denied，自检照实说"无法判定（需要管理员身份）"，**不猜**。送审留档用 `tools/disk-protection-check.ps1`（提权运行，退出码 0/1/2 = 成立/不成立/无法判定） |
 
 ## 4. 数据结构与接口
 
 ### 4.1 存储（与 03/05 对齐）
 
 ```rust
-/// 凭据（既有权衡）：密码/授权码 → Windows 凭据管理器；OAuth 令牌 → DPAPI 文件
+/// 凭据（既有权衡）：密码/授权码 → Windows 凭据管理器；OAuth 令牌与 client_secret → DPAPI 文件
+/// （两者同一个 `tokenstore`：一个账号的两份秘密不能一半在 vault 一半在数据库行里）
 pub enum SecretStore { CredentialManager, DpapiVault }        // 05 §3.2 已定
 
 /// 白名单（03 的 allowlist 表）：远程内容、垃圾判定复用
@@ -76,7 +80,23 @@ pub struct PgpKey { pub fingerprint: String, pub uids: Vec<String>, pub emails: 
 pub enum PgpTrust { Unknown, Tofu, Verified, OwnKey }
 pub enum KeySource { Imported, Wkd, Keyserver, Autocrypt, Generated }
 pub struct PgpSecretRef { pub fingerprint: String, pub encrypted: Vec<u8>, pub kdf: KdfParams }   // 口令保护
+
+/// 正文是否允许落盘（`design/A3` 选项 1，已实现）。默认 `Cached`（与历史行为一致），
+/// 由用户在"存储与清理"里改成 `OnlineOnly`；**模式存在 `user.db`**，因为"清空缓存"是用户为了
+/// 停止正文累积会做的动作，它不能顺手把这条安全设置一起关掉。
+/// 启动时读取失败（`user.db` 打不开 / 那一行读不出来）一律落到 `OnlineOnly`：不写正文只多一次下载，
+/// 写正文则在"这台机器是否加密"还没证实之前就把机密文本放进了文件。
+pub enum BodyStorage { Cached, OnlineOnly }                       // as_key()/from_key()：cached | online
+
+/// 磁盘加密前置条件的自检（`design/A3` 选项 2）。只读，结果是一份可以直接抄进部署记录的报告。
+pub struct DiskProtectionReport { pub volumes: Vec<Volume>, pub verdict: Verdict, pub note: String }
+pub struct Volume { pub drive: String, pub state: VolumeState,
+                    pub conversion: Option<i64>, pub protection: Option<i64> }   // 原始数字一起带出去
+pub enum VolumeState { Protected, EncryptedUnprotected, NotEncrypted, Converting, Unknown }
+pub enum Verdict { Protected, NotEncrypted, Mixed, Converting, EncryptedUnprotected, Unknown }
 ```
+> 非 Windows 平台没有对应的卷加密类可查，自检返回 `Unknown` + 一句"这个自检只在 Windows 上查询卷的加密状态"，
+> 不自创第七个状态值。
 
 ### 4.2 接口（函数级）
 
@@ -251,6 +271,8 @@ impl NetAudit { pub fn record(&self, host: &str, port: u16, purpose: NetPurpose,
 | 脱敏 | 诊断包 grep：不得出现令牌、密码、完整邮件正文；邮箱地址按规则掩码 |
 | **脱敏（评审补）** | **日志模板本身不得包含邮件派生文本**（主题/正文片段/搜索词/通知文案）：主题只在用户显式勾选"包含样本头部"时才出现，导出预览里单独列出该项 |
 | 真机 | 一份真实钓鱼样本 + 一份真实 PGP 邮件（若有）+ 一份真实 S/MIME 邮件（企业） |
+| **正文不落盘（已实现，实测在案）** | `in_online_mode_the_body_never_reaches_the_database_file`（打开一封邮件后，**整个缓存文件的字节里搜不到正文文字**——不只断言行数，因为"先写再删"行数也对，而文字还在空闲页上）、`purging_bodies_empties_the_file_and_keeps_the_metadata`（清空后主题与附件名仍然搜得到、摘要一封不少）、`an_older_cache_gains_the_metadata_columns_without_losing_its_bodies`（老库升级后正文照旧可读，且在这种库上清空仍然不丢 Cc 与文件名的搜索）、`the_body_storage_mode_is_a_user_preference_not_a_cache_setting`（`user.db`）、`the_stored_mode_is_applied_to_the_cache_handle_it_was_opened_with` + `an_unreadable_body_storage_preference_stops_bodies_instead_of_allowing_them`（启动装配与失败方向） |
+| **磁盘加密自检（已实现，实测在案）** | `diskprotect::tests` 四条：`the_documented_numbers_map_to_the_documented_states`（数字→状态映射，含 `(1,2)`"保护状态未知"不等于"已开启"）、`only_lines_of_three_fields_are_volumes`（只接受三字段且首字段像盘符的行，PowerShell 的报错文本不会变成一个卷）、`a_mixed_machine_is_not_reported_as_protected`、`protection_off_is_never_reported_as_protected`。工具脚本 `tools/disk-protection-check.ps1` 在**非提权**进程里实跑过：按预期返回"无法判定"并 `exit 2` |
 
 ## 10. 门禁新增项
 
@@ -260,6 +282,8 @@ impl NetAudit { pub fn record(&self, host: &str, port: u16, purpose: NetPurpose,
 4. **端点清单一致性**：`NetAudit` 的 `NetPurpose` 枚举与文档 §11 的端点表一一对应（测试遍历枚举）。
 5. **脱敏函数覆盖**：`redact()` 对 8 类敏感形态（邮箱/令牌/路径/手机号/授权码/私钥块/信用卡形态/身份证形态）各有断言。
 6. **凭据零明文**：仓库与运行产物中不得出现 `password` 字面量写日志（正则）；缓存库与 vault 的字段名不得出现在日志模板里。
+7. **正文落盘只有一个决策点，且失败方向是"不落"**（`tools/check.ps1`，本条与下一条共 20 个变异逐个验红）：把测试模块整体剥掉之后，生产代码里写 `bodies` 表的语句**必须只有一条**，并且它在 `if store_body` 之后；`put_detail` 必须从**句柄**上取模式而不是让调用方传；后台补全在拉正文前必须问过模式；启动必须真的调用 `apply_stored_body_storage(&cache, &user, user_store_error.is_none())`；`startup_body_storage` 的两个失败分支都必须选 `OnlineOnly`；清空只允许发生在**进入** `OnlineOnly` 的路上；模式必须存在 `userdb.rs` 而 `cache.rs` 里不得出现这个键；前端必须能读能设。
+8. **磁盘加密自检读数字、不读句子**：查询常量里必须是 `Get-CimInstance` 且不得出现 `manage-bde`；`VolumeState::Protected` 只能来自 `(1, 1)`；`state_of` 必须以 `Unknown` 兜底；`parse_volumes` 必须调用盘符校验；`probe` 必须原样传常量 `QUERY` 并写明解释器；探测失败的两个分支都必须返回 `Verdict::Unknown`；`tools/disk-protection-check.ps1` 里三条"结论："句子后面**紧跟的第一个 exit 码**必须分别是 0/1/2（不是"文件里出现过 exit 2"）；启动自检必须既定义又被调用，面板必须有读它的命令。
 
 ## 11. 我们访问哪些外部端点（透明清单，与 `NetPurpose` 一一对应）
 
@@ -328,7 +352,7 @@ impl NetAudit { pub fn record(&self, host: &str, port: u16, purpose: NetPurpose,
 | S1 | PGP 引擎：rPGP（MIT/Apache）还是 Sequoia（LGPL，但 `crypto-cng` 无系统依赖） | 许可证 vs 审计历史 | **rPGP**（许可证简单）；若你接受 LGPL 义务则 Sequoia |
 | S2 | Autocrypt 是否做 | 生态弱、策略难 | v1 不做（只做 WKD + 手动/keyserver） |
 | S3 | S/MIME 是否做，以及是否先做 LDAP/GAL | 企业路线 | 先验签/解密；加密等 LDAP |
-| S4 | SEC-11 本地库加密（SQLCipher） | 依赖/许可 | M3 评估；本设计只预留接口 |
+| S4 | SEC-11 本地库加密（SQLCipher） | 依赖/许可 | **已定：不做整库加密。** 调研见 `design/A3-local-store-protection.md`（头部客户端没有一家把本地库加密当安全边界；密钥丢失=数据丢失，与"不能有数据丢失风险"直接冲突；本机实测 `bundled-sqlcipher` 卡在 `OPENSSL_DIR`）。替代组合：正文不落地模式 + OS 加密作为书面部署前置条件与启动自检 + 草稿/发件队列镜像到服务器 |
 | S5 | 是否做"仅解锁时显示通知摘要" | 隐私 | M2 小功能 |
 | S6 | 网络活动台账是否默认开启 | 隐私 vs 透明 | 默认开（只记主机名，不上传），可关 |
 
@@ -341,7 +365,14 @@ impl NetAudit { pub fn record(&self, host: &str, port: u16, purpose: NetPurpose,
 - [ ] 凭据/令牌：日志、诊断包、缓存库 grep 不到；vault 文件 ACL 仅当前用户。
 - [ ] 诊断包可预览且脱敏（8 类敏感形态断言）。
 - [ ] 端点清单与 `NetPurpose` 一致（门禁自动验证）。
-- [ ] `check.ps1` 六项新增检查通过。
+- [ ] 正文不落盘：切到该模式后打开一封邮件，**用十六进制编辑器在 `cache.db` 里搜正文里的词搜不到**；勾"同时清空"后已存的正文在文件里消失而主题/附件名搜索仍在；关掉 `user.db` 的读权限再启动，本次运行不写正文。
+  > 第一段**已在真实 profile 上做掉**（第 101 轮续，读数在 `PROGRESS.md`）：`tools/probe-body-storage.mjs` 点面板切换，
+  > `tools/probe-body-storage-report.py` 直接在 `%APPDATA%\com.easyemail.desktop\cache.db` **加 `-wal`** 的字节里搜那封邮件正文的
+  > 26 字符片段——不落盘时搜不到且没有 `bodies` 行，切回缓存在本地后同一段出现。人没开十六进制编辑器，是脚本读的字节；
+  > 证据是**同一封邮件的两臂配对**，但只有 2 封（候选 12 封里 10 封服务器已不再返回正文）。
+  > 仍未做：勾"同时清空"那一条没在真账号上试过（要删这台机器上已有的 482 封正文，属不可逆删除，故意留给人做），
+  > 以及关掉 `user.db` 读权限再启动那一条。
+- [ ] `check.ps1` 八项新增检查通过。
 
 > **章节名对照（模板 13 节）**：数据结构→§4.1 存储。
 > 内容齐全，只是节名与模板不完全同名（见 design/README.md 的说明）。

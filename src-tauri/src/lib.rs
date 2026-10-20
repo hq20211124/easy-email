@@ -9,6 +9,7 @@
 //! half-broken state. Pooling, and honouring `AccountConfig::max_connections`, is the natural
 //! next step.
 
+mod diskprotect;
 mod store;
 
 use std::collections::HashMap;
@@ -20,13 +21,13 @@ use mail_core::providers::{self, Provider};
 #[macro_use]
 extern crate mail_core;
 use mail_core::{
-    AccountConfig, BackfillBudget, BackfillReport, BackfillStop, Cache, ConnectionPool,
-    ConnectionReport, DraftMirrorReport, FilingReport, FilingRun, MailError, MailboxInfo,
-    MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun, OutgoingAttachment,
-    OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit, SentCopy, Spool,
-    SyncDriver, SyncOutcome, SyncWindow, account_with_endpoints, backfill_older, ensure_sent_copy,
-    file_sent_copies, file_sha256, fill_thread_keys, prepare_attachments, recover_in_flight,
-    run_due, secret, smtp,
+    AccountConfig, BackfillBudget, BackfillReport, BackfillStop, BodyStorage, Cache,
+    ConnectionPool, ConnectionReport, DraftMirrorReport, FilingReport, FilingRun, MailError,
+    MailboxInfo, MessageDetail, MessageSummary, NewOutbox, OutboxItem, OutboxRun,
+    OutgoingAttachment, OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit,
+    SentCopy, Spool, SyncDriver, SyncOutcome, SyncWindow, account_with_endpoints, backfill_older,
+    ensure_sent_copy, file_sent_copies, file_sha256, fill_thread_keys, prepare_attachments,
+    recover_in_flight, run_due, secret, smtp,
     userdb::{Draft, DraftMirror, UserStore},
     watch,
 };
@@ -96,6 +97,15 @@ struct AppState {
     /// and the click. `Mutex` (not `tokio::sync::Mutex`) because nothing is held across an `.await`
     /// — the download is started by the same command that owns it.
     pending_update: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// What the machine says about its own disk encryption, filled in by the startup self-check.
+    ///
+    /// `None` until that thread answers. The check is read-only and may never finish (a blocked
+    /// PowerShell, a machine with no WMI), and a mail client must not be able to be stopped by a
+    /// question about the operating system — so the window shows "正在查询" rather than waiting.
+    ///
+    /// It is stored rather than re-run per command because the answer cannot change while the app
+    /// runs, and `Get-CimInstance` is not free.
+    disk_protection: Mutex<Option<diskprotect::DiskProtectionReport>>,
 }
 
 /// The two tasks that make up one account's push pipeline.
@@ -200,7 +210,14 @@ async fn secret_for(state: &AppState, cfg: &AccountConfig) -> Result<String, Str
         return password_for(&cfg.id);
     }
 
-    let Some(settings) = state.user.oauth_settings(&cfg.id).map_err(describe)? else {
+    // The store is opened first: the sealed client registration lives in the same place as the
+    // refresh token, so reading the registration and renewing the token use one handle.
+    let store = token_store(state)?;
+    let Some(settings) = state
+        .user
+        .oauth_settings(&cfg.id, &store)
+        .map_err(describe)?
+    else {
         return Err(format!(
             "{} 是 OAuth2 账号，但还没有保存客户端 ID。请重新登录一次。",
             cfg.email
@@ -209,8 +226,6 @@ async fn secret_for(state: &AppState, cfg: &AccountConfig) -> Result<String, Str
 
     let provider = oauth_provider_for(&cfg.provider_id, &settings.client_id)
         .ok_or_else(|| format!("{} 不支持 OAuth2 登录。", cfg.provider_id))?;
-
-    let store = token_store(state)?;
     let transport = http_tokens()?;
     // Through the cache, so two commands that need this account at the same time refresh **once**:
     // with rotation (A1-F34) two racing refreshes can leave the older token on disk, and the account
@@ -354,9 +369,10 @@ async fn save_account(
     // An account whose registration is already stored was signed in with OAuth a moment ago (the
     // wizard does that before saving). Marking it here — rather than asking the frontend to say so —
     // keeps the two facts from being able to disagree: the registration is what makes it OAuth.
+    let registration_store = token_store(&state)?;
     if state
         .user
-        .oauth_settings(&cfg.id)
+        .oauth_settings(&cfg.id, &registration_store)
         .map_err(describe)?
         .is_some()
     {
@@ -403,6 +419,9 @@ async fn delete_account(state: State<'_, AppState>, account_id: String) -> Resul
     // OAuth registration and refresh token belong to the account too.
     let _ = state.user.delete_oauth_settings(&account_id);
     if let Ok(store) = token_store(&state) {
+        // Both sealed files. Leaving the client secret behind means a removed account still owns
+        // credential material on the machine, which is exactly what the user just asked to stop.
+        let _ = store.delete_client_secret(&account_id);
         let _ = store.delete(&account_id);
     }
     // Outbox rows and their frozen bytes: leaving them means "forever undeliverable".
@@ -1366,9 +1385,10 @@ async fn oauth_relogin(
     account_id: String,
 ) -> Result<mail_core::oauth::TokenSet, String> {
     let cfg = state.find(&account_id)?;
+    let store = token_store(&state)?;
     let settings = state
         .user
-        .oauth_settings(&cfg.id)
+        .oauth_settings(&cfg.id, &store)
         .map_err(describe)?
         .ok_or_else(|| {
             format!(
@@ -1396,9 +1416,7 @@ async fn oauth_relogin(
 
     match tokens.refresh_token.as_deref() {
         Some(refresh) => {
-            token_store(&state)?
-                .save(&cfg.id, refresh)
-                .map_err(describe)?;
+            store.save(&cfg.id, refresh).map_err(describe)?;
             log_line(&format!("[easy-email] {} 已重新授权", cfg.id));
         }
         None => {
@@ -1743,6 +1761,7 @@ async fn oauth_sign_in(
 
     // The registration is stored with the token: a refresh needs both, and asking the user for the
     // client id a second time would be asking them to remember something we already know.
+    let store = token_store(&state)?;
     state
         .user
         .set_oauth_settings(
@@ -1751,6 +1770,7 @@ async fn oauth_sign_in(
                 client_id: client_id.clone(),
                 client_secret: client_secret.clone(),
             },
+            &store,
         )
         .map_err(describe)?;
 
@@ -1758,9 +1778,7 @@ async fn oauth_sign_in(
     // Microsoft's rotation, it also invalidates the one we would otherwise have kept.
     match tokens.refresh_token.as_deref() {
         Some(refresh) => {
-            token_store(&state)?
-                .save(&account_id, refresh)
-                .map_err(describe)?;
+            store.save(&account_id, refresh).map_err(describe)?;
             log_line(&format!("[easy-email] {email} 的 OAuth 刷新令牌已保存"));
         }
         None => log_line(&format!(
@@ -2231,6 +2249,139 @@ async fn set_sync_window(state: State<'_, AppState>, window: SyncWindow) -> Resu
     state.user.set_sync_window(window).map_err(describe)?;
     log_line(&format!("[easy-email] 同步窗口改为 {}", window.as_key()));
     Ok(())
+}
+
+/// The body-storage mode this run starts in, and the sentence that says why.
+///
+/// `None` means `user.db` itself could not be opened; `Some(Err)` means the row could not be read.
+/// Both fail **closed**, into `OnlineOnly`. The reasoning is that the two directions are not
+/// symmetric: writing bodies is what the security setting exists to stop, while refusing to write
+/// them costs only a re-download and deletes nothing that is already on disk. So the fallback that
+/// cannot lose the user anything is also the one that cannot leak them — an unreadable preference is
+/// not permission to put secret text in a file.
+fn startup_body_storage(read: Option<mail_core::Result<BodyStorage>>) -> (BodyStorage, String) {
+    match read {
+        Some(Ok(mode)) => (mode, format!("正文存储模式：{}", mode.as_key())),
+        None => (
+            BodyStorage::OnlineOnly,
+            "用户数据库不可用，本次运行不把正文写入缓存".to_string(),
+        ),
+        Some(Err(e)) => (
+            BodyStorage::OnlineOnly,
+            format!("正文存储模式读取失败（{e}），本次运行不把正文写入缓存"),
+        ),
+    }
+}
+
+/// Apply the stored preference to the cache handle, and say what was chosen.
+///
+/// Split from [`startup_body_storage`] only so the whole of it can be tested against two real stores:
+/// the decision is pure, but a startup that decides correctly and then forgets to call
+/// `set_body_storage` is the same bug seen from the user's side.
+fn apply_stored_body_storage(
+    cache: &Cache,
+    user: &UserStore,
+    store_open: bool,
+) -> (BodyStorage, String) {
+    // `user.db` unavailable means the in-memory store answers with a *default*, and a default is not
+    // this user's choice — see the `user_store_error` comment at the call site.
+    let read = if store_open {
+        Some(user.body_storage())
+    } else {
+        None
+    };
+    let (mode, why) = startup_body_storage(read);
+    cache.set_body_storage(mode);
+    (mode, why)
+}
+
+/// Whether the local cache is allowed to hold message bodies, and how many it holds right now.
+///
+/// The mode is read from the **live cache handle**, not re-read from `user.db`: the number and the
+/// rule have to describe the same running program, or the screen could say "在线优先" while bodies
+/// are still being written.
+#[tauri::command]
+async fn get_body_storage(state: State<'_, AppState>) -> Result<BodyStorageReport, String> {
+    Ok(BodyStorageReport {
+        mode: state.cache.body_storage(),
+        stored_bodies: state.cache.stored_body_count().map_err(describe)?,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct BodyStorageReport {
+    mode: BodyStorage,
+    /// Message bodies currently stored in `cache.db`.
+    stored_bodies: u32,
+}
+
+/// Choose whether bodies may be written to `cache.db`; returns how many were purged.
+///
+/// `purge_existing` is honoured **only on the way into** `OnlineOnly`. Turning caching back on
+/// deletes nothing, and a clear that happens while bodies are still allowed would be refilled by the
+/// next background pass — so accepting it there would be an erasure the screen cannot explain.
+#[tauri::command]
+async fn set_body_storage(
+    state: State<'_, AppState>,
+    mode: BodyStorage,
+    purge_existing: bool,
+) -> Result<u32, String> {
+    // Persisted first, and into `user.db` rather than the cache: the preference has to survive
+    // "delete the cache", otherwise the one action a user takes to stop bodies accumulating would
+    // also switch the rule off again.
+    state.user.set_body_storage(mode).map_err(describe)?;
+    state.cache.set_body_storage(mode);
+    let removed = if purge_existing && mode == BodyStorage::OnlineOnly {
+        state.cache.purge_all_bodies().map_err(describe)?
+    } else {
+        0
+    };
+    log_line(&format!(
+        "[easy-email] 正文存储改为 {}{}",
+        mode.as_key(),
+        if removed > 0 {
+            format!("，已清空 {removed} 封正文")
+        } else {
+            String::new()
+        }
+    ));
+    Ok(removed)
+}
+
+/// What the machine says about its own disk encryption — the other half of `design/A3` 选项 2.
+///
+/// Read-only, and it returns the answer the startup self-check already found rather than running a
+/// query per click. `pending` until that check's thread reports, which is the whole point of keeping
+/// it off the startup path.
+#[tauri::command]
+async fn disk_protection_status(
+    state: State<'_, AppState>,
+) -> Result<diskprotect::DiskProtectionReport, String> {
+    Ok(state
+        .disk_protection
+        .lock()
+        .expect("磁盘加密自检的锁")
+        .clone()
+        .unwrap_or_else(diskprotect::DiskProtectionReport::pending))
+}
+
+/// Run the disk-encryption self-check once, on its own thread.
+///
+/// `std::thread`, not a task: `diskprotect::probe` blocks in a child process, and parking a runtime
+/// worker for the length of a WMI query is how a status line starts costing the mail that shares the
+/// pool. Same reasoning as the auto-vacuum rebuild next to it in `setup`.
+fn start_disk_protection_check(app: AppHandle) {
+    std::thread::spawn(move || {
+        let report = diskprotect::probe();
+        log_line(&format!(
+            "[easy-email] 磁盘加密自检：{:?} —— {}",
+            report.verdict, report.note
+        ));
+        *app.state::<AppState>()
+            .disk_protection
+            .lock()
+            .expect("磁盘加密自检的锁") = Some(report);
+    });
 }
 
 /// Why the last server refresh failed, and how much is cached. Drives the status line.
@@ -2711,15 +2862,16 @@ async fn search_hints(query: String) -> Result<Vec<String>, String> {
 
 /// One bounded pass of body indexing, so mail the user never opened becomes searchable.
 ///
-/// Bounded on purpose: reading a body costs what opening the message costs, so this must not turn
-/// into a whole-mailbox fetch that starves the user's own refresh. The desktop shell runs it on a
-/// 60 s tick; the button in the search box runs it on demand.
+/// Bounded on purpose: a pass holds a connection and asks for a batch's worth of mail, so it must not
+/// turn into a whole-mailbox fetch that starves the user's own refresh. The desktop shell runs it from
+/// [`Self::start_body_index_worker`], paced by [`mail_core::index::backfill_wait`]; the button in the
+/// search box runs it on demand, immediately, which is why this command exists at all.
 #[tauri::command]
 async fn index_bodies(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<mail_core::index::IndexReport, String> {
-    body_index_pass(&state, &account_id).await
+    body_index_pass(&state, &account_id, true).await
 }
 
 /// Throw the search index away so the renderer can start rebuilding it.
@@ -2748,29 +2900,35 @@ async fn rebuild_search_step(
     cache.rebuild_search_step(limit as usize).map_err(describe)
 }
 
-/// One pass for one account, shared by the command and the background tick.
+/// One pass for one account, shared by the command and the background worker.
 ///
 /// Both callers need the same shape — claim a connection from the pool, walk the pending list, store
 /// what comes back — and the pool's retry macro expands its block twice, so this lives in one
 /// function rather than being written out at each call site.
+///
+/// `on_demand` is the one thing that differs: a pass the user asked for by name must not step aside
+/// because another command happens to hold a connection ([`mail_core::index::OnDemand`]).
 async fn body_index_pass(
     state: &AppState,
     account_id: &str,
+    on_demand: bool,
 ) -> Result<mail_core::index::IndexReport, String> {
     let cfg = state.find(account_id)?;
     let password = secret_for(state, &cfg).await?;
     let cache = state.cache.clone();
 
     let report = pool_op!(&state.pool, &cfg, &password, |client| {
-        mail_core::index::index_bodies_pass(
-            mail_core::index::BodyIndexRun {
-                cache: &cache,
-                cfg: &cfg,
-                limit: mail_core::index::DEFAULT_PASS_LIMIT,
-            },
-            &mut client,
-        )
-        .await
+        let run = mail_core::index::BodyIndexRun {
+            cache: &cache,
+            cfg: &cfg,
+            limit: mail_core::index::DEFAULT_PASS_LIMIT,
+        };
+        if on_demand {
+            let mut asked = mail_core::index::OnDemand(&mut client);
+            mail_core::index::index_bodies_pass(run, &mut asked).await
+        } else {
+            mail_core::index::index_bodies_pass(run, &mut client).await
+        }
     })
     .map_err(describe)?;
 
@@ -2809,38 +2967,76 @@ fn start_search_rebuild_worker(app: AppHandle) {
     });
 }
 
-/// Keep the body index moving on its own tick (`design/20-v0.2-plan.md` V2-A).
+/// Keep the body index moving, paced by how much is left and by whether the user is in the way.
 ///
-/// 60 s between passes because the per-message cost equals opening the message: slow and
-/// interruptible beats a burst that holds the account's connection budget while the user is trying
-/// to refresh. A pass that fails is simply not retried until the next tick — an offline account
-/// must not spin.
+/// The shape changed on 2026-10-20 (`reports/performance.md` §16). It used to be a flat 60 s tick and
+/// 20 messages a pass, which was the correct amount of politeness when **each message cost its own
+/// round trip**: 20 封/分钟 was the price of not starving a manual refresh. Once a pass is one command
+/// (§16.7), the same politeness is expressed as a **share of the connection** rather than a frequency,
+/// and [`mail_core::index::backfill_wait`] is the single place that decides — a pure function, because
+/// a `sleep` written inline in a `loop` is exactly the part of a design nobody can review.
+///
+/// One account per iteration, round-robin: the loop is polite to *each* account's connection, and a
+/// sweep that interleaved them would either over-sleep the eager one or under-sleep the quiet one.
+/// Under-running the duty here is the safe direction — it costs backfill time, not the user's.
+///
+/// A pass that fails waits out a whole [`mail_core::index::BACKFILL_QUIET`]: an offline account must
+/// not spin on a handshake it cannot complete.
 fn start_body_index_worker(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let cadence = mail_core::index::BackfillCadence::default();
+        // At launch the interesting work is the sync itself, so the first pass waits a full tick.
+        let mut wait = cadence.quiet;
+        let mut cursor = 0usize;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(wait).await;
 
-            let accounts = app.state::<AppState>().snapshot();
-            for cfg in accounts {
-                // Ask the cache before claiming a connection: most ticks there is nothing to do, and
-                // a pass on an account with no pending bodies would still pay for the handshake.
-                let pending = match app.state::<AppState>().cache.bodies_pending_count(&cfg.id) {
-                    Ok(count) => count,
-                    Err(_) => continue,
-                };
-                if pending == 0 {
+            let state = app.state::<AppState>();
+            let accounts = state.snapshot();
+            if accounts.is_empty() {
+                wait = cadence.quiet;
+                continue;
+            }
+            let cfg = &accounts[cursor % accounts.len()];
+            cursor += 1;
+
+            // Ask the cache before claiming a connection: most of the time there is nothing to do,
+            // and a pass on an account with no pending bodies would still pay for the handshake.
+            let pending = match state.cache.bodies_pending_count(&cfg.id) {
+                Ok(count) => count,
+                Err(_) => {
+                    wait = cadence.quiet;
                     continue;
                 }
+            };
+            if pending == 0 {
+                wait = cadence.quiet;
+                continue;
+            }
+            // Someone is already holding a connection for this account. Starting anyway would not
+            // block them — `acquire` opens a second socket rather than waiting — it would make *them*
+            // pay for a cold handshake on top of the bandwidth this pass is about to use.
+            //
+            // `> 0` here, `> 1` inside the pass: nothing has been checked out yet, so the count does
+            // not include this worker's own connection — see `PooledClient::should_yield`.
+            if state.pool.busy_count(&cfg.id) > 0 {
+                wait = cadence.recheck;
+                continue;
+            }
 
-                match body_index_pass(&app.state::<AppState>(), &cfg.id).await {
-                    Ok(report) if report.indexed > 0 => {
+            let started = std::time::Instant::now();
+            match body_index_pass(&state, &cfg.id, false).await {
+                Ok(report) => {
+                    if report.indexed > 0 {
                         // So the search box's coverage line stays honest without polling.
                         let _ = app.emit("body-index:changed", cfg.id.clone());
                     }
-                    Ok(_) => {}
-                    Err(error) => {
-                        log_line(&format!("[easy-email] 正文索引 {} 失败：{error}", cfg.id));
-                    }
+                    wait = mail_core::index::backfill_wait(&cadence, &report, started.elapsed())
+                        .after();
+                }
+                Err(error) => {
+                    log_line(&format!("[easy-email] 正文索引 {} 失败：{error}", cfg.id));
+                    wait = cadence.quiet;
                 }
             }
         }
@@ -4015,6 +4211,13 @@ pub fn run() {
                 }
             };
 
+            // The body-storage mode is a *user* preference and the cache is where it takes effect, so
+            // it is applied here, once, after both stores are open. It lives in `user.db` and not in
+            // the cache because "delete the cache" is the action a user takes to get rid of bodies;
+            // it must not also be the action that switches the rule back off.
+            let (_mode, why) = apply_stored_body_storage(&cache, &user, user_store_error.is_none());
+            log_line(&format!("[easy-email] {why}"));
+
             // The send spool. Same rule once more: if it cannot be created, the app still starts —
             // the worker rebuilds a missing spool file from the stored payload before sending.
             let spool = match Spool::open(dir.join("spool")) {
@@ -4042,6 +4245,7 @@ pub fn run() {
                 user_store_error: Mutex::new(user_store_error),
                 outbox_wake: Arc::new(Notify::new()),
                 pending_update: std::sync::Mutex::new(None),
+                disk_protection: Mutex::new(None),
             });
 
             // Start the outbox worker. Queued messages outlive the window, so this is what actually
@@ -4054,6 +4258,9 @@ pub fn run() {
             start_body_index_worker(app.handle().clone());
             start_search_rebuild_worker(app.handle().clone());
             start_db_watchdog(app.handle().clone());
+            // A read-only question to the operating system, asked on its own thread so the window is
+            // up and mailing before it answers (`design/A3` 选项 2's self-check half).
+            start_disk_protection_check(app.handle().clone());
 
             // The tray icon. Built here rather than in config so the menu can drive the app.
             let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
@@ -4154,6 +4361,9 @@ pub fn run() {
             list_thread,
             get_sync_window,
             set_sync_window,
+            get_body_storage,
+            set_body_storage,
+            disk_protection_status,
             backfill_to_window,
             save_draft,
             list_drafts,
@@ -4199,10 +4409,92 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureKind, SyncFailure, UNIQUE_NAME_TRIES, account_id_for, app_version, failure_kind,
-        safe_file_name, slow_query_delta, unique_path,
+        BodyStorage, Cache, FailureKind, SyncFailure, UNIQUE_NAME_TRIES, account_id_for,
+        app_version, apply_stored_body_storage, failure_kind, safe_file_name, slow_query_delta,
+        startup_body_storage, unique_path,
     };
     use mail_core::db::DbStats;
+    use mail_core::userdb::UserStore;
+
+    /// The startup rule has to reach the handle, not stop at the decision.
+    ///
+    /// `startup_body_storage` alone can be correct while the line that applies it is missing — and
+    /// the symptom is a cache that silently keeps writing bodies for the one user who turned it off.
+    /// So this runs the whole of it against two real stores.
+    #[test]
+    fn the_stored_mode_is_applied_to_the_cache_handle_it_was_opened_with() {
+        let cache = Cache::open_in_memory().expect("cache");
+        let user = UserStore::open_in_memory().expect("user store");
+
+        // A store with nothing recorded is the behaviour the app has always had.
+        assert_eq!(
+            apply_stored_body_storage(&cache, &user, true).0,
+            BodyStorage::Cached
+        );
+        assert_eq!(cache.body_storage(), BodyStorage::Cached);
+
+        user.set_body_storage(BodyStorage::OnlineOnly)
+            .expect("record the preference");
+        let (mode, why) = apply_stored_body_storage(&cache, &user, true);
+        assert_eq!(mode, BodyStorage::OnlineOnly);
+        assert_eq!(
+            cache.body_storage(),
+            BodyStorage::OnlineOnly,
+            "every writer reads the handle; a mode that never got there is not in force"
+        );
+        assert!(
+            why.contains("online"),
+            "the log names the mode it chose: {why}"
+        );
+
+        // A store that could not be opened leaves an in-memory fallback whose `cached` default is not
+        // anybody's choice, and must not be read as one.
+        assert_eq!(
+            apply_stored_body_storage(&cache, &user, false).0,
+            BodyStorage::OnlineOnly
+        );
+        assert_eq!(cache.body_storage(), BodyStorage::OnlineOnly);
+    }
+
+    /// The body-storage setting must fail **closed**, and both ways of not knowing the preference
+    /// have to land in the same place.
+    ///
+    /// The asymmetric case is the one nobody notices in review: `Cached` is the shipped default, so
+    /// a fallback written as "when in doubt, behave like before" reads harmless and quietly turns
+    /// body-onto-disk back on for an account that had it switched off.
+    #[test]
+    fn an_unreadable_body_storage_preference_stops_bodies_instead_of_allowing_them() {
+        use mail_core::BodyStorage;
+
+        // A preference we can read is honoured in whichever direction it points.
+        assert_eq!(
+            startup_body_storage(Some(Ok(BodyStorage::OnlineOnly))).0,
+            BodyStorage::OnlineOnly
+        );
+        assert_eq!(
+            startup_body_storage(Some(Ok(BodyStorage::Cached))).0,
+            BodyStorage::Cached,
+            "a user who never turned this on must not lose offline reading because the code got \
+             cautious: the known default stays the default"
+        );
+
+        // `user.db` unavailable: its in-memory store answers `Ok(Cached)`, and that is not a choice.
+        let (mode, why) = startup_body_storage(None);
+        assert_eq!(mode, BodyStorage::OnlineOnly);
+        assert!(
+            why.contains("不把正文写入缓存"),
+            "the log must say what happened: {why}"
+        );
+
+        let (mode, why) = startup_body_storage(Some(Err(mail_core::MailError::Cache(
+            "数据库被占用".into(),
+        ))));
+        assert_eq!(mode, BodyStorage::OnlineOnly);
+        assert!(
+            why.contains("数据库被占用"),
+            "and the reason it had to fall back: {why}"
+        );
+    }
 
     /// **The watchdog is only a detector if it stays quiet when there is nothing to detect.**
     ///

@@ -35,6 +35,9 @@ pub const QUOTA_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// `kv` key holding the chosen sync window.
 pub const SYNC_WINDOW_KEY: &str = "sync_window";
 
+/// `kv` key holding the chosen body-storage mode (`design/A3` 选项 1).
+pub const BODY_STORAGE_KEY: &str = "body_storage";
+
 /// The client registration an OAuth account signs in with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OAuthSettings {
@@ -48,8 +51,11 @@ pub fn oauth_client_id_key(account_id: &str) -> String {
     format!("oauth_client_id:{account_id}")
 }
 
-/// `kv` key holding one account's OAuth client secret, if the provider needs one.
-pub fn oauth_client_secret_key(account_id: &str) -> String {
+/// `kv` key that **used** to hold one account's OAuth client secret.
+///
+/// Nothing writes a secret here any more (`oauth_settings` moved it to the token store); the key is
+/// read once per account, for as long as files written by an older version are still being opened.
+fn oauth_client_secret_key(account_id: &str) -> String {
     format!("oauth_client_secret:{account_id}")
 }
 
@@ -1186,41 +1192,76 @@ impl UserStore {
 
     /// What a signed-in OAuth account needs to renew its token.
     ///
-    /// Stored in `kv` beside the other per-account settings rather than in `accounts.json`: that file
-    /// is the *account list* (addresses, servers, display names) and is meant to be readable and
-    /// copyable, while these two values are what the client registration consists of. A1-F32 is
-    /// explicit that a desktop `client_secret` is not actually a secret — this is about keeping the
-    /// account list clean, not about hiding the value.
+    /// The client id lives in `kv` beside the other per-account settings rather than in
+    /// `accounts.json`: that file is the *account list* (addresses, servers, display names) and is
+    /// meant to be readable and copyable. The **secret does not live in `kv`** — `user.db` is the one
+    /// file in this app that gets copied into a backup and carried to another machine, and A1-F32's
+    /// point that a desktop `client_secret` is not a real secret is about what an attacker learns from
+    /// the *provider*, not about letting it leave the machine on a stick. It is sealed in the token
+    /// store, which is already where the refresh token — the more valuable half — lives.
+    ///
+    /// `kv` is still read, and that read **is** the migration: a file written before the secret moved
+    /// holds it in the clear, and the first read moves it and removes the row. If the move fails the
+    /// value is returned anyway and left in place, because "sign in again" is a worse outcome for the
+    /// user than one more day of the old plaintext, and the next read tries again.
     ///
     /// `client_secret` is optional because whether a provider demands one is exactly M0-8's open
     /// question.
-    pub fn oauth_settings(&self, account_id: &str) -> Result<Option<OAuthSettings>> {
+    pub fn oauth_settings(
+        &self,
+        account_id: &str,
+        tokens: &crate::tokenstore::TokenStore,
+    ) -> Result<Option<OAuthSettings>> {
         let Some(client_id) = self.kv_get(&oauth_client_id_key(account_id))? else {
             return Ok(None);
         };
         if client_id.is_empty() {
             return Ok(None);
         }
+        let sealed = tokens.load_client_secret(account_id)?;
+        let legacy = self
+            .kv_get(&oauth_client_secret_key(account_id))?
+            .filter(|value| !value.is_empty());
+        let client_secret = match (sealed, legacy) {
+            (Some(secret), _) => Some(secret),
+            (None, Some(plaintext)) => {
+                if tokens.save_client_secret(account_id, &plaintext).is_ok() {
+                    let _ = self.kv_delete(&oauth_client_secret_key(account_id));
+                }
+                Some(plaintext)
+            }
+            (None, None) => None,
+        };
         Ok(Some(OAuthSettings {
             client_id,
-            client_secret: self
-                .kv_get(&oauth_client_secret_key(account_id))?
-                .filter(|value| !value.is_empty()),
+            client_secret,
         }))
     }
 
     /// Remember which client registration an account signs in with.
-    pub fn set_oauth_settings(&self, account_id: &str, settings: &OAuthSettings) -> Result<()> {
+    pub fn set_oauth_settings(
+        &self,
+        account_id: &str,
+        settings: &OAuthSettings,
+        tokens: &crate::tokenstore::TokenStore,
+    ) -> Result<()> {
         self.kv_set(&oauth_client_id_key(account_id), &settings.client_id)?;
         match settings.client_secret.as_deref() {
-            // An empty value *removes* the secret: a blank box in the wizard means "this provider
-            // does not need one", and keeping the old value would quietly keep using it.
-            None => self.kv_set(&oauth_client_secret_key(account_id), ""),
-            Some(secret) => self.kv_set(&oauth_client_secret_key(account_id), secret),
-        }
+            // A blank box in the wizard means "this provider does not need one", so the stored secret
+            // is removed: keeping it would quietly keep sending it.
+            None => tokens.delete_client_secret(account_id),
+            Some(secret) => tokens.save_client_secret(account_id, secret),
+        }?;
+        // Only once the sealed copy is settled: a row that still holds the old plaintext would survive
+        // as the thing a backup carries.
+        self.kv_delete(&oauth_client_secret_key(account_id))
     }
 
     /// Remove the stored OAuth registration for an account.
+    ///
+    /// This is the `kv` half; the sealed client-secret file is removed by whoever holds the token
+    /// store, which is also where the password and the refresh token get deleted
+    /// (`src-tauri/src/lib.rs`'s `delete_account`).
     pub fn delete_oauth_settings(&self, account_id: &str) -> Result<()> {
         self.kv_delete(&oauth_client_id_key(account_id))?;
         self.kv_delete(&oauth_client_secret_key(account_id))?;
@@ -1814,6 +1855,28 @@ impl UserStore {
         self.kv_set(SYNC_WINDOW_KEY, &window.as_key())
     }
 
+    /// Whether message bodies may be written to the cache database.
+    ///
+    /// The setting lives in `user.db`, next to the sync window, and for the same reason: it is a
+    /// preference about *this machine's* behaviour. Keeping it in `cache.db` would mean that deleting
+    /// the cache — the action this setting is closest to — silently turned 正文不落盘 back off, which
+    /// is a security preference failing open.
+    ///
+    /// An unreadable value is the caller's decision, not this function's: the two ways to guess
+    /// ("write bodies like everyone else" / "assume the secret mode") are opposite behaviours, and
+    /// the shell that has a log and a settings UI is the place allowed to pick one.
+    pub fn body_storage(&self) -> Result<crate::cache::BodyStorage> {
+        Ok(self
+            .kv_get(BODY_STORAGE_KEY)?
+            .map(|raw| crate::cache::BodyStorage::from_key(&raw))
+            .unwrap_or(crate::cache::BodyStorage::Cached))
+    }
+
+    /// Remember the choice.
+    pub fn set_body_storage(&self, mode: crate::cache::BodyStorage) -> Result<()> {
+        self.kv_set(BODY_STORAGE_KEY, mode.as_key())
+    }
+
     /// How many drafts are stored. Used by the UI's "drafts (2)" badge and by tests.
     pub fn draft_count(&self) -> Result<u32> {
         self.count("drafts")
@@ -2139,6 +2202,38 @@ mod tests {
         assert_eq!(again.sync_window().expect("window"), SyncWindow::Years(5));
         drop(again);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The 正文不落盘 preference survives a restart **and a cache wipe**.
+    ///
+    /// Which is the whole argument for keeping it in `user.db`: the mode and "delete my cache" are
+    /// operations on the same subject (the bodies on this disk), and if the setting lived in the file
+    /// being deleted, the deletion would silently turn a security preference back off.
+    #[test]
+    fn the_body_storage_mode_is_a_user_preference_not_a_cache_setting() {
+        use crate::cache::BodyStorage;
+        let store = UserStore::open_in_memory().expect("open");
+        assert_eq!(
+            store.body_storage().expect("read"),
+            BodyStorage::Cached,
+            "a fresh install caches bodies like every mail client does"
+        );
+
+        store
+            .set_body_storage(BodyStorage::OnlineOnly)
+            .expect("set mode");
+        assert_eq!(store.body_storage().expect("read"), BodyStorage::OnlineOnly);
+
+        // A value this program did not write is not a licence to guess the opposite behaviour:
+        // `from_key` falls back to the default, and the default is the one that keeps the app usable.
+        store
+            .kv_set(BODY_STORAGE_KEY, "encrypted-everything")
+            .expect("seed a value from a future version");
+        assert_eq!(
+            store.body_storage().expect("read"),
+            BodyStorage::Cached,
+            "an unrecognised mode must not silently change what reaches the disk"
+        );
     }
 
     #[test]
@@ -2530,9 +2625,15 @@ mod tests {
 
     #[test]
     fn oauth_settings_round_trip_and_a_blank_secret_removes_it() {
+        // The sealed half is a *file*, so the test drives it through a temporary directory: the real
+        // store lives in the user's own data directory, and a test that wrote there would put a
+        // credential on the machine of whoever runs the gate.
+        let tokens = scratch_token_store("oauth-settings");
         let store = UserStore::open_in_memory().expect("open");
         assert_eq!(
-            store.oauth_settings("me@example.com").expect("read"),
+            store
+                .oauth_settings("me@example.com", &tokens)
+                .expect("read"),
             None,
             "an account with no registration is a password account"
         );
@@ -2544,10 +2645,13 @@ mod tests {
                     client_id: "client-123".into(),
                     client_secret: Some("shh".into()),
                 },
+                &tokens,
             )
             .expect("write");
         assert_eq!(
-            store.oauth_settings("me@example.com").expect("read"),
+            store
+                .oauth_settings("me@example.com", &tokens)
+                .expect("read"),
             Some(OAuthSettings {
                 client_id: "client-123".into(),
                 client_secret: Some("shh".into())
@@ -2563,10 +2667,13 @@ mod tests {
                     client_id: "client-456".into(),
                     client_secret: None,
                 },
+                &tokens,
             )
             .expect("write");
         assert_eq!(
-            store.oauth_settings("me@example.com").expect("read"),
+            store
+                .oauth_settings("me@example.com", &tokens)
+                .expect("read"),
             Some(OAuthSettings {
                 client_id: "client-456".into(),
                 client_secret: None
@@ -2574,10 +2681,156 @@ mod tests {
         );
 
         assert_eq!(
-            store.oauth_settings("other@example.com").expect("read"),
+            store
+                .oauth_settings("other@example.com", &tokens)
+                .expect("read"),
             None,
             "settings are per account"
         );
+    }
+
+    #[test]
+    fn a_client_secret_never_reaches_the_database_file() {
+        // The assertion this item exists for. `user.db` is the file that gets copied into a backup and
+        // carried to another machine, and the SQLite pages hold a value there even after the row is
+        // deleted, so "we stopped writing it" has to be checked against the **bytes of the file** —
+        // not against what the current query returns.
+        let tokens = scratch_token_store("secret-not-in-db");
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-userdb-secret-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = UserStore::open(&path).expect("open file");
+        store
+            .set_oauth_settings(
+                "me@example.com",
+                &OAuthSettings {
+                    client_id: "client-123".into(),
+                    client_secret: Some("NEVER-IN-USER-DB".into()),
+                },
+                &tokens,
+            )
+            .expect("write");
+        // Checkpoint the write-ahead log into the main file, then read every byte the app left behind.
+        drop(store);
+        let mut raw = std::fs::read(&path).expect("read db");
+        for side in ["-wal", "-shm"] {
+            // Not just the main file: a value that reached only the log is still a value that left the
+            // machine on a copied folder.
+            if let Ok(extra) = std::fs::read(format!("{}{side}", path.display())) {
+                raw.extend(extra);
+            }
+        }
+        assert!(
+            !raw.windows(b"NEVER-IN-USER-DB".len())
+                .any(|window| window == b"NEVER-IN-USER-DB"),
+            "the client secret must not be readable in user.db"
+        );
+        let _ = std::fs::remove_file(&path);
+        for side in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{side}", path.display()));
+        }
+    }
+
+    #[test]
+    fn a_secret_left_in_kv_by_an_older_version_moves_on_the_first_read() {
+        // Migration, and the reason the migration is a *read*: the wizard is not opened again by
+        // somebody who upgraded, but every later refresh calls `oauth_settings`, so the plaintext row
+        // cannot survive an upgrade even if the user never looks at the account settings.
+        let tokens = scratch_token_store("secret-migration");
+        let store = UserStore::open_in_memory().expect("open");
+        store
+            .kv_set(&oauth_client_id_key("me@example.com"), "client-123")
+            .expect("seed id");
+        store
+            .kv_set(&legacy_secret_row("me@example.com"), "OLD-PLAINTEXT")
+            .expect("seed secret");
+
+        let read = store
+            .oauth_settings("me@example.com", &tokens)
+            .expect("read")
+            .expect("registration");
+        assert_eq!(
+            read.client_secret.as_deref(),
+            Some("OLD-PLAINTEXT"),
+            "upgrading must not sign anybody out"
+        );
+
+        // Second read: the row is gone, the sealed file answers.
+        let again = store
+            .oauth_settings("me@example.com", &tokens)
+            .expect("reread")
+            .expect("registration");
+        assert_eq!(again.client_secret.as_deref(), Some("OLD-PLAINTEXT"));
+        assert_eq!(
+            store
+                .kv_get(&legacy_secret_row("me@example.com"))
+                .expect("kv"),
+            None,
+            "the plaintext row must not survive the read that moved it"
+        );
+        assert_eq!(
+            tokens
+                .load_client_secret("me@example.com")
+                .expect("sealed")
+                .as_deref(),
+            Some("OLD-PLAINTEXT")
+        );
+    }
+
+    /// The legacy `kv` row, spelled out here instead of reached for in the module: the key builder is
+    /// private now precisely because nothing may write it any more, and a migration test still has to
+    /// seed the row. The name deliberately avoids the builder's own name, because
+    /// `tools/auth_axis_check.py` refuses a `kv_set` that mentions it.
+    fn legacy_secret_row(account_id: &str) -> String {
+        format!("oauth_client_secret:{account_id}")
+    }
+
+    /// A token store over a temporary directory, removed when the test's guard is dropped.
+    fn scratch_token_store(label: &str) -> sealed_store::Guard {
+        sealed_store::Guard::new(label)
+    }
+
+    mod sealed_store {
+        use std::path::PathBuf;
+
+        /// Owns the directory so a test that panics still leaves nothing behind.
+        pub struct Guard {
+            dir: PathBuf,
+            store: crate::tokenstore::TokenStore,
+        }
+
+        impl Guard {
+            pub(super) fn new(label: &str) -> Guard {
+                let dir = std::env::temp_dir().join(format!(
+                    "easy-email-sealed-{label}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).expect("temp dir");
+                Guard {
+                    store: crate::tokenstore::TokenStore::new(&dir),
+                    dir,
+                }
+            }
+        }
+
+        impl std::ops::Deref for Guard {
+            type Target = crate::tokenstore::TokenStore;
+            fn deref(&self) -> &Self::Target {
+                &self.store
+            }
+        }
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
     }
 
     #[test]

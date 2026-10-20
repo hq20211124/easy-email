@@ -41,7 +41,7 @@ use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 /// used to fold `cc:` onto `to_addrs`). FTS5 tables cannot gain a column, so the migration drops the
 /// index table and lets the create-if-not-exists below rebuild it with the new shape, then re-indexes
 /// every cached message — the index is derived data, so this loses nothing.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Which index shape a `bodies` row was last written by.
 ///
@@ -162,6 +162,8 @@ struct IndexSource {
     from_name: Option<String>,
     from_addr: Option<String>,
     to_addrs: Option<String>,
+    cc_addrs: Option<String>,
+    attachment_names: Option<String>,
     detail_json: Option<String>,
 }
 
@@ -209,6 +211,21 @@ pub fn to_tokens(text: &str) -> String {
     }
 
     tokens.join(" ")
+}
+
+/// A JSON array of strings, flattened into the space-separated text the index wants.
+///
+/// `messages.cc_addrs` and `messages.attachment_names` are JSON because the same columns have to
+/// round-trip for the reader while the index wants one string. No value, or a value that is not an
+/// array, comes back as-is rather than as an error: an index row missing one recipient is a worse
+/// search result, and a failed write would drop the message out of the index entirely.
+fn json_list_to_text(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return String::new();
+    };
+    serde_json::from_str::<Vec<String>>(raw)
+        .map(|items| items.join(" "))
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// Cut to `limit` *characters*, never to bytes.
@@ -345,12 +362,61 @@ mod predicate_tests {
     }
 }
 
+/// Where message bodies may be written.
+///
+/// The security-relevant half of `design/A3-local-store-protection.md` 选项 1: in `OnlineOnly` the
+/// body of a message is fetched into memory, shown, and never written to `cache.db`. That removes
+/// the question "how strong is the encryption of the body on disk" instead of answering it — which
+/// is why no mainstream desktop client treats whole-file encryption as the boundary (A3-F1/F5/F10
+/// /F11/F15) while Microsoft's own Work Protection guidance names Online mode as the first
+/// workaround (A3-F8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BodyStorage {
+    /// Bodies are cached; a message reads instantly and offline. The default.
+    #[serde(rename = "cached")]
+    Cached,
+    /// Bodies stay in memory only: nothing new is written to `bodies`.
+    #[serde(rename = "online")]
+    OnlineOnly,
+}
+
+impl BodyStorage {
+    /// The form stored in `user.db`, and the form the settings screen sends and receives.
+    ///
+    /// One vocabulary for both because the command boundary and the stored preference must never be
+    /// able to disagree about what "online" means. Note that reading this value is **lenient**
+    /// ([`BodyStorage::from_key`]) while *sending* it is strict: an unknown `serde` variant is a
+    /// parse error at the command, so a mistyped call cannot silently re-enable body writes.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            BodyStorage::Cached => "cached",
+            BodyStorage::OnlineOnly => "online",
+        }
+    }
+
+    /// An unrecognised value means "the setting was written by a program we have not written yet,
+    /// or was corrupted" — and the safe reading of that is the behaviour the user has always had.
+    pub fn from_key(value: &str) -> BodyStorage {
+        match value {
+            "online" => BodyStorage::OnlineOnly,
+            _ => BodyStorage::Cached,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Cache {
     /// Shared handle: one writer thread plus a read pool (`db.rs`). Not a bare `Connection`, because
     /// the app must not open a connection per command — and because a batch has to be one
     /// transaction.
     db: Db,
+    /// A [`BodyStorage`], in an `Arc` so the handle stays `Clone` the way every other caller expects.
+    ///
+    /// A process-wide switch rather than an argument on each write because the rule "no body reaches
+    /// the disk" has to hold for *every* writer — the interactive open, the background backfill and
+    /// any future third one — and a parameter that each caller can forget is the version of this that
+    /// leaks.
+    body_storage: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Cache {
@@ -363,6 +429,7 @@ impl Cache {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let cache = Self {
             db: Db::open(path, DbKind::Cache, DbOptions::for_kind(DbKind::Cache))?,
+            body_storage: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         cache.migrate()?;
         Ok(cache)
@@ -370,9 +437,31 @@ impl Cache {
 
     /// Wrap an already-open handle (used when the app owns a [`DbSet`]).
     pub fn from_db(db: Db) -> Result<Self> {
-        let cache = Self { db };
+        let cache = Self {
+            db,
+            body_storage: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        };
         cache.migrate()?;
         Ok(cache)
+    }
+
+    /// Set whether bodies may be written. Called at startup from `user.db` and by the settings
+    /// command; see [`BodyStorage`].
+    pub fn set_body_storage(&self, mode: BodyStorage) {
+        self.body_storage.store(
+            match mode {
+                BodyStorage::Cached => 0,
+                BodyStorage::OnlineOnly => 1,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub fn body_storage(&self) -> BodyStorage {
+        match self.body_storage.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => BodyStorage::OnlineOnly,
+            _ => BodyStorage::Cached,
+        }
     }
 
     /// Underlying handle, for the callers that need the database itself rather than a query — the
@@ -385,6 +474,7 @@ impl Cache {
     pub fn open_in_memory() -> Result<Self> {
         let cache = Self {
             db: Db::open_in_memory("cache")?,
+            body_storage: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         cache.migrate()?;
         Ok(cache)
@@ -616,6 +706,17 @@ impl Cache {
             // (`design/09` §5.4: rebuilding belongs in bounded background batches, never in the
             // startup transaction).
             add_column_if_missing(conn, "bodies", "index_version", "integer not null default 0")?;
+            // v10: the two pieces of a body that the index needs, kept **on the message row** so they
+            // survive a cache that holds no bodies.
+            //
+            // Until now Cc and attachment filenames could only be read out of `bodies.detail` — they
+            // are not IMAP `ENVELOPE` items, so a header-only sync never sees them. That is fine while
+            // bodies are cached, and it is a hole in 正文不落盘 mode: with no `bodies` row, the index
+            // row would silently lose the Cc and the filename search that the user can still see on
+            // screen. Storing them here is exactly the line `design/A3` draws — **envelope metadata may
+            // be cached, the text of the message may not** — and a filename is metadata.
+            add_column_if_missing(conn, "messages", "cc_addrs", "text")?;
+            add_column_if_missing(conn, "messages", "attachment_names", "text")?;
             // Rebuilding the full-text index belongs in bounded background batches too
             // (`rebuild_search_step`, driven by `start_search_rebuild_worker`).
             backfill_subject_keys(conn)?;
@@ -1374,12 +1475,22 @@ impl Cache {
     }
 
     /// Store a parsed message so it can be read again without touching the network.
+    ///
+    /// In [`BodyStorage::OnlineOnly`] it stores everything **except** the body: the recipients and
+    /// attachment filenames are learned from this message and are metadata, while the text itself
+    /// stays in memory and is re-fetched the next time the message is opened.
     pub fn put_detail(&self, account_id: &str, folder: &str, detail: &MessageDetail) -> Result<()> {
         let account_id = account_id.to_string();
         let folder = folder.to_string();
         let detail = detail.clone();
-        self.db
-            .write_blocking(move |conn| Self::write_detail(conn, &account_id, &folder, &detail))
+        // Asked of the handle rather than passed in by the caller: the rule is "in 涉密模式 no body
+        // reaches the disk", and a rule that each writer has to remember to apply is a rule the next
+        // writer breaks. `write_detail` takes the flag as an argument only so the P9 benchmark can
+        // hold it fixed while it varies the transaction boundary.
+        let store_body = matches!(self.body_storage(), BodyStorage::Cached);
+        self.db.write_blocking(move |conn| {
+            Self::write_detail(conn, &account_id, &folder, &detail, store_body)
+        })
     }
 
     /// The statements `put_detail` runs, without the transaction around them.
@@ -1388,38 +1499,65 @@ impl Cache {
     /// ingest time goes — and that question can only be asked by running the same statements with the
     /// boundary in two places. Copied SQL would answer it for a version of the write path that does
     /// not exist.
+    ///
+    /// `store_body` is the [`BodyStorage`] decision, taken by the caller that owns the handle: this
+    /// function is where the bodies row is written or not written, and it is the only place in the
+    /// module that says so.
     fn write_detail(
         conn: &Connection,
         account_id: &str,
         folder: &str,
         detail: &MessageDetail,
+        store_body: bool,
     ) -> Result<()> {
-        let detail_json = serde_json::to_string(&detail)
-            .map_err(|e| MailError::Cache(format!("序列化正文失败：{e}")))?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        conn.execute(
-            "insert into bodies (account_id, folder, uid, detail, fetched_at)
-             values (?1, ?2, ?3, ?4, ?5)
-             on conflict(account_id, folder, uid) do update set
-                 detail = excluded.detail, fetched_at = excluded.fetched_at",
-            params![account_id, folder, i64::from(detail.uid), detail_json, now],
-        )?;
-
-        // The summary table may not carry `to_addrs` yet (headers alone do not include it), and
-        // the body is where we learn it. Write it back so recipient search works.
-        if !detail.to.is_empty() {
-            let to_json = serde_json::to_string(&detail.to)
-                .map_err(|e| MailError::Cache(format!("序列化收件人失败：{e}")))?;
+        if store_body {
+            let detail_json = serde_json::to_string(&detail)
+                .map_err(|e| MailError::Cache(format!("序列化正文失败：{e}")))?;
             conn.execute(
-                "update messages set to_addrs = ?4
-                 where account_id = ?1 and folder = ?2 and uid = ?3",
-                params![account_id, folder, i64::from(detail.uid), to_json],
+                "insert into bodies (account_id, folder, uid, detail, fetched_at)
+                 values (?1, ?2, ?3, ?4, ?5)
+                 on conflict(account_id, folder, uid) do update set
+                     detail = excluded.detail, fetched_at = excluded.fetched_at",
+                params![account_id, folder, i64::from(detail.uid), detail_json, now],
             )?;
         }
+
+        // Metadata the body carries but the headers do not: the recipients we can only learn by
+        // reading, and the attachment filenames. Written in **both** modes, because in 正文不落盘 they
+        // are the only place the index can get them from — and because a message read once while the
+        // mode was off should not lose its Cc search when the mode is switched on.
+        //
+        // `coalesce` rather than a plain assignment: a message whose To/Cc came back empty must not
+        // wipe what an earlier read had learned.
+        let json_of = |fields: &[String]| -> Result<Option<String>> {
+            if fields.is_empty() {
+                return Ok(None);
+            }
+            serde_json::to_string(fields)
+                .map(Some)
+                .map_err(|e| MailError::Cache(format!("序列化收件人失败：{e}")))
+        };
+        let names: Vec<String> = detail.attachments.iter().map(|a| a.name.clone()).collect();
+        conn.execute(
+            "update messages
+                set to_addrs = coalesce(?4, to_addrs),
+                    cc_addrs = coalesce(?5, cc_addrs),
+                    attachment_names = coalesce(?6, attachment_names)
+              where account_id = ?1 and folder = ?2 and uid = ?3",
+            params![
+                account_id,
+                folder,
+                i64::from(detail.uid),
+                json_of(&detail.to)?,
+                json_of(&detail.cc)?,
+                json_of(&names)?,
+            ],
+        )?;
 
         Self::refresh_search_row(
             conn,
@@ -1649,6 +1787,89 @@ impl Cache {
             Self::refresh_after_delete(conn, &doomed)?;
             Ok(report)
         })
+    }
+
+    /// How many bodies are on disk right now, across every account.
+    ///
+    /// The settings screen puts this next to the mode so "清空" has a number attached to it, and so
+    /// the honest reading of `OnlineOnly` is checkable by the user: after turning it on and purging,
+    /// this should stay at zero.
+    pub fn stored_body_count(&self) -> Result<u32> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let n: i64 = conn.query_row("select count(*) from bodies", [], |row| row.get(0))?;
+        Ok(n as u32)
+    }
+
+    /// Delete **every** stored body, and rewrite the file so the text is not left behind in it.
+    ///
+    /// The action that belongs with [`BodyStorage::OnlineOnly`]: turning the mode on stops *new*
+    /// bodies, this one removes the bodies already there. Together they are the whole of `design/A3`
+    /// 选项 1. It deletes nothing the user cannot get back from the server, which is the property
+    /// A3 §八(c) requires of anything we erase or encrypt — the reason an encrypted `user.db` was
+    /// rejected and an erasable `cache.db` is not.
+    ///
+    /// Two things it does that a `delete from bodies` does not:
+    ///
+    /// * the Cc and the attachment filenames are copied into `messages` first. They are not IMAP
+    ///   envelope items, so a body is the only place they exist — without this, a purge would drop
+    ///   recipient and filename search for every message the user had read.
+    /// * the file is `VACUUM`ed afterwards. A plain delete leaves the bytes on the freelist, and only
+    ///   pages past the last live page get truncated; so "the bodies are gone from the file" would be
+    ///   false. That sentence is the one this feature exists to make true, so the rebuild is not
+    ///   tidiness and it is not optional.
+    ///
+    /// Returns how many bodies were removed.
+    pub fn purge_all_bodies(&self) -> Result<u32> {
+        let removed = self.with_connection(|conn| {
+            // `$.to` / `$.cc` already *are* JSON arrays, so their text is byte-for-byte what the
+            // column holds. The attachment names are an array of objects, so `json_each` has to walk
+            // it and `json_group_array` put the names back together — `json_extract` refuses the
+            // `[*]` wildcard (measured: `bad JSON path`).
+            conn.execute(
+                "update messages
+                    set to_addrs = coalesce(to_addrs,
+                            (select json_extract(b.detail, '$.to') from bodies b
+                              where b.account_id = messages.account_id
+                                and b.folder = messages.folder and b.uid = messages.uid)),
+                        cc_addrs = coalesce(cc_addrs,
+                            (select json_extract(b.detail, '$.cc') from bodies b
+                              where b.account_id = messages.account_id
+                                and b.folder = messages.folder and b.uid = messages.uid)),
+                        attachment_names = coalesce(attachment_names,
+                            (select json_group_array(json_extract(je.value, '$.name'))
+                               from bodies b,
+                                    json_each(b.detail, '$.attachments') as je
+                              where b.account_id = messages.account_id
+                                and b.folder = messages.folder and b.uid = messages.uid))
+             where exists (select 1 from bodies b
+                             where b.account_id = messages.account_id
+                               and b.folder = messages.folder and b.uid = messages.uid)",
+                [],
+            )?;
+            let doomed: Vec<(String, String, u32)> = conn
+                .prepare("select account_id, folder, uid from bodies")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            conn.execute("delete from bodies", [])?;
+            Self::refresh_after_delete(conn, &doomed)?;
+            Ok(doomed.len() as u32)
+        })?;
+        if removed > 0 {
+            // Outside the transaction, because `VACUUM` cannot run inside one — which is what
+            // [`crate::db::Db::exec_blocking`] exists for.
+            //
+            // The checkpoint has to **truncate**: a plain one writes the pages back into the main
+            // file and leaves the WAL itself the same size it was, holding every frame that was just
+            // checkpointed. Those bytes are the bodies. Measured here: without the truncate the test
+            // that greps the side files fails on the `-wal` alone.
+            self.db.exec_blocking(|conn| {
+                conn.execute_batch("vacuum; pragma wal_checkpoint(TRUNCATE);")
+                    .map_err(|e| MailError::Cache(format!("清空正文后的整理失败：{e}")))?;
+                Ok(())
+            })?;
+        }
+        Ok(removed)
     }
 
     /// Header-only index rows for exactly the messages whose bodies this cleanup took.
@@ -1984,7 +2205,8 @@ impl Cache {
         // until the fixture existed.
         let row: Option<(Option<i64>, IndexSource)> = conn
             .query_row(
-                "select m.search_rowid, m.subject, m.from_name, m.from_addr, m.to_addrs, b.detail
+                "select m.search_rowid, m.subject, m.from_name, m.from_addr, m.to_addrs,
+                        m.cc_addrs, m.attachment_names, b.detail
                      from messages m
                      left join bodies b
                        on b.account_id = m.account_id and b.folder = m.folder and b.uid = m.uid
@@ -1998,7 +2220,9 @@ impl Cache {
                             from_name: row.get(2)?,
                             from_addr: row.get(3)?,
                             to_addrs: row.get(4)?,
-                            detail_json: row.get(5)?,
+                            cc_addrs: row.get(5)?,
+                            attachment_names: row.get(6)?,
+                            detail_json: row.get(7)?,
                         },
                     ))
                 },
@@ -2049,26 +2273,32 @@ impl Cache {
         // — the name is short and is exactly what the user types on a long thread. `to_tokens` does
         // the per-character spacing, so a Chinese filename matches the same way a Chinese body
         // does; an ASCII extension like `pdf` is already a single token.
-        let names = detail
-            .as_ref()
-            .map(|d| {
-                d.attachments
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
+        //
+        // With no stored body the names and the Cc come from the message row, which is where
+        // `write_detail` keeps a copy of them for exactly this case (正文不落盘 mode, and a cleanup
+        // that deleted the body but left the mail listed).
+        let names = match detail.as_ref() {
+            Some(d) => d
+                .attachments
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => json_list_to_text(source.attachment_names.as_deref()),
+        };
         let indexed_body = if names.is_empty() {
             to_tokens(body)
         } else {
             format!("{} {}", to_tokens(body), to_tokens(&names))
         };
 
-        // Carbon-copy recipients, like the body, live only inside the stored detail (a header summary
-        // does not carry them), so they are pulled from the same parse. Empty until the body has been
-        // fetched — which is correct: we genuinely do not know the Cc before reading the message.
-        let cc_addrs = detail.as_ref().map(|d| d.cc.join(" ")).unwrap_or_default();
+        // Carbon-copy recipients are not part of an IMAP `ENVELOPE`, so the only other place they
+        // exist is the stored body — hence the same fallback. Empty until the message has been read,
+        // which is correct: we genuinely do not know the Cc before then.
+        let cc_addrs = match detail.as_ref() {
+            Some(d) => d.cc.join(" "),
+            None => json_list_to_text(source.cc_addrs.as_deref()),
+        };
 
         conn.execute(
             "insert into search
@@ -4512,6 +4742,304 @@ mod tests {
         );
     }
 
+    // ====================================================== 正文不落盘 (design/A3 选项 1)
+
+    /// Every byte of a database file this cache owns, including the side files.
+    ///
+    /// The WAL belongs in the read: a page that has been written but not checkpointed lives *only*
+    /// there, so a test that looked at `cache.sqlite` alone would pass on exactly the version of this
+    /// feature that leaks.
+    fn file_bytes(path: &std::path::Path) -> Vec<u8> {
+        let mut all = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.to_path_buf();
+            if !suffix.is_empty() {
+                candidate.set_file_name(format!(
+                    "{}{suffix}",
+                    path.file_name().expect("name").to_string_lossy()
+                ));
+            }
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                all.extend_from_slice(&bytes);
+            }
+        }
+        all
+    }
+
+    /// The point of the whole mode: after a message has been opened, **the body is not in the file**.
+    ///
+    /// Asserted against the bytes rather than against the row count because the row count is what an
+    /// implementation that forgot to obey the flag would also get right if it wrote and then deleted —
+    /// and a delete leaves the text on a freelist page. Both halves matter, so this test checks the
+    /// file and the one after it checks the vacuum.
+    #[test]
+    fn in_online_mode_the_body_never_reaches_the_database_file() {
+        let (cache, path) = temp_cache("online-mode");
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "开会通知", "a@example.com", 1_700_000_000)],
+            )
+            .expect("seed");
+        cache.set_body_storage(BodyStorage::OnlineOnly);
+
+        let mut opened =
+            detail_with_attachments(1, "开会通知", "记得带 SECRET-BODY-TEXT", &["会议纪要.pdf"]);
+        opened.cc = vec!["boss@example.com".to_string()];
+        cache.put_detail("acc", "INBOX", &opened).expect("put");
+
+        assert!(
+            cache.get_detail("acc", "INBOX", 1).expect("read").is_none(),
+            "a body read in this mode must not be readable back from disk"
+        );
+        let bytes = file_bytes(&path);
+        assert!(
+            !bytes
+                .windows(b"SECRET-BODY-TEXT".len())
+                .any(|w| w == b"SECRET-BODY-TEXT"),
+            "the body text is in the file anyway — which is the sentence this mode exists to make false"
+        );
+        // The HTML half travels with the text half: `detail()` gives every fixture a `<p>html</p>`.
+        assert!(
+            !bytes
+                .windows(b"<p>html</p>".len())
+                .any(|w| w == b"<p>html</p>"),
+            "the HTML body must not be stored either"
+        );
+
+        // What the mode must NOT take away: the message stays listed and searchable by everything a
+        // header or a filename carries. Cc and attachment names used to exist only inside the stored
+        // body, which is why `messages` now keeps a copy of them.
+        assert_eq!(cache.search("acc", "开会", 10).expect("subject").len(), 1);
+        assert_eq!(
+            cache.search("acc", "boss", 10).expect("cc").len(),
+            1,
+            "the Cc stays searchable with no body stored"
+        );
+        assert_eq!(
+            cache.search("acc", "纪要", 10).expect("name").len(),
+            1,
+            "the attachment filename stays searchable"
+        );
+
+        drop(cache);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.clone();
+            if !suffix.is_empty() {
+                candidate.set_file_name(format!(
+                    "{}{suffix}",
+                    path.file_name().expect("name").to_string_lossy()
+                ));
+            }
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    /// Turning the mode on and purging leaves **no body anywhere in the file** — and keeps the mail.
+    ///
+    /// The purge is the half that a `delete from bodies` gets wrong: SQLite puts the freed pages on
+    /// the file's own freelist, where the text stays readable with a hex editor until something
+    /// rewrites the file. So the assertion is about bytes, and `VACUUM` is the statement that makes it
+    /// pass.
+    #[test]
+    fn purging_bodies_empties_the_file_and_keeps_the_metadata() {
+        let (cache, path) = temp_cache("purge-bodies");
+        let summaries: Vec<MessageSummary> = (1..=3u32)
+            .map(|uid| {
+                summary(
+                    uid,
+                    &format!("主题 {uid}"),
+                    "a@example.com",
+                    1_700_000_000 + i64::from(uid),
+                )
+            })
+            .collect();
+        cache
+            .upsert_summaries("acc", "INBOX", &summaries)
+            .expect("seed");
+
+        // Two of the three read while bodies were still being cached — each with its **own** filename,
+        // so "search finds it" below cannot be satisfied by the other message.
+        for uid in 1..=2u32 {
+            let name = format!("对账单{uid}.pdf");
+            let opened = detail_with_attachments(
+                uid,
+                &format!("主题 {uid}"),
+                "流水号 PURGED-BODY-TEXT",
+                &[name.as_str()],
+            );
+            cache
+                .put_detail("acc", "INBOX", &opened)
+                .expect("cache the body");
+        }
+        assert_eq!(
+            cache.body_coverage("acc").expect("coverage").indexed,
+            2,
+            "before the purge both bodies are stored — otherwise this test proves nothing"
+        );
+
+        cache.set_body_storage(BodyStorage::OnlineOnly);
+        let removed = cache.purge_all_bodies().expect("purge");
+        assert_eq!(removed, 2, "the two stored bodies are the two it reports");
+
+        let bytes = file_bytes(&path);
+        assert!(
+            !bytes
+                .windows(b"PURGED-BODY-TEXT".len())
+                .any(|w| w == b"PURGED-BODY-TEXT"),
+            "the deleted body text is still in the file: the purge must rebuild it, not only delete rows"
+        );
+
+        // Nothing the user owns went with them: three messages listed, and each of the two purged
+        // ones still answers a subject search and a filename search.
+        assert_eq!(
+            cache.summary_count("acc", "INBOX").expect("count"),
+            3,
+            "the purge deletes bodies, never the mail"
+        );
+        assert_eq!(cache.search("acc", "主题 1", 10).expect("subject").len(), 1);
+        assert_eq!(
+            cache.search("acc", "对账单1", 10).expect("filename").len(),
+            1,
+            "the filename survives the body it came from"
+        );
+        assert_eq!(cache.body_coverage("acc").expect("coverage").indexed, 0);
+
+        drop(cache);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.clone();
+            if !suffix.is_empty() {
+                candidate.set_file_name(format!(
+                    "{}{suffix}",
+                    path.file_name().expect("name").to_string_lossy()
+                ));
+            }
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    /// A cache written by the previous version keeps its bodies and gains the two metadata columns.
+    ///
+    /// `v10` adds columns to `messages`, and a column cannot arrive through
+    /// `create table if not exists` — the other two tests in this family (`thread_key`,
+    /// `subject_key`) exist for the same reason. What is specific to *this* column pair is that the
+    /// data they need is inside a JSON blob in another table, so the upgrade has to leave old rows
+    /// readable rather than promise to backfill them.
+    #[test]
+    fn an_older_cache_gains_the_metadata_columns_without_losing_its_bodies() {
+        let (cache, path) = temp_cache("v10-upgrade");
+        cache
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(1, "开会通知", "a@example.com", 1)],
+            )
+            .expect("seed");
+        // The old row carries a Cc and a filename **inside the body**, which is the only place v9
+        // could keep them — exactly the shape the purge must not lose.
+        let mut seeded =
+            detail_with_attachments(1, "开会通知", "记得带季度报表", &["会议纪要.pdf"]);
+        seeded.cc = vec!["boss@example.com".to_string()];
+        cache.put_detail("acc", "INBOX", &seeded).expect("put");
+        drop(cache);
+
+        // Back to the v9 shape: the two columns removed (with everything in them), the version rewound.
+        {
+            let db = Db::open(
+                &path,
+                crate::db::DbKind::Cache,
+                crate::db::DbOptions::for_kind(crate::db::DbKind::Cache),
+            )
+            .expect("db");
+            db.write_blocking(|conn: &Connection| {
+                conn.execute_batch(
+                    "alter table messages drop column cc_addrs;
+                     alter table messages drop column attachment_names;
+                     pragma user_version = 9;",
+                )?;
+                Ok(())
+            })
+            .expect("downgrade");
+        }
+
+        let upgraded = Cache::open(&path).expect("reopen a v9 file");
+        assert_eq!(upgraded.schema_version().expect("version"), SCHEMA_VERSION);
+        let stored = upgraded
+            .get_detail("acc", "INBOX", 1)
+            .expect("read")
+            .expect("the body a v9 file already had must still be there");
+        assert_eq!(stored.body_text.as_deref(), Some("记得带季度报表"));
+
+        // Now the security action, on a file whose metadata lives **only** inside its bodies. The
+        // columns are NULL here — nothing has been written since the upgrade — so the only way the
+        // Cc and the filename survive the purge is the copy the purge itself makes.
+        upgraded.set_body_storage(BodyStorage::OnlineOnly);
+        assert_eq!(upgraded.purge_all_bodies().expect("purge"), 1);
+        assert_eq!(
+            upgraded.search("acc", "纪要", 10).expect("filename").len(),
+            1,
+            "purging must not delete the search the user could already do on that message"
+        );
+        assert_eq!(
+            upgraded
+                .search("acc", "boss@example.com", 10)
+                .expect("cc")
+                .len(),
+            1,
+            "…same for the Cc, which came out of the same body"
+        );
+        assert!(
+            upgraded
+                .get_detail("acc", "INBOX", 1)
+                .expect("read")
+                .is_none(),
+            "…while the body itself really is gone"
+        );
+
+        // The mode has to hold on an upgraded file, not only on a new one.
+        upgraded
+            .upsert_summaries(
+                "acc",
+                "INBOX",
+                &[summary(2, "薪酬说明", "b@example.com", 2)],
+            )
+            .expect("seed a second message");
+        let mut opened =
+            detail_with_attachments(2, "薪酬说明", "第二段 SECRET-BODY", &["通知.pdf"]);
+        opened.cc = vec!["hr@example.com".to_string()];
+        upgraded
+            .put_detail("acc", "INBOX", &opened)
+            .expect("put in the mode");
+        assert_eq!(
+            upgraded
+                .search("acc", "hr@example.com", 10)
+                .expect("cc")
+                .len(),
+            1,
+            "the columns the upgrade added must be writable and searchable"
+        );
+        let bytes = file_bytes(&path);
+        assert!(
+            !bytes
+                .windows(b"SECRET-BODY".len())
+                .any(|w| w == b"SECRET-BODY"),
+            "the new message's body must not reach the file either"
+        );
+
+        drop(upgraded);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.clone();
+            if !suffix.is_empty() {
+                candidate.set_file_name(format!(
+                    "{}{suffix}",
+                    path.file_name().expect("name").to_string_lossy()
+                ));
+            }
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
     /// Where does P9's ingest time actually go: the **transaction boundary**, or the statements?
     ///
     /// `design/15` §4's P9 line has been read as "入库慢是因为每封一个事务，合并成批量事务就能快", and
@@ -4620,7 +5148,7 @@ mod tests {
                                 .db
                                 .write_blocking(move |conn: &Connection| {
                                     for detail in &chunk {
-                                        Cache::write_detail(conn, "acc", "INBOX", detail)?;
+                                        Cache::write_detail(conn, "acc", "INBOX", detail, true)?;
                                     }
                                     Ok(())
                                 })

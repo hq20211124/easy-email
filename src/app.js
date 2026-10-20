@@ -4386,8 +4386,17 @@ async function openLog() {
 async function openStoragePanel() {
   const report = await run('读取存储占用', () => invoke('storage_report'));
   if (report === null) return;
+  // Read separately from the storage report because it answers a different question: that one is
+  // how much space the cache takes, this one is whether message text is allowed on the disk at all.
+  const bodies = await invoke('get_body_storage').catch(() => null);
+  // The disk-encryption self-check ran (or did not) in the background at startup; this only reads
+  // what it found. `design/A3` 选项 2 puts the boundary on the volume, so the panel that offers to
+  // stop writing bodies also has to say whether the volume they are written to is encrypted.
+  const disk = await invoke('disk_protection_status').catch(() => null);
 
   const helper = window.__easyEmailStorage;
+  const bodyInfo = helper.bodyStorageSummary(bodies);
+  const diskInfo = helper.diskProtectionSummary(disk);
   openModal({
     title: '存储与清理',
     bodyHtml: `
@@ -4396,6 +4405,43 @@ async function openStoragePanel() {
         其中已下载正文 ${escapeHtml(helper.formatBytes(report.bodies_bytes))}
         （${report.messages} 封摘要、${report.bodies} 封带正文）。
       </p>
+      <div class="about-storage-actions">
+        <span class="field-label">本机磁盘加密（部署前置条件）</span>
+        <p class="about-note" id="disk-protection-line">
+          结论：<strong>${escapeHtml(diskInfo.verdict)}</strong>。<br />${escapeHtml(diskInfo.note)}${
+            diskInfo.volumes.length > 0 ? `<br />逐卷：${escapeHtml(diskInfo.volumes.join('；'))}` : ''
+          }
+        </p>
+      </div>
+      <div class="about-storage-actions">
+        <span class="field-label">正文存储</span>
+        <p class="about-note" id="body-storage-line">
+          当前：<strong>${escapeHtml(bodyInfo.label)}</strong>${
+            bodies === null
+              ? ''
+              : `，本地已存 ${bodyInfo.stored} 封正文`
+          }。<br />${escapeHtml(bodyInfo.note)}
+        </p>
+        <label class="radio-row">
+          <input type="radio" name="body-storage" value="cached" ${
+            bodyInfo.online ? '' : 'checked'
+          } />
+          <span>正文缓存在本地（读过的邮件离线可打开，正文里的词可搜）</span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="body-storage" value="online" ${
+            bodyInfo.online ? 'checked' : ''
+          } />
+          <span>正文不落盘（每次打开都重新下载，本地文件里不留邮件正文）</span>
+        </label>
+        <label class="radio-row">
+          <input type="checkbox" id="body-purge" ${bodyInfo.canPurge ? '' : 'disabled'} />
+          <span id="body-purge-label">同时清空已下载的正文${
+            bodyInfo.canPurge ? `（现在 ${bodyInfo.stored} 封）` : '（本地没有可清空的正文）'
+          }</span>
+        </label>
+        <button class="btn ghost small" id="btn-body-storage-save" type="button">应用</button>
+      </div>
       <label class="field">
         <span class="field-label">缓存上限（MB，只在超过时清理）</span>
         <input id="storage-limit" type="text" inputmode="numeric"
@@ -4424,6 +4470,50 @@ async function openStoragePanel() {
       const runButton = modal.querySelector('#btn-storage-run');
       const limitBox = modal.querySelector('#storage-limit');
       let currentPlan = null;
+
+      // The 正文存储 controls. Clearing is only ever offered **on the way into** 不落盘: a purge
+      // while bodies are still allowed would be refilled by the next background pass, which is an
+      // erasure this screen could not explain.
+      const bodyLine = modal.querySelector('#body-storage-line');
+      const bodyPurge = modal.querySelector('#body-purge');
+      const bodyPurgeLabel = modal.querySelector('#body-purge-label');
+      const bodySave = modal.querySelector('#btn-body-storage-save');
+      const pickedMode = () =>
+        modal.querySelector('input[name="body-storage"]:checked')?.value || 'cached';
+      const syncPurgeControls = (stored) => {
+        const useful = pickedMode() === 'online' && stored > 0;
+        if (!useful) bodyPurge.checked = false;
+        bodyPurge.disabled = !useful;
+        bodyPurgeLabel.textContent = useful
+          ? `同时清空已下载的正文（现在 ${stored} 封）`
+          : pickedMode() === 'online'
+            ? '同时清空已下载的正文（本地没有可清空的正文）'
+            : '同时清空已下载的正文（只在切到不落盘时执行）';
+      };
+      const storedNow = bodyInfo.stored;
+      syncPurgeControls(storedNow);
+      modal.querySelectorAll('input[name="body-storage"]').forEach((box) => {
+        box.addEventListener('change', () => syncPurgeControls(storedNow));
+      });
+      bodySave.addEventListener('click', async () => {
+        const mode = pickedMode();
+        bodySave.disabled = true;
+        const removed = await run('保存正文存储设置', () =>
+          invoke('set_body_storage', { mode, purgeExisting: bodyPurge.checked })
+        );
+        bodySave.disabled = false;
+        if (removed === null) return;
+        const latest = await invoke('get_body_storage').catch(() => null);
+        const info = helper.bodyStorageSummary(latest);
+        bodyLine.textContent = `当前：${info.label}${
+          latest === null ? '' : `，本地已存 ${info.stored} 封正文`
+        }。${info.note}`;
+        syncPurgeControls(info.stored);
+        toast(
+          removed > 0 ? `已切换，并清空 ${removed} 封正文` : `已切换：${info.label}`,
+          'ok'
+        );
+      });
 
       modal.querySelector('#btn-storage-dry').addEventListener('click', async () => {
         const limitMb = window.__easyEmailStorage.suggestStorageLimit(limitBox.value);

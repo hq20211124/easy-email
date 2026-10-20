@@ -26,13 +26,46 @@
 //!
 //! Access tokens are deliberately **not** stored: they last an hour, nothing else uses them, and a
 //! file that only ever holds longer-lived secrets is a smaller thing to get wrong.
+//!
+//! The OAuth **client secret** lives here too. It is the other half of the same registration and a
+//! refresh needs both, so one store means an account cannot be saved halfway; it used to be a plain
+//! row in `user.db`, which is the one file in this app that people copy into backups and onto another
+//! machine; and unlike the credential manager this is a seam a test can point at a temporary
+//! directory, so testing it never writes into the real person's vault.
 
 use crate::error::{MailError, Result};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Refresh tokens for a set of accounts, in one directory.
+/// Which of an account's OAuth secrets a file holds.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// What renews an access token without asking the user again.
+    Token,
+    /// The client registration's secret, for the providers that require one.
+    Client,
+}
+
+impl Kind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Kind::Token => "token",
+            Kind::Client => "client",
+        }
+    }
+
+    /// Goes into the error text, because "令牌无法解密，请重新登录" is the wrong advice for a
+    /// client secret — the user has to re-enter the registration, not their password.
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Token => "令牌",
+            Kind::Client => "客户端密钥",
+        }
+    }
+}
+
+/// The OAuth secrets of a set of accounts, in one directory.
 pub struct TokenStore {
     dir: PathBuf,
 }
@@ -47,60 +80,108 @@ impl TokenStore {
 
     /// Store (or replace) one account's refresh token.
     pub fn save(&self, account_id: &str, refresh_token: &str) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|error| MailError::Config(format!("无法创建令牌目录：{error}")))?;
-        restrict_dir(&self.dir);
-        let sealed = protect(refresh_token.as_bytes(), account_id.as_bytes())?;
-        let path = self.path_for(account_id);
-        // Write to a temporary file and rename: a crash halfway through must not leave a truncated
-        // token where a working one used to be, because that would silently sign the user out.
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, &sealed)
-            .map_err(|error| MailError::Config(format!("无法写入令牌：{error}")))?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|error| MailError::Config(format!("无法替换令牌文件：{error}")))?;
-        restrict_file(&path);
-        Ok(())
+        self.put(Kind::Token, account_id, refresh_token)
     }
 
     /// Read one account's refresh token, or `None` when there is none.
     pub fn load(&self, account_id: &str) -> Result<Option<String>> {
-        let path = self.path_for(account_id);
+        self.take(Kind::Token, account_id)
+    }
+
+    /// Forget one account's refresh token. Missing is success.
+    pub fn delete(&self, account_id: &str) -> Result<()> {
+        self.forget(Kind::Token, account_id)
+    }
+
+    /// Store (or replace) the client secret that belongs to an account's client id.
+    pub fn save_client_secret(&self, account_id: &str, secret: &str) -> Result<()> {
+        self.put(Kind::Client, account_id, secret)
+    }
+
+    /// Read the stored client secret, or `None` when this account's provider needs none.
+    pub fn load_client_secret(&self, account_id: &str) -> Result<Option<String>> {
+        self.take(Kind::Client, account_id)
+    }
+
+    /// Forget the stored client secret. Missing is success.
+    pub fn delete_client_secret(&self, account_id: &str) -> Result<()> {
+        self.forget(Kind::Client, account_id)
+    }
+
+    fn put(&self, kind: Kind, account_id: &str, value: &str) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|error| MailError::Config(format!("无法创建{}目录：{error}", kind.label())))?;
+        restrict_dir(&self.dir);
+        let sealed = protect(value.as_bytes(), account_id.as_bytes())?;
+        let path = self.path_for(kind, account_id);
+        // Write to a temporary file and rename: a crash halfway through must not leave a truncated
+        // secret where a working one used to be, because that would silently sign the user out.
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, &sealed)
+            .map_err(|error| MailError::Config(format!("无法写入{}：{error}", kind.label())))?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|error| MailError::Config(format!("无法替换{}：{error}", kind.label())))?;
+        restrict_file(&path);
+        Ok(())
+    }
+
+    fn take(&self, kind: Kind, account_id: &str) -> Result<Option<String>> {
+        let path = self.path_for(kind, account_id);
         let sealed = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(MailError::Config(format!("无法读取令牌：{error}"))),
+            Err(error) => {
+                return Err(MailError::Config(format!(
+                    "无法读取{}：{error}",
+                    kind.label()
+                )));
+            }
         };
 
         let plain = unprotect(&sealed, account_id.as_bytes()).map_err(|error| {
             // Worth being explicit: this is what a *copied* file looks like, and the useful answer is
             // "sign in again", not a mysterious crash.
-            MailError::Credential(format!("令牌无法解密（可能需要重新登录）：{error}"))
+            MailError::Credential(format!(
+                "{}无法解密（可能需要重新登录）：{error}",
+                kind.label()
+            ))
         })?;
         String::from_utf8(plain)
             .map(Some)
-            .map_err(|_| MailError::Credential("令牌内容不是文本，请重新登录".into()))
+            .map_err(|_| MailError::Credential(format!("{}内容不是文本，请重新登录", kind.label())))
     }
 
-    /// Forget one account's refresh token. Missing is success.
-    pub fn delete(&self, account_id: &str) -> Result<()> {
-        match std::fs::remove_file(self.path_for(account_id)) {
+    fn forget(&self, kind: Kind, account_id: &str) -> Result<()> {
+        match std::fs::remove_file(self.path_for(kind, account_id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(MailError::Config(format!("无法删除令牌：{error}"))),
+            Err(error) => Err(MailError::Config(format!(
+                "无法删除{}：{error}",
+                kind.label()
+            ))),
         }
     }
 
-    /// One file per account, named by a hash so an address never becomes a path.
-    fn path_for(&self, account_id: &str) -> PathBuf {
+    /// One file per secret per account, named by a hash so an address never becomes a path.
+    ///
+    /// The token's name is hash(account_id) **exactly as it has always been**, and the new kind is
+    /// salted instead of both of them being salted: a renamed token file is not a cosmetic change, it
+    /// is every existing OAuth account silently signing out, and Microsoft rotates refresh tokens, so
+    /// the token the app can no longer find is also the one it may not reuse. `design/06`'s rule for a
+    /// stored secret is that the old name keeps working.
+    fn path_for(&self, kind: Kind, account_id: &str) -> PathBuf {
         use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(account_id.as_bytes());
+        let bytes = match kind {
+            Kind::Token => account_id.as_bytes().to_vec(),
+            Kind::Client => format!("client|{account_id}").into_bytes(),
+        };
+        let digest = Sha256::digest(bytes);
         let short: String = digest
             .iter()
             .take(8)
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        self.dir.join(format!("token-{short}.bin"))
+        self.dir.join(format!("{}-{short}.bin", kind.prefix()))
     }
 }
 
@@ -452,8 +533,8 @@ mod tests {
             .save("first@example.com", "token-for-first")
             .expect("save");
 
-        let sealed = std::fs::read(store.path_for("first@example.com")).expect("read");
-        std::fs::write(store.path_for("second@example.com"), &sealed).expect("copy");
+        let sealed = std::fs::read(store.path_for(Kind::Token, "first@example.com")).expect("read");
+        std::fs::write(store.path_for(Kind::Token, "second@example.com"), &sealed).expect("copy");
 
         assert_eq!(
             store.load("first@example.com").expect("load").as_deref(),
@@ -482,7 +563,7 @@ mod tests {
             .save("me@example.com", "a-real-refresh-token")
             .expect("save");
 
-        let path = store.path_for("me@example.com");
+        let path = store.path_for(Kind::Token, "me@example.com");
         let sealed = std::fs::read(&path).expect("read");
         std::fs::write(&path, &sealed[..sealed.len() / 2]).expect("truncate");
 
@@ -507,7 +588,7 @@ mod tests {
     #[test]
     fn an_address_never_becomes_a_file_name() {
         let store = TokenStore::new("C:/nowhere");
-        let path = store.path_for("../../etc/passwd\\..");
+        let path = store.path_for(Kind::Token, "../../etc/passwd\\..");
         let name = path
             .file_name()
             .expect("name")
@@ -519,5 +600,122 @@ mod tests {
         );
         assert!(!name.contains(".."), "{name}");
         assert!(!name.contains('\\'), "{name}");
+    }
+
+    #[test]
+    fn a_client_secret_round_trips_and_is_not_readable_in_the_file() {
+        if !available() {
+            return;
+        }
+        let dir = TempDir::new("client-secret");
+        let store = TokenStore::new(dir.path());
+        assert_eq!(
+            store.load_client_secret("me@example.com").expect("load"),
+            None
+        );
+
+        store
+            .save_client_secret("me@example.com", "SUPERSECRET-CLIENT-SECRET")
+            .expect("save");
+        assert_eq!(
+            store
+                .load_client_secret("me@example.com")
+                .expect("load")
+                .as_deref(),
+            Some("SUPERSECRET-CLIENT-SECRET")
+        );
+
+        let path = store.path_for(Kind::Client, "me@example.com");
+        let raw = std::fs::read(&path).expect("read");
+        assert!(
+            !raw.windows("SUPERSECRET-CLIENT-SECRET".len())
+                .any(|window| window == b"SUPERSECRET-CLIENT-SECRET"),
+            "the client secret must not be readable on disk"
+        );
+
+        store
+            .delete_client_secret("me@example.com")
+            .expect("delete is idempotent");
+        store
+            .delete_client_secret("me@example.com")
+            .expect("delete twice still works");
+        assert_eq!(
+            store.load_client_secret("me@example.com").expect("load"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_two_secrets_of_one_account_never_share_a_file() {
+        // If a token write ever landed on the client secret's path, refreshing a token would destroy
+        // the registration that makes the refresh possible — and the user finds out at the next
+        // launch, as "please sign in again" forever.
+        if !available() {
+            return;
+        }
+        let dir = TempDir::new("two-kinds");
+        let store = TokenStore::new(dir.path());
+        store.save("me@example.com", "TOKEN").expect("save token");
+        store
+            .save_client_secret("me@example.com", "SECRET")
+            .expect("save secret");
+
+        assert_eq!(
+            store.load("me@example.com").expect("load").as_deref(),
+            Some("TOKEN")
+        );
+        assert_eq!(
+            store
+                .load_client_secret("me@example.com")
+                .expect("load")
+                .as_deref(),
+            Some("SECRET")
+        );
+
+        store.delete("me@example.com").expect("delete token");
+        assert_eq!(
+            store
+                .load_client_secret("me@example.com")
+                .expect("load")
+                .as_deref(),
+            Some("SECRET"),
+            "forgetting the token must leave the registration alone"
+        );
+    }
+
+    #[test]
+    fn the_token_file_name_is_the_one_older_versions_wrote() {
+        // Renaming this file is not cosmetic. A token written by an earlier build would stop being
+        // found, which signs every existing OAuth account out — and because Microsoft *rotates*
+        // refresh tokens, the token the app can no longer locate is also one it may not reuse, so the
+        // user cannot fix it by retrying. The name below is recomputed from the rule that shipped
+        // before the client secret existed (hash of the account id alone, no kind), and the store must
+        // read a file written under it.
+        use sha2::{Digest, Sha256};
+        let id = "legacy@example.com";
+        let short: String = Sha256::digest(id.as_bytes())
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let dir = TempDir::new("legacy-name");
+        let store = TokenStore::new(dir.path());
+        std::fs::create_dir_all(dir.path().join("tokens")).expect("tokens dir");
+        std::fs::write(
+            dir.path().join("tokens").join(format!("token-{short}.bin")),
+            protect(b"written-by-an-older-build", id.as_bytes()).expect("seal"),
+        )
+        .expect("write");
+
+        assert_eq!(
+            store.load(id).expect("load").as_deref(),
+            Some("written-by-an-older-build")
+        );
+        assert_eq!(
+            store.load_client_secret(id).expect("load"),
+            None,
+            "the registration is a different file, not a different name for the same one"
+        );
     }
 }

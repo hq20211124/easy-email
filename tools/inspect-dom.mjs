@@ -11,9 +11,11 @@
  * world in that frame can read `img.naturalWidth` and settle "did the remote image actually load?".
  *
  * Requires the app to be built with the debugging port enabled. Add
- * `--remote-debugging-port=9222` to `additionalBrowserArgs` in `src-tauri/tauri.conf.json`,
- * rebuild, and launch. It is deliberately NOT left on by default: any local process can drive the
- * webview through that port.
+ * `--remote-debugging-port=9222` to `additionalBrowserArgs` in
+ * `src-tauri/tauri.windows.conf.json` — **not** `tauri.conf.json`: Tauri merges the platform file
+ * over the base one, so the base copy is silently ignored (2026-10-19 burned a full release build
+ * on that). Rebuild, and launch. It is deliberately NOT left on by default: any local process can
+ * drive the webview through that port.
  *
  *     node tools/inspect-dom.mjs
  *     node tools/inspect-dom.mjs "document.querySelector('#reader').getBoundingClientRect().width"

@@ -39,6 +39,19 @@ struct Idle {
 pub struct ConnectionPool {
     /// Account id → connections that are not currently in use.
     idle: Mutex<HashMap<String, Vec<Idle>>>,
+    /// Account id → connections handed out and not yet returned.
+    ///
+    /// This is the *contention* signal, and it is the only honest one available: a background task
+    /// cannot know what the user is about to do, but it can know that someone is holding a connection
+    /// right now. The body-index backfill reads it before starting work and between batches, and
+    /// gives way when it is non-zero — see [`crate::index::BodySource::should_yield`].
+    ///
+    /// Counted separately from `idle` because the two must not be confused: `max_connections` bounds
+    /// *idle* sockets (the ones that grow without bound), while a checked-out socket is one command
+    /// in flight. A user's command is never blocked by this number — `acquire` opens a new socket
+    /// rather than waiting — which is exactly why the background task has to be the one that steps
+    /// aside: the alternative to stepping aside is a cold handshake on the user's critical path.
+    in_use: Mutex<HashMap<String, usize>>,
 }
 
 impl ConnectionPool {
@@ -76,6 +89,7 @@ impl ConnectionPool {
             // A dead probe means the server hung up on it; fall through and connect anew rather
             // than hand back a connection that is about to fail.
             if fresh_enough && idle.client.noop().await.is_ok() {
+                self.count_out(&key);
                 return Ok(PooledClient {
                     pool: self,
                     key,
@@ -87,6 +101,7 @@ impl ConnectionPool {
         }
 
         let client = ImapClient::connect_credential(cfg, credential).await?;
+        self.count_out(&key);
         Ok(PooledClient {
             pool: self,
             key,
@@ -94,6 +109,32 @@ impl ConnectionPool {
             client: Some(client),
             poisoned: false,
         })
+    }
+
+    /// How many connections are handed out and not yet returned — the contention signal itself.
+    pub fn busy_count(&self, account_id: &str) -> usize {
+        self.in_use
+            .lock()
+            .expect("connection pool mutex")
+            .get(account_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn count_out(&self, key: &str) {
+        *self
+            .in_use
+            .lock()
+            .expect("connection pool mutex")
+            .entry(key.to_string())
+            .or_default() += 1;
+    }
+
+    fn count_back(&self, key: &str) {
+        let mut guard = self.in_use.lock().expect("connection pool mutex");
+        if let Some(slot) = guard.get_mut(key) {
+            *slot = slot.saturating_sub(1);
+        }
     }
 
     /// How many idle connections are being held for an account.
@@ -108,6 +149,11 @@ impl ConnectionPool {
     /// Drop everything held for an account (account removed, or the app is shutting down).
     pub fn clear(&self, account_id: &str) {
         self.idle
+            .lock()
+            .expect("connection pool mutex")
+            .remove(account_id);
+        // Both halves, or a "cleared" account whose id is reused would start out looking busy.
+        self.in_use
             .lock()
             .expect("connection pool mutex")
             .remove(account_id);
@@ -180,10 +226,24 @@ impl crate::index::BodySource for PooledClient<'_> {
     ) -> crate::Result<Vec<(u32, crate::Result<crate::MessageDetail>)>> {
         ImapClient::fetch_bodies(self, folder, uids).await
     }
+
+    /// This source is a *shared* connection, so the question has an answer: anyone else holding one
+    /// means the user (or a sync, or a push) is in flight.
+    ///
+    /// `> 1`, not `> 0`: this pass's own checkout is in the count. It is a slightly delicate
+    /// assumption, and the failure mode if it drifts is "the backfill never runs" rather than data
+    /// loss — which is the safe direction, but still worth reading here.
+    fn should_yield(&self) -> bool {
+        self.pool.busy_count(&self.key) > 1
+    }
 }
 
 impl Drop for PooledClient<'_> {
     fn drop(&mut self) {
+        // Unconditionally: a poisoned connection was still counted as handed out, and leaving it
+        // there would make the account look busy forever — which now means more than an idle socket,
+        // it means the backfill permanently steps aside.
+        self.pool.count_back(&self.key);
         if let (Some(client), false) = (self.client.take(), self.poisoned) {
             self.pool.release(&self.key, client, self.limit);
         }

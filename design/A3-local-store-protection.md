@@ -1,0 +1,183 @@
+# A3 本地存储保护（存储加密）——外部世界怎么做，以及我们该怎么做
+
+> 本文回答一个具体问题：**涉密客户要的"存储加密（at rest）"，业界真实做法是什么？我们该交付什么？**
+> 沿用 `A1-research-findings.md` 的约定：每条结论标 **已核实（带来源）/ 未核实 / 会变**；
+> 每条都带一手来源 URL；抓不到一手的一律写"未核实"，不粉饰。
+> 核对时间：2026-10-19（检索工具为联网搜索 + 原文抓取；被 JS/bot 拦截的页面已在状态列说明）。
+> 本文引用 `A1-Fxx` 编号处，指 `A1-research-findings.md`。
+
+---
+
+## 〇、一句话结论
+
+**主流桌面邮件客户端没有一家把"本地消息库加密"当作安全边界。**
+Microsoft 自己在支持页里写"PST 密码**并非**旨在防止恶意访问"，Mozilla 自己写"主密码**无法**防止他人看到你的消息"，
+Apple 的答案是 FileVault / Data Protection（操作系统层），Proton 的 Bridge 官方文档承认明文必然落到桌面客户端。
+真正做整库加密的是**服务端产品**（MailStore 归档、ESET 邮件隔离、国密邮件系统的 TDE），
+而在中国合规语境下（密评/分保），邮件正文的"存储加密"落地形态是**逐封邮件体数字信封 + 密钥归口密码服务平台（加密机）**，
+**客户端不持有密钥**——这是四川省密码管理局刊登的国密邮件系统方案的原话。
+
+所以对涉密客户，"我们靠 BitLocker"并不是行业反面教材，它就是行业标准答案；
+但它**不能**拿到密评/分保里"应用和数据安全——重要数据存储机密性"这一项的分，因为那一项判的是**信源本身是否被加密**。
+能给这一项加分的只有：①**不落地正文**（在线优先）②**逐封加密**（S/MIME 增强 / OpenPGP）③**服务端 TDE**（不是我们的层）。
+
+---
+
+## 一、Mozilla Thunderbird
+
+| 编号 | 结论 | 状态 |
+|---|---|---|
+| **A3-F1** | **官方对 Primary Password（主密码）范围的定性**：`设置主密码` 页第一小节标题就是"主密码保护什么？"，正文原话："**主密码保护你的已存密码，但是它无法防止他人看到你的 Thunderbird 消息。**" 同页给出的"防他人看信"建议不是加密，而是操作系统账号隔离："如果你与他人共享一台电脑，最安全方法是为每个人在操作系统上创建一个单独的账号……Thunderbird 会为每个操作系统账号分别存储账号、信息和密码"。⇒ 消息库（mbox / Maildir / `global-messages-db.sqlite`）**不在主密码的保护范围内**，官方口径是"交给 OS 账号"。**一手来源**：https://support.mozilla.org/zh-CN/kb/%E8%AE%BE%E7%BD%AE%E4%B8%BB%E5%AF%86%E7%A0%81 （页面最后更新 2022-02-15；英文对应页 `en-US/kb/master-password`，抓取被 JS 拦截，未能核对英文原句）。 | 已核实（官方支持页原文） |
+| **A3-F2** | **主密码丢失的官方处理 = 删除凭据，不删数据**：同页"如果主密码被遗忘的情况下重置主密码"带明确警告"**重置主密码会移除所有已保存的用户名和密码**"。⇒ Thunderbird 把"密钥丢失"的爆炸半径限定在**可重建的东西**（登录口令）上，消息与配置不受影响。这是我们该抄的模式，而不是 SQLCipher 本身。 | 已核实（同 A3-F1 页面） |
+| **A3-F3** | **端到端加密（OpenPGP/S-MIME）才是 Thunderbird 对"内容保密"的回答**，而且它把私钥保护**重新外包给主密码**：官方设置页："为了确保密钥仍然安全地保存在你的电脑上，最好在 Thunderbird 设置中设置一个主密码，**这样也会自动用来保护你的 OpenPGP 密钥**"。来源：https://support.mozilla.org/zh-CN/kb/thunderbird-help-setup-account-e2ee/compare?from=247346&locale=zh-CN&to=262216 。⚠️ 反向证据：曾有 **CVE-2021-29956**（Thunderbird 78.8.1–78.10.1 把 OpenPGP 私钥**明文**落盘，绕过主密码），我这次只拿到二手中文报道（https://tech.sina.com.cn/roll/2021-05-27/doc-ikmyaawc7847984.shtml ），**Mozilla 安全公告原文未抓取**。 | 行为已核实；CVE 细节**未核实**（一手待抓） |
+| **A3-F4** | **Thunderbird 的本地库没有任何形式加密**（既非 SQLCipher 也非列加密），消息是 `Mail/`、`ImapMail/` 下的 mbox/maildir 纯文本 + 明文 SQLite 索引（结构见 `A1-F5`）。这是"从 A3-F1 的官方承认 + 文件结构"推得的结论：**没有一手文档写着"我们的消息库不加密"**（厂商不会这样写），所以严格说是**未见任何加密声明**。 | 基本核实（推论 + 结构）；措辞上属**未见声明** |
+
+## 二、Microsoft Outlook / Windows Mail
+
+| 编号 | 结论 | 状态 |
+|---|---|---|
+| **A3-F5** | **"PST 密码"确实存在，但微软自己否认它是安全边界**：官方支持页原话——"Outlook 数据文件 (.pst) 密码**不是**为了防止恶意尝试访问你的信息提供安全性。为了更好地限制对数据的访问，请为使用该计算机的任何人创建**受密码保护的 Windows 用户帐户**。" 同页强调 `.pst` 密码上限 **15 个字符**，并建议"为使用该计算机的任何人创建 Windows 用户账号"。⇒ 微软给的 at-rest 答案 = OS 用户隔离 + （下一页）BitLocker/加密，而不是 PST。来源：https://support.microsoft.com/en-us/office/set-a-password-to-help-protect-your-outlook-information-f60fb0e7-f0ad-4d7c-858b-9619d1b9f0b6 （中文同文 https://support.microsoft.com/zh-cn/office/设置密码帮助保护-outlook-信息-f60fb0e7-… ）。 | 已核实（官方原文） |
+| **A3-F6** | **"Encrypt contents of PST" 的真相**：PST 的加密设置只有 `none / compressible / high` 三档，是**固定表字节替换**与**类 Enigma 固定转子**的混淆，且"**两种模式都不把用户口令作为密钥的任何部分**"（`Personal Storage Table` 条目引 [MS-PST] 规范）。旁证：NirSoft `PstPassword` 能直接从文件里恢复口令（http://www.nirsoft.net/utils/pst_password.html 自称"PST 的口令加密非常弱"）。⚠️ **我没能抓到 [MS-PST] 开放规范原文页**（learn.microsoft 搜索未命中），所以"逐字引用规范"这一步是缺的——交付材料里应写"微软公开的 PST 规范把该加密描述为不受口令约束的混淆"并要求复核规范原文。来源：https://en.wikipedia.org/wiki/Personal_Storage_Table（二手，指向一手规范）。 | **未核实**（一手规范页未取得）；结论方向有多源一致旁证 |
+| **A3-F7** | **微软对 OST 的定性 = "服务器数据的副本，不必备份"**："对某些帐户(IMAP、Microsoft Exchange Server 和 Outlook.com)使用脱机 Outlook 数据文件 (.ost)。这是保存在服务器上的消息的同步副本……**无需备份**脱机 Outlook 数据文件 (.ost)，因为它已经是服务器上实时信息的副本。"（OST 位置 `%USERPROFILE%\AppData\Local\Microsoft\Outlook`）来源：https://support.microsoft.com/zh-cn/office/outlook-数据文件-pst-和-ost-概述-222eaf92-a995-45d9-bde2-f331f60e2790 。⇒ **这正是我们 `cache.db` 的可处置性论点的官方同款表述**；`A1` 里"导入默认本地 + 服务器是权威"的设计与之同构。 | 已核实（官方原文） |
+| **A3-F8** | **⚠️ 最有价值的一条（问题 (d) 的直接一手答案）**：微软官方文档明确把"本地缓存邮件"列为**不受保护**并建议改为在线模式——"Limitation: Microsoft Office Outlook offline data files (PST and OST files) are not marked as **Work** files, and are therefore **not protected**. How it appears: **If Microsoft Office Outlook is set to work in cached mode (default setting)**, or if some emails are stored in a local PST file, **the data is unprotected**. Workaround: **It is recommended to use Microsoft Office Outlook in Online mode**, or to use encryption to protect OST and PST files manually."来源：https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/information-protection/windows-information-protection/limitations-with-wip （文档已归档，ms.date 2019-04-05）。⇒ **厂商亲口说："要么不缓存正文（Online 模式），要么你自己加密文件"**——"不落地"是被官方承认的正解，不是妥协。 | 已核实（官方原文） |
+| **A3-F9** | **New Outlook（以及它的存储位置）**：微软官方 VDI 部署文档给出目录事实——配置文件与缓存位于 `%LocalAppData%\Microsoft\olk\`（含 `EBWebView\Default\IndexedDB`、`Local Storage`、`Cache`、`Attachments`）与 MSIX 包目录 `Microsoft.OutlookForWindows_*_8wekyb3d8bbwe`；即 **New Outlook 是 WebView2/IndexedDB 架构的 Web 应用**，附件单独落 `%LocalAppData%\Microsoft\olk\Attachments`。**通篇没有任何"本地缓存被加密"的声明**。来源：https://learn.microsoft.com/zh-cn/microsoft-365-apps/outlook/get-started/virtualized-desktop-infrastructure 。 | 存储位置**已核实**；"是否加密"**未核实（官方无声明，未见一手）** |
+| **A3-F10** | **微软对"邮件在存储状态怎么保护"的官方分层**：Exchange S/MIME 页的"相关邮件加密技术"一节："各种加密技术配合使用，为处于静止和传送状态的邮件提供保护"，列举 **TLS**（服务器之间/客户端与服务器之间）与 **BitLocker**（"对数据中心硬盘上的数据进行加密，以便在有人获得未经授权的访问时无法读取该数据"）；并明确 **"用户控制 S/MIME 中的加密密钥"**、S/MIME 需要 PKI/证书发布基础设施、依赖 AD DS 里 `UserSMIMECertificate`/`UserCertificate` 发布证书。⇒ 微软的答案：**内容层用 S/MIME（密钥在客户手里），磁盘层用 BitLocker（在自己的设备上），两者都不是"客户端库加密"**。来源：https://learn.microsoft.com/zh-cn/exchange/policy-and-compliance/smime/ 。 | 已核实（官方原文） |
+
+## 三、Apple Mail（macOS）
+
+| 编号 | 结论 | 状态 |
+|---|---|---|
+| **A3-F11** | **Apple 的回答是卷加密 + 文件级 Data Protection，Mail 自己不做加密层**：官方《通过加密保护 Mac 信息》把 FileVault 作为对"磁盘上数据"的保护手段（https://support.apple.com/zh-cn/guide/mac-help/mh40593/mac ）；官方《Data Protection classes》列出 `Complete` / `CompleteUnlessOpen` / `Protected Until First User Authentication` 等类，并写明"**macOS 使用卷密钥来复现 FileVault 的保护特性**"，且举的例子正是邮件——"**一个很好的例子就是后台下载中的邮件附件**"。⇒ macOS 上"邮件正文/附件的 at-rest 保护"= OS 提供的 Data Protection/FileVault，Mail 不额外加密；文件级密钥由系统托管，用户不感知、也不需要记口令。来源：https://support.apple.com/en-us/guide/security/secb010e978a/web 。 | 已核实（官方手册原文） |
+| **A3-F12** | 反例事件：2019 年 macOS 的 `suggestd` 在 `~/Library/Application Support/…/Suggests/snippets.db` 里留下 **S/MIME 加密邮件的明文副本**，Apple 的缓解条件之一就是"用户须启用 FileVault"。我**只拿到二手中文报道**（https://m.zol.com.cn/article/7321171.html ），**Apple 官方 security releases / 公告未抓取**。它的用途只是说明：**"逐封加密"并不能保护"本地那份明文缓存"——问题在缓存，不在算法。** | **未核实**（一手未取到）；仅作为论证性旁证 |
+
+## 四、其它客户端（含中文产品）
+
+| 编号 | 结论 | 状态 |
+|---|---|---|
+| **A3-F13** | **The Bat!（Ritlabs）是唯一在官网层面宣称"整库可加密落盘"的桌面邮件客户端**：产品页原话（搜索抓取）："protects your information through **multiple encryption streams**, with **the option to keep all information encrypted on your disk**, and to protect emails during…" 来源：https://www.ritlabs.com/en/products/thebat/ 。⚠️ **两个没核实到的关键点**：①加密粒度（整库/每账户/每邮箱）与算法；②**口令丢失的后果**。官网与知识库页被 JS/bot 挑战拦截（`ritlabs.com` 返回 proof-of-work 页），我没能拿到一手条文。**不要**把它当"它不会丢数据"或"口令丢了就全没"的证据——两者都待官网复核。 | 宣称**已核实（厂商官网）**；机制与密钥丢失**未核实** |
+| **A3-F14** | **eM Client**：官方内容只讲 **PGP / S-MIME** 与"离线下载 / 备份"（https://www.emclient.com/email-data-loss 讲 `Download messages for offline use` 与 `.eml` 导出/内置备份；App Store 官方简介列 "PGP and S/MIME encryption"），**未见任何"本地数据库加密"声明**。同页有另一条重要口径（也是 A3-F13 类问题的通用答案）：设置密钥时提示"**如果您的私钥丢失，您将无法再读取加密的邮件**"——厂商对密钥丢失的态度是**免责告知**，不是补救。 | **未见声明**（负面命题无法证明）；免责口径厂商内容**已核实** |
+| **A3-F15** | **Mailbird**：官方博客明确"本地存储模型 = 邮件只在你设备上，Mailbird 服务器永远拿不到"，并把设备侧加密责任**交给用户**："The local storage model concentrates security responsibility on individual devices, **requiring users to maintain device-level encryption** through methods like **FileVault on macOS**, strong passwords, and multi-factor authentication." 来源：https://www.getmailbird.com/apple-mail-emergency-security-patch-webkit-vulnerabilities/ 、https://www.getmailbird.com/comparing-email-providers-privacy-security/ 。⇒ 又一家"我们把 at-rest 交给 OS"的厂商，且是厂商自述。 | 已核实（厂商自述，属营销文，非安全设计文档） |
+| **A3-F16** | **Mailspring / Air Mail**：本次检索**没有拿到任何一手说明**（官方文档/源码页未被检索命中）。**结论缺失，不要引用。** | **未核实** |
+| **A3-F17** | **国产"本地加密存储"宣称的真相**——这是本次最重要的中文发现之一：① **QQ 邮箱官方帮助**对"邮件加密"的定义是**服务端 + 收件人口令**："加密的内容包括邮件正文、附件，收件人需要解密后才可查看"，外域用户收到的是"**加密打包成一个 zip 压缩包**"，并说"可以使用 **Foxmail 7** 邮件客户端查看该封加密邮件（输入邮件密码）"。⇒ 中文产品说的"邮件加密"= **逐封口令信封**，与"本地库 at-rest 加密"无关。来源：https://service.mail.qq.com/detail/0/152 。② 中文下载站/AI 文库大量出现"Foxmail **本地邮件数据库默认采用 AES 加密存储**""网易邮箱大师**本地存储采用 AES-256-CBC + PBKDF2**，敏感数据在 **DPAPI** 容器中，'邮件保险柜'**RSA-2048 封装 AES 密钥**"等具体到算法的"说明"（如 https://m.php.cn/faq/2474685.html 、https://wenku.csdn.net/doc/6qbtaea4do ）。**这三家的官方渠道我都没有找到对应表述**，且这些站点是典型的 SEO/机器生成内容（内容自相矛盾、给出根本不存在的版本号细节）。⇒ **判定：这些"本地加密存储"宣称没有一手出处，属不可引用材料。** ③ Foxmail 的账户口令历史上是**固定密钥异或混淆**（社区问答给死密钥 `~draGon~` / `~F@7%m$~`，https://wap.zol.com.cn/ask/x_7740852.html ）——二手、**未核实**，但方向与"混淆≠加密"一致。④ **网易邮箱大师官方可见的安全口径**只有 `EAL2 认证`、`锁定口令`、`专属邮件保险柜` 这类营销短语（多处下载站转述，官网未取到一手）。 | ①**已核实（官方帮助页）**；②④**未核实/存疑（疑为不实，勿引用）**；③**未核实** |
+| **A3-F18** | 唯一一个我找到"整库口令加密 + 明确承认口令丢失=数据丢失"的中文客户端是**畅邮（DreamMail）**：官方帮助文案（下载站镜像）："**若进行数据加密，他人即使获取邮件数据，没有密码也打不开！**"、"**务必记得密码，否则将打不开数据!**"、"建议不要勾选'记住密码'，否则时间长遗忘密码将导致所有数据丢失"。来源：https://m.gamedog.cn/pcsoft/617.html （镜像，**待官网复核**）。⇒ 这就是问题 (c) 的反面样本：**口令派生密钥 + 无恢复路径 = 把数据丢失风险制度化**，而我们的客户同时要"无数据丢失风险"。 | **未核实**（镜像来源；但表述内部一致，方向可信） |
+
+## 五、Proton Mail Bridge：这一层"客户端修不了"的最干净例子
+
+| 编号 | 结论 | 状态 |
+|---|---|---|
+| **A3-F19** | **Bridge 官方安全模型原话**："**Bridge does not store decrypted message data**. When an IMAP client requests a message body or attachment, it is downloaded from the Proton servers as an encrypted PGP message, **decrypted locally, and then transmitted to the IMAP client**."（https://proton.me/blog/bridge-security-model ）；产品页（中文/繁中）："**您的密碼絕不會離開您的機器，我們也絕不會將您的 PGP 金鑰或已解密的訊息資料永久儲存在磁碟上**"，同时另一段明确鼓励 "**Keep your existing workflow and store messages locally**" 与 "**Work offline when you need to: Download your emails using your desktop client**"（https://proton.me/mail/bridge 、https://proton.me/zh-tw/mail/bridge ）。 | 已核实（厂商原文；`proton.me/blog/bridge-security-model` 直抓失败一次，语句取自检索到的该页原文摘录，**URL 为一手**） |
+| **A3-F20** | **推论（重要）**：端到端加密服务商自己把密钥留在服务端之外、自己一个字节明文都不落盘，**但它的商业卖点就是"你可以用 Outlook/Thunderbird/Apple Mail 本地存一份"**——那一落盘，明文就在第三方客户端的库里了。⇒ **"客户端能不能加密本地库"根本不是这条链的瓶颈；瓶颈是"要不要在磁盘上留正文"。** 这条可以直接讲给涉密客户听：连 Proton 都承认这一层只能由 OS/用户负责。 | 已核实（由 A3-F19 原文直接得出） |
+
+## 六、企业归档 / DLP / 中国涉密·密评·国密实践
+
+| 编号 | 结论 | 状态 |
+|---|---|---|
+| **A3-F21** | **服务端归档产品真的做整库加密**——MailStore Server 10.0 发布说明："**【新增功能】数据库和审核日志的完全加密。** 除了数据库内的电子邮件内容和敏感数据的现有加密外，所有数据库和内部审核日志也将从此版本**完全加密**。这需要**升级所有存档存储**。"，同页另有"在慢磁盘或 USB 驱动器上的**数据库加密**期间，升级过程可能会意外停止""`MailStoreFileGroup.fdb.key`"等条目 ⇒ 整库加密 + **每个存储一份独立 `.key` 文件**。来源（厂商中文站）：https://www.mailstore.cn/blog/mailarchive-mailstore-server-new-features 。英文一手（mailstore.com 帮助/发行说明）未直接抓取。 | 已核实（厂商发布说明）；英文一手**待补** |
+| **A3-F22** | **邮件安全/隔离类产品也做**：ESET Mail Security 官方帮助："本地隔离使用本地文件系统存储隔离的电子邮件，并使用 SQLite 数据库作为索引。**出于安全原因，将对存储的隔离电子邮件文件以及数据库文件进行加密。**" 来源：https://help.eset.com/emsx/10.1/zh-CN/local_quarantine.html 。⇒ **共同点：加密的是"服务端/网关上那一份不得不留的副本"，密钥由服务器与管理员管理，不是桌面用户口令。** | 已核实（官方帮助） |
+| **A3-F23** | **国密邮件系统的真实架构（政府网站文章，本次最有价值的一条中文一手）**：四川省密码管理局刊登《基于商用密码技术的电子邮件系统研究》（2021-05-17，http://www.scmgj.gov.cn/scsmmglj/c103333/2021/5/17/56ae7953645d42a18ab89f3e1ea60c67.shtml ）明确：① 客户端"支持 SM2……为邮件客户端提供签名验签和加解密服务；支持 SM3……完整性验证；支持 SM4……为邮件客户端提供数据加密服务"，但"**与密码服务平台服务端共同为邮件客户端提供密钥生成、分发、存储等密钥管理服务和证书签发、验证等证书管理服务**"；② "**密钥、证书只在密码服务平台服务端和密码服务 SDK 中保存和分发，邮件服务端和邮件客户端不直接使用密钥和证书**"（逐字抓取成功）；③ "**SMIME 规范的当前版本只定义有国际标准的 RC、DES 等加密算法和 MD5、SHA 等摘要算法，未涉及商密算法**"，本文方案是"对 S/MIME 规范的增强，采用 SM2/SM3/SM4 进行邮件的加密、摘要和签名"；④ 依据 **《GM/T 0010—2012 SM2 密码算法加密签名消息语法规范》"要求，对明文电子邮件 MIME 中的邮件体进行数字信封封装"**。⇒ **结论：在中国合规语境里，"邮件内容的存储加密"= 逐封邮件体数字信封（S/MIME 的国密增强），密钥归口密码服务平台（加密机/服务器密码机），桌面客户端只是 SDK 调用方。** 客户想听的那句不是"我的库加密了"，而是"我的邮件体被 SM2/SM4 数字信封封装，密钥在你们的密码服务平台里"。 | 已核实（政府网站文章；文章是研究性论文，不是强制性标准） |
+| **A3-F24** | **标准著录（可用于写材料的准确名称/版本）**：`GM/T 0010-2012《SM2密码算法加密签名消息语法规范》`（国家密码管理局归口，**已被 `GM/T 0010-2023` 代替**；对应国标 `GB/T 35275-2017`；SM9 版为 `GM/T 0081-2020《SM9密码算法加密签名消息语法规范》`，另有 2025 年计划项 `20250639-T-469`/`20250640-T-469`）。来源：全国标准信息公共服务平台行业标准著录页 https://std.samr.gov.cn/hb/search/stdHBDetailed?id=1BF26B7A9FF7FD76E06397BE0A0A81D8 ；国家密码管理局公告（第 24 号，公布 14 项密码行业标准含 GM/T 0009/0010）http://gmj.tj.gov.cn/TZGG0/202109/t20210914_5594562.html 。⚠️ 用户提问里猜的 **GM/T 0034 与邮件无关**（它是证书认证系统密码及其相关安全技术规范方向）——**写材料时不要写错标准号**。 | 已核实（标准著录平台）；**会变**（2023 版与 2025 计划项在推进） |
+| **A3-F25** | **密评对"存储机密性"的判定要点（决定我们做什么才有分）**：① 依据标准是 **GB/T 39786-2021《信息安全技术 信息系统密码应用基本要求》**（2021-03-09 发布、2021-10-01 实施，24 页，四个技术层面：物理和环境/网络和通信/设备和计算/应用和数据安全）——著录页 https://scjgj.yangzhou.gov.cn/bzpt/BzInfoDetail/4f86cf1a-eba9-48fd-b26b-9664a193a7dc 。② **三级要求是"应"不是"宜"**：应采用密码技术保证信息系统应用的**重要数据在存储过程中的机密性**；配套还有传输机密性（应）、访问控制信息完整性（宜）等，业界总结为三级"14 宜 7 应 1 可"。③ **通过条件：得分 ≥60 且无高风险**；"未采用密码技术保证重要数据存储机密性"被列为**无缓解的高风险项**（见《数据存储加密技术白皮书 V2.0》对判定体系的转述，http://data.eastmoney.com/report/zw_industry.jshtml?encodeUrl=… 与腾讯云密评方案页 https://cloud.tencent.com/solution/guomi/ ）。④ **关键细节（腾讯云密评方案页原话）**："**数据加密密钥应存储在具有国密资质的产品中，若明文存储在密码产品之外，如配置文件、数据库等，将判定为高风险，一票否决。**" ⑤ **FAQ 第四版第 23 条**（四川省密码行业协会转载解读 https://www.schcia.org.cn/488/35521/2221070 ）："对于该项指标实现的符合性判定，**应以应用对数据资源（信源）本身是否进行加密为准**"——即用"透明加密设备整体包一层"而信源仍是明文，判分时看信源。⚠️ 标准正文逐字句与《信息系统密码应用高风险判定指引》原文我**都没有取到一手 PDF**（指引由密评联委会 2020-12 首发、2021-12-30 与另 4 项指导性文件一并更新发布，存在性可在四川省密码管理局目录页核到 https://www.scmgj.gov.cn/scsmmglj/c103248/list.shtml ）。 | ①②③**已核实（著录+多源一致）**；④⑤**已核实（转述自官方发布文件，逐字原文未取）** → **实现前必须拿标准正文复核** |
+| **A3-F26** | **自己写代码加密能不能被认可？** FAQ 第四版**有专门章节**《通过代码实现数据机密性、完整性保护的判定方法》与《组合密码算法的量化评估和风险判定》（目录见发布页 https://www.cacrnet.org.cn/site/content/1713.html ，中国密码学会密评联委会，2026-03-31 发布，附 PDF）。同时量化口径在业界被一致转述为：**明文存储 0 分；低强度算法（DES/RSA-1024/MD5/SHA-1）0.5 分；高强度算法（3DES/AES/RSA-2048/SHA-256/SM 系列）1 分**（https://www.modb.pro/db/635719 ）；但"**自行设计/未经安全性论证的算法**"直接触发高风险（题库口径）。⇒ **好消息：软件实现（含我们自己用 AES/SM4 加密字段）本身可被判分；坏消息：密钥必须交给合规密码产品（加密机/KMS/SDK），否则等于白做。** 我们的 DPAPI/凭据管理器**不是**国密资质密码产品。 | 章节存在**已核实（学会发布页）**；分值为**未核实（二手转述）** |
+| **A3-F27** | **涉密（分级保护）侧的法规底座**：《中华人民共和国保守国家秘密法》（2024 修订）第三十条："存储、处理国家秘密的计算机信息系统（以下简称涉密信息系统）按照涉密程度实行**分级保护**……按照国家保密规定和标准规划、建设、运行、维护，并配备保密设施、设备……**经检查合格后，方可投入使用**，并定期开展风险评估"；第三十一条禁止"未按照国家保密规定和标准采取有效保密措施，将涉密信息系统、涉密信息设备接入互联网"。来源：https://cpc.people.com.cn/GB/n1/2024/0228/c64387-40184765.html 。 | 已核实（法律全文） |
+| **A3-F28** | **涉密分级保护的技术依据是国家保密标准 BMB17（+ BMB22/BMB23），但这些标准不公开**。能在公开法规里核到的是：《信息安全等级保护管理办法》第四章"涉及国家秘密信息系统的分级保护管理"——涉密系统"按照国家保密工作部门有关涉密信息系统分级保护的管理规定和技术标准"保护、"依据国家保密标准 BMB17-2006《涉及国家秘密的计算机信息系统分级保护技术要求》确定系统等级"、由**国家保密局授权的测评机构**依据 BMB22-2007 测评、**通过审批后方可投入使用**（来源：https://baike.baidu.com/item/信息安全等级保护管理办法/383022 第四章全文转录；政务可核版本见山东省三部门印发文件 https://www.dengbaoceping.net.cn/dynamic/710.html ）。⇒ **"BMB17 第 5.3.1 条要求存储加密"这类句子只在 CSDN/文库里流传，一手不可得。交付材料里绝对不要写具体条款号，写"依据国家保密标准的分级保护要求，由客户方测评机构判定"更安全。** | 存在性与流程**已核实**；BMB 条文细节**未核实（不公开）** |
+| **A3-F29** | **信创/等保市场里邮件系统"存储加密"的真实交付形态（厂商自述，可作为"客户期待什么"的证据）**：拓波 TurboEx 的国密方案页给出两条路线——"方案一：SM9 全程端到端加密……邮件在发送端加密、只有最终收件人能解密。**服务器管理员也无法查看**。适用于**党政军涉密单位、纪检监察**"；"方案二（合规安全等级）：**SM4 存储加密 + SM2 TLS 传输**……存储用 SM4 加密硬盘……一次性满足**密评对传输加密和存储加密的双重要求**"，实现为 **TDE 透明数据库加密**（"在数据写入磁盘前自动加密、读取时自动解密，覆盖邮件正文、附件、地址簿、系统日志及备份文件"），密钥交给"**卫士通、奥联、渔翁、格尔、三未信安等加密机**"。来源：http://www.pcpop.com/article/6928708.shtml 、https://news.mydrivers.com/1/1140/1140114.htm 。⚠️ 均为媒体软文性质，**技术方向一致、具体性能数字（"损耗低于 5%"）不可引用**。 | 已核实（厂商口径，营销文）；数字**不可引用** |
+
+## 七、问题 (7)：有没有主流客户端用 SQLCipher？
+
+| 编号 | 结论 | 状态 |
+|---|---|---|
+| **A3-F30** | **桌面端：没有。** 逐一核对后：Thunderbird（明文 mbox/maildir，A3-F1）、Classic Outlook（口令非密钥约束的混淆，A3-F5/F6）、New Outlook（WebView2/IndexedDB，无加密声明，A3-F9）、Apple Mail（交给 FileVault/Data Protection，A3-F11）、eM Client / Mailbird（无库加密声明，A3-F14/F15）、Proton Bridge（自己不落盘，客户端落盘，A3-F19）。唯一宣称整库加密的是 The Bat!（自研，非 SQLCipher，A3-F13）。 | 已核实（各厂商一手均无 SQLCipher/页级库加密证据）；"确实没有"这一否定命题仍属**未见声明** |
+| **A3-F31** | **移动端同样没有一手证据。** Apple 移动/桌面统一走 **OS 级 Data Protection**（A3-F11），应用层加密在 iOS 上是"额外可选"而非行业默认；FairEmail 的官方 FAQ（`M66B/FairEmail` 仓库 `FAQ.md`）**完全没有提到 SQLCipher / 数据库加密**（我抓取全文检索后返回"无相关内容"）。Android 开发文档确实推荐"SQLCipher + Android Keystore 加密 Room"（如 https://juejin.cn/post/7554311700456194087 ），但**那是通用开发实践，不是我能在任何一个主流邮件 App 官方文档里核实的产品事实**。 | **未核实**（不要写"移动端都这么做"） |
+| **A3-F32** | **做整库加密的是服务端产品**：MailStore（归档，A3-F21）、ESET Mail Security（隔离区，A3-F22）、国密邮件系统的 TDE（A3-F29）。⇒ 这条对比很重要：**"整库加密 + 独立 `.key` 文件/加密机"是服务器运维模型**，桌面场景没有管理员、没有 KMS，套同一个方案只会把风险换成数据丢失。 | 已核实（A3-F21/22/29 来源） |
+| **A3-F33** | **对既有测量的一点复核（不推翻，只加固）**：SQLCipher 上游 `README.md` 原文要求"**compile and link with a supported cryptographic provider (OpenSSL, LibTomCrypt, CommonCrypto/Security.framework, or NSS)**"。⇒ ① 本机 `rusqlite bundled-sqlcipher` 报 `Missing environment variable OPENSSL_DIR` 与上游要求完全一致，**不是我们环境配错了**；② 上游承认 **LibTomCrypt** 是合法 provider，**与 `sqlcipher-src` 无 OpenSSL 路线一致**，这条路线在架构上成立；③ Windows 上 `sqlcipher.net/sqlcipher-for-windows/` 抓取失败，**"官方是否提供预编译 Windows 二进制"未核实**——需要时再核。来源：https://raw.githubusercontent.com/sqlcipher/sqlcipher/master/README.md 。 | 已核实（一手 README）；预编译包**未核实**；**会变** |
+
+---
+
+## 八、直接回答四个问题
+
+**(a) 行业标准答案是什么？它是不是恰好就是"不做，交给 OS / 用逐封加密"？**
+是。而且这不是我的一句概括，是**每家厂商各自的书面口径**：Mozilla——"主密码无法防止他人看到你的消息，请用 OS 独立账号"（A3-F1）；Microsoft——"PST 密码并非旨在抵御恶意访问，请创建受密码保护的 Windows 账号"（A3-F5），并在合规文档里把 at-rest 分层为 S-MIME（内容）+ BitLocker（磁盘）（A3-F10）；Apple——FileVault + Data Protection 类，Mail 自己不做（A3-F11）；Mailbird——"设备加密由用户维护（FileVault 等）"（A3-F15）；Proton——"我不落盘，但鼓励你本地存一份"（A3-F19/20）。
+**没有一家主流桌面客户端把"消息库页级加密"当成安全边界。** 做整库加密的三类产品（归档/隔离/服务端邮件系统）有一个共同前提：**那台机器上有管理员和密钥基础设施**（A3-F21/22/29/23）。
+
+**(b) 要给涉密客户"比 BitLocker 更进一步"的东西，现实选项按成本 × 实际保护排序** —— 见下一节表。
+
+**(c) 厂商怎么处理密钥丢失陷阱？**
+答案很干脆：**不处理，改为书面免责。**
+Microsoft："Microsoft、ISP 或邮件管理员都无法访问您的密码，如果您忘记了密码，他们也不能帮助您恢复 Outlook 数据文件 (.pst) 的内容"（https://support.microsoft.com/zh-cn/office/增加-outlook-97-2002-中-outlook-数据文件-pst-的存储容量-b099d89a-1d75-4f54-a32c-b40b86d9440f ）；
+畅邮："务必记得密码，否则将打不开数据"（A3-F18）；
+eM Client："如果私钥丢失，您将无法再读取加密的邮件"（A3-F14）。
+**唯一"避免"了这个陷阱的模式是 Thunderbird 的模式**：受密钥保护的东西一旦丢了，**丢掉的是可重建的东西**——重置主密码只是删掉已存口令，邮件与配置毫发无损（A3-F2）。
+翻译成我们的设计：**把"被加密保护且不可重建的数据"降到 0**，或者**让不可重建的数据在服务器上有一份副本**（A3-F7 的 OST 定性就是这句话）。
+"密钥绑定账号口令、重新登录即恢复"这条路我也核了一遍：中文厂商的"邮件加密"其实是**每封一个口令、口令靠人工转达**（A3-F17），它不依赖本地密钥文件，因此也没有本地密钥丢失问题；但它把恢复问题变成了"你知不知道那封信的口令"，**同样是免责式**。
+
+**(d) 有没有一手资料明说"本地缓存邮件正文本身就是合规问题"？**
+**有，就是微软自己。** WIP 官方文档（A3-F8）："**如果 Outlook 处于默认的缓存模式……数据不受保护（the data is unprotected）**"，Workaround 第一句就是"**建议使用 Outlook 的 Online 模式**"，第二句才是"或者手工加密 OST/PST"。⇒ "不落正文"是被厂商文档写进缓解措施的第一选项。
+另外两条支撑：Apple 的 2019 `snippets.db` 事件说明"缓存里那份明文会绕过你的端到端加密"（A3-F12，二手）；Proton 明确自己不落盘、把落盘留给客户端（A3-F19/20）。
+**涉密侧我没有找到"禁止本地缓存邮件"的一手公开条文**（BMB 系列不公开，A3-F28）——这一点要标"未核实"，让客户的保密办/测评机构给依据，我们只提供能力（开关 + 审计日志），不要替标准做断言。
+
+---
+
+## 九、给本仓库的选项排序（成本 × 实际保护的是什么）
+
+> 成本口径：**S = ≤1 周，M = 2–6 周，L = 1–3 个月**（人周）；
+> "保护什么"只写**能被拿在手里看的东西**，不写营销词。
+> 当前基线：`cache.db`（正文 + FTS5，可弃，`crates/mail-core/src/cache.rs:542`）、`user.db`（草稿/发件队列/规则/联系人/ Saved Search/设置，唯一不可重建，`crates/mail-core/src/userdb.rs:1903-2041`）、`spool` 明文 `.eml`（`crates/mail-core/src/spool.rs:45-57`）、口令在凭据管理器、令牌在 DPAPI（`secret.rs`/`tokenstore.rs`）。
+
+| 选项 | 成本 | 实际保护什么 | 关键工程/合规后果 |
+|---|---|---|---|
+| **1. 在线优先 / 正文不落地（"涉密模式"）**：`cache.db` 只存信封元数据（头/flags/UID/大小/附件名），正文按需 `UID FETCH` 且不写盘（只进内存），可配"最近 N 天正文"窗口 + 一键"清空全部正文" | **S**（3–6 天）：现有 fetch 路径已把正文与索引解耦；改的是"写不写 body"这一个决策 | **消除**，而不是缓解：磁盘上不存在正文 ⇒ 没有"加密强度"可谈，同用户恶意软件与离线取证都拿不到东西 | 全文搜索退化为"服务器端 `UID SEARCH` + 主题/发件人本地 FTS"（`A1-F43`：复杂 SEARCH 可用，`ESEARCH` 不可用 → 用原始 `UID SEARCH`）；离线体验变差，必须 UI 明示。**与 A3-F8 微软官方建议同向，是本次唯一"能改变合规判定前提"的选项** |
+| **2. OS 加密作为书面部署前置条件 + 启动自检**：检测 BitLocker/设备加密与"当前 OS 账号独占"，不满足则拒绝启用涉密模式并给出报告 | **S**（1–2 天）：WMI `Win32_EncryptableVolume` 或 `manage-bde -status` 取状态，写进 `14-security-privacy.md` 部署章节 | 保护**T4 物理接触/离线磁盘**（这是 `14-security-privacy.md` 威胁表里唯一"加密库"也救不了的场景之一，因为运行时磁盘是解开的） | 这是 Microsoft/Apple/Mailbird 三家共同的官方口径（A3-F10/F11/F15）。**注意：密评分层里它记在"设备和计算安全"，拿不到"应用和数据安全—存储机密性"的分**（A3-F25/26）⇒ 对客户要诚实说这是前提条件而不是交付物 |
+| **3. 逐封加密：OpenPGP（已排期）+ S/MIME 验签/解密（已排期）+ 国密增强（SM2/SM3/SM4 数字信封）** | OpenPGP 发送端 = `A1-F16` 的 **L（2–4 个月）**；S-MIME 验签/解密 **M**；**国密增强另加 M**（对接客户密码服务平台 SDK / `GM/T 0009`/`0010`/GB/T 32918 系列，用 `windows` crate 调 SKF/智能密码钥匙或 SDF 接口） | **邮件体本身**，且这是唯一与"信源是否加密"的判定口径对齐的选项（A3-F25 ⑤、A3-F23 ④） | **前提：客户侧必须有 PKI/密码服务平台**（A3-F10/F23）。没有它，客户端做国密只是"自己写算法"，按 A3-F26 反而可能触发高风险。**这才是"比 BitLocker 更好"的那句话** |
+| **4. 把草稿与发件队列镜像到服务器**（IMAP `APPEND` 到 Drafts / 专用文件夹；POP/本地账号则给显式"上传备份"） | **S–M**（1–2 周，含 A1-F3 的 `APPENDLIMIT` 预检、A1-F2 的 163 30 天范围坑） | **不是加密，是消掉"丢了就没了"这件事** ⇒ 让选项 5/6 的密钥丢失后果从"不可接受"变成"重新登录即可" | 这是 A3-F7（OST 不必备份，因为服务器是权威）与 A3-F2（主密码丢了只是丢凭据）两个模式在我们身上的落地。**做 5/6 之前先做 4**，否则 5/6 会净增数据丢失风险 |
+| **5. `user.db` 整库页级加密（SQLCipher）** | **M–L**（2–4 周纯功能 + **本仓库的构建/测试面被拖累**：`A1` 提到的 510 测试与性能夹具都要重跑；上游要求外部 crypto provider，见 A3-F33，本机 `OPENSSL_DIR`/`nasm`/`make` 缺失是**上游要求**不是环境问题） | `user.db` 里**不可重建的那一小撮**（草稿、发件队列、规则、Saved Search、设置） | ① 密钥若来自用户口令 ⇒ 引入 A3-F18 式免责；② 密钥若来自 DPAPI/凭据管理器 ⇒ **同用户恶意软件照样能解（SECURITY.md 已承认），且按密评口径"密钥明文存在密码产品之外"可能被判高风险，等于白做**（A3-F25 ④）；③ 客户会误以为"涉密达标"。**结论：技术上可做，合规与体验上都买不到东西，性价比最低** |
+| **6. 选择性字段/文件加密**（只加密 `user.db` 的 draft body 列 + `spool/*.eml` + 附件缓存，用 AES-256-GCM/SM4，密文放同库新列） | **S–M**（3–8 天）：不动 SQLite 引擎、不动 `synchronous=FULL` 断言、**不碰 `cache.db` 的 FTS5**（FTS5 与加密正文天然互斥） | 与 5 同样的数据，但**明确划定"只有不可重建的正文被加密"**，可给出"哪张表哪一列是密文"的可核查清单（比"整库加密"更好向测评解释） | 密钥策略仍受 5 的②约束 ⇒ **只有配合 4（服务器副本）或 1（在线优先）才值得做**；性能影响可控（草稿体量小） |
+| **7. 国密改造对接客户密码服务平台（SDK / 加密机）** | **L**（1–2 个月，且大部分不是我们写：客户须已有 密码服务平台 + CA + 密钥管理，见 A3-F23 ②、A3-F29） | 与选项 3 相同，但**密钥不由我们保管**——这是涉密项目里唯一"密钥丢失"不存在的路径（密钥在客户的基础设施里） | **这是真正能"给客户看见比 BitLocker 更好"的方案**，但它是**集成项目**不是产品功能；要谈成"由客户/集成商提供 SDK 与证书，我们负责调用"的分工，否则我们变成密钥管理责任方 |
+
+**推荐组合（写给决策的一句话）**：**1 + 2 + 4 打底（≤3 周，S 级），3 按客户 PKI 情况跟进，5/6 只在 4 已完成后作为可选增强，7 留作商务/集成议题。**
+理由：1 与 4 直接把"存储加密"和"数据丢失"两个要求同时消解掉，而不是在两者之间做交换；2/3 是厂商与合规口径都认的表述；5 是唯一"看起来最像交付物、实际买不到分、还会新增丢失面"的选项（A3-F25/26/33）。
+
+### 落地情况（本轮实测，不是计划）
+
+**选项 1 已实现**（正文不落盘 = `BodyStorage::OnlineOnly`）：
+
+| 部分 | 位置 |
+|---|---|
+| 模式本身与"写不写正文"的唯一决策点 | `crates/mail-core/src/cache.rs:374`（枚举）、`:450`（句柄上的 mode）、`:1804`（已存正文计数）、`:1830`（`purge_all_bodies`） |
+| 元数据列（正文可以不留，收件人/抄送/附件名必须留下） | `SCHEMA_VERSION = 10` 的 `messages.cc_addrs` / `messages.attachment_names`，清空时从 `bodies.detail` 回填 |
+| 后台预取在同模式下不发 FETCH | `crates/mail-core/src/index.rs:433`（并让 `backfill_wait` 报 `Idle` 而不是变成重试风暴） |
+| 偏好存在 `user.db`（不是 `cache.db`） | `crates/mail-core/src/userdb.rs:39`、`:1868`、`:1876` ⇒ **删缓存不可能把这个开关关掉** |
+| 启动时读取并施加；读不到就**关闭写入**而不是沿用默认 | `src-tauri/src/lib.rs:2262`、`:2281` |
+| 命令与界面 | `src-tauri/src/lib.rs:2304`/`:2324`，设置在"存储与清理"面板（`src/app.js:4417`），清空只在**切进**不落盘时提供 |
+| 取证 | `cache.rs` 里 4 个新测试直接 grep `cache.db` + `-wal` + `-shm` 的字节：正文文本不在，而主题/收件人/抄送/附件名仍可搜 |
+
+**选项 2 的"部署前置条件 + 启动自检"已实现**：`src-tauri/src/diskprotect.rs`（`Win32_EncryptableVolume` 的**两个整数**，不解析 `manage-bde` 的本地化文案）+ 提权脚本 `tools/disk-protection-check.ps1`（退出码 0/1/2 可直接用于部署验证）。
+实测：`manage-bde -status` 与同一 CIM 查询在**非管理员**进程里都返回 Access Denied（本机 Windows 10.0.26300），所以应用内自检是三态（已加密且保护已开启 / 不满足 / **无法判定**），且"无法判定"永远不等于"满足前置条件"。留档以提权脚本的输出为准。
+
+选项 4（草稿与发件队列镜像到服务器）**先前已实现**：`crates/mail-core/src/sentcopy.rs` + `userdb.rs` 的 `draft_mirrors`。
+⇒ 推荐组合的 1/2/4 三件现在都在代码里；**剩下能买分的只有 3（OpenPGP/S-MIME）与 7（客户密码服务平台）**，而两者都取决于客户侧是否已有 PKI。
+
+---
+
+## 十、我不建议做的事
+
+1. **不要把 SQLCipher 当作"满足涉密/密评存储加密要求"的卖点。** 桌面场景没有 KMS/加密机，密钥只能落 DPAPI/凭据管理器/口令派生，三条出路分别撞上：同用户恶意软件可读（`SECURITY.md` 既有承认）、密评"密钥明文存于密码产品之外=高风险"（A3-F25 ④）、口令丢失=数据永久不可读（A3-F18）。
+2. **不要自己发明主密钥体系**（应用级 KMS、"主密钥+每库随机密钥+备份种子码"这类）。按密评口径，"自行设计/未经安全性论证的算法"直接触发高风险（A3-F26），且种子码会把我们变成密钥托管方，风险高于收益。
+3. **不要为了"看起来加密了"去加密 `cache.db` 的正文列。** FTS5 全文索引会废掉（索引项就是明文分词），而 A1-F41/43 告诉我们搜索与增量同步都建立在这套索引上；换来的是"同用户恶意软件仍然能解"的东西。想做正文不落盘，做选项 1，不是选项 6。
+4. **不要在交付材料里引用**：BMB17 的具体条款号（条文不公开，A3-F28）、"网易邮箱大师/Foxmail 本地 AES 加密存储"（无一手出处，A3-F17）、MailStore/TurboEx 的性能数字（厂商营销，A3-F29/21）、"iOS/Android 邮件 App 都用 SQLCipher"（无一手证据，A3-F31）。
+5. **不要在材料里把"依赖操作系统加密"写成我们的短板或含糊其辞。** Microsoft/Apple/Mozilla 三家的一手原文就是这么说的（A3-F1/5/10/11/15）；正确写法是把它作为**书面部署前置条件**（选项 2）并给出自检工具，而不是道歉。
+6. **不要碰别的客户端保存的口令/密钥库**（沿用 `A1-F7` 结论）。
+7. **不要写"军事级加密/银行级加密"式话术**（`14-security-privacy.md` 反驳 5 已有此约定，本文再确认一次：我们的诚实披露比营销词更能过测评）。
+8. **不要在 S-MIME/国密上对客户做无法兑现的承诺**：`A1-F18`（互联网上没有 S-MIME 密钥发现机制）+ A3-F10（S-MIME 需要客户自建 PKI/证书发布）→ 没有客户侧 CA 与密码服务平台，就不要写"支持国密邮件加密"。
+
+---
+
+## 十一、待补（下一轮）
+
+| 缺口 | 影响 | 状态 |
+|---|---|---|
+| [MS-PST] 开放规范中"PST 加密不受口令约束"的**逐字条文**（A3-F6） | 讲 Classic Outlook 时最想引的一手 | 未取到（learn.microsoft 规范页搜索未命中），待用规范 PDF 定位 |
+| GB/T 39786-2021 **正文逐字句** + 《信息系统密码应用高风险判定指引》原文 PDF（A3-F25/26） | 任何"密评会怎么判"的书面陈述都依赖它 | 仅有著录与多源转述；**实现前必须买/查正式文本** |
+| Thunderbird 英文 KB 原句 + Mozilla 对 CVE-2021-29956 的安全公告（A3-F1/F3） | 材料里要放英文一手 | support.mozilla.org 页面被 JS 拦截；已用 zh-CN 官方页 + 检索到的原文 |
+| The Bat! 官网/知识库的加密粒度与口令丢失政策（A3-F13） | 唯一宣称整库加密的桌面客户端，客户一定会问"别人怎么管密钥" | ritlabs.com 有 bot 挑战，未取到 |
+| MailStore 英文一手发行说明/帮助（A3-F21）、`sqlcipher-for-windows` 官方预编译包（A3-F33） | 归档侧对照 + 构建路线选择 | 中文厂商页/README 已足够下结论，细节待补 |
+| 涉密项目对"终端本地缓存涉密邮件"的实际处置（禁用/白名单/审计上报），以及《涉密信息系统分级保护》测评项里是否有对应条目（问题 d） | 直接决定选项 1 是否要做成默认 | **未核实**（BMB 不公开）⇒ 由客户保密办/测评机构给依据 |
