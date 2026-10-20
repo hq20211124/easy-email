@@ -198,6 +198,39 @@ fn header_block(raw: &[u8]) -> &[u8] {
     }
 }
 
+/// What the fixture answers for `uid`, with `body_chars` of Chinese filler appended to the synthetic
+/// messages.
+///
+/// The four rich templates keep their own bytes — behaviour tests read them. Only the filler grows a
+/// body, and it grows a **Chinese** one, because that is the mail this product indexes and CJK is
+/// tokenised per character (`design/09` §11): a body of ASCII `x`s would make a throughput reading
+/// look like the cheap half of the work.
+fn message_served(uid: u32, body_chars: u32, mailbox: &str) -> Vec<u8> {
+    let mut raw = message_for(uid);
+    if body_chars == 0 || uid <= RICH_MESSAGES {
+        return raw;
+    }
+    const FILLER: &str = "这封信的正文用来量吞吐，每封都不一样，索引要一个字一个字地切。";
+    // Naming the mailbox it was served from is what makes a cross-folder mix-up *visible*: without it,
+    // a body fetched from the wrong folder is byte-identical to the right one and no assertion can see
+    // the bug (`Server::require_select`).
+    let mut body = format!("文件夹 {mailbox} · 第 {uid} 封 · ");
+    while (body.chars().count() as u32) < body_chars {
+        body.push_str(FILLER);
+        body.push_str(&format!("（第 {uid} 封）"));
+    }
+    raw.extend_from_slice(body.as_bytes());
+    raw
+}
+
+/// The mailbox argument of a `SELECT`/`EXAMINE` line, unquoted.
+fn mailbox_argument(line: &str) -> String {
+    // `A9 SELECT "已发送/存档"`: everything after the verb is the name, and the name may contain
+    // spaces. Quoting is only stripped at the ends, which is all the fixture's own clients send.
+    let rest = line.splitn(3, ' ').nth(2).unwrap_or("INBOX");
+    rest.trim().trim_matches('"').to_string()
+}
+
 /// Parse the `<start.length>` suffix of a partial fetch, if the command carries one.
 ///
 /// Takes an uppercased command line, which does not matter here: the suffix is all digits.
@@ -289,6 +322,30 @@ struct Server {
     /// Off by default because the folder list is asserted on elsewhere, and a fixture that quietly
     /// grows a folder makes those assertions lie about what they cover.
     drafts: bool,
+    /// Milliseconds the server waits before answering a `FETCH` — the fixture's round trip.
+    ///
+    /// Zero for every behavioural test, so nothing that used to pass changes shape. It exists because
+    /// the body prefetch pass is *round-trip* bound rather than byte bound (one `UID FETCH` per
+    /// message), and a fixture with a free round trip cannot measure that: on a zero-latency loopback
+    /// the serial shape and a batched one differ by milliseconds, while on a real server 150 ms × N
+    /// is the whole cost. The throughput bench turns this knob and reads the rate back.
+    fetch_latency_ms: Arc<AtomicU32>,
+    /// Body length, in characters, appended to the *synthetic* messages (`uid > RICH_MESSAGES`).
+    ///
+    /// The filler the paging tests use is header-only, which would make a throughput reading measure
+    /// nothing but framing. Real Chinese mail carries a body, and the body is what costs: it is parsed,
+    /// stored and tokenised one character at a time (`design/09` §11). Counted in characters rather
+    /// than bytes for the same reason the index cap is.
+    filler_body_chars: Arc<AtomicU32>,
+    /// Refuse to answer `UID FETCH` when nothing has been `SELECT`ed on this connection.
+    ///
+    /// **This is what a real server does** — `UID FETCH` has no folder argument, it only means
+    /// something inside a selection. Off by default because most of the 52 behavioural tests here are
+    /// about other commands, and the lenient fixture is exactly what let the body prefetch pass ship
+    /// for months without ever selecting: it was reading whichever folder the pooled connection last
+    /// sat in, and storing that body under another folder's key. A folder-scoped pass must run with
+    /// this on, or the test proves nothing about folders.
+    require_select: bool,
 }
 
 impl Default for Server {
@@ -300,6 +357,9 @@ impl Default for Server {
             idle: Arc::new(Mutex::new(Idle::Quiet)),
             extra: Arc::new(AtomicU32::new(0)),
             drafts: false,
+            fetch_latency_ms: Arc::new(AtomicU32::new(0)),
+            filler_body_chars: Arc::new(AtomicU32::new(0)),
+            require_select: false,
         }
     }
 }
@@ -332,6 +392,9 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
             let close_on_noop = Arc::clone(&server.close_on_noop);
             let idle = Arc::clone(&server.idle);
             let extra = Arc::clone(&server.extra);
+            let fetch_latency_ms = Arc::clone(&server.fetch_latency_ms);
+            let filler_body_chars = Arc::clone(&server.filler_body_chars);
+            let require_select = server.require_select;
             tokio::spawn(async move {
                 let _ = serve_imap(
                     stream,
@@ -342,6 +405,9 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
                     close_on_noop,
                     idle,
                     extra,
+                    fetch_latency_ms,
+                    filler_body_chars,
+                    require_select,
                 )
                 .await;
             });
@@ -363,6 +429,9 @@ async fn serve_imap(
     close_on_noop: Arc<AtomicBool>,
     idle: Arc<Mutex<Idle>>,
     extra: Arc<AtomicU32>,
+    fetch_latency_ms: Arc<AtomicU32>,
+    filler_body_chars: Arc<AtomicU32>,
+    require_select: bool,
 ) -> std::io::Result<()> {
     let (read_half, mut write) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -381,6 +450,11 @@ async fn serve_imap(
     // arrived. (A snapshot would make `SELECT` keep reporting the old size after a push, which is how
     // this line went wrong the first time.)
     let available = || RICH_MESSAGES + extra.load(Ordering::SeqCst);
+    // Which mailbox this connection is `SELECT`ed into. `UID FETCH` carries no folder argument, so in
+    // real IMAP it means "in whatever is selected right now" — and a fixture that does not track the
+    // selection cannot tell a client that selects per folder from one that reads whichever folder the
+    // connection last happened to sit in. That distinction is the whole point of `require_select`.
+    let mut in_mailbox: Option<String> = None;
     let mut line = String::new();
 
     loop {
@@ -478,6 +552,7 @@ async fn serve_imap(
                             .as_bytes(),
                     )
                     .await?;
+                in_mailbox = Some(mailbox_argument(&trimmed));
                 ok(&mut write, &tag, "[READ-WRITE] SELECT completed").await?;
             }
             "UID" => {
@@ -511,14 +586,35 @@ async fn serve_imap(
                         ok(&mut write, &tag, "UID SEARCH completed").await?;
                     }
                     "FETCH" => {
+                        // RFC 2177/3501: `UID FETCH` outside a selection is a protocol error, not an
+                        // empty answer. A fixture that answers it anyway is what lets a client that
+                        // never `SELECT` look correct — see `Server::require_select`.
+                        if require_select && in_mailbox.is_none() {
+                            bad(
+                                &mut write,
+                                &tag,
+                                "UID FETCH: no mailbox selected (fixture require_select)",
+                            )
+                            .await?;
+                            continue;
+                        }
                         let set = tokens.get(3).copied().unwrap_or("1");
                         let query = trimmed.to_ascii_uppercase();
                         let headers_only = query.contains("[HEADER]");
                         // A partial fetch (`BODY[]<start.length>`) must return only that slice, or a
                         // streaming download would silently receive the whole message every time.
                         let partial = partial_range(&query);
+                        // The round trip, paid **once per command** — which is exactly the quantity the
+                        // prefetch pass multiplies by the number of messages it fetches one at a time.
+                        // Placed before the first response byte, so the client waits for the whole command.
+                        let latency = fetch_latency_ms.load(Ordering::SeqCst);
+                        if latency > 0 {
+                            tokio::time::sleep(Duration::from_millis(latency as u64)).await;
+                        }
+                        let body_chars = filler_body_chars.load(Ordering::SeqCst);
+                        let served_in = in_mailbox.clone().unwrap_or_else(|| "INBOX".to_string());
                         for uid in parse_uid_set(set, available()) {
-                            let raw = &message_for(uid);
+                            let raw = message_served(uid, body_chars, &served_in);
                             let (payload, section): (&[u8], String) = match partial {
                                 Some((start, length)) => {
                                     let start = start.min(raw.len());
@@ -526,7 +622,7 @@ async fn serve_imap(
                                     (&raw[start..end], format!("BODY[]<{start}.{length}>"))
                                 }
                                 None if headers_only => {
-                                    (header_block(raw), "BODY[HEADER]".to_string())
+                                    (header_block(&raw), "BODY[HEADER]".to_string())
                                 }
                                 None => (raw.as_slice(), "BODY[]".to_string()),
                             };
@@ -673,6 +769,12 @@ async fn serve_imap(
                 // A pool must survive a server that closed an idle connection without saying so.
                 if close_on_noop.swap(false, Ordering::SeqCst) {
                     return Ok(());
+                }
+                // `CLOSE` really does unselect (RFC 3501: the connection returns to the selected
+                // state's absence), and a fixture that keeps the old selection would let a client keep
+                // fetching after a close as if the folder were still open.
+                if verb == "CLOSE" {
+                    in_mailbox = None;
                 }
                 ok(&mut write, &tag, "completed").await?
             }
@@ -2652,7 +2754,14 @@ impl mail_core::index::BodySource for UnreadableUid<'_> {
 /// pass picks up exactly what the first one left).
 #[tokio::test]
 async fn a_bounded_body_index_pass_resumes_until_nothing_is_pending() {
-    let (addr, _log) = spawn_imap(true).await;
+    // `require_select`: a pass that fetches bodies without selecting a folder must not be able to pass
+    // this test by accident — the lenient fixture would answer from whichever folder it last saw.
+    let (addr, _log) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        ..Server::default()
+    })
+    .await;
     let cfg = account(addr, addr);
     let mut client = within(ImapClient::connect(&cfg, "app-password"))
         .await
@@ -2713,6 +2822,208 @@ async fn a_bounded_body_index_pass_resumes_until_nothing_is_pending() {
     );
 }
 
+/// **The folder bug this fixture was hiding (found 2026-10-20, while building the P8b ruler).**
+///
+/// `UID FETCH` has no folder argument — it reads from whatever the connection has `SELECT`ed. The
+/// background body pass ignored the `folder` it was handed (`BodySource for ImapClient` said "the
+/// caller already selected it", and the caller never did), so every pending row in the account was
+/// fetched out of whichever folder the pooled connection last happened to sit in. Two outcomes, both
+/// wrong: nothing gets indexed (a server that refuses the command, and the log line only prints when
+/// it indexed something), or **another folder's body gets stored under the right key** — the message
+/// the user later opens, and the words search then matches, are somebody else's mail.
+///
+/// The old fixture answered `FETCH` regardless of selection, so all of this was invisible: the pass
+/// was green here and broken against every real server. `require_select` is the server saying what a
+/// real server says.
+#[tokio::test]
+async fn the_body_pass_fetches_each_folder_from_that_folder() {
+    let (addr, _log) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        extra: Arc::new(AtomicU32::new(10)),
+        filler_body_chars: Arc::new(AtomicU32::new(90)),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+
+    within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+
+    // A second folder, holding the *same UIDs*. This is the case that corrupts: in the first folder's
+    // selection, `UID FETCH 7` answers that folder's number seven, and the pass used to store it
+    // against 已发送/7. Fetching these headers also leaves the connection SELECTed into 已发送 —
+    // exactly the stale selection the bug relied on.
+    let page = within(client.fetch_newest_headers("已发送", 20))
+        .await
+        .expect("sent headers");
+    assert!(
+        !page.summaries.is_empty(),
+        "the fixture serves the second folder"
+    );
+    cache
+        .upsert_summaries(&cfg.id, "已发送", &page.summaries)
+        .expect("store sent rows");
+
+    let mut rounds = 0u32;
+    loop {
+        let report = within(index_bodies_pass(
+            mail_core::index::BodyIndexRun {
+                cache: &cache,
+                cfg: &cfg,
+                limit: 20,
+            },
+            &mut client,
+        ))
+        .await
+        .expect("pass");
+        assert_eq!(
+            report.failed, 0,
+            "a fetch from the wrong folder must not be needed"
+        );
+        rounds += 1;
+        if report.remaining == 0 {
+            break;
+        }
+        assert!(
+            rounds < 6,
+            "the pass must drain the backlog, not stall in one folder"
+        );
+    }
+
+    for uid in 5..=9u32 {
+        let sent = cache
+            .get_detail(&cfg.id, "已发送", uid)
+            .expect("read")
+            .unwrap_or_else(|| panic!("已发送/{uid} has no body — the pass did not index it"));
+        let inbox = cache
+            .get_detail(&cfg.id, "INBOX", uid)
+            .expect("read")
+            .unwrap_or_else(|| panic!("INBOX/{uid} has no body — the pass did not index it"));
+        let sent_body = sent.body_text.unwrap_or_default();
+        let inbox_body = inbox.body_text.unwrap_or_default();
+        assert!(
+            sent_body.contains("文件夹 已发送"),
+            "已发送/{uid} holds a body that says it came from {sent_body}"
+        );
+        assert!(
+            inbox_body.contains("文件夹 INBOX"),
+            "INBOX/{uid} holds a body that says it came from {inbox_body}"
+        );
+    }
+}
+
+/// **P8b 基线尺子（第 9 项步骤 1）.** How many bodies one prefetch pass can swallow, and what each one
+/// costs in round trips, as the server's latency moves.
+///
+/// Ignored because it is a measurement, not an assertion — run it with:
+/// `cargo test --release -p mail-core --test loopback bench_p8_body_prefetch_throughput -- --ignored --nocapture`
+///
+/// Two numbers are printed per arm and they answer different questions:
+///   * **封/秒** — what one pass can do, which is what the batched FETCH changes;
+///   * **FETCH 命令/封** — the mechanism, read straight off the transcript rather than inferred from
+///     the rate. Today it is 1.0: the pass opens one message per command, so the mailbox's worth of
+///     latency is paid once per message. If the rate moves and this ratio does not, the reading is
+///     about the machine, not about the code.
+///
+/// It deliberately does **not** model the 60 s tick (`src-tauri`'s politeness). How often a pass runs
+/// is the other, independent half of P8b and this bench cannot see it; the report does that arithmetic.
+#[tokio::test]
+#[ignore = "throughput bench: see the run command in the doc comment above"]
+async fn bench_p8_body_prefetch_throughput() {
+    const MESSAGES: u32 = 120;
+    const BODY_CHARS: u32 = 600;
+    // The production cap, so the reading is of the shape users get, not of a made-up batch size.
+    const LIMIT: usize = mail_core::index::DEFAULT_PASS_LIMIT;
+
+    for latency_ms in [0u32, 150, 400] {
+        let (addr, transcript) = spawn_server(Server {
+            uidplus: true,
+            require_select: true,
+            extra: Arc::new(AtomicU32::new(MESSAGES - RICH_MESSAGES)),
+            fetch_latency_ms: Arc::new(AtomicU32::new(latency_ms)),
+            filler_body_chars: Arc::new(AtomicU32::new(BODY_CHARS)),
+            ..Server::default()
+        })
+        .await;
+        let cfg = account(addr, addr);
+        let mut client = within(ImapClient::connect(&cfg, "app-password"))
+            .await
+            .expect("connect");
+        let cache = Cache::open_in_memory().expect("cache");
+        within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+
+        // The fixture really grew, or the bench is measuring four messages and reporting a number
+        // that belongs to nothing.
+        let pending = cache.bodies_pending_count(&cfg.id).expect("pending");
+        assert_eq!(pending, MESSAGES, "a sync stores headers only");
+
+        // Only the pass's own commands count: the sync's header FETCHes are already in the log.
+        let before = transcript.lock().unwrap().len();
+        let started = std::time::Instant::now();
+        let mut indexed = 0u32;
+        let mut passes = 0u32;
+        loop {
+            let report = tokio::time::timeout(
+                Duration::from_secs(180),
+                index_bodies_pass(
+                    mail_core::index::BodyIndexRun {
+                        cache: &cache,
+                        cfg: &cfg,
+                        limit: LIMIT,
+                    },
+                    &mut client,
+                ),
+            )
+            .await
+            .expect("a pass must finish")
+            .expect("pass");
+            passes += 1;
+            indexed += report.indexed;
+            if report.remaining == 0 {
+                break;
+            }
+            assert_eq!(
+                report.indexed, LIMIT as u32,
+                "a full pass must make progress"
+            );
+        }
+        let seconds = started.elapsed().as_secs_f64();
+
+        let body_fetches = transcript.lock().unwrap()[before..]
+            .iter()
+            .filter(|line| {
+                let up = line.to_ascii_uppercase();
+                up.contains("UID FETCH") && !up.contains("[HEADER]")
+            })
+            .count();
+        assert_eq!(indexed, MESSAGES, "every message must end up indexed");
+        assert_eq!(
+            cache.body_coverage(&cfg.id).expect("coverage").indexed,
+            MESSAGES
+        );
+
+        println!(
+            "P8b  往返 {:>3} ms · {:>3} 封 / {:>5.2} s = {:>5.1} 封/秒 · FETCH 命令 {} 次（每封 {:.2} 次）· {} 轮 × limit {}",
+            latency_ms,
+            indexed,
+            seconds,
+            indexed as f64 / seconds,
+            body_fetches,
+            body_fetches as f64 / indexed as f64,
+            passes,
+            LIMIT,
+        );
+    }
+    println!(
+        "口径：这把尺子量的是一轮能吞多少封（往返受限）。多久跑一轮（礼貌 tick，60 秒）是 src-tauri 的另一半，\
+         它不在这里，两个瓶颈得分开修。"
+    );
+}
+
 /// **V2-A, failure half.** One unreadable message must not abandon the rest of the pass.
 ///
 /// The pass covers a mailbox, so stopping at the first failure would leave every message behind it
@@ -2721,7 +3032,12 @@ async fn a_bounded_body_index_pass_resumes_until_nothing_is_pending() {
 /// rather than hidden: `remaining` still includes it.
 #[tokio::test]
 async fn a_failing_message_does_not_stop_the_pass_and_stays_pending() {
-    let (addr, _log) = spawn_imap(true).await;
+    let (addr, _log) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        ..Server::default()
+    })
+    .await;
     let cfg = account(addr, addr);
     let mut client = within(ImapClient::connect(&cfg, "app-password"))
         .await

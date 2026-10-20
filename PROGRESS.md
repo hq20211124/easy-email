@@ -7,13 +7,69 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **488**（mail-core lib 415 + 桌面壳 lib 15 + loopback 52 +
-  reachability 4 + bench_fixture 1 + oauth_flow 1）。这 488 是**跑过的**条数；另有 **10** 条 `#[ignore]`
+- **测试数量**：基线 116 → 现在 **489**（mail-core lib 415 + 桌面壳 lib 15 + loopback 53 +
+  reachability 4 + bench_fixture 1 + oauth_flow 1）。这 489 是**跑过的**条数；另有 **11** 条 `#[ignore]`
   的基准不在里面 —— 第 99 轮续加了两条：`cache::tests::p9_time_is_not_in_the_transaction_boundary`
   （P9 事务边界，约 30 秒，复现命令在 `reports/performance.md` §10.6）与
-  `db::tests::the_watchdog_costs_less_than_the_read_it_measures`（第 5 项的计时代价，约 2 秒，§11.7）。
+  `db::tests::the_watchdog_costs_less_than_the_read_it_measures`（第 5 项的计时代价，约 2 秒，§11.7）；
+  第 100 轮的 P8b 吞吐基准 `bench_p8_body_prefetch_throughput` 是第 11 条（三档延迟，约 70 秒，§16.2）。
   `tools/check.ps1` **全绿**：**62 步**（第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
   早已过期，只有"fmt + clippy -D warnings + build + test + PE=2"这几条一直是骨架）。
+
+### 第 9 项（1 与 2a）：P8b 的尺子造出来了，量完先挖出一条会把别人的信存进来的缺陷（第 100 轮，2026-10-20）🐞📏
+
+**用户把决定交给了我**（原话："我无法判断，但我需要你做的决定，质量超过行业头部"）。三条结论写在
+`reports/performance.md` §16.1：**① 不降预算** —— 20 封/秒 = "10 万封 ≤ 1.5 小时全部可搜"，实现的
+20 封/分钟 = **3.5 天**，能翻译成用户等待的数字不该为迁就实现改写；**② 口径在这一行行内拆**（P8a 交互路径
+**✅ 早已达标**、重索引 286 封/秒；P8b 后台补全 ❌），**表还是 16 行**，`tools/bench.ps1` 的覆盖清单与
+`check.ps1:668` 钉死的 P1…P16 一项没动；**③ 要改的是往返次数，不是常数** —— 一条连接串行逐封 `UID FETCH`，
+天花板 = 1/往返，而"每轮几封"和"多久一轮"是**两条独立瓶颈**。
+
+**尺子**：`crates/mail-core/tests/loopback.rs` 的假 IMAP 加两个**默认关**的旋钮 —— `fetch_latency_ms`
+（服务器回答前睡，写在第一个响应字节之前）与 `filler_body_chars`（给合成邮件补中文正文）。加前者的理由记在 §16.2：
+**零延迟的 loopback 让串行和批量只差零点几秒，会给出一个假的绿灯** —— 而"每封一次往返"正是这条预算超 60 倍的原因。
+原先那句"P8 未测，需要 IMAP 限速夹具"里，"未测"和"没有夹具"两句都是错的，端到端测试早就在跑。
+
+**基线**（release、同一进程三档、`target/p8-baseline.txt`；120 封未索引、正文 600 字、生产的 `limit=20` 连跑到清空）：
+
+| 服务器往返 | 120 封耗时 | 封/秒 | 每封 FETCH 命令数 |
+| --- | --- | --- | --- |
+| 0 ms | 0.06 s | 2 046 | 1.00 |
+| 150 ms（典型宽带） | 19.32 s | 6.2 | 1.00 |
+| 400 ms（跨国 / 移动网络） | 49.45 s | 2.4 | 1.00 |
+
+**三档都是 6 轮 × 20 封，`indexed=120`、`remaining=0`**。**每封 1.00 条命令是数自会话记录、不是推的**。
+150 ms 档里 120×150 ms = 18.0 s 纯等，19.32 − 18.0 = 1.32 s 才是干活 ⇒ **98.4 % 付给往返**，
+"正文解析太慢"那一类猜测就此否掉。反过来算上限：一轮一次往返 ⇒ ≈ 8 ms/封 ⇒ 潜在 **~120 封/秒**，
+比预算余量 6 倍 —— **"到不到 20 封/秒"从判断变成可核对的算术**。而**批量治不了持续速率**：20 封/60 秒 =
+0.33 封/秒，把一轮从 3 秒缩到 0.15 秒一个字节都不改，所以**不许批量做完就宣布 P8 修好**（§10 那条是
+"量到收益、用户拿不到"的第一次重复）。占空比账在 §16.4：批量后每轮一次往返，150 ms 链路跑 20 封/秒
+只需 15 % 的连接，改之前同样预算只买得起 1 封/秒 —— 这就是"必须先批量、再放开礼貌"的理由。
+
+**缺陷（比吞吐严重，`reports/performance.md` §16.5）**：`UID FETCH` **没有文件夹参数**，只在当前 `SELECT`
+的文件夹里有意义，而 UID 在每个文件夹指向不同的信。`index.rs` 里 `impl BodySource for ImapClient` 把调用方
+给的 `folder` 丢了（注释写"the caller already selected it"），**而调用方从来没 SELECT**：`body_index_pass`
+只有 `pool_op!` 取连接（它只是 acquire），连接还是池里**复用**的、挂着别人上次选的文件夹。两种结果都错：
+**没 SELECT ⇒ 每封 `failed`、`indexed=0`、日志一行不打**（日志只在 `indexed>0` 写）⇒ 后台预取静默完全不工作；
+**停在别的文件夹 ⇒ 把那个文件夹同 UID 的正文存进正确的键** ⇒ 用户点开看到的是别人的信、搜到的也是别人的正文。
+**为什么一直全绿**：夹具答 FETCH 不看有没有 SELECT，而旧的两条 pass 测试只有一个文件夹，stale selection
+恰好就是对的。变异实测：撤掉修复，新测试报出 `INBOX/5 holds a body that says it came from 文件夹 已发送`，
+**旧的两条仍然 ok** —— 这就是"文本上正确、形状上没牙"的夹具怎么把数据正确性缺陷养了几个月。
+
+**修法（三处，一条断言都没放宽）**：`imap.rs` 的 `ImapClient` 加 `selected: Option<String>`，所有 `SELECT`
+收口到 `select_to()`（6 个直接写 `self.session.select(...)` 的点全改走它），新增 `use_mailbox()` ——
+已经是当前文件夹就不重发命令（否则每封多一次往返，把 2b 要省的钱先花掉），IDLE 前后把选择带过去；
+`index.rs` 的 `fetch_body` 先 `use_mailbox(folder)`，pass 在 `pick_pending` **之后**按文件夹分组（所以它只影响
+SELECT 次数，不影响这轮取哪些信）；夹具 `require_select` 回答真服务器那句 `BAD no mailbox selected`、
+`CLOSE` 清空选择、`message_served` 把"被哪个文件夹服务"写进正文，**旧的两条 pass 测试同时打开 `require_select`**，
+不再靠单文件夹蒙对。loopback **52 → 53** 条，`cargo test -p mail-core` 全绿（415 + 53 + 其余，11 条 `#[ignore]`
+不在跑过的条数里 —— 加的就是第 9 项那把吞吐基准），
+clippy `-D warnings` 干净，`cargo check -p easy-email` ok，全量门禁 `target/gate-item9-2a.txt`
+**`steps: 62 ran, 62 ok, 0 failed`**（第一次跑被 `cargo fmt --check` 拦下 —— 新写的分组代码自己没格式化，
+`cargo fmt` 后重跑；这一步的牙是有效的）。
+
+**顺序因此被这条发现改掉**：**先正确（2a，本节）→ 再省往返（2b 批量 FETCH）→ 再放开礼貌（步骤 3 自适应轮次 +
+给用户让路）**。没有 2a 就做 2b，等于把"取回 20 封"变成"一次取回 20 封错信"。
 
 ### 第 8 项收尾：最终代码的 P1 复测 + 出厂二进制（第 100 轮，2026-10-20）
 

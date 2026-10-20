@@ -257,6 +257,16 @@ pub struct ImapClient {
     /// surface as a cleanly-ended stream rather than an `Err`, which would silently make delete
     /// a no-op.
     uidplus: bool,
+    /// Which mailbox this session is currently `SELECT`ed into, as far as we know.
+    ///
+    /// IMAP's `UID FETCH`/`STORE`/`SEARCH` are **only meaningful inside a selection**, and a UID
+    /// means a different message in every folder. Without this field the callers that forget to
+    /// `SELECT` do not fail loudly — they read whatever folder the pooled connection happens to be
+    /// sitting in, and store that body under another folder's key. That is exactly what the body
+    /// prefetch pass did until 2026-10-20 (`index::BodySource for ImapClient` documents the fix).
+    /// Every `SELECT` on this type goes through [`ImapClient::select_to`], so the field cannot
+    /// drift behind the session.
+    selected: Option<String>,
 }
 
 impl ImapClient {
@@ -391,6 +401,9 @@ impl ImapClient {
             session,
             host: ep.host,
             uidplus,
+            // A fresh session is in the authenticated state: no mailbox is selected yet, and every
+            // folder-scoped command has to earn its `SELECT` first.
+            selected: None,
         })
     }
 
@@ -486,7 +499,28 @@ impl ImapClient {
 
     /// Select a mailbox, returning its metadata (message count, UIDVALIDITY, ...).
     pub async fn select(&mut self, mailbox: &str) -> Result<Mailbox> {
-        timed(async { self.session.select(mailbox).await.map_err(imap_err) }).await
+        self.select_to(mailbox).await
+    }
+
+    /// The one place `SELECT` is sent, so [`ImapClient::selected`] cannot fall behind the session.
+    async fn select_to(&mut self, mailbox: &str) -> Result<Mailbox> {
+        let mailbox_metadata =
+            timed(async { self.session.select(mailbox).await.map_err(imap_err) }).await?;
+        self.selected = Some(mailbox.to_string());
+        Ok(mailbox_metadata)
+    }
+
+    /// Make `mailbox` the current selection, skipping the command when it already is.
+    ///
+    /// Folder-scoped primitives (`UID FETCH`, `UID STORE`) carry no folder of their own, so anything
+    /// that loops over messages from several folders has to call this before it asks for one —
+    /// otherwise the answer it gets belongs to a different folder's UID space.
+    pub async fn use_mailbox(&mut self, mailbox: &str) -> Result<()> {
+        if self.selected.as_deref() == Some(mailbox) {
+            return Ok(());
+        }
+        self.select_to(mailbox).await?;
+        Ok(())
     }
 
     /// Fetch the newest `limit` messages in `mailbox`, headers only.
@@ -512,7 +546,7 @@ impl ImapClient {
         limit: usize,
     ) -> Result<HeaderPage> {
         timed(async {
-            let selected = self.session.select(mailbox).await.map_err(imap_err)?;
+            let selected = self.select_to(mailbox).await?;
             // A public field in async-imap, not an accessor.
             let uidvalidity = selected.uid_validity.unwrap_or(0);
 
@@ -577,7 +611,7 @@ impl ImapClient {
         limit: usize,
     ) -> Result<HeaderPage> {
         timed(async {
-            let selected = self.session.select(mailbox).await.map_err(imap_err)?;
+            let selected = self.select_to(mailbox).await?;
             // A public field in async-imap, not an accessor.
             let uidvalidity = selected.uid_validity.unwrap_or(0);
 
@@ -661,7 +695,7 @@ impl ImapClient {
             return Ok(Vec::new());
         }
         timed(async {
-            self.session.select(mailbox).await.map_err(imap_err)?;
+            self.select_to(mailbox).await?;
 
             // `1:<before-1>` — the older half. `before_uid - 1` cannot underflow because of the guard.
             let query = format!("1:{}", before_uid - 1);
@@ -894,7 +928,7 @@ impl ImapClient {
     /// Permanently delete one message.
     pub async fn delete_message(&mut self, mailbox: &str, uid: u32) -> Result<()> {
         timed(async {
-            self.session.select(mailbox).await.map_err(imap_err)?;
+            self.select_to(mailbox).await?;
             self.flag_deleted_and_expunge(uid).await
         })
         .await
@@ -945,7 +979,7 @@ impl ImapClient {
         let id = id.replace(['"', '\\'], "");
         let id: String = id.chars().filter(|c| !c.is_control()).collect();
         timed(async {
-            self.session.select(mailbox).await.map_err(imap_err)?;
+            self.select_to(mailbox).await?;
             let query = format!("HEADER Message-ID \"{id}\"");
             let found = self.session.uid_search(query).await.map_err(imap_err)?;
             Ok(found.into_iter().max())
@@ -956,7 +990,7 @@ impl ImapClient {
     /// Move a message to another mailbox (used for "Move to Trash").
     pub async fn move_message(&mut self, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
         timed(async {
-            self.session.select(mailbox).await.map_err(imap_err)?;
+            self.select_to(mailbox).await?;
             self.session
                 .uid_copy(uid.to_string(), dest)
                 .await
@@ -1004,6 +1038,7 @@ impl ImapClient {
             session,
             host,
             uidplus,
+            selected: selection,
         } = self;
 
         let mut handle = session.idle();
@@ -1035,9 +1070,12 @@ impl ImapClient {
             session,
             host,
             uidplus,
+            // IDLE does not leave the selection, so carry it over rather than claiming the session
+            // came back unselected — that would cost a `SELECT` the server does not need.
+            selected: selection,
         };
-        let selected = client.select(mailbox).await?;
-        Ok((client, selected.exists))
+        let mailbox_state = client.select(mailbox).await?;
+        Ok((client, mailbox_state.exists))
     }
 }
 

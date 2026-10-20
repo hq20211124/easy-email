@@ -86,10 +86,15 @@ pub trait BodySource {
 }
 
 impl BodySource for crate::imap::ImapClient {
-    async fn fetch_body(&mut self, _folder: &str, uid: u32) -> Result<MessageDetail> {
-        // The folder is not passed through: the client is already selected by the caller, and
-        // `fetch_message` fetches from the current selection. Re-selecting per message would cost a
-        // round trip the pool then has to pay for again on the next pass.
+    async fn fetch_body(&mut self, folder: &str, uid: u32) -> Result<MessageDetail> {
+        // `UID FETCH` is only meaningful **inside a selection**, and a UID identifies a different
+        // message in every folder. Until 2026-10-20 this line did not exist — the folder argument was
+        // ignored on the assumption that "the caller already selected it", which the background pass
+        // never does. It therefore read UIDs out of whichever folder the pooled connection happened
+        // to be sitting in, and `put_detail` stored that body under the pending row's folder: either
+        // a hard failure (nothing indexed, and the log line only prints when it indexed something) or
+        // the wrong message's body behind the right key.
+        self.use_mailbox(folder).await?;
         self.fetch_message(uid).await
     }
 }
@@ -108,7 +113,27 @@ pub async fn index_bodies_pass(
     let picked = pick_pending(pending, run.limit);
 
     let mut report = IndexReport::default();
+    // **Folder by folder.** `UID FETCH` is scoped to a selection (see the `BodySource` impl above) and
+    // `bodies_pending` mixes the account's folders, so working in the raw order would pay a `SELECT`
+    // every time the folder alternates. Grouping happens *after* `pick_pending` has decided which
+    // messages this pass takes, so it cannot change what gets indexed — only how few selections it
+    // costs. The newest-first order still holds inside each group.
+    let mut folders: Vec<&str> = Vec::new();
     for item in &picked {
+        if !folders.contains(&item.folder.as_str()) {
+            folders.push(item.folder.as_str());
+        }
+    }
+    let work: Vec<&PendingBody> = folders
+        .iter()
+        .flat_map(|folder| {
+            picked
+                .iter()
+                .filter(move |item| item.folder.as_str() == *folder)
+        })
+        .collect();
+
+    for item in &work {
         // Two kinds of pending work. A body that is already stored only needs its index row
         // rebuilt — one write transaction, no connection — and that is the upgrade path for mail
         // indexed before the current shape existed. A message with no body at all still has to be
