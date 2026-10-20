@@ -763,6 +763,67 @@ impl ImapClient {
         parse_detail(uid, &raw)
     }
 
+    /// Fetch several whole messages from the **current selection** in one command.
+    ///
+    /// This exists because the background body index used to pay a round trip per message, and
+    /// `reports/performance.md` §16.3 measured 98 % of that pass's cost as nothing but waiting.
+    ///
+    /// **The echoed UID decides which message the bytes belong to, never the position** — a server may
+    /// answer a set in any order, and the caller stores by `(folder, uid)`. Keying by position would
+    /// file one message's body behind another message's key, which is the exact class of bug the
+    /// 2026-10-20 fix removed. A response without a UID is dropped rather than guessed at.
+    ///
+    /// An `Err` *inside* the map is "this message is unusable" (too big to hold, unparsable); an
+    /// `Err` from the call is about **the command as a whole**, and the caller retries those UIDs one
+    /// by one — a server with an opinion about set sizes must not cost the user their mail.
+    pub async fn fetch_messages(
+        &mut self,
+        uids: &[u32],
+    ) -> Result<std::collections::HashMap<u32, Result<MessageDetail>>> {
+        let mut out = std::collections::HashMap::new();
+        if uids.is_empty() {
+            return Ok(out);
+        }
+        // A comma set, never a range: UIDs are not dense, and `a:b` would fetch mail nobody asked
+        // for (see [`since_range`], which is the same trap in the header path).
+        let set = uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        timed(async {
+            let mut stream = self
+                .session
+                .uid_fetch(&set, "(UID FLAGS RFC822.SIZE BODY.PEEK[])")
+                .await
+                .map_err(imap_err)?;
+
+            while let Some(fetch) = stream.try_next().await.map_err(imap_err)? {
+                let Some(uid) = fetch.uid else { continue };
+                let Some(bytes) = fetch.body() else { continue };
+                // Same ceiling as a single fetch, applied per message: one 500 MB literal must not
+                // take the process — or the other nineteen messages in the batch — out with it.
+                if bytes.len() > MAX_FETCH_BYTES {
+                    out.insert(
+                        uid,
+                        Err(MailError::Parse(format!(
+                            "邮件太大（{} MB），超过本应用能安全处理的 {} MB 上限。",
+                            bytes.len() / (1024 * 1024),
+                            MAX_FETCH_BYTES / (1024 * 1024)
+                        ))),
+                    );
+                    continue;
+                }
+                out.insert(uid, parse_detail(uid, bytes));
+            }
+            Ok::<(), MailError>(())
+        })
+        .await?;
+
+        Ok(out)
+    }
+
     /// Save one attachment to `dest`.
     ///
     /// **This refetches the whole message and takes the part out of it**, so peak memory is

@@ -1300,7 +1300,7 @@ impl Cache {
         let guard = self.db.read_guard();
         let conn: &Connection = &guard;
         let mut stmt = conn.prepare(
-            "select m.folder, m.uid, (b.uid is not null) as has_body
+            "select m.folder, m.uid, (b.uid is not null) as has_body, m.size
              from messages m
              left join bodies b
                on b.account_id = m.account_id and b.folder = m.folder and b.uid = m.uid
@@ -1315,6 +1315,10 @@ impl Cache {
                 folder: row.get(0)?,
                 uid: row.get::<_, i64>(1)? as u32,
                 has_body: row.get::<_, i64>(2)? != 0,
+                // `RFC822.SIZE` as the header sync stored it. Batched fetches are bounded by bytes,
+                // and a row from before sizes were recorded is `None` — which `plan_batches` treats as
+                // "fetch it alone", the cost it had before batching existed.
+                size: row.get::<_, Option<i64>>(3)?.map(|n| n.max(0) as u32),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

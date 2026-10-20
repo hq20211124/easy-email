@@ -172,6 +172,14 @@ impl crate::index::BodySource for PooledClient<'_> {
     async fn fetch_body(&mut self, folder: &str, uid: u32) -> crate::Result<crate::MessageDetail> {
         ImapClient::fetch_body(self, folder, uid).await
     }
+
+    async fn fetch_bodies(
+        &mut self,
+        folder: &str,
+        uids: &[u32],
+    ) -> crate::Result<Vec<(u32, crate::Result<crate::MessageDetail>)>> {
+        ImapClient::fetch_bodies(self, folder, uids).await
+    }
 }
 
 impl Drop for PooledClient<'_> {

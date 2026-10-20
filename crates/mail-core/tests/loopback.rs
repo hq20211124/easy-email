@@ -340,12 +340,26 @@ struct Server {
     /// Refuse to answer `UID FETCH` when nothing has been `SELECT`ed on this connection.
     ///
     /// **This is what a real server does** — `UID FETCH` has no folder argument, it only means
-    /// something inside a selection. Off by default because most of the 52 behavioural tests here are
+    /// something inside a selection. Off by default because most of the 53 behavioural tests here are
     /// about other commands, and the lenient fixture is exactly what let the body prefetch pass ship
     /// for months without ever selecting: it was reading whichever folder the pooled connection last
     /// sat in, and storing that body under another folder's key. A folder-scoped pass must run with
     /// this on, or the test proves nothing about folders.
     require_select: bool,
+    /// Answer a `FETCH` whose set names several UIDs in **descending** order instead of ascending.
+    ///
+    /// RFC 3501 says responses *SHOULD* come back in ascending order — a "should", not a "must", and
+    /// the reason the protocol echoes `UID` in every response at all. A client that pairs a body with
+    /// the request by position instead of by that echoed UID therefore passes an in-order test and
+    /// files the wrong body behind the right key on a server that answers differently. This knob is
+    /// how the batched prefetch is made to prove it reads the UID.
+    reverse_fetch_order: bool,
+    /// Answer `BAD` to any `FETCH` whose set names more than one UID.
+    ///
+    /// Some real servers and proxies cap or refuse long sequence sets. The prefetch pass must then
+    /// fall back to fetching one message at a time rather than losing the mail — and the only way to
+    /// test that fallback is a server that actually objects.
+    refuse_uid_sets: bool,
 }
 
 impl Default for Server {
@@ -360,6 +374,8 @@ impl Default for Server {
             fetch_latency_ms: Arc::new(AtomicU32::new(0)),
             filler_body_chars: Arc::new(AtomicU32::new(0)),
             require_select: false,
+            reverse_fetch_order: false,
+            refuse_uid_sets: false,
         }
     }
 }
@@ -395,6 +411,8 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
             let fetch_latency_ms = Arc::clone(&server.fetch_latency_ms);
             let filler_body_chars = Arc::clone(&server.filler_body_chars);
             let require_select = server.require_select;
+            let reverse_fetch_order = server.reverse_fetch_order;
+            let refuse_uid_sets = server.refuse_uid_sets;
             tokio::spawn(async move {
                 let _ = serve_imap(
                     stream,
@@ -408,6 +426,8 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
                     fetch_latency_ms,
                     filler_body_chars,
                     require_select,
+                    reverse_fetch_order,
+                    refuse_uid_sets,
                 )
                 .await;
             });
@@ -432,6 +452,8 @@ async fn serve_imap(
     fetch_latency_ms: Arc<AtomicU32>,
     filler_body_chars: Arc<AtomicU32>,
     require_select: bool,
+    reverse_fetch_order: bool,
+    refuse_uid_sets: bool,
 ) -> std::io::Result<()> {
     let (read_half, mut write) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -599,6 +621,15 @@ async fn serve_imap(
                             continue;
                         }
                         let set = tokens.get(3).copied().unwrap_or("1");
+                        if refuse_uid_sets && (set.contains(',') || set.contains(':')) {
+                            bad(
+                                &mut write,
+                                &tag,
+                                "UID FETCH: this server answers one UID at a time (fixture refuse_uid_sets)",
+                            )
+                            .await?;
+                            continue;
+                        }
                         let query = trimmed.to_ascii_uppercase();
                         let headers_only = query.contains("[HEADER]");
                         // A partial fetch (`BODY[]<start.length>`) must return only that slice, or a
@@ -613,7 +644,11 @@ async fn serve_imap(
                         }
                         let body_chars = filler_body_chars.load(Ordering::SeqCst);
                         let served_in = in_mailbox.clone().unwrap_or_else(|| "INBOX".to_string());
-                        for uid in parse_uid_set(set, available()) {
+                        let mut ids = parse_uid_set(set, available());
+                        if reverse_fetch_order {
+                            ids.reverse();
+                        }
+                        for uid in ids {
                             let raw = message_served(uid, body_chars, &served_in);
                             let (payload, section): (&[u8], String) = match partial {
                                 Some((start, length)) => {
@@ -2916,21 +2951,221 @@ async fn the_body_pass_fetches_each_folder_from_that_folder() {
     }
 }
 
-/// **P8b 基线尺子（第 9 项步骤 1）.** How many bodies one prefetch pass can swallow, and what each one
-/// costs in round trips, as the server's latency moves.
+/// **P8b 步骤 2b（第 100 轮）.** The pass must ask for a whole folder in one command, and must still
+/// store the right body when the server answers that command in the *other* order.
+///
+/// Two things are being pinned, and they fail independently:
+///   * **one command per folder per pass** — `reports/performance.md` §16.3 measured 98 % of this pass
+///     as waiting on a round trip, so the number of commands *is* the throughput. A regression back to
+///     one `UID FETCH` per message shows up here as `commands == indexed`.
+///   * **attribution by the echoed UID, never by position** — RFC 3501 only *SHOULD* order a response
+///     set ascending, which is exactly why the protocol echoes `UID`. `reverse_fetch_order` makes the
+///     server answer a batch backwards; a client that paired bodies with requests positionally would
+///     then store 已发送/9's text under 已发送/5 and stay green on every in-order test.
+#[tokio::test]
+async fn a_batched_pass_asks_once_per_folder_and_pairs_each_body_with_its_uid() {
+    let (addr, transcript) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        reverse_fetch_order: true,
+        extra: Arc::new(AtomicU32::new(10)),
+        filler_body_chars: Arc::new(AtomicU32::new(90)),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+    within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    let page = within(client.fetch_newest_headers("已发送", 20))
+        .await
+        .expect("sent headers");
+    cache
+        .upsert_summaries(&cfg.id, "已发送", &page.summaries)
+        .expect("store sent rows");
+
+    let before = transcript.lock().unwrap().len();
+    let mut indexed = 0u32;
+    let mut rounds = 0u32;
+    loop {
+        let report = within(index_bodies_pass(
+            mail_core::index::BodyIndexRun {
+                cache: &cache,
+                cfg: &cfg,
+                limit: 20,
+            },
+            &mut client,
+        ))
+        .await
+        .expect("pass");
+        assert_eq!(
+            report.failed, 0,
+            "no message may fail on a server that only reordered"
+        );
+        indexed += report.indexed;
+        rounds += 1;
+        if report.remaining == 0 {
+            break;
+        }
+        assert!(
+            rounds < 8,
+            "the backlog must drain, not stall in one folder"
+        );
+    }
+
+    let body_fetches = transcript.lock().unwrap()[before..]
+        .iter()
+        .filter(|line| {
+            let up = line.to_ascii_uppercase();
+            up.contains("UID FETCH") && !up.contains("[HEADER]")
+        })
+        .count() as u32;
+    assert!(
+        body_fetches * 3 <= indexed,
+        "{indexed} 封只该花几次往返，实测 {body_fetches} 条 body FETCH —— 一轮里每封一条就退回 2b 之前了"
+    );
+
+    // Every stored body must name the folder *and* the UID it was filed under. The fixture writes both
+    // into the text, so a positional match shows up as a body that contradicts its own key.
+    let pending_after = cache.bodies_pending_count(&cfg.id).expect("pending");
+    assert_eq!(pending_after, 0);
+    for folder in ["INBOX", "已发送"] {
+        for uid in 5..=9u32 {
+            let got = cache
+                .get_detail(&cfg.id, folder, uid)
+                .expect("read")
+                .unwrap_or_else(|| panic!("{folder}/{uid} has no body"));
+            let body = got.body_text.unwrap_or_default();
+            assert!(
+                body.contains(&format!("文件夹 {folder} · 第 {uid} 封")),
+                "{folder}/{uid} holds {body}"
+            );
+        }
+    }
+}
+
+/// **The fallback half of 2b.** A server that objects to a multi-UID set must cost round trips, not mail.
+///
+/// Without this, "batch the fetches" would be a silent bet on every IMAP server in the wild accepting
+/// long sequence sets. The assertion is the *shape* of the traffic: after a refusal, the pass has to
+/// have asked once per message (so the refusal really was the trigger) and still indexed everything.
+#[tokio::test]
+async fn a_server_that_refuses_sets_still_indexes_every_message() {
+    let (addr, transcript) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        refuse_uid_sets: true,
+        extra: Arc::new(AtomicU32::new(20)),
+        filler_body_chars: Arc::new(AtomicU32::new(90)),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+
+    // **Seeded locally, not synced.** This fixture answers BAD to *any* FETCH that names more than one
+    // UID, and the header sync asks for a range (`1:14`) — so syncing through the same server leaves no
+    // rows at all, and the pass would report "nothing pending" while proving nothing. The rows are
+    // written straight into the cache instead; the UIDs are ones the fixture will answer, because it
+    // serves every UID up to the size of its mailbox.
+    let rows: Vec<MessageSummary> = (5..=14u32)
+        .map(|uid| MessageSummary {
+            uid,
+            subject: format!("主题 {uid}"),
+            from_name: Some("发件人".to_string()),
+            from_addr: Some("shop@example.com".to_string()),
+            date: Some(1_700_000_000 + uid as i64),
+            size: Some(512),
+            seen: false,
+            flagged: false,
+            thread_key: None,
+            subject_key: None,
+        })
+        .collect();
+    cache
+        .upsert_summaries(&cfg.id, "INBOX", &rows)
+        .expect("seed rows");
+
+    let before = transcript.lock().unwrap().len();
+    let mut indexed = 0u32;
+    let mut rounds = 0u32;
+    loop {
+        let report = within(index_bodies_pass(
+            mail_core::index::BodyIndexRun {
+                cache: &cache,
+                cfg: &cfg,
+                limit: 20,
+            },
+            &mut client,
+        ))
+        .await
+        .expect("pass");
+        assert_eq!(
+            report.failed, 0,
+            "a refusal is the server's opinion about the set, not about the mail"
+        );
+        indexed += report.indexed;
+        rounds += 1;
+        if report.remaining == 0 {
+            break;
+        }
+        assert!(rounds < 8, "the backlog must drain through the fallback");
+    }
+
+    assert_eq!(
+        indexed, 10,
+        "ten rows were pending, ten must end up indexed"
+    );
+    assert_eq!(cache.bodies_pending_count(&cfg.id).expect("pending"), 0);
+
+    let lines = transcript.lock().unwrap()[before..].to_vec();
+    let refused = lines
+        .iter()
+        .filter(|l| {
+            let up = l.to_ascii_uppercase();
+            up.contains("UID FETCH") && !up.contains("[HEADER]") && up.contains(',')
+        })
+        .count();
+    let singles = lines
+        .iter()
+        .filter(|l| {
+            let up = l.to_ascii_uppercase();
+            up.contains("UID FETCH") && !up.contains("[HEADER]") && !up.contains(',')
+        })
+        .count() as u32;
+    assert!(
+        refused >= 1,
+        "the batched attempt must really have been made and refused (no comma set in the log: {lines:?})"
+    );
+    assert_eq!(
+        singles, indexed,
+        "each refused message retried exactly once — got {singles} single-UID fetches for {indexed} messages"
+    );
+}
+
+/// **P8b 尺子的 A/B 两臂（第 9 项步骤 1 建、步骤 2b 配对）。** 一轮正文预取能吞多少封，
+/// 每封花几次往返，以及同一进程里"逐封"与"批量"两臂的配对倍数。
 ///
 /// Ignored because it is a measurement, not an assertion — run it with:
 /// `cargo test --release -p mail-core --test loopback bench_p8_body_prefetch_throughput -- --ignored --nocapture`
 ///
-/// Two numbers are printed per arm and they answer different questions:
-///   * **封/秒** — what one pass can do, which is what the batched FETCH changes;
+/// Three numbers per arm, and they answer different questions:
+///   * **封/秒** — what one pass can do;
 ///   * **FETCH 命令/封** — the mechanism, read straight off the transcript rather than inferred from
-///     the rate. Today it is 1.0: the pass opens one message per command, so the mailbox's worth of
-///     latency is paid once per message. If the rate moves and this ratio does not, the reading is
-///     about the machine, not about the code.
+///     the rate. This is the quantity 2b actually changes; if the rate moves and this does not, the
+///     reading is about the machine, not about the code;
+///   * **倍数** — printed per latency档 from the two arms that ran **in the same process, on the same
+///     fixture, back to back**. A cross-run comparison would be a comparison of days (§13's lesson).
 ///
 /// It deliberately does **not** model the 60 s tick (`src-tauri`'s politeness). How often a pass runs
-/// is the other, independent half of P8b and this bench cannot see it; the report does that arithmetic.
+/// is the other, independent half of P8b and this bench cannot see it; the report does that arithmetic,
+/// and §16.3's conclusion stands whatever this prints: batching moves the per-pass ceiling, not the
+/// sustained rate.
 #[tokio::test]
 #[ignore = "throughput bench: see the run command in the doc comment above"]
 async fn bench_p8_body_prefetch_throughput() {
@@ -2939,89 +3174,155 @@ async fn bench_p8_body_prefetch_throughput() {
     // The production cap, so the reading is of the shape users get, not of a made-up batch size.
     const LIMIT: usize = mail_core::index::DEFAULT_PASS_LIMIT;
 
+    println!(
+        "P8b A/B：{MESSAGES} 封未索引 · 正文 {BODY_CHARS} 字 · limit {LIMIT} · 同一进程两臂配对"
+    );
     for latency_ms in [0u32, 150, 400] {
-        let (addr, transcript) = spawn_server(Server {
-            uidplus: true,
-            require_select: true,
-            extra: Arc::new(AtomicU32::new(MESSAGES - RICH_MESSAGES)),
-            fetch_latency_ms: Arc::new(AtomicU32::new(latency_ms)),
-            filler_body_chars: Arc::new(AtomicU32::new(BODY_CHARS)),
-            ..Server::default()
-        })
-        .await;
-        let cfg = account(addr, addr);
-        let mut client = within(ImapClient::connect(&cfg, "app-password"))
-            .await
-            .expect("connect");
-        let cache = Cache::open_in_memory().expect("cache");
-        within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+        let (slow_msgs, slow_secs, slow_cmds, slow_passes) =
+            run_p8_arm(latency_ms, false, MESSAGES, BODY_CHARS, LIMIT).await;
+        let (fast_msgs, fast_secs, fast_cmds, fast_passes) =
+            run_p8_arm(latency_ms, true, MESSAGES, BODY_CHARS, LIMIT).await;
 
-        // The fixture really grew, or the bench is measuring four messages and reporting a number
-        // that belongs to nothing.
-        let pending = cache.bodies_pending_count(&cfg.id).expect("pending");
-        assert_eq!(pending, MESSAGES, "a sync stores headers only");
-
-        // Only the pass's own commands count: the sync's header FETCHes are already in the log.
-        let before = transcript.lock().unwrap().len();
-        let started = std::time::Instant::now();
-        let mut indexed = 0u32;
-        let mut passes = 0u32;
-        loop {
-            let report = tokio::time::timeout(
-                Duration::from_secs(180),
-                index_bodies_pass(
-                    mail_core::index::BodyIndexRun {
-                        cache: &cache,
-                        cfg: &cfg,
-                        limit: LIMIT,
-                    },
-                    &mut client,
-                ),
-            )
-            .await
-            .expect("a pass must finish")
-            .expect("pass");
-            passes += 1;
-            indexed += report.indexed;
-            if report.remaining == 0 {
-                break;
-            }
+        for (shape, msgs, secs, cmds, passes) in [
+            ("逐封", slow_msgs, slow_secs, slow_cmds, slow_passes),
+            ("批量", fast_msgs, fast_secs, fast_cmds, fast_passes),
+        ] {
             assert_eq!(
-                report.indexed, LIMIT as u32,
-                "a full pass must make progress"
+                msgs, MESSAGES,
+                "every message must end up indexed ({shape})"
+            );
+            println!(
+                "P8b  往返 {:>3} ms · {shape} · {:>3} 封 / {:>5.2} s = {:>6.1} 封/秒 · body FETCH {} 次（每封 {:.2}）· {} 轮",
+                latency_ms,
+                msgs,
+                secs,
+                msgs as f64 / secs,
+                cmds,
+                cmds as f64 / msgs as f64,
+                passes,
             );
         }
-        let seconds = started.elapsed().as_secs_f64();
-
-        let body_fetches = transcript.lock().unwrap()[before..]
-            .iter()
-            .filter(|line| {
-                let up = line.to_ascii_uppercase();
-                up.contains("UID FETCH") && !up.contains("[HEADER]")
-            })
-            .count();
-        assert_eq!(indexed, MESSAGES, "every message must end up indexed");
-        assert_eq!(
-            cache.body_coverage(&cfg.id).expect("coverage").indexed,
-            MESSAGES
-        );
-
+        // The paired multiple, from the two arms measured one after the other.
         println!(
-            "P8b  往返 {:>3} ms · {:>3} 封 / {:>5.2} s = {:>5.1} 封/秒 · FETCH 命令 {} 次（每封 {:.2} 次）· {} 轮 × limit {}",
+            "P8b  往返 {:>3} ms · 配对倍数 = {:>5.1} 封/秒 ÷ {:>6.1} 封/秒 = {:.1} 倍 · 每封命令 {:.2} → {:.2}",
             latency_ms,
-            indexed,
-            seconds,
-            indexed as f64 / seconds,
-            body_fetches,
-            body_fetches as f64 / indexed as f64,
-            passes,
-            LIMIT,
+            fast_msgs as f64 / fast_secs,
+            slow_msgs as f64 / slow_secs,
+            (fast_msgs as f64 / fast_secs) / (slow_msgs as f64 / slow_secs),
+            slow_cmds as f64 / slow_msgs as f64,
+            fast_cmds as f64 / fast_msgs as f64,
         );
     }
     println!(
-        "口径：这把尺子量的是一轮能吞多少封（往返受限）。多久跑一轮（礼貌 tick，60 秒）是 src-tauri 的另一半，\
-         它不在这里，两个瓶颈得分开修。"
+        "口径：这把尺子量的是一轮能吞多少封（往返受限）。多久跑一轮（礼貌 tick，60 秒）是 src-tauri 的另一半，         它不在这里，两个瓶颈得分开修 —— 0.33 封/秒 的持续速率不由这条倍数决定（步骤 3 治它）。"
     );
+}
+
+/// One arm of the bench: a fresh server, a fresh cache, the backlog drained to empty.
+///
+/// `batched` picks the source shape. The per-message arm is **not** the old code — it is today's code
+/// seen through [`PerMessage`], a wrapper that leaves `BodySource::fetch_bodies` at the trait default
+/// (a loop over `fetch_body`). Both arms therefore run the same parsing, storing and indexing, and the
+/// only difference between them is how many commands the folder costs.
+async fn run_p8_arm(
+    latency_ms: u32,
+    batched: bool,
+    messages: u32,
+    body_chars: u32,
+    limit: usize,
+) -> (u32, f64, u32, u32) {
+    let (addr, transcript) = spawn_server(Server {
+        uidplus: true,
+        require_select: true,
+        extra: Arc::new(AtomicU32::new(messages - RICH_MESSAGES)),
+        fetch_latency_ms: Arc::new(AtomicU32::new(latency_ms)),
+        filler_body_chars: Arc::new(AtomicU32::new(body_chars)),
+        ..Server::default()
+    })
+    .await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+    within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+
+    // The fixture really grew, or the bench is measuring four messages and reporting a number that
+    // belongs to nothing.
+    assert_eq!(
+        cache.bodies_pending_count(&cfg.id).expect("pending"),
+        messages,
+        "a sync stores headers only"
+    );
+
+    // Only the pass's own commands count: the sync's header FETCHes are already in the log.
+    let before = transcript.lock().unwrap().len();
+    let started = std::time::Instant::now();
+    let (indexed, passes) = if batched {
+        drain_bodies(&cache, &cfg, &mut client, limit).await
+    } else {
+        let mut one_by_one = PerMessage(&mut client);
+        drain_bodies(&cache, &cfg, &mut one_by_one, limit).await
+    };
+    let seconds = started.elapsed().as_secs_f64();
+    let commands = transcript.lock().unwrap()[before..]
+        .iter()
+        .filter(|line| {
+            let up = line.to_ascii_uppercase();
+            up.contains("UID FETCH") && !up.contains("[HEADER]")
+        })
+        .count() as u32;
+
+    assert_eq!(
+        cache.body_coverage(&cfg.id).expect("coverage").indexed,
+        messages
+    );
+    (indexed, seconds, commands, passes)
+}
+
+async fn drain_bodies<S: mail_core::index::BodySource>(
+    cache: &Cache,
+    cfg: &AccountConfig,
+    source: &mut S,
+    limit: usize,
+) -> (u32, u32) {
+    let mut indexed = 0u32;
+    let mut passes = 0u32;
+    loop {
+        let report = tokio::time::timeout(
+            Duration::from_secs(180),
+            index_bodies_pass(mail_core::index::BodyIndexRun { cache, cfg, limit }, source),
+        )
+        .await
+        .expect("a pass must finish")
+        .expect("pass");
+        passes += 1;
+        indexed += report.indexed;
+        if report.remaining == 0 {
+            return (indexed, passes);
+        }
+        assert_eq!(
+            report.indexed, limit as u32,
+            "a full pass must make progress"
+        );
+    }
+}
+
+/// A source that will not batch: `fetch_body` is delegated and `fetch_bodies` is left at the trait's
+/// default loop, which is precisely the shape the prefetch pass had before 2b.
+///
+/// It exists so the bench can run both shapes against the same server in the same process. Nothing in
+/// production uses it — if that ever changes, this is the wrong place to look.
+struct PerMessage<'a, S>(&'a mut S);
+
+impl<S: mail_core::index::BodySource> mail_core::index::BodySource for PerMessage<'_, S> {
+    async fn fetch_body(
+        &mut self,
+        folder: &str,
+        uid: u32,
+    ) -> mail_core::Result<mail_core::MessageDetail> {
+        self.0.fetch_body(folder, uid).await
+    }
 }
 
 /// **V2-A, failure half.** One unreadable message must not abandon the rest of the pass.
