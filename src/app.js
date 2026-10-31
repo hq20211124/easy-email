@@ -203,6 +203,14 @@ const state = {
    * folder or a search, because the same key in another folder is a different set of messages.
    */
   expandedThreads: new Set(),  /** Non-empty means the list is showing cache hits rather than the current folder. */
+  /**
+   * Outbox rows the user opened, by outbox id.
+   *
+   * Held in state rather than in the DOM because `outbox:changed` re-renders the whole list every
+   * time the queue moves (the worker ticks every five seconds). A row that collapsed itself while
+   * the user was reading it would be the kind of flicker that teaches people not to trust the panel.
+   */
+  expandedOutbox: new Set(),
   searchQuery: '',
   searchHits: [],
   /**
@@ -1935,7 +1943,7 @@ function renderOutbox(list) {
     const state_ = item.state;
     const preview = outboxPreview(item);
     const row = document.createElement('div');
-    row.className = 'msg' + (state_ === 'failed' || state_ === 'needs_attention' ? ' outbox-trouble' : '');
+    row.className = 'msg outbox-row' + (state_ === 'failed' || state_ === 'needs_attention' ? ' outbox-trouble' : '');
     row.dataset.outboxId = String(item.id);
     row.setAttribute('role', 'button');
     row.tabIndex = 0;
@@ -1980,8 +1988,26 @@ function renderOutbox(list) {
       buttons.appendChild(rowButton('删除', () => discardOutboxItem(item.id)));
     }
 
-    // The row itself is not clickable: an outbox item has no reader to open. Keeping it a div with
-    // a role means the buttons inside are the only targets.
+    // The row text is clipped by the list's one-line ellipsis (`.msg-subject`), and a subject the
+    // user cannot read is a subject they cannot check before it leaves. The tooltip is the cheap
+    // half; the expandable record below is the half that also carries the state.
+    row.title = `${preview.destinations} — ${preview.subject}`;
+    const expanded = state.expandedOutbox.has(item.id);
+    row.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+
+    // The row itself is not a reader — an outbox item is the message about to leave, not one that
+    // arrived — but it is still a thing the user points at and asks "did this go?". Clicking it
+    // opens the record instead of doing nothing.
+    row.addEventListener('click', () => {
+      if (state.expandedOutbox.has(item.id)) state.expandedOutbox.delete(item.id);
+      else state.expandedOutbox.add(item.id);
+      // `keepScroll`: opening a record four rows down must not throw the user back to the top of
+      // the queue. Only the clicked row changes height, and it is the one under the pointer.
+      renderMessages({ keepScroll: true });
+    });
+
+    if (expanded) row.appendChild(buildOutboxDetail(item));
+
     list.appendChild(row);
   }
 
@@ -2026,6 +2052,121 @@ function outboxPreview(item) {
   } catch {
     return { destinations: '(内容读不出来)', subject: '(内容读不出来)' };
   }
+}
+
+/** The queued payload as an object, or `null` when the stored JSON cannot be read. */
+function outboxMail(item) {
+  try {
+    return JSON.parse(item.payload_json);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One sentence answering the only question this panel exists for: did it go out?
+ *
+ * "Sent" means the SMTP server took the message — nothing on this machine can prove more than
+ * that, and saying so plainly beats a green tick that implies the recipient has read it.
+ */
+function outboxVerdict(item) {
+  switch (item.state) {
+    case 'queued':
+      return '还没发出去：还在撤销窗口里，这封信一个字节都没有离开这台电脑。';
+    case 'sending':
+      return '正在和服务器对话，结果还不知道。';
+    case 'sent':
+      return '服务器已经收下这封信（SMTP 接受了它）。这不等于对方已经读到。';
+    case 'failed':
+      return '没发出去：这次失败了，可以重试。';
+    case 'needs_attention':
+      return '不知道发没发：这类失败程序不会自动重发（怕重复投递），需要你自己判断。';
+    case 'cancelled':
+      return '没有发出去：你撤销了它。';
+    default:
+      return `状态是 ${item.state}。`;
+  }
+}
+
+/**
+ * Folder names that mean "the server's copy of what you sent".
+ *
+ * The backend localises folder names (RFC 6154 role first, English name as fallback), so this reads
+ * both the wire name and the label. It only ever decides a sentence on screen, never a behaviour —
+ * getting it wrong costs a misleading subtitle, not a lost message.
+ */
+function looksLikeSentFolder(name) {
+  if (!name) return false;
+  return /^(sent|sent items|sent messages|sent mail|已发送|已发送邮件|已发出的邮件)$/i.test(
+    String(name).trim()
+  );
+}
+
+/**
+ * What the list header should say.
+ *
+ * The 「已发送」 list is read from the cache, but the rows in it came from the server's Sent folder —
+ * so a message showing up there has already left this machine. That is the evidence people go
+ * looking for, and it is worth one sentence: the folder itself is the answer to "did it go?".
+ */
+function mailboxTitleText(label, provisional = false) {
+  const base = label || state.mailbox;
+  const sent = looksLikeSentFolder(state.mailbox) || looksLikeSentFolder(label);
+  const text = sent ? `${base}（服务器上的副本）` : base;
+  return provisional ? `${text}（正在收取…）` : text;
+}
+
+/**
+ * The full record of one outbox row.
+ *
+ * Built with DOM calls rather than `innerHTML` because every value here is user text — a subject
+ * with `<` in it is ordinary, and a payload is not a place to start trusting strings.
+ */
+function buildOutboxDetail(item) {
+  const mail = outboxMail(item);
+  const box = document.createElement('div');
+  box.className = 'outbox-detail';
+  // The row toggles on click; the record inside it must not collapse when the user clicks the text
+  // they are trying to select.
+  box.addEventListener('click', (event) => event.stopPropagation());
+
+  const verdict = document.createElement('p');
+  verdict.className = 'outbox-verdict';
+  verdict.textContent = outboxVerdict(item);
+  box.appendChild(verdict);
+
+  const dl = document.createElement('dl');
+  const add = (label, value) => {
+    if (!value) return;
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    dd.textContent = value;
+    dl.append(dt, dd);
+  };
+
+  if (!mail) {
+    add('内容', '这封信的载荷读不出来，细节无法显示。');
+  } else {
+    add('主题', mail.subject || '(无主题)');
+    add('收件人', (mail.to ?? []).join(', '));
+    add('抄送', (mail.cc ?? []).join(', '));
+    // Bcc appears here and nowhere else: this is the sender's own record, which is the last place
+    // the user can still see who else got a copy.
+    add('密送', (mail.bcc ?? []).join(', '));
+    const files = (mail.attachments ?? []).map((file) => file.name).filter(Boolean);
+    if (files.length) add('附件', files.join('、'));
+    const text = (mail.body_text ?? '').trim();
+    if (text) add('正文', text.length > 400 ? `${text.slice(0, 400)}…` : text);
+  }
+  add('状态', OUTBOX_LABELS[item.state] ?? item.state);
+  if (item.attempts > 0) add('尝试', `${item.attempts} 次`);
+  if (item.last_error) add('最后一次错误', item.last_error);
+  add('加入发件箱', formatDate(item.created_at));
+  add('Message-ID', item.sent_message_id || (mail && mail.message_id) || '');
+
+  box.appendChild(dl);
+  return box;
 }
 
 /**
@@ -2254,8 +2395,7 @@ function renderHistoryButton() {
  * event, so a second round trip there would re-check a folder nothing has touched since.
  */
 async function loadMessages({ reset = false, refresh = true } = {}) {
-  if (!state.accountId || !state.mailbox) return;
-  // The local lists are not backed by the server: fetching a folder here would both waste a round
+  if (!state.accountId || !state.mailbox) return;  // The local lists are not backed by the server: fetching a folder here would both waste a round
   // trip and paint mail over the list the user is looking at.
   if (state.view !== 'mail') return;
   if (reset) {
@@ -2277,7 +2417,7 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
     renderReader();
   }
 
-  $('mailbox-title').textContent = state.mailboxLabel || state.mailbox;
+  $('mailbox-title').textContent = mailboxTitleText(state.mailboxLabel);
 
   const list = $('message-list');
   const seq = ++state.listLoadSeq;
@@ -2314,7 +2454,7 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
     // Rows taken from disk must not read as the server's current state — `design/20` V2-B names that
     // as the failure this cache exists to avoid. Said where the user reads "what am I looking at",
     // and only while the list is provisional: before any row is up, the spinner already says it.
-    title.textContent = `${state.mailboxLabel || state.mailbox}（正在收取…）`;
+    title.textContent = mailboxTitleText(state.mailboxLabel, true);
   }
 
   const messages = await run('收取邮件', () =>

@@ -872,6 +872,52 @@ textarea {
   white-space: pre-wrap;
 }
 
+/* Outbox rows are not part of the virtualised list — there are a handful of them, and one can be
+   opened to show the whole record. The fixed height plus `overflow: hidden` above is what makes the
+   mail list cheap; here it would clip exactly the thing the user clicked to read. */
+.msg.outbox-row {
+  height: auto;
+  overflow: visible;
+}
+
+.outbox-detail {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  cursor: text;
+  /* The row itself is a single line; the record inside it is not. */
+  white-space: normal;
+}
+
+.outbox-verdict {
+  margin: 0 0 6px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.outbox-detail dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 10px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.outbox-detail dt {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.outbox-detail dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .list-footer {
   padding: 10px;
   border-top: 1px solid var(--border);  flex: none;

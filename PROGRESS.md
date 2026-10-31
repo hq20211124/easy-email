@@ -18,6 +18,31 @@
   `tools/check.ps1` **全绿**：**65 步**（第 101 轮给 2a/2b 各加一步；第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
   早已过期，只有"fmt + clippy -D warnings + build + test + PE=2"这几条一直是骨架）。
 
+### 发件箱能点开了；「已发送」说清"它在这里就是证据"（第 103 轮，2026-10-31）
+
+用户报的两个问题都是真的，而且都在我上一轮"发件箱界面"里留下的坑：
+
+- **发件箱的行设计上不可点**（旧注释写着 "an outbox item has no reader to open"），而 `.msg` 是虚拟列表行：
+  `height: var(--msg-height)` + `overflow: hidden` ⇒ **标题被截断，点开什么都没有**。
+- **「已发送」里看不出状态**：它是服务器 Sent 文件夹的镜像，界面上没有任何一句告诉用户
+  "这封信出现在这里，就说明它已经离开这台机器了"。
+
+修法（`src/app.js` + `src/style.css`）：
+
+1. `.msg.outbox-row { height: auto; overflow: visible }` —— 发件箱不是虚拟列表，固定高度在这里只会剪掉
+   用户正要看的东西。
+2. 点行展开**这封信的记录**：一句人话判决（"服务器已经收下这封信（SMTP 接受了它）。这不等于对方已经读到。"）
+   + 主题全文 / 收件人 / 抄送 / 密送 / 附件 / 正文前 400 字 / 状态 / 尝试次数 / 最后错误 / Message-ID。
+   全部用 DOM 构建而不是 `innerHTML`：这里的每个值都是用户文本，载荷不是开始相信字符串的地方。
+3. 展开状态放 `state.expandedOutbox`（Set）而不是 DOM：`outbox:changed` 每 5 秒重画整张表，
+   放在 DOM 里的展开会在用户读的时候被吃掉。
+4. 行加 `title`（悬停看全标题）；展开时 `renderMessages({ keepScroll: true })` —— 点第四行不该把人弹回顶部。
+5. 「已发送」标题变成 `已发送（服务器上的副本）`：这是用户去那里时真正想问的答案，值得一句话
+   （`mailboxTitleText` + `looksLikeSentFolder`，只影响一句文案，不影响任何行为）。
+
+**验证**：`node --check src/app.js` + 5 个 JS 门禁（history / reply / wizard_verdict / storage / payload_keys）全过。
+**未做真机目视验证** —— 本机 WebView2 在 CDP 下起不来（第 102 轮 §17.3），所以这一条要等用户看一眼才算数。
+
 ### 10 万封夹具终于存在：存储侧全部有数，桌面壳三项没测成（第 102 轮，2026-10-31）
 
 `design/15` §3 承诺的 `tools/make-fixture.ps1` 一直不存在，所以 P1/P5 那两行写着"10 万封 / 3 账号"，
