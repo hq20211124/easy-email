@@ -79,8 +79,12 @@ pub struct HeaderPage {
 /// small numeric window. NetEase hands out UIDs around 1.5e9, and `UID FETCH 1:500` on a 20-message
 /// inbox therefore returned nothing — the folder never synced and the cursor never moved, for ever
 /// (a full web inbox and an empty client). Bounding happens after the fact instead:
-/// [`ImapClient::fetch_headers_since`] asks `UID SEARCH` for what is above the cursor and fetches
-/// only the oldest `limit` of the answer.
+/// [`ImapClient::fetch_headers_since`] enumerates what is above the cursor with
+/// `UID FETCH <set> (UID)` and fetches headers for only the oldest `limit` of the answer.
+///
+/// **Not `UID SEARCH`.** QQ answers `UID SEARCH 210:*` with nothing while `UID FETCH 210:* (UID)`
+/// finds the message (measured 2026-11-01, `tests/sent_uid_probe.rs`, branch A) — the range is fine,
+/// the search over it is not.
 pub fn since_range(after_uid: u32) -> String {
     format!("{}:*", after_uid.saturating_add(1))
 }
@@ -110,6 +114,101 @@ pub fn keep_newest_page(mut summaries: Vec<MessageSummary>, limit: usize) -> Vec
         summaries = summaries.split_off(summaries.len() - limit);
     }
     summaries
+}
+
+/// What `UID SEARCH` and `UID FETCH` each answer about one target UID in one folder.
+///
+/// `UID SEARCH <n>:*` and `UID FETCH <n>:*` are both *ranges*, and RFC 3501 says nothing about how a
+/// server must resolve a range whose low end sits above the highest UID in the folder. `design/07`
+/// §14.2 records a real account where `UID SEARCH 210:*` came back empty while UID 226 existed — and
+/// "empty" has at least three causes with three different fixes. The previous plan picked one of them
+/// and was about to pay for it; this struct is how the guess becomes evidence.
+///
+/// Read-only by construction: one `SELECT` plus three `UID` commands, no `STORE`, no `APPEND`,
+/// nothing that can change the mailbox.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UidProbe {
+    /// Folder the probe ran in, as the wire spells it — the verdict line is worthless without it.
+    pub folder: String,
+    /// `UIDVALIDITY` from the `SELECT` the commands below ran under.
+    pub uidvalidity: u32,
+    /// `UIDNEXT` from that same `SELECT`.
+    pub uidnext: u32,
+    /// The cursor the question is about: `after_uid + 1` is the low end of every range below.
+    pub after_uid: u32,
+    /// The UID we are asking about (the one the user can see in another client).
+    pub target: u32,
+    /// `UID SEARCH <after+1>:*` named the target. `None` = the command itself failed.
+    pub search_since: Option<bool>,
+    /// `UID SEARCH ALL` named the target.
+    pub search_all: Option<bool>,
+    /// `UID FETCH <after+1>:* (UID)` returned the target.
+    pub fetch_since: Option<bool>,
+    /// First failure, verbatim. "The server said no" and "the server said nothing" are different
+    /// diagnoses and only the message tells them apart.
+    pub error: Option<String>,
+}
+
+/// Which fix the evidence points at (`design/07` §14.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UidBranch {
+    /// `SEARCH ALL` and `FETCH <n>:*` both see it, `SEARCH <n>:*` does not: the *search* range is
+    /// what is broken, so the fix is to stop asking `SEARCH` about ranges.
+    A,
+    /// Only `SEARCH ALL` sees it: both range forms are untrustworthy, so the fix has to avoid ranges
+    /// altogether (`UID FETCH 1:* (UID)` and filter locally).
+    APrime,
+    /// The server agrees the message is there, so the loss is on our side — branch B or C. Which one
+    /// needs the local cursor, which this type cannot see on purpose.
+    ServerAgrees,
+    /// The evidence supports no conclusion: the target is not in the folder, or a command failed.
+    /// Saying "unknown" is the honest answer, and the alternative is inventing a cause again.
+    Undecided,
+}
+
+impl UidProbe {
+    /// Classify the answers. Kept separate from the network call so the decision table can be tested
+    /// without a server — a diagnosis nobody can re-run offline is a rumour, not a result.
+    pub fn branch(&self) -> UidBranch {
+        match (self.search_all, self.search_since, self.fetch_since) {
+            (Some(true), Some(false), Some(true)) => UidBranch::A,
+            (Some(true), Some(false), Some(false)) => UidBranch::APrime,
+            (Some(true), Some(true), Some(true)) => UidBranch::ServerAgrees,
+            _ => UidBranch::Undecided,
+        }
+    }
+
+    /// The one line `design/07` §14.3 asks to be recorded, e.g.
+    /// `同步 Sent Messages：SEARCH 空 / FETCH 有 226 ⇒ 分支 A`.
+    pub fn verdict(&self) -> String {
+        format!(
+            "同步 {}：SEARCH {} / FETCH {} {} ⇒ 分支 {}",
+            self.folder,
+            answer(self.search_since),
+            answer(self.fetch_since),
+            self.target,
+            self.branch().name()
+        )
+    }
+}
+
+impl UidBranch {
+    pub fn name(self) -> &'static str {
+        match self {
+            UidBranch::A => "A（SEARCH 的区间不可信）",
+            UidBranch::APrime => "A′（区间解释整体不可信）",
+            UidBranch::ServerAgrees => "服务器一致（B/C，看本地游标）",
+            UidBranch::Undecided => "无法判定",
+        }
+    }
+}
+
+fn answer(seen: Option<bool>) -> &'static str {
+    match seen {
+        Some(true) => "有",
+        Some(false) => "空",
+        None => "失败",
+    }
 }
 
 /// Everything a transport must be, named once.
@@ -596,14 +695,22 @@ impl ImapClient {
     /// current `UIDVALIDITY`.
     ///
     /// This is what makes the local cache cheap to keep current: one `SELECT` (so the caller does not
-    /// have to make a second one just to read `UIDVALIDITY`), one `UID SEARCH` for what is above the
-    /// cursor, and one `UID FETCH` for at most one page of it.
+    /// have to make a second one just to read `UIDVALIDITY`), one `UID FETCH … (UID)` that asks the
+    /// server to *enumerate* the range, and one `UID FETCH` for at most one page of headers.
     ///
-    /// **The search-then-fetch shape is what makes "one page" correct.** A single
+    /// **It used to ask `UID SEARCH <after+1>:*` and that is why a sent copy could be invisible.**
+    /// Measured 2026-11-01 on QQ's `Sent Messages` (`tests/sent_uid_probe.rs`, branch A): with
+    /// `UIDVALIDITY=1579573363`, cursor 209 and UID 226 present, `UID SEARCH 210:*` answered
+    /// **empty**, `UID SEARCH ALL` contained 226, and `UID FETCH 210:* (UID)` contained 226. Two
+    /// commands, same range, opposite answers — so the search range is what cannot be trusted, and a
+    /// folder that never reports anything new never syncs (design/07 §14.2 root cause 2).
+    ///
+    /// **Enumeration is also what makes "one page" correct.** A single
     /// `UID FETCH <after+1>:<after+limit>` looks bounded but is not a page — UIDs are not dense, so
     /// on a server whose UIDs do not start near 1 the numeric window matches nothing and the folder
-    /// never syncs (see [`since_range`]). `SEARCH` is also *cheaper* in the ordinary case: when
-    /// nothing is new it returns an empty set and the fetch is skipped entirely.
+    /// never syncs (see [`since_range`]). The UID-only fetch is cheap in the ordinary case too: with
+    /// nothing new the range resolves to the last message alone (RFC 3501 ranges are unordered), one
+    /// row comes back, and the filter below drops it.
     pub async fn fetch_headers_since(
         &mut self,
         mailbox: &str,
@@ -616,13 +723,22 @@ impl ImapClient {
             let uidvalidity = selected.uid_validity.unwrap_or(0);
 
             let query = since_range(after_uid);
-            let mut uids: Vec<u32> = self
-                .session
-                .uid_search(&query)
-                .await
-                .map_err(imap_err)?
-                .into_iter()
-                .collect();
+            // `(UID)` and nothing else: no flags, no size, no header section. The cost is the round
+            // trip, not the bytes, and asking for the numbers alone is what keeps it at the same
+            // price as the `SEARCH` it replaces.
+            let mut uids: Vec<u32> = Vec::new();
+            {
+                let mut stream = self
+                    .session
+                    .uid_fetch(&query, "(UID)")
+                    .await
+                    .map_err(imap_err)?;
+                while let Some(fetch) = stream.try_next().await.map_err(imap_err)? {
+                    if let Some(uid) = fetch.uid {
+                        uids.push(uid);
+                    }
+                }
+            }
             // **The filter is not redundant.** `low:*` is still a *range*, and RFC 3501 ranges are
             // unordered — so when `after_uid` is the folder's highest UID, `after+1:*` resolves to
             // that last message rather than to nothing, and every sync would re-store it for ever.
@@ -673,6 +789,87 @@ impl ImapClient {
             })
         })
         .await
+    }
+
+    /// Read-only diagnosis of the two UID primitives (`design/07` §14.3, step D-1).
+    ///
+    /// The order is the design's, and it is not arbitrary: `SELECT` first, because `UIDVALIDITY` and
+    /// `UIDNEXT` have to describe the same folder generation the three commands below run under;
+    /// then `UID SEARCH <after+1>:*` (what the sync path actually does); then `UID SEARCH ALL`; then
+    /// `UID FETCH <after+1>:* (UID)`. The last two are the controls — the third asks the server to
+    /// *enumerate* rather than to search, which is why it can disagree with the first.
+    ///
+    /// A failing command is recorded rather than returned: a rejection is itself one of the answers,
+    /// and the caller wants all of them in one report. It also means the session may be unusable
+    /// afterwards (async-imap closes the stream on a rejection), so this belongs on a throwaway
+    /// connection, not in the middle of a sync.
+    pub async fn probe_uid_visibility(
+        &mut self,
+        mailbox: &str,
+        after_uid: u32,
+        target: u32,
+    ) -> Result<UidProbe> {
+        let selected = self.select_to(mailbox).await?;
+        let mut probe = UidProbe {
+            folder: mailbox.to_string(),
+            // Public fields in async-imap, not accessors.
+            uidvalidity: selected.uid_validity.unwrap_or(0),
+            uidnext: selected.uid_next.unwrap_or(0),
+            after_uid,
+            target,
+            ..UidProbe::default()
+        };
+
+        let range = since_range(after_uid);
+        match self.session.uid_search(&range).await {
+            Ok(uids) => probe.search_since = Some(uids.contains(&target)),
+            Err(e) => probe.error = Some(format!("SEARCH {range}: {e}")),
+        }
+
+        match self.session.uid_search("ALL").await {
+            Ok(uids) => probe.search_all = Some(uids.contains(&target)),
+            Err(e) => {
+                probe
+                    .error
+                    .get_or_insert_with(|| format!("SEARCH ALL: {e}"));
+            }
+        }
+
+        let mut seen: Vec<u32> = Vec::new();
+        match self.session.uid_fetch(&range, "(UID)").await {
+            Ok(mut stream) => {
+                let mut failed = None;
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(fetch)) => {
+                            if let Some(uid) = fetch.uid {
+                                seen.push(uid);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            failed = Some(format!("FETCH {range}: {e}"));
+                            break;
+                        }
+                    }
+                }
+                // Only a stream that ran to completion is an answer; a half-read one would report
+                // "no" for a target that simply had not arrived yet.
+                if failed.is_none() {
+                    probe.fetch_since = Some(seen.contains(&target));
+                }
+                if let Some(message) = failed {
+                    probe.error.get_or_insert(message);
+                }
+            }
+            Err(e) => {
+                probe
+                    .error
+                    .get_or_insert_with(|| format!("FETCH {range}: {e}"));
+            }
+        }
+
+        Ok(probe)
     }
 
     /// One page of **history**: up to `limit` headers from the UIDs *below* `before_uid`.
@@ -1454,6 +1651,74 @@ fn date_to_unix(dt: &mail_parser::DateTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decision table from `design/07` §14.3, one row per branch.
+    ///
+    /// This is the part of the diagnostic that can be re-run without a mailbox, so it is the part
+    /// that has to be pinned: the four rows are exactly the four conclusions the design allows, and
+    /// an unknown shape must fall through to `Undecided` rather than to the nearest guess.
+    #[test]
+    fn the_uid_probe_classifies_each_branch_from_its_three_answers() {
+        let case = |search_all, search_since, fetch_since| UidProbe {
+            folder: "Sent Messages".to_string(),
+            uidvalidity: 1579573363,
+            uidnext: 227,
+            after_uid: 209,
+            target: 226,
+            search_since,
+            search_all,
+            fetch_since,
+            error: None,
+        };
+
+        // A: SEARCH's range is the broken one; FETCH's range still works.
+        assert_eq!(
+            case(Some(true), Some(false), Some(true)).branch(),
+            UidBranch::A
+        );
+        // A′: both range forms are broken, only the unfiltered search works.
+        assert_eq!(
+            case(Some(true), Some(false), Some(false)).branch(),
+            UidBranch::APrime
+        );
+        // The server agrees the message is there: the loss is local (B or C).
+        assert_eq!(
+            case(Some(true), Some(true), Some(true)).branch(),
+            UidBranch::ServerAgrees
+        );
+        // Target not in the folder at all — the premise is wrong, so no conclusion.
+        assert_eq!(
+            case(Some(false), Some(false), Some(false)).branch(),
+            UidBranch::Undecided
+        );
+        // A failed command must not be read as "the server said no".
+        assert_eq!(
+            case(Some(true), None, Some(true)).branch(),
+            UidBranch::Undecided
+        );
+    }
+
+    /// The verdict line is the artefact `design/07` §14.3 requires to be recorded, so its shape is
+    /// asserted rather than eyeballed: folder, both answers, the target UID, the branch.
+    #[test]
+    fn the_verdict_line_names_the_folder_both_answers_and_the_branch() {
+        let probe = UidProbe {
+            folder: "Sent Messages".to_string(),
+            uidvalidity: 1579573363,
+            uidnext: 227,
+            after_uid: 209,
+            target: 226,
+            search_since: Some(false),
+            search_all: Some(true),
+            fetch_since: Some(true),
+            error: None,
+        };
+
+        assert_eq!(
+            probe.verdict(),
+            "同步 Sent Messages：SEARCH 空 / FETCH 有 226 ⇒ 分支 A（SEARCH 的区间不可信）"
+        );
+    }
 
     /// Build a `DateTime` with every field explicit.
     ///

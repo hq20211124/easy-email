@@ -514,7 +514,9 @@ M3 若要更大的附件走的仍是同一条路，**届时**才能移除单封�
 
 1. **归档成功不落列表。** `file_sent_copies`（`worker.rs:435`）在 `Ok(Some(copy))` 分支里只写 `sent_index`（一条指针，`worker.rs:469`），**不写 `messages` 行**，而「已发送」列表只读 `messages`。这一条是确定的，且独立于下面那条。
 2. **增量同步取不回刚 APPEND 的那封。** 症状确证：`fetch_headers_since` 发 `UID SEARCH 210:*`（`imap.rs:618` + `since_range`，`imap.rs:84-86`），在 QQ 的 Sent 上返回空。
-   **但原因没定位。** v3 把"没返回 226"写成了结论，它只是现象。至少三种可能：SEARCH 的区间解释不可信、游标推过头、取回之后被过滤掉。三种原因对应三种修法，**在 D-1 出结论之前不许动 D3**。
+   **原因已定位（2026-11-01，§14.3.1）：分支 A —— 该服务器的 `SEARCH <n>:*` 区间不可信，同一区间的
+   `UID FETCH` 能取到 226。** 修法已按 A 栏落地（`fetch_headers_since` 改用 `UID FETCH … (UID)` 枚举），
+   真机复验一次同步新增 17 封、游标落在 226。下面那段"三种可能"保留为当时的推理记录。
 
 ### 14.3 D-1：诊断（v4 新增；v5 补第四格 A′）
 
@@ -538,6 +540,45 @@ M3 若要更大的附件走的仍是同一条路，**届时**才能移除单封�
 | **C** | 2、3、4 都有、游标也对，行还是不出现 | 链路另有断点（例如该文件夹不在同步集合里） | 才做 D3（§14.5 标"条件性"），并连带做 D0（§14.4） |
 
 **可证伪**：诊断结论必须落成一条断言或一行日志（形如 `同步 Sent：SEARCH 空 / FETCH 有 226 ⇒ 分支 A`），写进本节。不许"顺手做了 D3 就当诊断过了"。
+
+#### 14.3.1 结论：**分支 A**（2026-11-01 实测，真账号 QQ `Sent Messages`）
+
+探针 `crates/mail-core/tests/sent_uid_probe.rs`（只读：一次 `SELECT` + 三条 `UID` 命令），输出原文：
+
+```
+账号        724921217@qq.com
+文件夹      Sent Messages（线路名）
+SELECT      UIDVALIDITY=1579573363 UIDNEXT=227
+本地游标    last_uid=209 uidvalidity=1579573363
+目标 UID    226
+SEARCH 210:*  → Some(false)
+SEARCH ALL             → Some(true)
+FETCH  210:*  → Some(true)
+同步 Sent Messages：SEARCH 空 / FETCH 有 226 ⇒ 分支 A（SEARCH 的区间不可信）
+```
+
+**同一连接、同一文件夹、同一区间，`SEARCH` 说没有、`FETCH` 说有。** 所以 §14.2 的第 2 条根因定位为
+**"该服务器的 `SEARCH <n>:*` 区间不可信"**，不再是"症状确证、原因未定位"；**D3 与 D0c 都不做**（§14.5、§14.4）。
+
+修法按 A 栏执行，已在同一提交里完成：`fetch_headers_since` 的"取 UID 列表"那一步从
+`UID SEARCH <after+1>:*` 换成 `UID FETCH <after+1>:* (UID)`，`retain(uid > after_uid)` 与
+`keep_oldest_page` 一条未动（区间无序 ⇒ 那个过滤器仍然是必需的）。
+
+**修复后的真机复验**（同一账号，同一文件夹，跑一次 `SyncDriver`）：
+
+```
+=== 同步 Sent Messages ===
+新增 17 封 · 缓存共 25 封 · last_uid 226 · uidvalidity 变了？false
+```
+
+改之前这台机器上同一操作反复得到"新增 0 封"（§14.1 的日志）。现在游标落在 outbox 声称的那个 UID 上，
+**「发件箱说已发送、已发送里没有它」这个矛盾在数据层已经消失**。界面那一半（D5 的分段控件、状态标签）
+仍未做，见 §14.10 的第 3 步。
+
+**回归**：`tests/loopback.rs::incremental_sync_enumerates_the_range_instead_of_searching_it` 断言的是
+**协议形状**（区间必须用 `FETCH … (UID)` 枚举、不得用 `SEARCH`），因为 loopback 夹具忠实于 RFC 3501 的区间语义，
+**复现不出 QQ 的答案** —— 这正是 §14.11 把"真机出口"与"A 栏离线验收"分开的理由。
+
 
 **成本对照**：A/B 的修法各约半天；D3 是 D0 + 三步顺序 + 边界表五行 + 一条新写入者。先花半天买一个"可能不需要后面全部东西"的答案。
 
@@ -744,14 +785,17 @@ settle_sent_row(outbox_row):
 ### 14.10 顺序与依赖（v5：D0 进分支，cache v11 缩成两列）
 
 ```
--1. D-1 诊断（§14.3）                                     半天，纯只读探针；**出结论之前不许动第 2 步**
+-1. D-1 诊断（§14.3）                                     ✅ 2026-11-01：分支 A（§14.3.1）
  0. cache v11：`sent_index.uidvalidity` + `messages.to_addrs`（D0a/D0b）  两条 add_column，A/B/C 都要
  1. user.db v5：sent_records + deleted_marks + 存量行 + settle_sent_row   纯后端，可独立验收
- 2a. 【A / A′ / B】修根因（改 `fetch_headers_since` 或游标那三处）        一个函数级别，D0c/D3 都不做
- 2b. 【C】D0c（message_id + 部分索引 + 四填充点）+ D3 + D6                 才付这份钱
+ 2a. 【A / A′ / B】修根因（改 `fetch_headers_since` 或游标那三处）        ✅ 2a-A 已做：改用 `UID FETCH … (UID)`
+ 2b. 【C】D0c（message_id + 部分索引 + 四填充点）+ D3 + D6                 **不做**（诊断结果是 A，不是 C）
  3. 列表合并 + 分段控件 + 状态批查（按 (folder, uid)）+ 事件 + spool 清扫   前端 + 一个新命令
  4. 侧栏 IA（`12` §16）                                    纯展示层，可与 -1..1 并行（见 `12` §16.5）
 ```
+
+**当前进度（2026-11-01）**：-1 与 2a 完成，下一步是 0（cache v11 两列）→ 1（`user.db` v5）→ 3。
+2b 因诊断结论为 A 而**永久关闭**，除非哪天在别的服务商上又看到"服务器说有、我们这边没有"。
 
 **为什么不能倒过来**：界面依赖的"这一行有没有副本"，在 0 之前只能靠 `outbox` 猜；靠猜就得两源合并，那就是 v1 的老路。
 

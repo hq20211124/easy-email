@@ -7,9 +7,9 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **526**（mail-core lib 442 + 桌面壳 lib 21 + loopback 57 +
-  reachability 4 + bench_fixture 1 + oauth_flow 1）。这 526 是**跑过的**条数；另有 **12** 条 `#[ignore]`
-  的基准不在里面 —— 第 99 轮续加了两条：`cache::tests::p9_time_is_not_in_the_transaction_boundary`
+- **测试数量**：基线 116 → 现在 **530**（mail-core lib 445 + 桌面壳 lib 21 + loopback 58 +
+  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107 轮加了 3 条）。这 530 是**跑过的**条数；
+  另有 **12** 条 `#[ignore]` 的基准不在里面 —— 第 99 轮续加了两条：`cache::tests::p9_time_is_not_in_the_transaction_boundary`
   （P9 事务边界，约 30 秒，复现命令在 `reports/performance.md` §10.6）与
   `db::tests::the_watchdog_costs_less_than_the_read_it_measures`（第 5 项的计时代价，约 2 秒，§11.7）；
   第 100 轮的 P8b 吞吐基准 `bench_p8_body_prefetch_throughput` 是第 11 条（三档延迟，约 70 秒，§16.2）；
@@ -17,6 +17,60 @@
   60 秒，约 135 秒，§16.8）。
   `tools/check.ps1` **全绿**：**65 步**（第 101 轮给 2a/2b 各加一步；第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
   早已过期，只有"fmt + clippy -D warnings + build + test + PE=2"这几条一直是骨架）。
+
+### D-1 出结论了：**分支 A**；一次同步把 226 收进来了（第 107 轮，2026-11-01）
+
+上一轮（第 106 轮）只改了文档，并把 `design/07` §14.10 的第 -1 步定成硬前置：**诊断出结论之前不许动第 2 步**。
+这一轮先把那一步做完，再按结论动手 —— 结论是 A，于是 v5 里最贵的那块（D0c + D3）**永久关闭**。
+
+**探针**：`crates/mail-core/tests/sent_uid_probe.rs`，只读（一次 `SELECT` + 三条 `UID` 命令），
+账号/密码/游标都取应用自己的（`accounts.json` + 凭据管理器 + `cache.db`），不复制、不写回。
+真机输出：
+
+```
+账号        724921217@qq.com
+文件夹      Sent Messages（线路名）
+SELECT      UIDVALIDITY=1579573363 UIDNEXT=227
+本地游标    last_uid=209 uidvalidity=1579573363
+目标 UID    226
+SEARCH 210:*  → Some(false)
+SEARCH ALL             → Some(true)
+FETCH  210:*  → Some(true)
+同步 Sent Messages：SEARCH 空 / FETCH 有 226 ⇒ 分支 A（SEARCH 的区间不可信）
+```
+
+**同一连接、同一文件夹、同一区间：`SEARCH` 说没有，`FETCH` 说有。** 这就是 §14.2 第 2 条根因的答案，
+也说明 v3/v4/v5 三轮反复讨论的 D3（归档时自己写 `messages` 行）**是在给一个不存在的缺陷付钱** ——
+同步本来就该拿到它，只是问错了命令。
+
+**修法（一个函数）**：`fetch_headers_since` 取 UID 列表的那一步
+`UID SEARCH <after+1>:*` → `UID FETCH <after+1>:* (UID)`，其余一字未动：
+`retain(uid > after_uid)` 仍然必需（区间无序 ⇒ 游标在最高位时 `n:*` 解析成最后一封），
+`keep_oldest_page` 仍然必需（游标只能推进到真正存下的最高 UID）。`since_range` 的文档跟着改，
+写明它现在交给 `FETCH`，以及 QQ 那组实测数字。
+
+**真机复验（同一账号、同一文件夹，跑一次 `SyncDriver`）**：
+
+```
+=== 同步 Sent Messages ===
+新增 17 封 · 缓存共 25 封 · last_uid 226 · uidvalidity 变了？false
+```
+
+改之前这台机器上同一操作反复是"新增 0 封"（§14.1 的日志原文）。现在 210–226 全进来了，游标落在 outbox
+声称的那个 UID 上。**「发件箱说已发送、已发送里没有它」在数据层已经消失**；界面上还缺 D5 的分段控件与状态标签，
+那是第 3 步，不是这一轮。
+
+**回归（离线可跑）**：`tests/loopback.rs::incremental_sync_enumerates_the_range_instead_of_searching_it`
+断言的是**协议形状** —— 区间必须用 `FETCH … (UID)` 枚举，且转录里不得出现带该区间的 `UID SEARCH`。
+这条断言必须看形状而不是看结果，因为 loopback 夹具忠实于 RFC 3501 的区间语义（`210:*` 就是 210–226），
+**复现不出 QQ 的答案**；而夹具现在也把 `(UID)` 当"只枚举"处理（不再回一份正文），
+否则"列 UID"和"下载一页"在夹具里的代价一样，任何断言都看不出区别。
+
+**数字**：mail-core lib **445 passed / 2 ignored**（新增 2 条分类表单测）；loopback **58 passed / 2 ignored**
+（新增 1 条）；`clippy -p mail-core --all-targets -D warnings` 干净。两条真机测试都 `#[ignore]`，
+门禁不会去拨真服务器。构建第一次撞到 `LNK1104`（无法创建测试 exe，exe 并不存在 ⇒ 不是锁），原样重跑即过。
+
+**未做**：`cache v11` 的 D0a/D0b 两列、`user.db` v5、界面那半（D5 分段控件/状态标签/事件）。2b 按结论关闭。
 
 ### 第三轮反向找茬：v4 的一笔钱花错了地方，`design/07` §14 与 `design/12` §16 升到 v5（第 106 轮，2026-10-31，**只有文档**）
 

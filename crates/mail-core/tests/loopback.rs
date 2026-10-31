@@ -632,6 +632,13 @@ async fn serve_imap(
                         }
                         let query = trimmed.to_ascii_uppercase();
                         let headers_only = query.contains("[HEADER]");
+                        // `(UID)` on its own is the server being asked to *enumerate* the range, not
+                        // to hand over mail: the sync path asks this way instead of `UID SEARCH`
+                        // because QQ's search range is unreliable (design/07 §14.2, branch A). If the
+                        // fixture answered with a body, that command would cost a full message here
+                        // and the difference between "list the UIDs" and "download a page" would be
+                        // invisible to every assertion.
+                        let uid_only = !headers_only && !query.contains("BODY");
                         // A partial fetch (`BODY[]<start.length>`) must return only that slice, or a
                         // streaming download would silently receive the whole message every time.
                         let partial = partial_range(&query);
@@ -663,6 +670,15 @@ async fn serve_imap(
                             };
                             // `UID` must be echoed or the client cannot correlate the response.
                             let flags = if uid == 1 { "\\Seen" } else { "" };
+                            if uid_only {
+                                write
+                                    .write_all(
+                                        format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n")
+                                            .as_bytes(),
+                                    )
+                                    .await?;
+                                continue;
+                            }
                             let head = format!(
                                 "* {uid} FETCH (UID {uid} FLAGS ({flags}) RFC822.SIZE {} {section} {{{}}}\r\n",
                                 raw.len(),
@@ -3717,6 +3733,63 @@ async fn syncing_a_folder_twice_only_fetches_what_is_new() {
         second.total_cached, 4,
         "and nothing re-inserted — the fixture answers `UID FETCH 5:*` with UID 4, because RFC 3501 \
          ranges are unordered, so a sync that trusted the server's range would duplicate it"
+    );
+}
+
+/// **Branch A regression (`design/07` §14.2/§14.3).** Incremental sync must not ask `UID SEARCH`
+/// about a range.
+///
+/// Measured on a real QQ account on 2026-11-01: with the cursor at 209 and UID 226 present in
+/// `Sent Messages`, `UID SEARCH 210:*` answered **empty**, `UID SEARCH ALL` contained 226, and
+/// `UID FETCH 210:* (UID)` contained 226. Two commands over the same range, opposite answers — so a
+/// folder whose search range is misread reports "nothing new" for ever, with no error anywhere, and
+/// the copy the user just sent never appears in 已发送.
+///
+/// The protocol shape *is* the assertion here: after a sync that has mail to pick up, the transcript
+/// must contain a `UID FETCH … (UID)` enumeration of the range and no `UID SEARCH` carrying it. The
+/// fixture is faithful to RFC 3501 ranges, so it cannot reproduce QQ's answer — which is exactly why
+/// the check is about which command we send, not about what comes back.
+#[tokio::test]
+async fn incremental_sync_enumerates_the_range_instead_of_searching_it() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+
+    let first = within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    assert_eq!(first.last_uid, 4, "the cold sync leaves the cursor at 4");
+
+    let before = transcript(&log).len();
+    let second = within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+    assert_eq!(second.fetched, 0, "nothing new must mean nothing stored");
+
+    let after = transcript(&log);
+    let incremental: Vec<&String> = after[before..]
+        .iter()
+        .filter(|line| {
+            let upper = line.to_ascii_uppercase();
+            upper.contains("UID SEARCH 5:") || upper.contains("UID FETCH 5:")
+        })
+        .collect();
+
+    assert!(
+        !incremental.is_empty(),
+        "the second sync has to ask about the range above the cursor: {:?}",
+        &after[before..]
+    );
+    assert!(
+        incremental
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("UID FETCH 5:*")),
+        "the range must be enumerated with FETCH: {incremental:?}"
+    );
+    assert!(
+        !incremental
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("UID SEARCH")),
+        "and never searched — QQ answers an empty set for a range it can enumerate: {incremental:?}"
     );
 }
 
