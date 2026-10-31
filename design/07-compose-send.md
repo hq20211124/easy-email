@@ -479,11 +479,27 @@ M3 若要更大的附件走的仍是同一条路，**届时**才能移除单封�
 
 ---
 
-## 14. 发件箱与「已发送」：一个列表 + 一份状态（2026-10-31，**v2，待用户确认后才动代码**）
+## 14. 发件箱与「已发送」：一个列表 + 一份状态（**v5，2026-10-31 第三轮反向找茬**）
 
-> **v1 已被本版取代**（v1 的"两源合并 + `origin` 三态 + 待发置顶"被否，理由见 §14.7）。
+> **v5 = v4 + 一次"先假设它错"的复核**。v4 修对了 v3 的七处，但留下一条方向性浪费（D0 无条件做，
+> 而它对存量邮件永远不生效）与六处硬伤。逐条见 §14.0。v1/v2/v3/v4 的原文结论保留在 §14.13
+> （这个仓库的规矩：改了什么、为什么改必须可查）。**仍然只有文档，代码一行没动。**
 
-### 14.1 用户看到的问题（真机数据，不是推测）
+### 14.0 v5 改了什么（v4 → v5）
+
+| # | v4 的说法 | 为什么站不住 | v5 改成 |
+|---|---|---|---|
+| 1 | D0（cache v11：列 + 模型 + 部分索引 + 四个填充点）**无条件做** | 主填充点是"同步头部解析"，而增量同步只问游标之上（`imap.rs:618`）；**843 封存量永远不会再走一遍**，计划又明确拒绝回填 ⇒ 升级后历史已发送行**全都没有** `message_id`，D2 的标签只对"升级后新发的信"有效——而那时同步自己就会写行。更要紧的是：`sent_index` 本来就有 `(folder, uid)`，列表行也自带 `(folder, uid)` | **D0 与 D3 捆绑成"分支 C 的条件块"**（§14.4）。A/B 下按 `(account_id, folder, uid, uidvalidity)` 关联；cache v11 只加**两列**（`sent_index.uidvalidity` + `messages.to_addrs`），**不建索引、不动前端状态契约**（§14.4 的 D0a/D0b） |
+| 2 | ⓿ 兜底搬移："`spool` 空 ⇒ 没有副本 ⇒ `folder=''`" | 真库 `outbox` id **11/12/14** 全是 `state=sent` 且 `spool_path is null`，而 `sent_index` 分别指向 `Sent Messages` **226/209/207** —— **"spool 空"正是这个 bug 的常态形状，不是"没有副本"的证据**。⓿ 会把已知位置降级成"未知"。另外老行 `sent_message_id` 为空时会撞 `NOT NULL`，⓿ 每轮报错、归档轮次整个跑不动 | 迁移与 ⓿ 合并成**同一个 `settle_sent_row()`**（§14.6.3）：先查 `sent_index` → 再合成键 → 最后才是 `folder=''` |
+| 3 | D7 只结 `state='sent'` 的案 | 真库 `id=13` 是 `failed` + `spool_path is null`：`frozen_bytes` 读不到字节 ⇒ `mark_outbox_failed(needs_attention)`（`worker.rs:150-156`）⇒ 点"重试"永远失败，而 D5 的 `n` 把它算作待发 ⇒ **「待发 (n)」永远回不到 0**，用户没有任何动作能让它消失 | D7 扩成**三种终局**（发出去了但没副本 / 发出去了但字节没了 / **没发出去且字节没了**），第 ③ 种给一个「删除这条记录」的出口 |
+| 4 | `deleted_marks` 进 cache v11 | 违背 D2 自己的理由（"状态是事实，不能放可删可重建的缓存"）：用户点「清空缓存」⇒ 墓碑消失 ⇒ 下一轮同步**把已删除的信复活** | 搬进 **`user.db` v5**（与 `pending_ops` 同库）；cache 里不再有它 |
+| 5 | D5 只写了"待发/失败不进时间流" | 「全部」档里 outbox 行放哪儿**没有定义**：`cancelled` 说"在全部里显示为已撤销"，`queued` 说"不进时间流" ⇒ 同一张列表两种待遇。写"置顶"就是 v1 的行位移，写"按日期插"就是 v1 的两源合并（分页立刻坏） | **两个档 = 两个数据源，永不混排**：`全部` 只读 `cache.messages`，`待发` 只读 `outbox`。可机器断言 |
+| 6 | D-1 的分支表只有三格 | 「`SEARCH ALL` 有 226、而 `UID FETCH 210:*` 也没有」这一格没有分支，而两者共用同一套 RFC 区间语义，一起坏完全可能 | 补 **A′**：`UID FETCH 1:* (UID)` 全量取 UID + 本地过滤（真正不依赖区间解释） |
+| 7 | `sent_records(folder, uid)` 与 `sent_index(folder, uid)` 重复，且 §14.8 里没有消费者 | 计划刚用"两个对象、各自权威"否掉 v3 合并 `draft_mirrors`，转头又存了一份位置；而"清缓存后列表为空是正确行为"让这张表的持久性无处可用 | 保留，但**写明它是 `sent_index` 的耐久镜像、且唯一消费者是 §14.8 的那句提示**（否则就删列） |
+| 8 | ④ 最后删 spool（顺序是对的） | ③ 与 ④ 之间崩溃 ⇒ 文件失去引用，**永远留着**（单封上限 25 MB） | 启动清扫：spool 目录里无 `outbox` 行引用、且 mtime > 24 h 的文件删掉；给断言 |
+| 9 | "`msg.to()` 已经在手" | `summarise()` 只调了 `msg.message_id()`（`imap.rs:1160`），**没有调 `to()`**。字段确实零成本可加，但不是"已在手" | 措辞改成"零成本可加"，并写明 `to_addrs` **只含 To**（Cc 在详情里） |
+
+### 14.1 用户看到的问题（真机数据，v5 复核后未改）
 
 | 事实 | 证据 |
 |---|---|
@@ -494,78 +510,315 @@ M3 若要更大的附件走的仍是同一条路，**届时**才能移除单封�
 
 **发件箱说"已发送"，已发送说"没这封信"——两个界面各自都对，用户看到的却是矛盾。**
 
-### 14.2 两条根因（分开修，第二条不在本次范围）
+### 14.2 两条根因（v5：第二条仍是"症状确证、原因未定位"）
 
-1. **归档成功不落列表。** `file_sent_copies`（`crates/mail-core/src/worker.rs`）在 `Ok(Some(copy))`
-   分支里只写 `sent_index`（一条指针），**不写 `messages` 行**，而「已发送」列表只读 `messages`。
-2. **增量同步取不回刚 APPEND 的那封。** `fetch_headers_since` 发 `UID SEARCH <last_uid+1>:*`
-   （`crates/mail-core/src/imap.rs:618`），在 QQ 上没返回 226。**作为已知缺陷单独记录**，
-   修它之前，"归档成功但同步看不见"必须靠 D3 兜住。
+1. **归档成功不落列表。** `file_sent_copies`（`worker.rs:435`）在 `Ok(Some(copy))` 分支里只写 `sent_index`（一条指针，`worker.rs:469`），**不写 `messages` 行**，而「已发送」列表只读 `messages`。这一条是确定的，且独立于下面那条。
+2. **增量同步取不回刚 APPEND 的那封。** 症状确证：`fetch_headers_since` 发 `UID SEARCH 210:*`（`imap.rs:618` + `since_range`，`imap.rs:84-86`），在 QQ 的 Sent 上返回空。
+   **但原因没定位。** v3 把"没返回 226"写成了结论，它只是现象。至少三种可能：SEARCH 的区间解释不可信、游标推过头、取回之后被过滤掉。三种原因对应三种修法，**在 D-1 出结论之前不许动 D3**。
 
-### 14.3 六个决定
+### 14.3 D-1：诊断（v4 新增；v5 补第四格 A′）
+
+一次探针：同一连接、同一文件夹，按顺序。
+
+| 步骤 | 命令 | 看什么 |
+|---|---|---|
+| 1 | `SELECT "Sent Messages"` | 返回的 `UIDVALIDITY` / `UIDNEXT` |
+| 2 | `UID SEARCH 210:*` | 有没有 226 |
+| 3 | `UID SEARCH ALL` | 有没有 226（只取 UID，不取头部，代价与 2 同级） |
+| 4 | `UID FETCH 210:* (UID)` | 有没有 226 |
+| 5 | 本地 `folders.last_uid` / `uidvalidity` | 与 1 是否一致 |
+
+三种结论（**v5 补第四格 A′**）：
+
+| 分支 | 现象 | 结论 | 下一步 |
+|---|---|---|---|
+| **A** | 3、4 有 226，2 没有 | 该服务器的 `SEARCH <n>:*` 区间不可信，`FETCH <n>:*` 可信 | **修根因**：`fetch_headers_since` 改用 `UID FETCH <after+1>:* (UID)` 取 UID 列表（不取头部，代价与 SEARCH 同级），再 `retain(> after)` + `keep_oldest_page` + 按页取头部。一页语义不变，**不再依赖 SEARCH 的区间解释**。D3 不做 |
+| **A′** | 3 有 226，**2 和 4 都没有** | 两条命令共用同一套 RFC 3501 区间语义，**区间解释整体不可信**（v5 新增：v4 没有这一格，遇到就只能现场发明） | **修根因**：`UID FETCH 1:* (UID)` 全量取 UID（只有编号，万级邮件几十 KB），本地 `retain(> after)` 后再按页取头部。这条**完全不依赖区间解释**，是 A 的兜底形态。D3 不做 |
+| **B** | 2、3、4 都有 226，缓存里没有 | 服务器没问题，是我们这边丢的 | 查三处：`advance_cursor` 是否把游标推过头（`sync.rs:252`）、`absorb` 的 `uidvalidity` 分支是否把行作废（`sync.rs:232-244`）、`retain(> after_uid)` 的入参是否用了**已推进后**的游标。修那一处，D3 不做 |
+| **C** | 2、3、4 都有、游标也对，行还是不出现 | 链路另有断点（例如该文件夹不在同步集合里） | 才做 D3（§14.5 标"条件性"），并连带做 D0（§14.4） |
+
+**可证伪**：诊断结论必须落成一条断言或一行日志（形如 `同步 Sent：SEARCH 空 / FETCH 有 226 ⇒ 分支 A`），写进本节。不许"顺手做了 D3 就当诊断过了"。
+
+**成本对照**：A/B 的修法各约半天；D3 是 D0 + 三步顺序 + 边界表五行 + 一条新写入者。先花半天买一个"可能不需要后面全部东西"的答案。
+
+### 14.4 D0（**v5：拆成"无条件的三件小事"与"分支 C 的一件大事"**）
+
+v4 把 D0 当成一个无条件整块，理由是"**D2 的键、边界的判等、清缓存后重新挂接**"三件事共用 `message_id` 这一列。v5 复核后：前两件**只在分支 C 下才存在**（A/B 下由同步写出行，判等由同步的 `upsert_summaries` 负责），第三件一个已有列就能做。
+
+**cache v11 = 两列 + 一个索引，只有索引是条件性的：**
+
+| 块 | 内容 | 什么时候做 | 成本 |
+|---|---|---|---|
+| **D0a** | `sent_index.uidvalidity` 一列 + `record_sent_copy` 带上它 | **总是**（A/B/A′/C 都要） | 一条 `add_column`，无索引、无模型、无前端契约 |
+| **D0b** | `messages.to_addrs` 一列 + `MessageSummary.to_addrs` + `summarise()` 填充（`msg.to()` 零成本可加）+ `upsert_summaries`/`list_summaries` 带上 | **总是**（否则「已发送」每一行都显示你自己） | 一列 + 一个字段，无索引 |
+| **D0c** | `messages.message_id` + `MessageSummary.message_id` + `messages_by_message_id` 部分索引 + 四个填充点 | **仅分支 C** | 10 万行索引（P14 已 171.5%）+ 前端契约 + 四个填充点 |
+
+**A/B/A′ 分支：只做 D0a + D0b。** 状态按 `(account_id, folder, uid)` 关联：
+
+| 需要什么 | 现在有什么 |
+|---|---|
+| 「这行有没有副本」 | `sent_index` 的 `(account_id, message_id, folder, uid)`（`cache.rs:641`），而列表行自带 `(folder, uid)` ⇒ 直接按 `(account_id, folder, uid)` join |
+| 「副本位置未知」 | `sent_index.uid is null` |
+| 「UIDVALIDITY 变了，这个 uid 不再是同一封信」 | **cache v11 的唯一改动**：`sent_index` 加 `uidvalidity` 一列，`record_sent_copy` 写入时带上；不匹配 ⇒ 显示"位置未知"，不误认 |
+
+**为什么这就够**：`message_id` 唯一多给的能力是"UID 全变了还能认"，那是低频事件；它的成本是
+10 万行索引（P14 已 171.5%）+ 前端契约 + 四个填充点，而收益只覆盖"升级后新发的信"（§14.0 第 1 条）
+——那批信本来就由同步直接写出带 `message_id` 的行，等于为一个已经成立的事实付两次钱。
+
+**分支 C：做 D0c，并与 D3 一起做**，内容回到 v4 的四项：
+
+1. **列**：`messages.message_id text`，允许 NULL。
+2. **模型**：`MessageSummary` 加 `message_id: Option<String>` 与 `to_addrs: Option<String>`（`#[serde(default)]`）。
+3. **索引**：`messages_by_message_id on messages(account_id, message_id) where message_id is not null`（分索引：10 万封里绝大多数是 NULL）。
+4. **填充点四个**（同步头部解析 / 归档时 / 详情到达时 / 迁移回填）。
+
+**顺序**：先 `add_column_if_missing`，再建索引。`cache.rs:658` 那段注释就是为这个坑写的——v2 文件走到这里时列还不存在，同批建索引会 `no such column`，并把整个升级一起带走。
+
+**`to_addrs` 的边界（v5 补）**：`summarise()` 现在只调 `msg.message_id()`（`imap.rs:1160`），`msg.to()` **没有被调用过**——不是"已经在手"，是"零成本可加"（`parsed` 已在手，不再发请求）。它**只含 To**：抄送/密送收件人不在列表行上显示，要看去详情。群发时这一行会显示不全，这是接受的代价，不为此再加两列。**它是 D0b，无条件做**——「已发送」每一行都显示你自己，那是第 103 轮就存在的可见缺陷，不该被 D-1 的结论绑住。
+
+**不做**：仍然不从服务器重取全部头部去补这一列（10 万封 = 10 万次头部解析，换来的只是一个暂时不用的键）。
+
+**可证伪**：A/B/A′ 下，`select count(*) from sent_index where uid is not null and uidvalidity = <当前文件夹的>` 必须等于「已发送」里带"副本已归档"标记的行数（同一份夹具，两处数一致）；**变异测试**：把 join 从 `(folder, uid)` 改成只看 `folder` ⇒ 该断言必须变红。分支 C 下沿用 v4 的断言。
+
+### 14.5 七个决定（v5：D0 条件化、D2 换键、D5 定位置规则、D7 扩三种终局）
 
 | # | 决定 | 理由 |
 |---|---|---|
-| **D1** | **一个列表**：侧栏只有「已发送」；列表数据**只来自 `cache.db` 的 `messages`**，分页/排序/虚拟滚动全部不变 | 两库联合查询会让 `message_page(offset)` 的分页重复或漏行 |
-| **D2** | **发送状态存在 `user.db` 的 `sent_records`**，列表渲染时**按当前页的 Message-ID 批量查一次**（≤50 个） | 状态是事实，不能放可删可重建的缓存；但也不能让列表变成联合查询 |
-| **D3** | **归档成功即写 `messages` 行**（摘要，UID 来自 `copy.uid`） | 服务器上有、用户看不到 = 和没做一样。这条同时兜住根因 2 |
-| **D4** | **删除 = 直接删**（本地行 + 服务器副本），**必须二次确认**；不提供"只删本地" | 用户原话："他们的概念就是删除这个账户下的这封邮件" |
-| **D5** | **待发/失败 = 顶部横幅 + 过滤视图**，**不进时间流** | 置顶会让翻页时的行位移，用户看到重复 |
-| **D6** | **归档成功后删除 `outbox` 行**，状态转存 `sent_records` | 否则那张表无限增长，而它每次都要全量读 |
+| **D1** | **一个列表**：侧栏只有「已发送」；数据**只来自 `cache.db` 的 `messages`**，分页/排序/窗口化不变 | 两库联合查询会让 `message_page(offset)` 的分页重复或漏行。**清空缓存会让这个列表变空——这是它的正确行为**（§14.8） |
+| **D2** | **状态存在 `user.db` 的 `sent_records`**，渲染时按当前页的 `(folder, uid, uidvalidity)` 批量查一次（`IN (...)`，≤50） | v4 用 `message_id` 做键，但那一列对存量邮件永远是 NULL（§14.0 第 1 条），等于按一个空集合查。`(folder, uid)` 两边都有、且现在就准；`uidvalidity` 是防"文件夹重建后同一个 UID 指向另一封信"。**`message_id` 只在分支 C 下才成为键**（那时 `messages` 行是我们自己写的） |
+| **D3**（**条件性**） | **归档成功即写 `messages` 行**（摘要，UID 来自 `copy.uid`）——**仅当 D-1 判定为分支 C 时执行** | 分支 A/B/A′ 下同步自己就会写出这行，D3 只剩"省一次同步等待"的收益，却要付边界表五行的成本。**收益/成本倒挂，所以不做** |
+| **D4** | **删除 = 直接删**（本地行 + 服务器副本），**必须二次确认**；不提供"只删本地" | 用户原话："他们的概念就是删除这个账户下的这封邮件"。实现约束见 §14.9 第 7-9 行 |
+| **D5** | **两个档 = 两个数据源，永不混排**：`全部` 只读 `cache.messages`，`待发` 只读 `outbox`；分段控件常驻列表头 | v4 的"cancelled 在全部里显示 / queued 不进时间流"是自相矛盾的：同一张列表两种待遇，而位置规则一个字没写——置顶就是 v1 的行位移，按日期插就是 v1 的两源合并。分成两档之后，"行从哪来"和"排第几"都不再需要回答 |
+| **D6** | **归档成功后删除 `outbox` 行**，状态转存 `sent_records` | 否则那张表无限增长，而它每次都要全量读。删除的前提：有副本时"`messages` 行（仅分支 C）+ `sent_index` + `sent_records` 三样都写成功"；没有副本时按 D7 结案，同样要删行 |
+| **D7**（**v5 扩成三种终局**） | 三条路都必须**结案**：① `sent` + 无副本（`Ok(None)` / `SkippedTooLarge`）② **`sent` + spool 字节丢了** ③ **`failed` / `needs_attention` + spool 为空**（从未发出，没有副本可谈）。①② 结案 = 搬进 `sent_records`（`folder=''`）+ 删 outbox 行 + 删 spool；**③ 只删行、不写 `sent_records`**（它从来没发出去，不属于「已发送」；写进去等于凭空造一条发送记录） | v4 只结第 ① 种。真库 `id=13` 就是第 ③ 种：`frozen_bytes` 读不到字节 ⇒ 永远 `needs_attention`，而 D5 的 `n` 把它算作待发 ⇒ **「待发 (n)」永远回不到 0**，用户没有任何动作能让它消失。第 ③ 种结案时必须让用户看见（见细则），否则等于把"失败"悄悄删掉 |
 
-### 14.4 数据模型
+**D5 的细则**（v5：加了位置规则与第 ③ 种终局的出口）：
 
-**`user.db` 新表 `sent_records`**（轻量，只留"这封信怎么了"）：
+- **位置规则（v5 新增，一句话就能机器断言）**：`全部` 档的行**只**来自 `cache.messages`；`待发` 档的行**只**来自 `outbox`。**任何一档都不混排两个来源**——这就是 v1 被否掉的那件事，v4 用"cancelled 在全部里显示"把它从后门放了回来。
+- **行形态：两套渲染分支，同一套定高。** cache 行走现有 `buildChildRow`；outbox 行走现有 `outbox-row` 分支（`app.js:1946`），但**去掉 `height: auto`**——它现在和普通行同处一个窗口化列表，`--msg-height` 必须成立。
+- **「这封信怎么了」不再行内展开，改成弹窗**（v4 改，保留）：点行右侧的「记录」按钮，复用 `openModal`（`app.js:5550`），内容从 `sent_records` / `outbox` 取（状态/尝试次数/最后错误/Message-ID）。理由：展开面板放不进 40 px 的定高行；做成弹窗，行几何就只剩一种，窗口化不用为它开特例。
+- **点开 outbox 行本身**：不发网络请求，只选中；「重试」只在 `failed` / `needs_attention` 上出现，放在弹窗里。
+- **第 ③ 种终局的出口（v5 新增）**：`failed` / `needs_attention` 且 spool 为空的弹窗里，「重试」旁边给**「删除这条记录」**（二次确认，说明"这封信没有发出去，也没有留下内容"）。没有这个出口，`n` 永远不会归零，而用户看到的是一个按了没反应的按钮。
+- **空态**：`全部` 档为空走现有空态；`待发` 档为空给一行「没有待发的信」——**不是整块隐藏**，分段控件自己就是入口。
+- **推送**：§14.7 的四步走完（② 写 `sent_records` 之后即可）发一个 `sent-state-changed` 事件；前端若正停在「已发送」，重取当前页状态与计数。没有它，用户会看到「待发 (1)」而列表里那行没有标签。
+- `n` = `outbox` 里 `queued`/`sending`/`failed`/`needs_attention` 的行数，**不含 `sent`**（`sent` 且 spool 还在 = 信发出去了、副本没归档，那不是"待发"，它也不该永远消失——见 §14.9 最后一行）。
+- `cancelled` 行：留在 `outbox`，**在 `待发` 档里**显示为"已撤销"（不在 `全部` 档），**7 天后由启动清理删除**。**但删之前必须先确认草稿还在**（`outbox.draft_id` 指向的 `drafts` 行存在）——spool 里是冻结的那封信，草稿才是用户的字；草稿不在了就把这行标成 `needs_attention` 交给用户，**不许自动删**（`12` §16.1 原则 6：自动清理只能施加在可以重建的东西上）。
+
+### 14.6 数据模型（v5）
+
+#### 14.6.1 `user.db` 新表 `sent_records`
 
 ```
-account_id   TEXT
-message_id   TEXT        -- 冻结的 Message-ID，主键的一部分
-folder       TEXT        -- 副本所在文件夹（无副本时为空串）
-uid          INTEGER     -- 服务器给的编号，可空
-state        TEXT        -- sent / failed / needs_attention / cancelled
-attempts     INTEGER
+account_id   TEXT    NOT NULL
+message_id   TEXT    NOT NULL   -- 冻结的 Message-ID；合成键见 14.6.2
+folder       TEXT    NOT NULL DEFAULT ''   -- 副本所在文件夹；空串 = 服务器上没有副本（D7）
+uid          INTEGER                        -- 服务器给的编号，可空
+uidvalidity  INTEGER                        -- v5 新增：没有它，(folder, uid) 在文件夹重建后会指向别的信
+state        TEXT    NOT NULL               -- sent / failed / needs_attention / cancelled
+attempts     INTEGER NOT NULL DEFAULT 0
 last_error   TEXT
-created_at   INTEGER     -- 入队时间
-updated_at   INTEGER
+synthetic    INTEGER NOT NULL DEFAULT 0     -- 1 = 这封没有真 Message-ID，是迁移补的
+created_at   INTEGER NOT NULL
+updated_at   INTEGER NOT NULL
 PRIMARY KEY (account_id, message_id)
 ```
 
-**`outbox` 表**从此只保留**未完成**的行（`queued`/`sending`/`failed`/`needs_attention`/`cancelled`）。
-归档成功 = 一个事务里 `insert into sent_records` + `delete from outbox`。
+`message_id` **必须 NOT NULL**：SQLite 的主键对 NULL 不去重（除非 `NOT NULL`），一列可空的键会让同一封失败的信插出多行。
 
-**列表渲染**：
-```
-message_page(account, folder, offset, limit)   → 本页 50 行（cache，分页语义不变）
-list_sent_states(account, [message_id...])     → 一次小查询，标注这 50 行的状态
+**`message_id` 在野外不唯一（v5 补）**：转发、再发、"另存为副本"都会复用原信的 `Message-ID`。所以写入一律用
+`on conflict do update`，且**只填当前为空的字段**；遇到"两边都非空且不同"的 `folder/uid` ⇒ 保留先到的、记一行日志，
+**不覆盖**。理由与 §14.9 第 2 行 ③ 同一条：拿一个不能判等的事实去盖章，比漏记一条更糟。
+
+**`uidvalidity` 为什么进 `sent_records`（v5 新增）**：D2 改成按 `(folder, uid)` 关联之后，没有它就等于按一个会
+被回收的地址去认人——文件夹删了重建，同一个 UID 可能是另一封信。它与 `sent_index.uidvalidity`（cache v11 那一列）
+必须同源写入，否则两边会各判各的。
+
+`folder=''` 同时表达"没有副本"与"没归档"，所以**不再需要 `no_copy` 列**——D7 结案时它就是空串，和"服务器没有 Sent 文件夹"是同一种事实。
+
+`outbox` 从此只保留**未完成**的行（`queued`/`sending`/`failed`/`needs_attention`/`cancelled`）。
+
+#### 14.6.2 迁移（`user.db` v4 → v5，必须升版本号）
+
+```sql
+create table if not exists sent_records (...);            -- 同上（含 uidvalidity）
+
+-- v5 新增：墓碑搬到这里，不再放 cache
+create table if not exists deleted_marks (
+    account_id  TEXT    NOT NULL,
+    folder      TEXT    NOT NULL,
+    uid         INTEGER NOT NULL,
+    uidvalidity INTEGER NOT NULL,
+    message_id  TEXT,
+    at          INTEGER NOT NULL,
+    PRIMARY KEY (account_id, folder, uid)
+);
+
+-- 1) 已经结案的 sent 行：状态搬家，连同已记下的副本位置
+insert or replace into sent_records
+    (account_id, message_id, folder, uid, uidvalidity, state, attempts, last_error, synthetic, created_at, updated_at)
+select o.account_id, o.sent_message_id,
+       coalesce(s.folder, ''), s.uid, coalesce(s.uidvalidity, 0), o.state, o.attempts, o.last_error, 0, o.created_at, o.sent_at
+  from outbox o
+  left join sent_index s on s.account_id = o.account_id and s.message_id = o.sent_message_id
+ where o.state = 'sent' and o.spool_path is null and o.sent_message_id is not null;
 ```
 
-### 14.5 边界（每一条都要有确定行为）
+- **`sent_index` 在另一个库（`cache.db`）**，迁移不能 join。上面那条 join 是**概念图**：实际实现是先从 `cache.db` 读出 `(account_id, message_id) → (folder, uid, uidvalidity)` 一张小表，再在 `user.db` 里做匹配。两张表都小（发件数），一次全读可行。
+- **只搬 `spool_path is null` 的行**。spool 非空的行下一轮会被归档轮次处理，**处理完必须由 D7 结案**；迁移不该替它结案，也不该把它删掉（删了就是丢信）。
+- **没有真 Message-ID 的存量行**（M1a-8 之前入队的）：给合成键 `local+<outbox.id>@easyemail.invalid`，`synthetic = 1`。这些行**不参与**"查看副本"，但**必须活着**——用户的历史不该因为我们加了一列就消失。
+- 迁移完删掉被搬走的那些 outbox 行（`state='sent' and spool_path is null`），**不是**删所有 `state='sent'`。
+- **可证伪**：迁移前数 `select count(*) from outbox where state='sent' and spool_path is null`，迁移后 `sent_records` 的行数必须等于它。**少一行就是丢信。**
+- **可证伪（v5 新增，专打 §14.0 第 2 条）**：迁移后 `select count(*) from sent_records where folder = ''` 必须 **等于**"`outbox` 里 spool 为空且 `sent_index` 里查不到对应 message_id 的行数"。真库上这个数应当是 **0**（11/12/14 三条在 `sent_index` 里都有 226/209/207）。**大于 0 就是又把已知位置写成了未知。**
+
+#### 14.6.3 结案函数 `settle_sent_row()`（v5：迁移与 ⓿ 共用一份实现）
+
+v4 里迁移会 `join sent_index`、会给 synthetic 键，而 ⓿ 两样都没有——两套逻辑必然漂移，而真库证明"spool 空"恰恰是**这个 bug 的常态形状**（11/12/14 三条都有副本位置）。v5 把结案收成**一个函数**，迁移与每轮兜底都调它：
+
+```
+settle_sent_row(outbox_row):
+  1. message_id = row.sent_message_id
+     └ 为空 ⇒ 合成键 local+<row.id>@easyemail.invalid，synthetic = 1
+  2. 查 cache.sent_index(account_id, message_id)
+     ├ 命中且 uid 非空 ⇒ folder = s.folder, uid = s.uid, uidvalidity = s.uidvalidity
+     ├ 命中但 uid 为空 ⇒ folder = s.folder, uid = null（"位置未知"，但**知道它在哪个文件夹**）
+     └ 未命中 ⇒ folder = ''（真的是没有副本）
+  3. insert or replace into sent_records(...)          -- 主键幂等，冲突规则见 14.6.1
+  4. delete from outbox where id = row.id              -- 幂等
+  5. spool 文件若存在则删
+```
+
+- 第 2 步**必须查**，不许因为"spool 为空"就跳过去：spool 为空有三种来源（归档成功后被删 / 字节丢失 / 从来没建过），只有查过 `sent_index` 才分得清。
+- 第 3 步用 `insert or replace` 而不是 `insert`：⓿ 每轮都跑，崩溃后重入是常态。
+- **幂等断言**：连跑两次 `settle_sent_row`，`sent_records` 行数不变、`outbox` 行数不变、`folder` 不被第二次调用改坏（尤其不能把第一次查到的 `Sent Messages` 改回 `''`）。
+
+**⓿ 兜底搬移**：每轮归档**开始前**跑一次，对 `state='sent' and spool_path is null` 的残留行调 `settle_sent_row()`。幂等，覆盖"迁移之后才产生"的孤儿（无 Sent 文件夹的账号、超大被跳过的账号，每发一封就产生一条）。
+
+**可证伪**：跑完一轮归档后 `select count(*) from outbox where state='sent'` 必须为 0；且上一条"`folder=''` 的数 == 真没有副本的数"仍然成立。
+
+**spool 孤儿清扫（v5 新增，§14.0 第 8 条）**：启动时扫 spool 目录，删掉**没有任何 `outbox` 行引用、且 mtime > 24 h** 的文件。④ 放在最后是对的（它是"还没归档"的证据），代价就是 ③ 与 ④ 之间崩溃会留下一个失去引用的文件——单封上限 25 MB，不扫就是永久泄漏。**可证伪**：造一个无引用的 spool 文件（mtime 改到 25 h 前）⇒ 启动后被删；mtime 是 1 h 前的 ⇒ **不**被删（避免删掉正在写的那一封）。
+
+### 14.7 四步顺序（v5：⓿ 走 `settle_sent_row`；跨库没有事务，所以顺序就是正确性）
+
+```
+⓿ user.db：把 state='sent' 且 spool 为空的行结案（settle_sent_row，幂等）  —— 每轮先跑
+① cache.db：写 messages 行（仅分支 C 的 D3）+ 写 sent_index（已有，v5 起带 uidvalidity）  —— upsert，可重入
+② user.db ：insert or replace sent_records                         —— 主键幂等
+③ user.db ：delete from outbox where id = ?                        —— 幂等
+④ 磁盘    ：删 spool 文件                                          —— 最后，它是"还没归档"的证据
+```
+
+任一步失败 ⇒ **停在那里，保留 outbox 行与 spool**，下一轮从 ① 重来（全部幂等）。④ 在最后：现在的代码是"先删 spool 再清标记"（`worker.rs:476-477`），中途崩掉就再也找不到那封信了。
+
+**没有副本的三条路**（D7）：不写 ①，直接 ②（`folder=''`）→ ③ → ④。
+
+### 14.8 清空缓存之后会发生什么（v5：给 `sent_records` 一个消费者）
+
+- 列表变空（行在 cache 里，被清了）；`sent_records` 里的状态成为**孤儿**——不显示，也不删（它是事实）。
+- 重新同步后，行按 `(folder, uid, uidvalidity)` 重新挂上（A/B 分支），或按 `message_id`（分支 C）。**这就是那一列 / 那个索引存在的全部理由**，除此之外没有别的消费者。
+- 面板加一句：「清空缓存后，「已发送」需要重新同步才能看到历史。」
+- **v5 新增一句，`sent_records` 的唯一可见消费者**：「已发送」为空、但 `sent_records` 非空时，空态下面补一行小字
+  「本机记录显示有 N 封已发送（服务器副本未同步）」。这是**提示**，不是列表来源——它不进分页、不参与排序、不参与计数（`n` 仍然只数 outbox）。
+- 为什么非要有这一句：没有它，`sent_records` 的持久性（清缓存后还在）在任何界面上都没有用处，那张表就退化成
+  `sent_index` 的一份跨库拷贝——而这正是 §14.0 第 7 条批评的东西。有了这一句，它才有"唯一持有某个事实"的身份。
+- **不做**：不把 `sent_records` 当列表来源。那会退回 v1 的两源合并，分页立刻坏。
+
+### 14.9 边界（v5：第 2 行降为分支 C；新增 `failed` 终局与"副本待归档"）
 
 | 情况 | 行为 |
 |---|---|
-| `copy.uid` 为空（服务器没给编号） | **不写 `messages` 行**（没有主键），等同步；`sent_records` 里 `uid` 留空，行上标「副本位置未知」 |
-| **UID 已被另一封信占用** | **不写**，只记日志。主键是 `(account, folder, uid)`，覆盖写会把别人的信换掉——这是 M1a 之前那类 bug 的翻版 |
-| 该行已存在（同步先到了） | **只补缺失字段，不覆盖 `seen`**。有些服务器把 Sent 副本标未读，upsert 覆盖会把服务器的真实状态抹掉 |
-| 服务器没有 Sent 文件夹 | 不写行；`sent_records` 记 `folder=''`，行上标「仅本地记录」 |
-| 副本因过大被跳过（`SkippedTooLarge`） | 同上：标「仅本地记录」，不假装已归档 |
-| 离线 | 本地记录可见；服务器副本可能缺失，顶部横幅说明"下面是上次同步的内容" |
-| **删除时服务器不可达** | 本地立即消失，进 `pending_ops`（新增 kind `delete_sent_copy`），界面如实说"已从本机删除，服务器副本待联网后删除" |
-| **删除时 `uid` 为空** | 先按 Message-ID `SEARCH` 定位；仍找不到 ⇒ 只删本地，并在确认弹窗里事先说明这一点 |
+| `copy.uid` 为空（服务器没给编号） | **仅分支 C**：**不写 `messages` 行**（主键要 uid），等同步；`sent_records.uid` 留空，行上标「副本位置未知」。A/B 分支没有「写行」这个动作，这一格自然不存在 |
+| **该 `(account, folder, uid)` 已有一行**（**仅分支 C**） | 用 `message_id` 判等，三种结局：① **该行 `message_id` 相同** ⇒ 只补空字段（`coalesce`），不动 `seen`；② **该行 `message_id` 不同** ⇒ **不写**，记日志，`sent_records.uid` 留空并标「副本位置未知」；③ **该行 `message_id` 为 NULL**（老行，无法判等）⇒ **什么都不写**，记日志 + 标「副本位置未知」。理由：③ 走 ① 就等于把我们的 id 盖在一行身份未知的记录上，那比漏写一行更糟。**A/B 分支没有这一行**——行由同步写，判等由 `upsert_summaries` 负责 |
+| **没有副本**（无 Sent 文件夹 / `SkippedTooLarge` / spool 字节丢了） | **D7 结案**：`sent_records(folder='', uid=null)` + 删 outbox 行 + 删 spool；行上标「仅本地记录」，不假装已归档。**但结案前必须先查 `sent_index`**（§14.6.3 第 2 步）：真库 11/12/14 三条 spool 为空、副本却在 226/209/207，按"spool 空就当没副本"处理就是把已知写成未知 |
+| **`failed` / `needs_attention` 且 spool 为空**（v5 新增） | **D7 第 ③ 种终局**：这封信**从来没有发出去**，所以没有副本可谈，重试也永远不可能成功（`frozen_bytes` 读不到字节，`worker.rs:150-156`）。弹窗里给「删除这条记录」，结案后 `n` 才可能归零。不结案就是「待发 (n)」永远不归零、而按钮按了没反应 |
+| 同步先到了，行已存在（**仅分支 C**） | 同第 2 行 ①；`thread_key`/`subject_key` 只在为空时才补。A/B 分支下这一格就是同步的普通 upsert，没有第二个作者 |
+| `seen` 谁说了算 | **服务器**。D3（分支 C）写 1 是猜测，同步改回 0 是**纠正**，不是 bug。测试要把这条写死，防止以后有人"修"它 |
+| 离线 | 本地记录可见；顶部横幅说明"下面是上次同步的内容" |
+| **删除：服务器不可达** | 本地立即消失，进 `pending_ops`（`kind = delete`，已有，`lib.rs:3395-3407`），界面如实说"已从本机删除，服务器副本待联网后删除" |
+| **删除：`uid` 为空** | 先按 Message-ID `SEARCH` 定位（`find_uid_by_message_id`，`imap.rs:1020`）；仍找不到 ⇒ 只删本地，**并在确认弹窗里事先说明这一点** |
+| **删除：没有 UIDPLUS 的服务器** | `EXPUNGE` 是**文件夹级**语义（`imap.rs:983`），会连带清掉别人标的 `\Deleted`。所以：先 `FETCH (FLAGS)` 数该文件夹的 `\Deleted` 集合，**只有集合恰好等于目标**才 EXPUNGE；否则只标 `\Deleted`，如实告诉用户"已标记删除，服务器清理时生效"，**并把补 EXPUNGE 放进 `pending_ops` 重试**（v4 补：否则这些信永远挂在 `\Deleted` 上） |
+| **删除后同步又看见它** | 加 `deleted_marks(account_id, folder, uid, uidvalidity, message_id, at)`，主键 `(account_id, folder, uid)`，**放 `user.db` v5**（v5 改：v4 放进 cache，而 cache 是用户点「清空缓存」就会清掉的那个库——墓碑一消失，下一轮同步就把删掉的信复活，这直接违背 D2 自己的理由）。同步 upsert 前先查，**命中必须同时匹配 `uidvalidity`**（UIDVALIDITY 一变，墓碑自动失效，比 30 天过期精确）；`pending_ops` 成功或放弃时删标记；启动时清掉超过 30 天的标记作兜底 |
+| **删除时本地清理** | `cache.delete_message` 现在只动 `search/messages/bodies`（`cache.rs:1359-1385`），**不清 `sent_index`** ⇒「查看副本」留下指向空行的链接。要求：同一次写事务里删掉 `sent_index` 里对应 `(folder, uid)` 的行 |
+| **归档成功但 `sent_records` 写失败** | 保留 outbox 行 + spool，下一轮重做（幂等）。**分支 C** 下这一封此时**同时**出现在列表（cache 行已写）与 outbox（`state=sent`、spool 在）——但它**不进「待发」计数**（D5），所以用户不会看到「已发送」和「待发」打架 |
+| **发出去了、副本还没归档（`sent` 且 spool 在）**（v5 新增） | 它在 `待发` 档末尾单列一行「已发出，副本待归档 (m)」，**m 不并入 n**。理由：离线时归档轮次根本跑不了，这封信既不进 `待发`（D5 排除 `sent`）、也不进「已发送」（A/B 分支下还没有 cache 行），用户会以为信丢了。它是**事实**（发出去了），只是副本还没到位，必须看得见 |
 
-### 14.6 验收（可证伪）
+### 14.10 顺序与依赖（v5：D0 进分支，cache v11 缩成两列）
 
-- [ ] 发信后**不点开「已发送」**，列表里就已经有那一行（真机）。
-- [ ] 同一个 `Message-ID` 不会出现两行。
-- [ ] 状态为 `sent` 的行**没有**状态标签；`failed` 的行有标签且能重试。
-- [ ] 删除：二次确认 → 本地立刻消失 → loopback 断言服务器收到 `STORE +FLAGS \Deleted` 与 `EXPUNGE`（或 `UID EXPUNGE`）。
-- [ ] 删除时服务器不可达 ⇒ 本地消失 + `pending_ops` 多一条；恢复联网后补做且只做一次。
-- [ ] `copy.uid` 与已有行冲突时**不写**，且原有行的 `message_id` 不变（变异测试：去掉守卫即红）。
-- [ ] 已存在的行不会被改掉 `seen`（变异测试：改成无条件 upsert 即红）。
+```
+-1. D-1 诊断（§14.3）                                     半天，纯只读探针；**出结论之前不许动第 2 步**
+ 0. cache v11：`sent_index.uidvalidity` + `messages.to_addrs`（D0a/D0b）  两条 add_column，A/B/C 都要
+ 1. user.db v5：sent_records + deleted_marks + 存量行 + settle_sent_row   纯后端，可独立验收
+ 2a. 【A / A′ / B】修根因（改 `fetch_headers_since` 或游标那三处）        一个函数级别，D0c/D3 都不做
+ 2b. 【C】D0c（message_id + 部分索引 + 四填充点）+ D3 + D6                 才付这份钱
+ 3. 列表合并 + 分段控件 + 状态批查（按 (folder, uid)）+ 事件 + spool 清扫   前端 + 一个新命令
+ 4. 侧栏 IA（`12` §16）                                    纯展示层，可与 -1..1 并行（见 `12` §16.5）
+```
 
-### 14.7 v1 被推翻的三处（诚实记录）
+**为什么不能倒过来**：界面依赖的"这一行有没有副本"，在 0 之前只能靠 `outbox` 猜；靠猜就得两源合并，那就是 v1 的老路。
 
-| v1 | 为什么错 |
-|---|---|
-| 两个来源**合并**成一个视图 | 行数变化让 `message_page(offset)` 的分页重复/漏行；两库无法在 SQL 层 join |
-| `origin` 三态显示在行上 | 它本身就是"本地/云端"标签，和用户要的东西相反；改成"打不开正文时给一句降级文案" |
-| 待发/失败**置顶** | 翻页时行位移、看到重复；改成横幅 + 过滤视图（D5） |
+**为什么 D-1 必须在第 2 步之前**：它决定第 2 步走 2a 还是 2b。跳过它，就是默认"必须做 D3"，而那正是 v3 的错误前提；顺着 v4 走，还会连带默认"必须做 D0"——两份钱都白花。
+
+**为什么 D0a/D0b 排在 2a 之前**：A/B 分支的整条展示路径都建立在 `(folder, uid)` 上，没有 `uidvalidity` 就是在按一个会被回收的地址认人；没有 `to_addrs`，列表每一行都显示你自己。这两列是这条路上全部的 schema 改动，也是最便宜的两处。
+
+### 14.11 验收（v5：A 栏按分支拆开，"升级后第一眼"提为该块出口）
+
+**A. 离线可证伪**（`cargo test` / loopback / node 门禁；当前环境 `cargo test --workspace` 有 LNK1104 限制，按第 102 轮记录的办法跑 `-p mail-core --lib`）
+
+- [ ] **cache v11**：老库打开后 `sent_index` 有 `uidvalidity` 列（已有行的值是 0 = 未知，**不是**被猜成当前值）、`messages` 有 `to_addrs` 列；新同步一封信后该行的 `to_addrs` 非空（loopback）。
+- [ ] 迁移：`count(outbox where state='sent' and spool_path is null)` == 迁移后 `sent_records` 行数（含 synthetic）；**少一行即失败**。
+- [ ] 迁移：`count(sent_records where folder='')` == "spool 空且 `sent_index` 查不到"的行数。**真库上应当是 0**（11/12/14 三条有 226/209/207）。大于 0 就是把已知写成了未知。
+- [ ] 结案：造一条无 Sent 文件夹的账号，发一封 ⇒ 跑一轮归档 ⇒ `count(outbox where state='sent')` == 0，且 `sent_records` 里有一条 `folder=''`。
+- [ ] 结案（v5 新增）：造一条 `failed` + spool 为空的 outbox 行 ⇒ 走「删除这条记录」⇒ `count(outbox)` 减一，`n` 归零，**且不写 `sent_records`**（它从来没发出去，不是"已发送"）。
+- [ ] 幂等：同一 Message-ID 归档两次，`messages` 仍只有一行、`sent_index` 仍只有一行；`settle_sent_row` 连跑两次，`folder` 不被第二次调用改回 `''`。
+- [ ] **分支 C 专属**：`message_id` 非空行数 ≥ `sent_index` 行数；`sent_index` 每行都能在 `messages` 找到 `(folder, uid)`；判等三结局三条单测；`seen` 权威（D3 写 1 后跑一轮同步 ⇒ 本地变 0，**断言这是期望行为**）；`summarise()` 产出的摘要带 `message_id` 与 `to_addrs`（loopback 断言非空）。
+- [ ] 墓碑：离线删除 ⇒ 跑一轮同步 ⇒ 行**没有**回来；`uidvalidity` 变了 ⇒ 墓碑失效、行可以回来；`pending_op` 成功后标记被删；**清空 cache 后墓碑仍在**（它在 `user.db`）。
+- [ ] `sent_index` 清理：删除后 `sent_copy(account, message_id)` 返回 `None`。
+- [ ] spool 孤儿：无引用且 mtime 25 h 前的文件被删；1 h 前的**不**被删。
+- [ ] **变异测试**（去掉即必须变红）：去掉墓碑；去掉 `message_id` 判等（分支 C）；把 `coalesce` 改回赋值；把 ④ 移到 ② 之前；去掉 ⓿ 兜底搬移；**把 `settle_sent_row` 第 2 步（查 `sent_index`）删掉**；把 `deleted_marks` 放回 `cache.db`（清缓存后行复活 ⇒ 红）。
+
+**B. 该块的出口条件（真机，一次，附截图）**
+
+这一条**不是发版条件，是第 2 步的出口条件**——A 栏全在 loopback 上，而 loopback 忠实复现的是 RFC 的区间语义，**不是 QQ 的 SEARCH 行为**。A 栏能证明"我们写了行"，不能证明"用户看到的矛盾消失了"。
+
+- [ ] 发信 → **不点开「已发送」** → 点开「已发送」 → 列表里有那一行，**且 Sent 里只有一封**。
+- [ ] **升级后第一眼（v5 新增）**：真库那三条历史（`outbox` 11/12/14）在「已发送」里能点开「查看副本」，分别落到 226/209/207 —— **不是「副本位置未知」**。这一条专打 §14.0 第 2 条。
+- [ ] 同一账号下，D-1 的探针日志与分支结论已写回 §14.3（形如 `同步 Sent：SEARCH 空 / FETCH 有 226 ⇒ 分支 A`）。
+- [ ] 离线排队时「待发 (1)」可见；关掉横幅后它仍在；点行右侧「记录」能打开弹窗，且行高没变。
+- [ ] **断网时发一封** ⇒ 「已发出，副本待归档 (1)」出现在 `待发` 档末尾，**且 `n` 不变**；恢复网络后它消失、出现在「已发送」。
+- [ ] 删除：二次确认 → 本地立刻消失 → 服务器 `\Deleted`/EXPUNGE 走通。
+- [ ] 三种主题下分段控件与设置弹窗各截一张。
+
+### 14.12 与第 103 轮代码的返工清单（v5 补一条）
+
+| 现在的代码 | 合并后 | 处置 |
+|---|---|---|
+| `state.expandedOutbox`（`app.js:213`）+ 行内「这封信的记录」 | 行内展开放不进 40 px 的定高行（`--msg-height`），而 outbox 行现在与普通行同处一个窗口化列表 | **改成弹窗**：`openModal` + 数据从 `sent_records` 取。用户价值（能点开看"这封信怎么了"）保留，容器换掉 |
+| `.msg.outbox-row { height: auto; overflow: visible }`（第 103 轮刚加） | 行回到同一个窗口化列表，`--msg-height` 的定高假设重新生效 | **删掉这条覆盖**。`height: auto` 会让 `vlist.computeWindow` 的偏移全错 |
+| `#btn-outbox` / `#outbox-count`（`app.js:535`、`1530`） | 侧栏没有「发件箱」 | 删元素与事件；计数迁到分段控件 |
+| `buildChildRow` 只渲染发件人 | 「已发送」每一行都会显示你自己 | **加收件人分支**：`folder` 是 Sent 时显示 `to_addrs`（v5：来自 **D0b**，无条件做，不等 D-1） |
+| 「已发送（服务器上的副本）」 | 仍然成立（它确实是服务器副本） | **保留**；消失的是"发件箱"这个词 |
+| 门禁「样式表里的 id 必须存在」 | 上面删掉的 id | 必须同步从 CSS 删，否则这一步会红 |
+
+### 14.13 v1 / v2 / v3 / v4 被推翻的记录（诚实记录，不删）
+
+| 版本 | 说法 | 为什么错 |
+|---|---|---|
+| v1 | 两个来源**合并**成一个视图 | 行数变化让 `message_page(offset)` 的分页重复/漏行；两库无法在 SQL 层 join |
+| v1 | `origin` 三态显示在行上 | 它本身就是"本地/云端"标签，和用户要的东西相反 |
+| v1 | 待发/失败**置顶** | 翻页时行位移、看到重复 |
+| v2 | D2 按 `Message-ID` 批查 | 那一列不存在（§14.0 第 1 条） |
+| v2 | "不覆盖 `seen`" | 守错一侧，同步会覆盖 |
+| v2 | 归档即删 `outbox` 行 | 存量 `sent` 行会消失 |
+| v2 | "一个事务里"三步 | 跨两个库文件，没有事务 |
+| v2 | 待发/失败"过滤视图" | 没有入口的视图等于不存在 |
+| v3 | 根因 2"不在本次范围"，用 D3 兜住 | 用户看到的矛盾就是根因 2；打开文件夹本来就会同步（`lib.rs:752`），修好它就够了。用架构绕过 bug = 让丢信级缺陷继续存在（§14.0 第 1 条） |
+| v3 | 填充点只有三个 | 最便宜的那个（同步头部解析）没列进去，`msg.message_id()` 已经在手（`imap.rs:1160`） |
+| v3 | ③ `message_id` 为 NULL "走 ① 不覆盖" | ① 是 `coalesce` 补空字段，等于给身份未知的行盖章（§14.0 第 3 条） |
+| v3 | D6 只在归档成功时删行 | "没有副本"也是结论，不结案就产生谁也看不见的孤儿行（§14.0 第 4 条） |
+| v4 | D0 无条件做（列 + 模型 + 部分索引 + 四填充点） | 主填充点走增量同步，而增量只问游标之上 ⇒ 存量 843 封永远不走这条路，`message_id` 恒为 NULL；D2 的键因此是一个空集合（§14.0 第 1 条） |
+| v4 | ⓿ 兜底搬移"`spool` 空 ⇒ `folder=''`" | 真库 11/12/14 三条 spool 空而副本在 226/209/207 —— "spool 空"是这个 bug 的常态形状，不是没有副本的证据（§14.0 第 2 条） |
+| v4 | D7 只结 `state='sent'` 的案 | `failed` + spool 空的行（真库 id=13）永远 `needs_attention`，`n` 永远回不到 0，重试按钮按了没反应（§14.0 第 3 条） |
+| v4 | `deleted_marks` 进 cache v11 | 用户点「清空缓存」⇒ 墓碑消失 ⇒ 已删的信复活；直接违背 D2 自己写的"状态不能放可删可重建的缓存"（§14.0 第 4 条） |
+| v4 | `cancelled` 行"在「全部」里显示" | 同一张列表两种来源、两种待遇，位置规则一个字没写；写置顶是 v1 的行位移，写按日期插是 v1 的两源合并（§14.0 第 5 条） |
+| v4 | D-1 只有三个分支 | 漏「`SEARCH ALL` 有、`UID FETCH 210:*` 没有」这一格，而两条命令共用同一套 RFC 区间语义，一起坏完全可能（§14.0 第 6 条） |
+| v4 | `sent_records(folder, uid)` 与 `sent_index` 重复 | 计划刚用"两个对象、各自权威"否掉 v3 合并 `draft_mirrors`，转头又存了一份位置；而 §14.8 里它没有消费者，持久性无处可用（§14.0 第 7 条） |
+| v4 | "`msg.to()` 已经在手" | `summarise()` 只调了 `msg.message_id()`（`imap.rs:1160`），`to()` 从未被调用；字段是零成本可加，不是已在手（§14.0 第 9 条） |
