@@ -51,8 +51,8 @@ getrandom = "0.3"
 # CAs are trusted now changes with the operating system, exactly as it does for the two protocol
 # paths. Revocation stays asymmetric and is *not* what this feature buys: Schannel calls
 # `CertGetCertificateChain` with `CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY | ..._CHAIN_EXCLUDE_ROOT`
-# (`schannel-0.1.29/src/tls_stream.rs:679`) while rustls does not consult revocation at all, and that
-# was true before this change as well.
+# (`schannel-0.1.29/src/tls_stream.rs:678-680`, the call is `:696`) while rustls does not consult
+# revocation at all, and that was true before this change as well.
 #
 # `system-proxy` is **not optional here**, and it is the one feature a `default-features = false`
 # build silently loses. Without it reqwest ignores the system proxy entirely — including the

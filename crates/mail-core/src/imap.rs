@@ -1329,7 +1329,10 @@ fn parse_detail(uid: u32, raw: &[u8]) -> Result<MessageDetail> {
 ///
 /// These bytes are serialised into the JSON handed to the webview, so an oversized part would
 /// turn into an oversized string and a stalled UI. Anything above this stays visible in the
-/// attachment list, where it can be fetched deliberately instead.
+/// attachment list, where it can be fetched deliberately instead — and that second half is not a
+/// hope: `an_oversized_inline_image_is_not_embedded_but_is_still_reachable` measures that
+/// `mail-parser` really does list a `Content-Disposition: inline` part, because a dropped image
+/// with no row to click would be a silent loss of mail content.
 const MAX_INLINE_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Largest message this app will buffer in memory.
@@ -1661,5 +1664,57 @@ mod tests {
         // than panic in a debug build, and the range must stay a valid number.
         assert_eq!(since_range(u32::MAX), "4294967295:*");
         assert_eq!(since_range(u32::MAX - 1), "4294967295:*");
+    }
+
+    /// What the 2 MB inline-image ceiling actually leaves the user.
+    ///
+    /// `MAX_INLINE_IMAGE_BYTES` drops an oversized part from the webview payload — that half is a
+    /// one-line `continue`, easy to believe. The claim worth testing is the one the constant's
+    /// comment makes back: that the part "stays visible in the attachment list, where it can be
+    /// fetched deliberately instead". Whether `mail-parser` counts a `Content-Disposition: inline`
+    /// part as an attachment is the parser's behaviour, not ours, so it gets measured.
+    #[test]
+    fn an_oversized_inline_image_is_not_embedded_but_is_still_reachable() {
+        use base64::Engine as _;
+
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(vec![7u8; MAX_INLINE_IMAGE_BYTES + 1]);
+        let raw = format!(
+            "From: a@example.com\r\n\
+             To: me@example.com\r\n\
+             Subject: 大图\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/related; boundary=\"REL\"\r\n\
+             \r\n\
+             --REL\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             \r\n\
+             <p><img src=\"cid:big@example.com\"></p>\r\n\
+             --REL\r\n\
+             Content-Type: image/png\r\n\
+             Content-ID: <big@example.com>\r\n\
+             Content-Disposition: inline; filename=\"big.png\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             {b64}\r\n\
+             --REL--\r\n"
+        );
+
+        let detail = parse_detail(1, raw.as_bytes()).expect("the fixture parses");
+
+        assert!(
+            detail.inline_images.is_empty(),
+            "a part above the ceiling must not be base64-serialised into the webview payload"
+        );
+        let listed: Vec<(String, bool, usize)> = detail
+            .attachments
+            .iter()
+            .map(|a| (a.name.clone(), a.inline, a.size))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("big.png".to_string(), true, MAX_INLINE_IMAGE_BYTES + 1)],
+            "the only way back to a dropped inline image is the attachment row that names its part"
+        );
     }
 }

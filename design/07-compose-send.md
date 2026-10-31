@@ -301,9 +301,15 @@ SMTP 接受后（message_id 已知）：
   ├ estimate_encoded_size 预检 → 超 provider 上限（A1-F3）→ Blocker + 建议（拆包/云盘/压缩）
   └ 记入草稿（路径 + sha256 + size）
 发送时
-  ├ build_to_spool 逐块读文件（256 KB 块）→ base64 → 写 spool（**建 spool 这一步的峰值 ≈ 1 MB**；真正的峰值在发送那一步，见 §8）
+  ├ 读附件字节 → mail-builder 组 MIME → 写 spool。**这一段不是流式的**：`attachment_part` 一次
+  `std::fs::read` 读整个文件（`crates/mail-core/src/smtp.rs:33`），组完再落盘；实测峰值 = 已编码邮件的
+  **3.000 倍**（24 MB 附件那封 98.5 MB，`reports/performance.md` P10）。256 KB 分块只发生在**算 SHA-256**
+  那一步（`crates/mail-core/src/attach.rs:31`），别把它当成发送路径的内存保证。
   ├ 发送前校验 sha256：变了 → AttachmentChanged（让用户选：发新版本 / 取消）
-  └ spool 在"sent"后删除；failed 保留（重试要用），超 7 天自动清理
+  └ spool 在"投递成功且服务器副本归档完成"后删除；失败保留（重试要用）。
+    **没有"超 7 天自动清理"这一回事**（2026-10-20 核对代码：`Spool` 只有 open/path_for/write/read/remove，
+    没有任何按年龄扫描；删它的三个时机是归档完成、用户取消、删掉发件队列那一行）。
+    一句 honest 的话：没发出去的信会以明文 `.eml` 一直躺在配置目录里，直到用户自己把它处理掉。
 ```
 
 ## 6. 失败模式与降级
@@ -342,21 +348,25 @@ SMTP 接受后（message_id 已知）：
 | 打开写信面板 | ≤ 100 ms（含签名渲染） |
 | 草稿保存（本地） | ≤ 20 ms |
 | 草稿镜像（服务器） | ≤ 1 s（后台，不阻塞 UI） |
-| 生成 MIME（spool 到磁盘） | 60 MB 邮件 ≤ 3 s；**峰值内存 ≈ 2× 邮件大小**（见下） |
+| 生成 MIME（spool 到磁盘） | 60 MB 邮件 ≤ 3 s；**峰值内存实测 3.000× 已编码邮件**（24 MB 附件那封 98.5 MB；这一段 2026-10-20 前写的是"≈2× 且建 spool 只占 1 MB"，那是设计意图不是实现，见下） |
 | 单封大小上限（默认） | `min(服务商上限, 25 MB)`；超限在**添加附件时**就拦住 |
 | 发送（含 TLS 握手） | ≤ 2 s + 传输时间 |
 | 撤销窗口结束后入队延迟 | ≤ 500 ms（**靠 enqueue / 窗口到期 / 网络恢复时主动唤醒**，不是等 5 s tick —— 评审指出固定轮询达不到这个预算） |
 
-**为什么会是 2× 而不是"流式"**（诚实记录，A1-F45 实测结论）：
+**为什么实测是 3× 而不是"流式"**（2026-10-20 核对代码重写：这一段此前描述的是设计意图，不是发出去的那条路）：
 lettre 0.11.23 的 `Body` 是 `Vec<u8>`，**没有文件/Reader 形式的 body**，也没有 `message_iter` 之外的低层流式入口
 （`AsyncSmtpConnection::message_iter` 是公开的，但用它就得自己接管 MIME 组装、连接池与 TLS）。
-所以 M1 的现实上限是：
-1. **我们自己的 spool**：用 `mail-builder`（1.0.0，显式 CTE 与自定义头，A1-F45）把 MIME **流式写到磁盘**，
-   峰值内存只与单块（256 KB）有关；
-2. **发送**：读 spool → `AsyncTransport::send_raw(&Envelope, &bytes)` —— 这一步会再占一份内存（= 邮件大小），
-   于是"峰值 ≈ 2× 邮件大小"；25 MB 上限下约 50 MB，可接受；
-3. **M3 若要更大的附件**：自己实现 SMTP DATA 的流式写入（`message_iter` 或自研 SMTP 客户端），
-   届时移除单封上限。**不要**在没有实测的情况下承诺"1 GB 附件"。
+于是今天真实占内存的是三步，每一步都握着完整一份：
+1. **读附件**：`attachment_part` 一次 `std::fs::read` 读整个文件（`crates/mail-core/src/smtp.rs:33`）。
+   **没有 256 KB 分块** —— 分块只属于算 SHA-256 那一步（`crates/mail-core/src/attach.rs:31`），
+   它保护的是"哈希一个 100 MB 文件不吃掉 UI 的时间预算"，不是发送路径的内存上限。
+2. **组 MIME**：`message.formatted()` 再产出一份完整编码字节（base64 之后 ≈ 1.33× 原文件）。
+3. **发送**：读 spool → `AsyncTransport::send_raw(&Envelope, &bytes)` 又占一份。
+
+实测 **98.5 MB = 已编码邮件的 3.000 倍**（24 MB 附件那封，`reports/performance.md`；断言放宽到 ≤3.1×），
+所以 P10 是**踩线通过、没有余量**。要把它降下来只有一条真路：自己按 part 边编码边写盘
+（绕开 `Body: Vec<u8>`），同时保住"`send_raw` 不改行尾"这条字节一致约束（见下）。
+M3 若要更大的附件走的仍是同一条路，**届时**才能移除单封上限；**不要**在没有实测的情况下承诺"1 GB 附件"。
 补充约束：`send_raw` **不做 LF→CRLF 重写**（只做点填充）⇒ spool 里必须是 CRLF 正确的字节；
 而走 lettre 的 builder 路径会被重新编码（改 CTE、折行、补 Date/Message-ID），
 **要字节一致就必须自己组 MIME + `send_raw`**（这也是我们选 `mail-builder` 的原因）。

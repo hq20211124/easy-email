@@ -72,7 +72,33 @@ credit if you want it. Reports are handled privately until a fix is released.
   The remaining protection is not encryption either: a saved draft is mirrored to the server's
   Drafts folder and a sent message gets its server copy, so losing the machine does not lose the
   mail.
-- Outgoing mail is spooled as plaintext `.eml` files until it is accepted by the SMTP server,
-  and attachments are fetched whole into memory before being written; a very large message
-  costs memory proportional to that message.
+- Outgoing mail is spooled as plaintext `.eml` files, and it stays there longer than "until it is
+  sent". The message is built **once, at enqueue time**, and frozen as `<outbox id>.eml` under the
+  app's config directory (default `%APPDATA%\com.easyemail.desktop\spool`; if that directory cannot
+  be created the spool falls back to a `easy-email-spool` folder under the machine temp directory) —
+  full headers and body, unencrypted. After SMTP accepts the message the file is **deliberately kept**
+  until the Sent copy is filed from those exact bytes, and a failed send keeps it so a retry delivers
+  the identical message. It is removed when the send is filed, when the user cancels, or when the
+  outbox row is dropped. **Nothing ages it out**: `design/07` §5.5 once promised a 7-day auto-clean
+  and that is not implemented, so the honest statement is that an unsent message sits in plaintext on
+  disk until the user resolves it. Drafts and outbox rows are plaintext too, in `user.db`
+  (`payload_json`), and received bodies are plaintext in `cache.db` unless 正文不落盘 is switched on.
+  The server-side mirror (draft → Drafts, sent → server copy) is what protects the *mail*; it does
+  not remove the local plaintext.
+- **The memory ceiling per message is ours, and it is a refusal rather than a stream.** A fetched
+  message above `MAX_FETCH_BYTES` (128 MB) fails with a readable per-message error instead of taking
+  the process out; an inline image above 2 MB is left out of the HTML view and stays in the
+  attachment list, where the user can fetch it deliberately. But the bytes arrive whole before that
+  check runs — `async-imap` buffers a literal up to its own 512 MiB ceiling first — and a batched
+  body prefetch holds every parsed detail of the batch in memory at once, its 8 MB budget planned
+  from the cached `RFC822.SIZE` rather than from what the server actually returns. Sending has the
+  same shape: each attachment is read whole into the MIME builder, measured peak **98.5 MB = 3.000×
+  the encoded message** for a 24 MB attachment (`reports/performance.md`, budget P10 — no headroom).
+  Only the SHA-256 integrity check streams (256 KB chunks); the send path does not.
+- **Attachments the user saves are theirs to clean up.** Saving one refetches the whole message and
+  writes the decoded part in a single `fs::write` into `<Downloads>\Easy Email\` (the name is
+  de-duplicated, never silently overwritten), and the app never deletes or ages those files. Peak
+  cost is proportional to the message, not to the attachment: an IMAP section fetch would bound it,
+  but the MIME part number `mail-parser` reports cannot be derived into the protocol's dotted part
+  path, so the cheap-looking version of that fix would risk putting the wrong bytes in the file.
 - Not yet audited by a third party.

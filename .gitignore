@@ -32,3 +32,6 @@ Thumbs.db
 # Agent scratch directory: working notes for a tool, not part of the project. Untracked so it cannot
 # be swept into a commit by `git add -A`.
 /.commandcode/
+
+# Agent workspace data (memory, session state). Never part of the product.
+/.workbuddy-ai/
