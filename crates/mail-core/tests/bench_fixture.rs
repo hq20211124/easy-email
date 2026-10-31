@@ -774,6 +774,7 @@ fn bench_storage_path() {
                 flagged: rng.chance(3),
                 thread_key,
                 subject_key: None,
+                to_addrs: Vec::new(),
             });
             written += 1;
 
@@ -1176,6 +1177,7 @@ fn the_fixture_generates_and_can_be_searched() {
             flagged: false,
             thread_key: None,
             subject_key: None,
+            to_addrs: Vec::new(),
         })
         .collect();
     cache

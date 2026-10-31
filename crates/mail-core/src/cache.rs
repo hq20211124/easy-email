@@ -41,7 +41,7 @@ use crate::model::{MailboxInfo, MessageDetail, MessageSummary, ThreadMember};
 /// used to fold `cc:` onto `to_addrs`). FTS5 tables cannot gain a column, so the migration drops the
 /// index table and lets the create-if-not-exists below rebuild it with the new shape, then re-indexes
 /// every cached message — the index is derived data, so this loses nothing.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Which index shape a `bodies` row was last written by.
 ///
@@ -67,6 +67,13 @@ pub struct SentCopyRecord {
     /// Its UID, or `None` when the server would not tell us (`APPEND` does not return one; A1-F43).
     /// `None` means "the copy is there, its number is unknown", never "no copy".
     pub uid: Option<u32>,
+    /// The folder generation that UID belongs to (`design/07` §14.4 D0a).
+    ///
+    /// `0` means **unknown** — every row written before this column existed. It is not "whatever the
+    /// folder says now": a folder that was deleted and recreated hands the same UID to a different
+    /// message, and guessing would mark the old copy as confirmed. A caller comparing this against the
+    /// folder's current `UIDVALIDITY` must treat `0` as "cannot confirm", not as "matches".
+    pub uidvalidity: u32,
     pub local_at: i64,
 }
 
@@ -717,6 +724,23 @@ impl Cache {
             // be cached, the text of the message may not** — and a filename is metadata.
             add_column_if_missing(conn, "messages", "cc_addrs", "text")?;
             add_column_if_missing(conn, "messages", "attachment_names", "text")?;
+
+            // v11 (design/07 §14.4 D0a): which generation of the folder the recorded UID belongs to.
+            //
+            // Without it, `(folder, uid)` is an address that can be recycled: delete the folder,
+            // recreate it, and the same number now points at a different message — so the 已发送 row
+            // would wear a status that belongs to someone else's mail. Existing rows get **0 =
+            // unknown**, deliberately not "whatever the folder says today": guessing here would
+            // silently mark every old copy as confirmed.
+            //
+            // No index: it is read only after `(account_id, message_id)` has already found the row.
+            add_column_if_missing(
+                conn,
+                "sent_index",
+                "uidvalidity",
+                "integer not null default 0",
+            )?;
+
             // Rebuilding the full-text index belongs in bounded background batches too
             // (`rebuild_search_step`, driven by `start_search_rebuild_worker`).
             backfill_subject_keys(conn)?;
@@ -921,11 +945,17 @@ impl Cache {
                     &account_id,
                 );
                 let subject_key = (!subject_key.is_empty()).then_some(subject_key);
+                // The column is a JSON array because that is what the detail pass writes into it; a
+                // header-only sync now writes it too (`design/07` §14.4 D0b), so 已发送 can show who
+                // each message went to without the body ever being fetched.
+                let to_addrs = (!summary.to_addrs.is_empty())
+                    .then(|| serde_json::to_string(&summary.to_addrs).ok())
+                    .flatten();
                 conn.execute(
                     "insert into messages
                          (account_id, folder, uid, subject, from_name, from_addr, date, size, seen,
-                          flagged, thread_key, subject_key)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                          flagged, thread_key, subject_key, to_addrs)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                      on conflict(account_id, folder, uid) do update set
                          subject   = excluded.subject,
                          from_name = excluded.from_name,
@@ -935,7 +965,10 @@ impl Cache {
                          seen      = excluded.seen,
                          flagged   = excluded.flagged,
                          thread_key = excluded.thread_key,
-                         subject_key = excluded.subject_key",
+                         subject_key = excluded.subject_key,
+                         -- `coalesce`, like the detail path: a header with no `To:` must not wipe
+                         -- what reading the message already learned.
+                         to_addrs  = coalesce(excluded.to_addrs, messages.to_addrs)",
                     params![
                         account_id,
                         folder,
@@ -949,6 +982,7 @@ impl Cache {
                         i64::from(summary.flagged),
                         summary.thread_key,
                         subject_key,
+                        to_addrs,
                     ],
                 )?;
                 Self::refresh_search_row(
@@ -976,7 +1010,7 @@ impl Cache {
 
         let mut stmt = conn.prepare(
             "select uid, subject, from_name, from_addr, date, size, seen, flagged, thread_key,
-                    subject_key
+                    subject_key, to_addrs
              from messages
              where account_id = ?1 and folder = ?2
              order by date desc, uid desc
@@ -998,6 +1032,7 @@ impl Cache {
                     // grouping by subject and sender, which is a guess but a visible one.
                     thread_key: row.get(8)?,
                     subject_key: row.get(9)?,
+                    to_addrs: to_addrs_of(row.get(10)?),
                 })
             },
         )?;
@@ -1111,7 +1146,7 @@ impl Cache {
         Self::query_members(
             conn,
             "select folder, uid, subject, from_name, from_addr, date, size, seen, flagged,
-                    thread_key, subject_key
+                    thread_key, subject_key, to_addrs
              from messages
              where account_id = ?1 and thread_key = ?2
              order by date asc, uid asc
@@ -1136,7 +1171,7 @@ impl Cache {
         let rows = Self::query_members(
             conn,
             "select folder, uid, subject, from_name, from_addr, date, size, seen, flagged,
-                    thread_key, subject_key
+                    thread_key, subject_key, to_addrs
              from messages
              where account_id = ?1 and subject_key = ?2
              order by date asc, uid asc
@@ -1183,6 +1218,7 @@ impl Cache {
                     flagged: row.get::<_, i64>(8)? != 0,
                     thread_key: row.get(9)?,
                     subject_key: row.get(10)?,
+                    to_addrs: to_addrs_of(row.get(11)?),
                 },
             })
         })?;
@@ -1306,6 +1342,7 @@ impl Cache {
         message_id: &str,
         folder: &str,
         uid: Option<u32>,
+        uidvalidity: u32,
         now: i64,
     ) -> Result<()> {
         let account_id = account_id.to_string();
@@ -1313,11 +1350,22 @@ impl Cache {
         let folder = folder.to_string();
         self.db.write_blocking(move |conn: &Connection| {
             conn.execute(
-                "insert into sent_index (account_id, message_id, folder, uid, local_at)
-                 values (?1, ?2, ?3, ?4, ?5)
+                "insert into sent_index (account_id, message_id, folder, uid, uidvalidity, local_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6)
                  on conflict(account_id, message_id) do update set
-                     folder = excluded.folder, uid = excluded.uid, local_at = excluded.local_at",
-                params![account_id, message_id, folder, uid.map(i64::from), now],
+                     folder = excluded.folder, uid = excluded.uid,
+                     -- `coalesce` on the generation: an append we could not attribute (0) must not
+                     -- erase the generation an earlier, better-informed pass recorded.
+                     uidvalidity = coalesce(nullif(excluded.uidvalidity, 0), sent_index.uidvalidity),
+                     local_at = excluded.local_at",
+                params![
+                    account_id,
+                    message_id,
+                    folder,
+                    uid.map(i64::from),
+                    i64::from(uidvalidity),
+                    now
+                ],
             )?;
             Ok(())
         })
@@ -1329,7 +1377,7 @@ impl Cache {
         let conn: &Connection = &guard;
         Ok(conn
             .query_row(
-                "select account_id, message_id, folder, uid, local_at
+                "select account_id, message_id, folder, uid, uidvalidity, local_at
                  from sent_index where account_id = ?1 and message_id = ?2",
                 params![account_id, message_id],
                 |row| {
@@ -1339,7 +1387,8 @@ impl Cache {
                         folder: row.get(2)?,
                         // A `NULL` uid is the documented APPEND outcome (A1-F43), not a missing copy.
                         uid: row.get::<_, Option<i64>>(3)?.map(|uid| uid as u32),
-                        local_at: row.get(4)?,
+                        uidvalidity: row.get::<_, i64>(4)? as u32,
+                        local_at: row.get(5)?,
                     })
                 },
             )
@@ -2431,6 +2480,18 @@ fn backfill_subject_keys(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Read the `to_addrs` column into the shape the list carries.
+///
+/// The column holds a JSON array (`design/07` §14.4 D0b) because that is what the detail pass
+/// already writes into it. Two kinds of row have nothing usable there — never opened (NULL) and
+/// written by a build that stored something else — and both become "no recipients" rather than an
+/// error: one unreadable column must not blank a whole list of mail.
+fn to_addrs_of(stored: Option<String>) -> Vec<String> {
+    stored
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
 /// SQLite has no `alter table ... add column if not exists`, so the check has to be made explicitly.
 /// Doing it by asking the schema rather than by trusting the recorded version is deliberate: the two
 /// can disagree (an interrupted migration, a file copied between versions), and the schema is what
@@ -2464,6 +2525,7 @@ mod tests {
             flagged: false,
             thread_key: None,
             subject_key: None,
+            to_addrs: Vec::new(),
         }
     }
 
@@ -3882,7 +3944,7 @@ mod tests {
         );
 
         cache
-            .record_sent_copy("acc", "<a@x>", "Sent", Some(4242), 100)
+            .record_sent_copy("acc", "<a@x>", "Sent", Some(4242), 900, 100)
             .expect("record");
         let found = cache
             .sent_copy("acc", "<a@x>")
@@ -3890,6 +3952,11 @@ mod tests {
             .expect("present");
         assert_eq!(found.folder, "Sent");
         assert_eq!(found.uid, Some(4242));
+        assert_eq!(
+            found.uidvalidity, 900,
+            "the generation travels with the UID: without it the pair is an address that a \
+             recreated folder can hand to different mail"
+        );
 
         // Another account's message with the same id is a different row: the index is per account.
         assert_eq!(cache.sent_copy("other", "<a@x>").expect("read"), None);
@@ -3897,7 +3964,7 @@ mod tests {
         // Recording the same message twice must not produce two rows — the archive step refuses to
         // write a second copy, so a second record is the same copy found again.
         cache
-            .record_sent_copy("acc", "<a@x>", "Sent", None, 200)
+            .record_sent_copy("acc", "<a@x>", "Sent", None, 900, 200)
             .expect("record again");
         let again = cache
             .sent_copy("acc", "<a@x>")
@@ -3913,7 +3980,7 @@ mod tests {
         // representable — otherwise the UI would offer to look up a message that is already there.
         let cache = Cache::open_in_memory().expect("open");
         cache
-            .record_sent_copy("acc", "<b@x>", "Sent Messages", None, 1)
+            .record_sent_copy("acc", "<b@x>", "Sent Messages", None, 0, 1)
             .expect("record");
         let found = cache
             .sent_copy("acc", "<b@x>")
@@ -3921,6 +3988,136 @@ mod tests {
             .expect("present");
         assert_eq!(found.uid, None);
         assert_eq!(found.folder, "Sent Messages");
+    }
+
+    /// `design/07` §14.4 D0a: a v10 cache gains `sent_index.uidvalidity`, and the rows it already
+    /// holds read **0 = unknown**.
+    ///
+    /// That value is the point of the column. Filling it with "whatever the folder says today" would
+    /// mark every pre-upgrade copy as confirmed against a generation it was never filed in, and a
+    /// folder that was deleted and recreated hands the same UID to different mail — the 已发送 row
+    /// would then wear a status belonging to somebody else's message.
+    #[test]
+    fn a_v10_cache_gains_the_sent_copy_generation_as_unknown() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-email-sent-generation-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        // A file whose `sent_index` has the v10 shape: no `uidvalidity`, one row already in it.
+        {
+            let db = Db::open(
+                &path,
+                crate::db::DbKind::Cache,
+                crate::db::DbOptions::for_kind(crate::db::DbKind::Cache),
+            )
+            .expect("db");
+            db.write_blocking(|conn: &Connection| {
+                conn.execute_batch(
+                    "create table sent_index (
+                         account_id text not null,
+                         message_id text not null,
+                         folder     text not null,
+                         uid        integer,
+                         local_at   integer not null,
+                         primary key (account_id, message_id)
+                     );
+                     insert into sent_index values ('acc', '<old@x>', 'Sent Messages', 226, 5);
+                     pragma user_version = 10;",
+                )?;
+                Ok(())
+            })
+            .expect("downgrade");
+        }
+
+        let cache = Cache::open(&path).expect("open a v10 file");
+        assert_eq!(cache.schema_version().expect("version"), SCHEMA_VERSION);
+
+        let old = cache
+            .sent_copy("acc", "<old@x>")
+            .expect("read")
+            .expect("the row survives the upgrade");
+        assert_eq!(old.uid, Some(226), "the address is kept as recorded");
+        assert_eq!(
+            old.uidvalidity, 0,
+            "and the generation is UNKNOWN, not guessed from the folder"
+        );
+
+        // A later filing that cannot read the generation must not erase a known one.
+        cache
+            .record_sent_copy("acc", "<old@x>", "Sent Messages", Some(226), 4242, 6)
+            .expect("record");
+        assert_eq!(
+            cache
+                .sent_copy("acc", "<old@x>")
+                .expect("read")
+                .expect("present")
+                .uidvalidity,
+            4242
+        );
+        cache
+            .record_sent_copy("acc", "<old@x>", "Sent Messages", Some(226), 0, 7)
+            .expect("record again");
+        assert_eq!(
+            cache
+                .sent_copy("acc", "<old@x>")
+                .expect("read")
+                .expect("present")
+                .uidvalidity,
+            4242,
+            "0 means unknown, so it cannot overwrite what an earlier pass knew"
+        );
+
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `design/07` §14.4 D0b: recipients travel with the list row, and a header with no `To:` must
+    /// not wipe what reading the message already learned.
+    #[test]
+    fn the_list_carries_recipients_and_a_header_only_sync_does_not_erase_them() {
+        let cache = Cache::open_in_memory().expect("open");
+
+        let mut row = summary(1, "报销单", "me@example.com", 1_700_000_000);
+        row.to_addrs = vec![
+            "甲 <a@example.com>".to_string(),
+            "b@example.com".to_string(),
+        ];
+        cache
+            .upsert_summaries("acc", "Sent Messages", &[row.clone()])
+            .expect("upsert");
+
+        let listed = cache
+            .list_summaries("acc", "Sent Messages", 10, 0)
+            .expect("list");
+        assert_eq!(
+            listed[0].to_addrs,
+            vec![
+                "甲 <a@example.com>".to_string(),
+                "b@example.com".to_string()
+            ],
+            "已发送 renders the sender, so without this every row reads as the user's own address"
+        );
+
+        // The same message synced again from a header with no `To:` at all.
+        let mut without = row.clone();
+        without.to_addrs = Vec::new();
+        cache
+            .upsert_summaries("acc", "Sent Messages", &[without])
+            .expect("upsert again");
+        assert_eq!(
+            cache
+                .list_summaries("acc", "Sent Messages", 10, 0)
+                .expect("list")[0]
+                .to_addrs
+                .len(),
+            2,
+            "coalesce, exactly like the detail path: an empty header does not erase knowledge"
+        );
     }
 
     /// A cache written by the previous schema gains `sent_index` on open.
@@ -3944,7 +4141,7 @@ mod tests {
             let cache = Cache::open(&path).expect("open");
             assert_eq!(cache.schema_version().expect("version"), SCHEMA_VERSION);
             cache
-                .record_sent_copy("acc", "<c@x>", "Sent", Some(7), 1)
+                .record_sent_copy("acc", "<c@x>", "Sent", Some(7), 900, 1)
                 .expect("record");
         }
         {
@@ -3972,7 +4169,7 @@ mod tests {
             "the dropped rows are gone, which is fine: this is derived data"
         );
         upgraded
-            .record_sent_copy("acc", "<d@x>", "Sent", Some(8), 2)
+            .record_sent_copy("acc", "<d@x>", "Sent", Some(8), 900, 2)
             .expect("the new table must be usable");
         assert!(upgraded.sent_copy("acc", "<d@x>").expect("read").is_some());
         drop(upgraded);
@@ -4316,6 +4513,7 @@ mod tests {
             flagged: false,
             thread_key: None,
             subject_key: None,
+            to_addrs: Vec::new(),
         }
     }
 
@@ -4691,6 +4889,7 @@ mod tests {
                     flagged: false,
                     thread_key: None,
                     subject_key: Some("甲".into()),
+                    to_addrs: Vec::new(),
                 }],
             )
             .expect("a");

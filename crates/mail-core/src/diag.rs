@@ -398,6 +398,7 @@ mod tests {
             flagged: false,
             thread_key: None,
             subject_key: Some(subject.to_string()),
+            to_addrs: Vec::new(),
         }
     }
 

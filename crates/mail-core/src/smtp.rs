@@ -662,6 +662,7 @@ mod tests {
             flagged: false,
             thread_key: None,
             subject_key: None,
+            to_addrs: Vec::new(),
         };
         let json = serde_json::to_string(&s).expect("serialise");
         assert!(json.contains("\"uid\":1"));

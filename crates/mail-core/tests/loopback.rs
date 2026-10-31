@@ -3101,6 +3101,7 @@ async fn a_server_that_refuses_sets_still_indexes_every_message() {
             flagged: false,
             thread_key: None,
             subject_key: None,
+            to_addrs: Vec::new(),
         })
         .collect();
     cache
@@ -3733,6 +3734,43 @@ async fn syncing_a_folder_twice_only_fetches_what_is_new() {
         second.total_cached, 4,
         "and nothing re-inserted — the fixture answers `UID FETCH 5:*` with UID 4, because RFC 3501 \
          ranges are unordered, so a sync that trusted the server's range would duplicate it"
+    );
+}
+
+/// **D0b (`design/07` §14.4).** A list row carries its `To:` recipients, and they arrive with the
+/// header sync — no body is fetched to get them.
+///
+/// This is not cosmetic: 已发送 renders the *sender*, and on a sent copy the sender is the user. With
+/// no recipients on the row, every message they ever sent reads as having been sent to themselves.
+#[tokio::test]
+async fn a_synced_row_carries_its_recipients_without_fetching_the_body() {
+    let (addr, log) = spawn_imap(true).await;
+    let cfg = account(addr, addr);
+    let mut client = within(ImapClient::connect(&cfg, "app-password"))
+        .await
+        .expect("connect");
+    let cache = Cache::open_in_memory().expect("cache");
+
+    within(sync_once(&mut client, &cache, &cfg.id, &inbox())).await;
+
+    let rows = cache.list_summaries(&cfg.id, "INBOX", 10, 0).expect("list");
+    let row = rows
+        .iter()
+        .find(|row| row.uid == 2)
+        .expect("UID 2 is cached");
+    assert_eq!(
+        row.to_addrs,
+        vec!["me@example.com".to_string()],
+        "the header already says who it went to"
+    );
+
+    // And it cost nothing: a `BODY[]` fetch here would mean the recipients came from opening the
+    // message, which is exactly the expense this column exists to avoid.
+    assert!(
+        !transcript(&log)
+            .iter()
+            .any(|line| line.to_ascii_uppercase().contains("BODY[]")),
+        "sync must not read bodies to learn the recipients"
     );
 }
 

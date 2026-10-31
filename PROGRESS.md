@@ -7,8 +7,8 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **530**（mail-core lib 445 + 桌面壳 lib 21 + loopback 58 +
-  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107 轮加了 3 条）。这 530 是**跑过的**条数；
+- **测试数量**：基线 116 → 现在 **533**（mail-core lib 447 + 桌面壳 lib 21 + loopback 59 +
+  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107 轮加了 3 条，第 108 轮加了 3 条）。这 533 是**跑过的**条数；
   另有 **12** 条 `#[ignore]` 的基准不在里面 —— 第 99 轮续加了两条：`cache::tests::p9_time_is_not_in_the_transaction_boundary`
   （P9 事务边界，约 30 秒，复现命令在 `reports/performance.md` §10.6）与
   `db::tests::the_watchdog_costs_less_than_the_read_it_measures`（第 5 项的计时代价，约 2 秒，§11.7）；
@@ -17,6 +17,37 @@
   60 秒，约 135 秒，§16.8）。
   `tools/check.ps1` **全绿**：**65 步**（第 101 轮给 2a/2b 各加一步；第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
   早已过期，只有"fmt + clippy -D warnings + build + test + PE=2"这几条一直是骨架）。
+
+### cache v11 两列落地：`uidvalidity` 的 0 是"未知"，`to_addrs` 从头部就来（第 108 轮，2026-11-01）
+
+`design/07` §14.10 的第 0 步。两处都不是"加一列"那么简单：
+
+**D0a —— `sent_index.uidvalidity`（v10 → v11）**
+
+- 迁移给已有行填 **0 = 未知**，**不猜当前代**。这是这条列的全部意义：文件夹删掉重建，同一个 UID 会指向
+  另一封信，猜一个"当前 UIDVALIDITY"就等于给每一封存量副本盖一个没核过的章。
+- `record_sent_copy` 多一个入参；写入用 `coalesce(nullif(excluded.uidvalidity, 0), sent_index.uidvalidity)`
+  —— 归档时读不到代（0）不得抹掉更早那次读到的值。`SentCopy` 因此带上 `uidvalidity`，
+  `ensure_sent_copy` 用新加的 `ImapClient::uidvalidity_of()` 取（**尽力而为**：读不到就记 0，
+  不能让一次已经完成的归档因为再读一次文件夹而失败）。
+- 真库核过：把真 `cache.db` 复制一份、只跑那条 `alter table`，三条存量行（UID 207/209/226）
+  迁移后全是 0 —— 与设计要的"未知"一致，不是 210/226 之类的猜测值。
+
+**D0b —— `messages.to_addrs` 其实早就有**
+
+- 那一列 v1 就在，正文到达时写 JSON 数组。所以 D0b 的真实内容是**让头部同步也写它**，并把值送到列表行：
+  `MessageSummary.to_addrs: Vec<String>`（`#[serde(default)]`，老客户端/老行都当空）。
+- `summarise()` 顺手填（`msg.to()` 的头部已经在解析，**零额外请求**）。写入 `coalesce`：一封没有 `To:` 的
+  信不得抹掉读正文时已经知道的东西 —— 与 `put_detail` 同一条规则。
+- 副作用（是收益）：`refresh_search_row` 读的就是这一列，所以**按收件人搜索从此不需要先打开过那封信**。
+- 为什么必须做：`已发送` 渲染的是**发件人**，而发出去的信发件人就是用户自己 —— 没有这列，每一行都显示自己。
+
+**数字**：lib **447**（+2：v10 迁移的"0 不是猜的"、列表带收件人且空头部不抹）、loopback **59**（+1：
+头部同步就带 `to_addrs`，且转录里**没有** `BODY[]`，证明不是靠打开信拿到的）、桌面壳 21，合计 **533**；
+`clippy -D warnings` 干净；`check.ps1` **65/65**（按上一轮记的办法设 `CARGO_INCREMENTAL=0`）。
+
+**未做**：`user.db` v5（`sent_records` + `deleted_marks` + `settle_sent_row`）与界面那半（第 3 步）。
+`to_addrs` 现在只是"存得住、传得出"，列表还不会显示它 —— 那是第 3 步的事，不冒充完成。
 
 ### D-1 出结论了：**分支 A**；一次同步把 226 收进来了（第 107 轮，2026-11-01）
 

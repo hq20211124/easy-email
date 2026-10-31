@@ -45,6 +45,12 @@ pub struct SentCopy {
     /// not echo `APPENDUID`, and async-imap discards it when it does (A1-F43) — so this is a lookup
     /// that failed, not a copy that failed. **Nothing may append again because of it.**
     pub uid: Option<u32>,
+    /// The folder generation this UID belongs to (`design/07` §14.4 D0a); `0` = could not be read.
+    ///
+    /// Recorded next to the UID because the pair is only an address inside one generation: a folder
+    /// deleted and recreated hands the same number to different mail, and the 已发送 row would then
+    /// wear a status that belongs to somebody else's message.
+    pub uidvalidity: u32,
     /// True when the server had not filed it and we wrote it ourselves.
     pub appended: bool,
 }
@@ -82,8 +88,12 @@ pub async fn ensure_sent_copy(
         }
         if let Some(uid) = client.find_uid_by_message_id(&folder, message_id).await? {
             return Ok(Some(SentCopy {
-                folder,
+                folder: folder.clone(),
                 uid: Some(uid),
+                // Best effort: failing to re-read the generation must not fail a filing that already
+                // happened. `0` means "unknown", and the cache refuses to overwrite a known value
+                // with it.
+                uidvalidity: client.uidvalidity_of(&folder).await.unwrap_or(0),
                 appended: false,
             }));
         }
@@ -97,8 +107,9 @@ pub async fn ensure_sent_copy(
     // duplicate this whole function exists to avoid.
     let uid = client.find_uid_by_message_id(&folder, message_id).await?;
     Ok(Some(SentCopy {
-        folder,
+        folder: folder.clone(),
         uid,
+        uidvalidity: client.uidvalidity_of(&folder).await.unwrap_or(0),
         appended: true,
     }))
 }

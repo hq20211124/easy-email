@@ -609,6 +609,15 @@ impl ImapClient {
         Ok(mailbox_metadata)
     }
 
+    /// The folder's current `UIDVALIDITY`, as this connection sees it.
+    ///
+    /// The archive step needs it: it records `(folder, uid)` for a sent copy, and that pair is only an
+    /// address inside one generation of the folder (`design/07` §14.4 D0a) — a folder deleted and
+    /// recreated hands the same UID to different mail.
+    pub async fn uidvalidity_of(&mut self, mailbox: &str) -> Result<u32> {
+        Ok(self.select_to(mailbox).await?.uid_validity.unwrap_or(0))
+    }
+
     /// Make `mailbox` the current selection, skipping the command when it already is.
     ///
     /// Folder-scoped primitives (`UID FETCH`, `UID STORE`) carry no folder of their own, so anything
@@ -1347,7 +1356,7 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         .header()
         .and_then(|raw| MessageParser::default().parse(raw));
 
-    let (subject, from_name, from_addr, date, thread_key) = match parsed {
+    let (subject, from_name, from_addr, date, thread_key, to_addrs) = match parsed {
         Some(msg) => {
             let from = msg.from().and_then(|a| a.first());
             // The thread key comes from headers already in hand: the root of the `References` chain,
@@ -1363,10 +1372,21 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
                 from.and_then(|a| a.address()).map(str::to_string),
                 msg.date().map(date_to_unix),
                 (!key.is_empty()).then_some(key),
+                // `To:` only, and free: the header is already parsed here (`design/07` §14.4 D0b).
+                // Without it every row in 已发送 shows the user their own address, because the list
+                // renders the *sender* and on a sent copy the sender is them.
+                collect_addresses(msg.to()),
             )
         }
         // A malformed header must not sink the whole list; show a placeholder row instead.
-        None => ("(无法解析的邮件头)".to_string(), None, None, None, None),
+        None => (
+            "(无法解析的邮件头)".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        ),
     };
 
     MessageSummary {
@@ -1380,6 +1400,7 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         // Computed by the cache, which is the layer that knows whose account this is: the key is only
         // for mail the user received, and "is this sender me?" cannot be answered from the headers.
         subject_key: None,
+        to_addrs,
         seen,
         flagged,
     }
@@ -1877,6 +1898,7 @@ mod tests {
             flagged: false,
             subject_key: None,
             thread_key: None,
+            to_addrs: Vec::new(),
         }
     }
 

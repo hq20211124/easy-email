@@ -471,6 +471,7 @@ where
                     &filed_id,
                     &copy.folder,
                     copy.uid,
+                    copy.uidvalidity,
                     run.now,
                 );
                 run.spool.remove(Path::new(&path));
@@ -708,6 +709,7 @@ mod tests {
                     Ok(Some(crate::sentcopy::SentCopy {
                         folder: "Sent".into(),
                         uid: Some(4242),
+                        uidvalidity: 77,
                         appended: false,
                     }))
                 }

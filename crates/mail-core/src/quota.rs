@@ -530,6 +530,7 @@ mod tests {
                         flagged: false,
                         thread_key: None,
                         subject_key: Some("订单".into()),
+                        to_addrs: Vec::new(),
                     }],
                 )
                 .expect("summary");

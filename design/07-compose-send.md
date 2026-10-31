@@ -786,7 +786,7 @@ settle_sent_row(outbox_row):
 
 ```
 -1. D-1 诊断（§14.3）                                     ✅ 2026-11-01：分支 A（§14.3.1）
- 0. cache v11：`sent_index.uidvalidity` + `messages.to_addrs`（D0a/D0b）  两条 add_column，A/B/C 都要
+ 0. cache v11：`sent_index.uidvalidity` + `messages.to_addrs`（D0a/D0b）   ✅ 2026-11-01：两列都落地
  1. user.db v5：sent_records + deleted_marks + 存量行 + settle_sent_row   纯后端，可独立验收
  2a. 【A / A′ / B】修根因（改 `fetch_headers_since` 或游标那三处）        ✅ 2a-A 已做：改用 `UID FETCH … (UID)`
  2b. 【C】D0c（message_id + 部分索引 + 四填充点）+ D3 + D6                 **不做**（诊断结果是 A，不是 C）
@@ -794,8 +794,18 @@ settle_sent_row(outbox_row):
  4. 侧栏 IA（`12` §16）                                    纯展示层，可与 -1..1 并行（见 `12` §16.5）
 ```
 
-**当前进度（2026-11-01）**：-1 与 2a 完成，下一步是 0（cache v11 两列）→ 1（`user.db` v5）→ 3。
+**当前进度（2026-11-01）**：-1、0、2a 完成，下一步是 1（`user.db` v5）→ 3。
 2b 因诊断结论为 A 而**永久关闭**，除非哪天在别的服务商上又看到"服务器说有、我们这边没有"。
+
+**第 0 步落地时的两处判断**：
+
+- **D0b 的列早就存在**（`messages.to_addrs` 是 v1 就有的列，正文到达时写 JSON 数组）。所以 D0b 不是
+  "加一列"，而是**让头部同步也写它**并把值送到列表行上（`MessageSummary.to_addrs: Vec<String>`，
+  `#[serde(default)]`）。写入用 `coalesce(excluded.to_addrs, messages.to_addrs)`，与正文路径同一规则：
+  一封没有 `To:` 的信不得抹掉读正文时已经知道的东西。
+- **D0a 的 `0 = 未知`是这条列的全部意义**。迁移不给已有行猜当前 `UIDVALIDITY`；`record_sent_copy` 收到 0
+  时用 `coalesce(nullif(excluded.uidvalidity, 0), sent_index.uidvalidity)` 保留旧值。
+  真库上核过：三条存量行（207/209/226）迁移后 `uidvalidity` 全是 0，正是"未知"而不是"当前代"。
 
 **为什么不能倒过来**：界面依赖的"这一行有没有副本"，在 0 之前只能靠 `outbox` 猜；靠猜就得两源合并，那就是 v1 的老路。
 
@@ -807,7 +817,7 @@ settle_sent_row(outbox_row):
 
 **A. 离线可证伪**（`cargo test` / loopback / node 门禁；当前环境 `cargo test --workspace` 有 LNK1104 限制，按第 102 轮记录的办法跑 `-p mail-core --lib`）
 
-- [ ] **cache v11**：老库打开后 `sent_index` 有 `uidvalidity` 列（已有行的值是 0 = 未知，**不是**被猜成当前值）、`messages` 有 `to_addrs` 列；新同步一封信后该行的 `to_addrs` 非空（loopback）。
+- [x] **cache v11**（2026-11-01 已做）：老库打开后 `sent_index` 有 `uidvalidity` 列（已有行的值是 0 = 未知，**不是**被猜成当前值）、`messages` 有 `to_addrs` 列；新同步一封信后该行的 `to_addrs` 非空（loopback：`a_synced_row_carries_its_recipients_without_fetching_the_body`）。
 - [ ] 迁移：`count(outbox where state='sent' and spool_path is null)` == 迁移后 `sent_records` 行数（含 synthetic）；**少一行即失败**。
 - [ ] 迁移：`count(sent_records where folder='')` == "spool 空且 `sent_index` 查不到"的行数。**真库上应当是 0**（11/12/14 三条有 226/209/207）。大于 0 就是把已知写成了未知。
 - [ ] 结案：造一条无 Sent 文件夹的账号，发一封 ⇒ 跑一轮归档 ⇒ `count(outbox where state='sent')` == 0，且 `sent_records` 里有一条 `folder=''`。

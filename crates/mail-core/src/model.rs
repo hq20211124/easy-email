@@ -315,6 +315,16 @@ pub struct MessageSummary {
     /// `None` for rows written before this existed, and for the messages that must not participate.
     #[serde(default)]
     pub subject_key: Option<String>,
+    /// The `To:` recipients, formatted `Name <addr>` (`design/07` §14.4 D0b).
+    ///
+    /// **Only To.** Cc and Bcc are not on the list row and never will be: a message sent to a list
+    /// would make every row three lines tall, and the reader has a detail view for that.
+    ///
+    /// It is filled from the headers during sync — `msg.to()` is already parsed there, so this costs
+    /// no extra request — and it is what stops every row in 已发送 from reading as the user's own
+    /// address. `#[serde(default)]` because the field arrived after the list payload existed.
+    #[serde(default)]
+    pub to_addrs: Vec<String>,
 }
 
 /// One message of a conversation, with the folder it lives in (`design/08` §4.2's `ThreadMessage`).
