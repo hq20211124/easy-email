@@ -476,3 +476,96 @@ M3 若要更大的附件走的仍是同一条路，**届时**才能移除单封�
 - [ ] 发送后在"已发送"里能找到（三种服务商行为都要覆盖），且没有重复副本。
 - [ ] `Bcc` 不出现在头部；`References` 链完整（回复在收件人客户端里成会话）。
 - [ ] `check.ps1` 六项新增检查通过。
+
+---
+
+## 14. 发件箱与「已发送」：一个列表 + 一份状态（2026-10-31，**v2，待用户确认后才动代码**）
+
+> **v1 已被本版取代**（v1 的"两源合并 + `origin` 三态 + 待发置顶"被否，理由见 §14.7）。
+
+### 14.1 用户看到的问题（真机数据，不是推测）
+
+| 事实 | 证据 |
+|---|---|
+| 发件箱那一行是 `sent` | `user.db` outbox id=14，`state=sent`，10-31 17:34 |
+| 副本确实归档了 | `cache.db` `sent_index`：folder `Sent Messages`、**UID 226**、写入于 17:35:27 |
+| 「已发送」列表里没有它 | `cache.db` 该文件夹只有 UID **202–209**，`folders.last_uid=209` |
+| 之后十几次同步都说没有新信 | 日志 17:35–17:59 反复 `同步 Sent Messages：新增 0 封，缓存共 8 封` |
+
+**发件箱说"已发送"，已发送说"没这封信"——两个界面各自都对，用户看到的却是矛盾。**
+
+### 14.2 两条根因（分开修，第二条不在本次范围）
+
+1. **归档成功不落列表。** `file_sent_copies`（`crates/mail-core/src/worker.rs`）在 `Ok(Some(copy))`
+   分支里只写 `sent_index`（一条指针），**不写 `messages` 行**，而「已发送」列表只读 `messages`。
+2. **增量同步取不回刚 APPEND 的那封。** `fetch_headers_since` 发 `UID SEARCH <last_uid+1>:*`
+   （`crates/mail-core/src/imap.rs:618`），在 QQ 上没返回 226。**作为已知缺陷单独记录**，
+   修它之前，"归档成功但同步看不见"必须靠 D3 兜住。
+
+### 14.3 六个决定
+
+| # | 决定 | 理由 |
+|---|---|---|
+| **D1** | **一个列表**：侧栏只有「已发送」；列表数据**只来自 `cache.db` 的 `messages`**，分页/排序/虚拟滚动全部不变 | 两库联合查询会让 `message_page(offset)` 的分页重复或漏行 |
+| **D2** | **发送状态存在 `user.db` 的 `sent_records`**，列表渲染时**按当前页的 Message-ID 批量查一次**（≤50 个） | 状态是事实，不能放可删可重建的缓存；但也不能让列表变成联合查询 |
+| **D3** | **归档成功即写 `messages` 行**（摘要，UID 来自 `copy.uid`） | 服务器上有、用户看不到 = 和没做一样。这条同时兜住根因 2 |
+| **D4** | **删除 = 直接删**（本地行 + 服务器副本），**必须二次确认**；不提供"只删本地" | 用户原话："他们的概念就是删除这个账户下的这封邮件" |
+| **D5** | **待发/失败 = 顶部横幅 + 过滤视图**，**不进时间流** | 置顶会让翻页时的行位移，用户看到重复 |
+| **D6** | **归档成功后删除 `outbox` 行**，状态转存 `sent_records` | 否则那张表无限增长，而它每次都要全量读 |
+
+### 14.4 数据模型
+
+**`user.db` 新表 `sent_records`**（轻量，只留"这封信怎么了"）：
+
+```
+account_id   TEXT
+message_id   TEXT        -- 冻结的 Message-ID，主键的一部分
+folder       TEXT        -- 副本所在文件夹（无副本时为空串）
+uid          INTEGER     -- 服务器给的编号，可空
+state        TEXT        -- sent / failed / needs_attention / cancelled
+attempts     INTEGER
+last_error   TEXT
+created_at   INTEGER     -- 入队时间
+updated_at   INTEGER
+PRIMARY KEY (account_id, message_id)
+```
+
+**`outbox` 表**从此只保留**未完成**的行（`queued`/`sending`/`failed`/`needs_attention`/`cancelled`）。
+归档成功 = 一个事务里 `insert into sent_records` + `delete from outbox`。
+
+**列表渲染**：
+```
+message_page(account, folder, offset, limit)   → 本页 50 行（cache，分页语义不变）
+list_sent_states(account, [message_id...])     → 一次小查询，标注这 50 行的状态
+```
+
+### 14.5 边界（每一条都要有确定行为）
+
+| 情况 | 行为 |
+|---|---|
+| `copy.uid` 为空（服务器没给编号） | **不写 `messages` 行**（没有主键），等同步；`sent_records` 里 `uid` 留空，行上标「副本位置未知」 |
+| **UID 已被另一封信占用** | **不写**，只记日志。主键是 `(account, folder, uid)`，覆盖写会把别人的信换掉——这是 M1a 之前那类 bug 的翻版 |
+| 该行已存在（同步先到了） | **只补缺失字段，不覆盖 `seen`**。有些服务器把 Sent 副本标未读，upsert 覆盖会把服务器的真实状态抹掉 |
+| 服务器没有 Sent 文件夹 | 不写行；`sent_records` 记 `folder=''`，行上标「仅本地记录」 |
+| 副本因过大被跳过（`SkippedTooLarge`） | 同上：标「仅本地记录」，不假装已归档 |
+| 离线 | 本地记录可见；服务器副本可能缺失，顶部横幅说明"下面是上次同步的内容" |
+| **删除时服务器不可达** | 本地立即消失，进 `pending_ops`（新增 kind `delete_sent_copy`），界面如实说"已从本机删除，服务器副本待联网后删除" |
+| **删除时 `uid` 为空** | 先按 Message-ID `SEARCH` 定位；仍找不到 ⇒ 只删本地，并在确认弹窗里事先说明这一点 |
+
+### 14.6 验收（可证伪）
+
+- [ ] 发信后**不点开「已发送」**，列表里就已经有那一行（真机）。
+- [ ] 同一个 `Message-ID` 不会出现两行。
+- [ ] 状态为 `sent` 的行**没有**状态标签；`failed` 的行有标签且能重试。
+- [ ] 删除：二次确认 → 本地立刻消失 → loopback 断言服务器收到 `STORE +FLAGS \Deleted` 与 `EXPUNGE`（或 `UID EXPUNGE`）。
+- [ ] 删除时服务器不可达 ⇒ 本地消失 + `pending_ops` 多一条；恢复联网后补做且只做一次。
+- [ ] `copy.uid` 与已有行冲突时**不写**，且原有行的 `message_id` 不变（变异测试：去掉守卫即红）。
+- [ ] 已存在的行不会被改掉 `seen`（变异测试：改成无条件 upsert 即红）。
+
+### 14.7 v1 被推翻的三处（诚实记录）
+
+| v1 | 为什么错 |
+|---|---|
+| 两个来源**合并**成一个视图 | 行数变化让 `message_page(offset)` 的分页重复/漏行；两库无法在 SQL 层 join |
+| `origin` 三态显示在行上 | 它本身就是"本地/云端"标签，和用户要的东西相反；改成"打不开正文时给一句降级文案" |
+| 待发/失败**置顶** | 翻页时行位移、看到重复；改成横幅 + 过滤视图（D5） |
