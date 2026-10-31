@@ -180,6 +180,22 @@ const FOLDERS: [&str; 8] = [
     "INBOX", "Sent", "Drafts", "Junk", "Trash", "Archive", "工作", "项目",
 ];
 
+/// What the sidebar shows for each of [`FOLDERS`].
+///
+/// Separate from the wire name on purpose: a fixture whose `display_name` equals its `name` would
+/// hide every bug in the "localise the folder list" path, which is one of the first things a cold
+/// start paints.
+const FOLDER_DISPLAY_NAMES: [&str; 8] = [
+    "收件箱",
+    "已发送",
+    "草稿箱",
+    "垃圾邮件",
+    "已删除",
+    "归档",
+    "工作",
+    "项目",
+];
+
 const ACCOUNT: &str = "bench@example.com";
 
 struct Spec {
@@ -666,6 +682,25 @@ fn bench_storage_path() {
 
     let db_path = spec.dir.join("cache.db");
     let cache = Cache::open(&db_path).expect("open fixture cache");
+
+    // The folder list is part of the shape a cold start paints, and it is the one table the first
+    // version of this fixture forgot: `src/first-paint.js` treats "the cache says zero folders" as
+    // "nothing to paint yet" and still asks the server, so a fixture without these rows would
+    // measure the network round trip and report it as a cold start.
+    for (name, display) in FOLDERS.iter().zip(FOLDER_DISPLAY_NAMES.iter()) {
+        cache
+            .upsert_folder(
+                ACCOUNT,
+                &mail_core::MailboxInfo {
+                    name: (*name).to_string(),
+                    display_name: (*display).to_string(),
+                    delimiter: Some("/".to_string()),
+                    selectable: true,
+                },
+                1,
+            )
+            .expect("seed folder");
+    }
 
     println!();
     println!(
