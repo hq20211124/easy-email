@@ -258,9 +258,28 @@ textarea {
   font-size: 12px;
   background: var(--surface);
   border-right: 1px solid var(--border);
-  /* The whole panel is the scroll container. The folder list is shown in full and only scrolls
-     when the sidebar genuinely overflows, instead of being squeezed into its own mini-scrollbar by
-     the fixed 本地/保存的搜索/关于/写邮件 stack below it. */
+  /* The panel itself does not scroll any more (`design/12` §16.4.4): 写邮件 is fixed at the top and
+     only `.sidebar-scroll` moves. While the whole column scrolled, an account with twenty folders
+     pushed the most-used button off screen — the primary action was part of the scroll content. */
+  overflow: hidden;
+}
+
+/* Brand row + 写邮件, outside the scroll area. */
+.sidebar-head {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: none;
+}
+
+/* Everything else: the one scroll container. `min-height: 0` is what lets a flex child actually
+   shrink below its content, which is the difference between "scrolls" and "pushes the footer out". */
+.sidebar-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -1066,14 +1085,6 @@ textarea {
 
 .saved-searches:empty {
   display: none;
-}
-
-.saved-empty {
-  margin: 2px 0 4px;
-  padding: 0 8px;
-  color: var(--text-dim);
-  font-size: 11px;
-  line-height: 1.5;
 }
 
 /*

@@ -561,11 +561,10 @@ function wireGlobalEvents() {
     // Refresh means "re-read what this pane is showing": for a local list that is `user.db`, not the
     // server, so it must not silently jump back to the folder.
     if (state.view === 'drafts') showDrafts();
-    else if (state.view === 'outbox') showOutbox();
+    else if (state.sentTab === 'pending' && looksLikeSentFolder(state.mailbox)) refreshOutbox();
     else loadMessages({ reset: true });
   });
   $('btn-drafts').addEventListener('click', showDrafts);
-  $('btn-outbox').addEventListener('click', showOutbox);
   $('sent-tab-all').addEventListener('click', () => selectSentTab('all'));
   $('sent-tab-pending').addEventListener('click', () => selectSentTab('pending'));
   $('btn-sync-window').addEventListener('click', openSyncWindowPicker);
@@ -733,11 +732,8 @@ async function selectAccount(accountId) {
     const wasShowing = state.view;
     await loadMailboxes();
     if (wasShowing === 'drafts') await showDrafts();
-    else if (wasShowing === 'outbox') await showOutbox();
   } else if (state.view === 'drafts') {
     await showDrafts();
-  } else if (state.view === 'outbox') {
-    await showOutbox();
   } else {
     // Still refresh the badges: they belong to this account whatever the pane shows.
     await refreshDrafts();
@@ -1229,12 +1225,14 @@ function renderSavedSearches() {
   ];
 
   if (rows.length === 0) {
-    const empty = document.createElement('p');
-    empty.className = 'saved-empty';
-    empty.textContent = '还没有保存的搜索。在搜索框里输入条件后点「保存」。';
-    host.appendChild(empty);
+    // Hidden rather than explained (`design/12` §16.4.5): a heading over nothing is a container
+    // announcing what it could have held, and it did that on every single launch. The way to create
+    // one is the search box, which is on screen anyway — so there is nothing to say here.
+    $('saved-searches-section').hidden = true;
+    host.replaceChildren();
     return;
   }
+  $('saved-searches-section').hidden = false;
 
   for (const { item, scope } of rows) {
     const row = document.createElement('div');
@@ -1522,6 +1520,10 @@ function renderMailboxes() {
     return;
   }
   for (const box of state.mailboxes) {
+    // The server's `\Drafts` is not listed (`design/12` §16.4.1): 草稿箱 is one list backed by
+    // `user.db`, and showing the server folder beside it makes the same draft appear twice — once
+    // editable, once not. The folder is still synced (the mirror needs its UIDs); it just has no row.
+    if (looksLikeDraftsFolder(box.name) || looksLikeDraftsFolder(box.display_name)) continue;
     const label = box.display_name || box.name;
     const button = document.createElement('button');
     button.className = 'row';
@@ -1557,14 +1559,11 @@ function renderMailboxes() {
  */
 function syncMailboxRows() {
   $('btn-drafts').classList.toggle('active', state.view === 'drafts');
-  $('btn-outbox').classList.toggle('active', state.view === 'outbox');
   // Empty rather than "0": a badge reading 0 is noise on a list that is already visibly empty.
   $('drafts-count').textContent = state.drafts.length > 0 ? String(state.drafts.length) : '';
-  // One definition of "pending" for the sidebar and for the 待发 tab (`design/07` §14.5 D5). Counting
-  // only queued+sending here would show 0 while a failed message still needs the user, which is the
-  // number that made 「待发 (n)」 lie.
-  const open = outboxPendingCount();
-  $('outbox-count').textContent = open > 0 ? String(open) : '';
+  // There is no sidebar badge for the queue any more (`design/12` §16.4.2): 待发 lives on the
+  // segmented control inside 「已发送」, and one number in two places is one number that can disagree
+  // with itself. `syncSentTabs` owns it.
 
   for (const row of document.querySelectorAll('#mailbox-list .row')) {
     row.classList.toggle('active', state.view === 'mail' && row.dataset.mailbox === state.mailbox);
@@ -1923,39 +1922,6 @@ const OUTBOX_LABELS = {
   needs_attention: '需要你决定',
 };
 
-/**
- * Show what the outbox is holding for the current account.
- *
- * Everything here comes from `user.db`, so a message queued offline is visible immediately, and the
- * list still works with the network down — which is precisely when a user wants to know whether
- * their mail left.
- */
-async function showOutbox() {
-  if (!state.accountId) {
-    toast('请先添加一个邮箱账号。', 'err');
-    return;
-  }
-
-  exitSearchMode({ reload: false });
-  $('search-input').value = '';
-  $('message-list').innerHTML = '<div class="empty"><span class="spinner"></span>正在读发件箱…</div>';
-
-  const items = await run('读取发件箱', () => invoke('list_outbox', { accountId: state.accountId }));
-  if (items === null) {
-    renderMessages();
-    return;
-  }
-
-  state.view = 'outbox';
-  state.outbox = items;
-  state.selectedUid = null;
-  state.detail = null;
-  $('mailbox-title').textContent = '发件箱';
-  renderReader();
-  syncMailboxRows();
-  renderMessages();
-}
-
 /** Re-read the outbox and keep the sidebar badge honest. */
 async function refreshOutbox() {
   if (!state.accountId) return;
@@ -1965,7 +1931,7 @@ async function refreshOutbox() {
   state.outbox = items;
   syncMailboxRows();
   syncSentTabs();
-  if (state.view === 'outbox' || (state.view === 'mail' && state.sentTab === 'pending')) {
+  if (state.view === 'mail' && state.sentTab === 'pending') {
     renderMessages({ keepScroll: true });
   }
 }
@@ -2069,28 +2035,36 @@ async function loadSentStates() {
   renderMessages({ keepScroll: true });
 }
 
-function renderOutbox(list, { tab = false } = {}) {
+/**
+ * The 待发 half of 「已发送」: what is still in `user.db`'s outbox for this account.
+ *
+ * Local only, so it works with the network down — which is precisely when the user wants to know
+ * whether their mail left. `sent` rows are **not** listed: they are the 「副本待归档」 line above,
+ * because a message that went out is not pending work and listing it here would make the count and
+ * the list disagree (`design/07` §14.5 D5).
+ */
+function renderPending(list) {
   $('list-footer').hidden = true;
 
-  // In the 待发 tab, `sent` rows are the 「副本待归档」 line above, not rows: they are not pending
-  // work, and listing them here would make the count and the list disagree (`design/07` §14.5 D5).
-  const items = tab ? state.outbox.filter((item) => item.state !== 'sent') : state.outbox;
-
-  if (items.length === 0) {
-    list.innerHTML = tab
-      ? '<div class="empty">没有待发的信。</div>'
-      : '<div class="empty">发件箱是空的。发送的邮件会先排在这里，再一封封送出去。</div>';
-    return;
-  }
+  const items = state.outbox.filter((item) => item.state !== 'sent');
 
   // 「已发出，副本待归档」is a third fact: not pending (it went out) and not in the list above (no
   // cache row yet). Said out loud so it is not mistaken for a lost message (`design/07` §14.9).
   const awaiting = outboxAwaitingCopyCount();
-  if (tab && awaiting > 0) {
+  if (awaiting > 0) {
     const note = document.createElement('div');
     note.className = 'outbox-awaiting';
     note.textContent = `已发出，副本待归档 (${awaiting})`;
     list.appendChild(note);
+  }
+
+  if (items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent =
+      awaiting > 0 ? '队列里没有待发的信。' : '没有待发的信。发送的邮件会先排在这里，再一封封送出去。';
+    list.appendChild(empty);
+    return;
   }
 
   for (const item of items) {
@@ -2249,6 +2223,15 @@ function outboxVerdict(item) {
  * both the wire name and the label. It only ever decides a sentence on screen, never a behaviour —
  * getting it wrong costs a misleading subtitle, not a lost message.
  */
+function looksLikeDraftsFolder(name) {
+  if (!name) return false;
+  // Display-only, like `looksLikeSentFolder`: getting it wrong costs a row that should be hidden or
+  // one that should not, never a message. A folder whose *wire* name is encoded (NetEase sends
+  // `&XfJSIJZk-`) will not match — that is a known gap, not a silent one: it shows an extra row,
+  // which is the safe direction.
+  return /(^|[\/\\])drafts$/i.test(String(name).trim());
+}
+
 function looksLikeSentFolder(name) {
   if (!name) return false;
   return /^(sent|sent items|sent messages|sent mail|已发送|已发送邮件|已发出的邮件)$/i.test(
@@ -2756,16 +2739,12 @@ function renderMessages({ keepScroll = false } = {}) {
     return;
   }
 
-  // And fourth: the outbox, which is also local-only.
-  if (state.view === 'outbox') {
-    renderOutbox(list);
-    return;
-  }
-
   // 「已发送」的第二个档: the queue. A different source from the rows below (`design/07` §14.5 D5),
   // so it is rendered *instead of* them — never beside, never interleaved, never sorted together.
+  // This is the **only** place the queue is listed: the sidebar entry that used to do it is gone
+  // (`design/12` §16.4.2), because two entrances to one table are two places to disagree.
   if (state.sentTab === 'pending' && looksLikeSentFolder(state.mailbox)) {
-    renderOutbox(list, { tab: true });
+    renderPending(list);
     return;
   }
 

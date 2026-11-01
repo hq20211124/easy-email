@@ -31,13 +31,23 @@
         The window's own title bar, drawn here because the native one is off (`decorations: false`).
         Two reason      <!-- ---------------------------------------------------------------- accounts + folders -->
       <aside id="sidebar">
-        <div class="brand" data-tauri-drag-region>
-          <span class="brand-mark"></span>
-          <span>Easy Email</span>
-          <button id="btn-accent" class="btn ghost icon" title="主题色：默认蓝（点击切换）" aria-label="切换主题色">🎨</button>
-          <button id="btn-theme" class="btn ghost icon" title="切换到深色模式" aria-label="切换主题">🌙</button>
+        <!--
+          Fixed head (`design/12` §16.4.4): the brand row and 写邮件 do not scroll. The compose button
+          used to sit at the bottom of the scrolling column, so an account with twenty folders pushed
+          the most-used button off screen — principle 3, "the primary action must not be carried away
+          by the scroll".
+        -->
+        <div class="sidebar-head" data-tauri-drag-region>
+          <div class="brand">
+            <span class="brand-mark"></span>
+            <span>Easy Email</span>
+            <button id="btn-accent" class="btn ghost icon" title="主题色：默认蓝（点击切换）" aria-label="切换主题色">🎨</button>
+            <button id="btn-theme" class="btn ghost icon" title="切换到深色模式" aria-label="切换主题">🌙</button>
+          </div>
+          <button id="btn-compose" class="btn primary block">写邮件</button>
         </div>
 
+        <div class="sidebar-scroll">
         <div class="section">
           <div class="section-title">账号</div>
           <div id="account-list" class="account-list"></div>
@@ -46,24 +56,26 @@
 
         <div class="section grow">
           <div class="section-title">文件夹</div>
-          <div id="mailbox-list" class="mailbox-list"></div>
-        </div>
-
-        <!--
-          Drafts are local (`user.db`), not a server folder, so they are listed separately from the
-          mailbox tree rather than mixed into it: a "草稿箱" that appears only after the server
-          answers would be missing exactly when the network is, which is when drafts matter most.
-        -->
-        <div class="section">
-          <div class="section-title">本地</div>
+          <!--
+            草稿箱 sits with the folders rather than in a 「本地」 group of its own: the user does not
+            distinguish "local" from "on the server" (`design/12` §16.1 principle 2), and a separate
+            heading for one row was a container with nothing to say. The server's `\Drafts` folder is
+            hidden from this list (`folders` still syncs it — the mirror needs it), so the same draft
+            cannot appear twice.
+          -->
           <button id="btn-drafts" class="row" type="button">
             <span class="label">草稿箱</span>
             <span id="drafts-count" class="count"></span>
           </button>
-          <button id="btn-outbox" class="row" type="button">
-            <span class="label">发件箱</span>
-            <span id="outbox-count" class="count"></span>
-          </button>
+          <div id="mailbox-list" class="mailbox-list"></div>
+        </div>
+
+        <!--
+          Everything that used to be a flat 「本地」 group: one heading that meant "not a folder",
+          which is not a thing the user thinks. These are settings, and they say so.
+        -->
+        <div class="section">
+          <div class="section-title">设置</div>
           <button id="btn-sync-window" class="row" type="button" title="决定客户端往回取多少邮件">
             <span class="label">同步窗口</span>
             <span id="sync-window-value" class="count"></span>
@@ -84,6 +96,16 @@
           <button id="btn-storage" class="row" type="button" title="缓存占了多少空间、能清什么、清过什么">
             <span class="label">存储与清理</span>
           </button>
+          <!--
+            Which build this is, and how to get a newer one. The version had no home in the UI at all
+            before this: the only place it existed was the installer's filename, which is not
+            something a user reporting a bug can be asked to read out. It is a settings row, not a
+            group of its own — one row under a heading is a container with nothing to hold.
+          -->
+          <button id="btn-about" class="row" type="button">
+            <span class="label">关于</span>
+            <span id="about-version" class="count"></span>
+          </button>
         </div>
 
         <!--
@@ -93,25 +115,15 @@
           row itself. The "所有账号" label is what the row shows when it is global: without it, a
           global row appearing after an account switch looks like it followed the user, which is
           exactly the thing that makes people wonder whether their mail leaked between accounts.
+          Hidden while empty (`design/12` §16.4.5): a heading over nothing is a container announcing
+          what it could have held.
         -->
-        <div class="section">
+        <div id="saved-searches-section" class="section" hidden>
           <div class="section-title">保存的搜索</div>
           <div id="saved-searches" class="saved-searches"></div>
         </div>
 
-        <!--
-          Which build this is, and how to get a newer one. The version had no home in the UI at all
-          before this: the only place it existed was the installer's filename, which is not something
-          a user reporting a bug can be asked to read out.
-        -->
-        <div class="section">
-          <button id="btn-about" class="row" type="button">
-            <span class="label">关于</span>
-            <span id="about-version" class="count"></span>
-          </button>
         </div>
-
-        <button id="btn-compose" class="btn primary block">写邮件</button>
       </aside>
 
       <!-- ---------------------------------------------------------------- message list -->

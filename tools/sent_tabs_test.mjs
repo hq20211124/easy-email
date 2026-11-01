@@ -28,7 +28,11 @@ function fail(message) {
 }
 
 // 1. The branch exists, and is reached before the cache-empty early return.
-const pendingBranch = source.indexOf("state.sentTab === 'pending' && looksLikeSentFolder(state.mailbox)");
+// Anchored on the `if (` so a one-line caller elsewhere (the refresh handler also asks this question)
+// cannot be mistaken for the render branch.
+const pendingBranch = source.indexOf(
+  "if (state.sentTab === 'pending' && looksLikeSentFolder(state.mailbox)) {"
+);
 if (pendingBranch < 0) {
   fail('renderMessages has no 待发 branch keyed on sentTab + the Sent folder');
 }
@@ -40,15 +44,15 @@ if (emptyCheckBefore > 0 && emptyCheckBefore < pendingBranch) {
 
 // 2. It renders the queue and stops there.
 const branch = source.slice(pendingBranch, pendingBranch + 500);
-if (!/renderOutbox\(list, \{ tab: true \}\)/.test(branch)) {
-  fail('the 待发 branch must render the outbox tab, not the cache rows');
+if (!/renderPending\(list\)/.test(branch)) {
+  fail('the 待发 branch must render the pending list, not the cache rows');
 }
 if (!/return;/.test(branch)) {
   fail('the 待发 branch must return: falling through would paint cache rows under the queue');
 }
 
 // 3. `sent` rows are not rows in the queue half.
-const filterAt = source.indexOf("tab ? state.outbox.filter((item) => item.state !== 'sent')");
+const filterAt = source.indexOf("state.outbox.filter((item) => item.state !== 'sent')");
 if (filterAt < 0) {
   fail('the 待发 tab must filter out `sent` rows — they are the 副本待归档 line, not work');
 }

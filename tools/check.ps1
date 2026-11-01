@@ -1928,6 +1928,23 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step '侧栏结构：写邮件不随滚动走，队列只有一个入口' {
+        # `design/12` §16.5 A 栏。为什么不是文本断言：按钮和 class 两种情况都在，正则数一次 `<div>` 就能绕过
+        # 一次重构，然后对着错的树说"通过"——这个仓库记过好几次这种假通过。所以这里走标签栈，问的是
+        # `#btn-compose` 的**祖先链**（它到底在不在滚动容器里）。
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/sidebar_structure.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '写邮件会被滚走，或者侧栏又多了一个队列入口/空分组' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step '已发送的两个档各读各的库，永不混排' {
         # `design/07` §14.5 D5: 全部 只读 cache.messages，待发 只读 outbox。合并成一张列表是两个数据源
         # 同处一个滚动区 —— 队列里的信还没有 cache 行，它的位置只能靠发明，于是分页偏移、计数、排序
