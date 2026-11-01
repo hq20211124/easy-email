@@ -22,7 +22,7 @@ use crate::sync::SyncWindow;
 ///
 /// 2 added `quota_ledger` (`design/04` §5.7). Additive: `migrate` runs `create table if not
 /// exists` for every table it owns, so an existing file picks the new one up on the next open.
-pub const USER_SCHEMA_VERSION: i64 = 4;
+pub const USER_SCHEMA_VERSION: i64 = 5;
 
 /// How long a quota window lasts.
 ///
@@ -219,6 +219,43 @@ impl OutboxItem {
     /// The state, with anything unreadable landing on `needs_attention` rather than `queued`.
     pub fn parsed_state(&self) -> OutboxState {
         OutboxState::parse_state(&self.state)
+    }
+}
+
+/// A send that is **finished** (`design/07` §14.5 D6/D7): what the outbox used to keep for ever.
+///
+/// The outbox is a queue, and a queue that never forgets is a table that grows with every message the
+/// user ever sends and is read in full on every pass. When the copy is filed — or proven never to be
+/// filed — the fact moves here and the queue row goes away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentRecord {
+    pub account_id: String,
+    /// The frozen `Message-ID`, or a synthetic `local+<outbox id>@easyemail.invalid` when the message
+    /// never had one. Synthetic rows cannot be matched against the server, which is why the flag
+    /// exists rather than being inferred from the shape of the string.
+    pub message_id: String,
+    /// Where the server's copy is. `''` = there is none (no Sent folder / too large / bytes lost).
+    pub folder: String,
+    pub uid: Option<u32>,
+    /// The folder generation `uid` belongs to; `0` = unknown (`design/07` §14.4 D0a).
+    pub uidvalidity: u32,
+    /// The state the send ended in: `sent`, `failed`, `needs_attention`, `cancelled`.
+    pub state: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub synthetic: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl SentRecord {
+    /// The key a message with no `Message-ID` gets (`design/07` §14.6.2).
+    ///
+    /// Deterministic from the outbox id, so re-settling the same row after a crash writes the same
+    /// key instead of a second record. The domain is `.invalid` (RFC 2606) on purpose: it can never
+    /// collide with a real message id, so a synthetic key cannot make us claim someone else's mail.
+    pub fn synthetic_key(outbox_id: i64) -> String {
+        format!("local+{outbox_id}@easyemail.invalid")
     }
 }
 
@@ -1897,7 +1934,204 @@ impl UserStore {
         Ok(n as u32)
     }
 
-    /// How many offline operations are queued.
+    // ------------------------------------------------------------- settled sends (v5)
+
+    /// Record that a send is finished. Idempotent, and deliberately conservative about conflicts.
+    ///
+    /// The settle step runs again after a crash by design, so this is an upsert. The columns fill
+    /// **only when they are empty**, and a known value is never replaced by a different one: two
+    /// disagreeing `(folder, uid)` for one `Message-ID` (a forward that reused the id, a copy filed
+    /// twice) is a fact we cannot adjudicate, and stamping either one would be worse than keeping the
+    /// first — `design/07` §14.6.1.
+    pub fn insert_sent_record(&self, record: &SentRecord) -> Result<()> {
+        let record = record.clone();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "insert into sent_records
+                     (account_id, message_id, folder, uid, uidvalidity, state, attempts, last_error,
+                      synthetic, created_at, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 on conflict(account_id, message_id) do update set
+                     folder = case when sent_records.folder = ''
+                                   then excluded.folder else sent_records.folder end,
+                     uid = coalesce(sent_records.uid, excluded.uid),
+                     uidvalidity = case when sent_records.uidvalidity = 0
+                                        then excluded.uidvalidity else sent_records.uidvalidity end,
+                     attempts = max(sent_records.attempts, excluded.attempts),
+                     last_error = coalesce(excluded.last_error, sent_records.last_error),
+                     updated_at = max(sent_records.updated_at, excluded.updated_at)",
+                rusqlite::params![
+                    record.account_id,
+                    record.message_id,
+                    record.folder,
+                    record.uid.map(i64::from),
+                    i64::from(record.uidvalidity),
+                    record.state,
+                    i64::from(record.attempts),
+                    record.last_error,
+                    i64::from(record.synthetic),
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// One settled send, by the key it was settled under.
+    pub fn sent_record(&self, account_id: &str, message_id: &str) -> Result<Option<SentRecord>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        Ok(conn
+            .query_row(
+                "select account_id, message_id, folder, uid, uidvalidity, state, attempts,
+                        last_error, synthetic, created_at, updated_at
+                   from sent_records where account_id = ?1 and message_id = ?2",
+                rusqlite::params![account_id, message_id],
+                |row| {
+                    Ok(SentRecord {
+                        account_id: row.get(0)?,
+                        message_id: row.get(1)?,
+                        folder: row.get(2)?,
+                        uid: row.get::<_, Option<i64>>(3)?.map(|uid| uid as u32),
+                        uidvalidity: row.get::<_, i64>(4)? as u32,
+                        state: row.get(5)?,
+                        attempts: row.get::<_, i64>(6)? as u32,
+                        last_error: row.get(7)?,
+                        synthetic: row.get::<_, i64>(8)? != 0,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// How many settled sends this account has.
+    ///
+    /// The one visible consumer is the 已发送 empty state (`design/07` §14.8): when the list is empty
+    /// but this number is not, the screen says "本机记录显示有 N 封已发送（服务器副本未同步）" rather
+    /// than pretending the user never sent anything. It is a **hint**, never a list source — counting
+    /// it into the list is the two-source merge the design rejected.
+    pub fn count_sent_records(&self, account_id: &str) -> Result<u32> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let n: i64 = conn.query_row(
+            "select count(*) from sent_records where account_id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        Ok(n as u32)
+    }
+
+    /// Leftovers for the settle step (⓿): `state = 'sent'` rows whose spool is already gone.
+    ///
+    /// These are the rows the old code abandoned. `sent_awaiting_copy` cannot see them (it requires a
+    /// spool), the send queue skips them (`sent` is not pending), and the outbox screen counts only
+    /// pending work — so before this they were reachable from nowhere and stayed for ever.
+    pub fn settled_sent_rows(&self, account_id: &str) -> Result<Vec<OutboxItem>> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(&format!(
+            "select {OUTBOX_COLUMNS} from outbox
+             where account_id = ?1 and state = 'sent' and spool_path is null
+             order by sent_at asc, id asc"
+        ))?;
+        let rows = stmt.query_map([account_id], row_to_outbox_item)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    // ------------------------------------------------------------------ tombstones (v5)
+
+    /// Remember that the user deleted this message here, so the next sync does not bring it back.
+    ///
+    /// `uidvalidity` is recorded because it is half of the identity: a folder deleted and recreated
+    /// hands the same UID to different mail, and a tombstone keyed on the number alone would hide a
+    /// message the user has never seen (`design/07` §14.9).
+    pub fn mark_deleted(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+        uidvalidity: u32,
+        message_id: Option<&str>,
+        at: i64,
+    ) -> Result<()> {
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        let message_id = message_id.map(str::to_string);
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "insert into deleted_marks (account_id, folder, uid, uidvalidity, message_id, at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6)
+                 on conflict(account_id, folder, uid) do update set
+                     uidvalidity = excluded.uidvalidity,
+                     message_id = coalesce(excluded.message_id, deleted_marks.message_id),
+                     at = excluded.at",
+                rusqlite::params![
+                    account_id,
+                    folder,
+                    i64::from(uid),
+                    i64::from(uidvalidity),
+                    message_id,
+                    at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Is this message one the user deleted? Requires the same folder generation it was deleted in.
+    pub fn is_deleted(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+        uidvalidity: u32,
+    ) -> Result<bool> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let n: i64 = conn.query_row(
+            "select count(*) from deleted_marks
+              where account_id = ?1 and folder = ?2 and uid = ?3 and uidvalidity = ?4",
+            rusqlite::params![account_id, folder, i64::from(uid), i64::from(uidvalidity)],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Forget a tombstone — the server has agreed, or the intent was abandoned.
+    pub fn clear_deleted_mark(&self, account_id: &str, folder: &str, uid: u32) -> Result<()> {
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        self.db.write_blocking(move |conn| {
+            conn.execute(
+                "delete from deleted_marks where account_id = ?1 and folder = ?2 and uid = ?3",
+                rusqlite::params![account_id, folder, i64::from(uid)],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drop tombstones older than `max_age_secs`, as a backstop for one that never got cleared.
+    ///
+    /// A backstop, not the mechanism: the normal path clears the mark when the server confirms the
+    /// deletion. This exists for the case where it never does (offline for a month, the operation was
+    /// dropped), so the table cannot grow for ever. Thirty days is the design's number.
+    pub fn prune_deleted_marks(&self, now: i64, max_age_secs: i64) -> Result<u32> {
+        self.db.write_blocking(move |conn| {
+            let removed = conn.execute(
+                "delete from deleted_marks where at < ?1",
+                [now - max_age_secs],
+            )?;
+            Ok(removed as u32)
+        })
+    }
+
     /// Test seam: rewrite a row's kind to something this build cannot read.
     ///
     /// `#[cfg(test)]` because no production path needs it — the point of the tests that use it is
@@ -2097,7 +2331,58 @@ impl UserStore {
                      uid        integer,
                      message_id text not null,
                      updated_at integer not null
-                 );",
+                 );
+
+                 -- **Settled sends** (`design/07` §14.5 D6/D7). Every sent message used to leave its
+                 -- outbox row behind for ever — the table grew without bound and was read in full on
+                 -- every pass. Once the copy is filed (or proven never to be filed), the *fact* moves
+                 -- here and the queue row goes away.
+                 --
+                 -- `message_id` is NOT NULL on purpose: SQLite's primary key does not dedupe NULLs, so
+                 -- a nullable key lets the same failed send insert a second row every pass. A message
+                 -- with no real id gets a synthetic one (`synthetic = 1`) rather than a NULL.
+                 --
+                 -- `folder = ''` means 「the server has no copy of this」 — the same fact as
+                 -- 「this account has no Sent folder」 and as 「the copy was too large to append」,
+                 -- which is why there is no separate `no_copy` column.
+                 create table if not exists sent_records (
+                     account_id  text    not null,
+                     message_id  text    not null,
+                     folder      text    not null default '',
+                     uid         integer,
+                     uidvalidity integer not null default 0,
+                     state       text    not null,
+                     attempts    integer not null default 0,
+                     last_error  text,
+                     synthetic   integer not null default 0,
+                     created_at  integer not null,
+                     updated_at  integer not null,
+                     primary key (account_id, message_id)
+                 );
+                 create index if not exists sent_records_by_account
+                     on sent_records(account_id, updated_at desc);
+
+                 -- **Tombstones for mail the user deleted here** (`design/07` §14.9). Without them the
+                 -- next sync sees the message still on the server and puts it back — the user deletes
+                 -- the same mail every day and the client undoes it every hour.
+                 --
+                 -- In `user.db`, not `cache.db`: the cache is the file 「清空缓存」 empties, and a
+                 -- tombstone that disappears with it would resurrect everything the user deleted. That
+                 -- is the same rule as 「state is a fact, not a derivative」.
+                 --
+                 -- `uidvalidity` is part of the match, not decoration: a folder that was deleted and
+                 -- recreated hands the same UID to different mail, and a tombstone keyed on the number
+                 -- alone would hide a message the user never saw.
+                 create table if not exists deleted_marks (
+                     account_id  text    not null,
+                     folder      text    not null,
+                     uid         integer not null,
+                     uidvalidity integer not null default 0,
+                     message_id  text,
+                     at          integer not null,
+                     primary key (account_id, folder, uid)
+                 );
+                 create index if not exists deleted_marks_by_age on deleted_marks(at);",
             )?;
 
             // `draft_mirrors` gained `account_id` after the table had already shipped in a release.
@@ -3723,5 +4008,145 @@ mod tests {
         }
         assert_eq!(store.cleanup_logs(2).expect("list").len(), 2);
         assert_eq!(store.cleanup_logs(0).expect("list").len(), 0);
+    }
+
+    // ------------------------------------------------- v5: settled sends and tombstones
+
+    fn settled(message_id: &str) -> SentRecord {
+        SentRecord {
+            account_id: "t".to_string(),
+            message_id: message_id.to_string(),
+            folder: "Sent Messages".to_string(),
+            uid: Some(226),
+            uidvalidity: 900,
+            state: "sent".to_string(),
+            attempts: 1,
+            last_error: None,
+            synthetic: false,
+            created_at: 10,
+            updated_at: 20,
+        }
+    }
+
+    /// The settle step runs again after a crash, so the record has to be an upsert — and a second,
+    /// disagreeing location must not replace the first: two `(folder, uid)` for one Message-ID is a
+    /// fact this program cannot adjudicate (`design/07` §14.6.1).
+    #[test]
+    fn a_settled_send_is_recorded_once_and_never_overwrites_what_it_knows() {
+        let store = store();
+        store.insert_sent_record(&settled("<a@x>")).expect("insert");
+        store
+            .insert_sent_record(&settled("<a@x>"))
+            .expect("again — a crash mid-settle means this runs twice");
+        assert_eq!(
+            store.count_sent_records("t").expect("count"),
+            1,
+            "one message, one record"
+        );
+
+        let conflicting = SentRecord {
+            folder: "Sent".to_string(),
+            uid: Some(1),
+            uidvalidity: 5,
+            updated_at: 30,
+            ..settled("<a@x>")
+        };
+        store.insert_sent_record(&conflicting).expect("conflict");
+        let kept = store
+            .sent_record("t", "<a@x>")
+            .expect("read")
+            .expect("present");
+        assert_eq!(kept.folder, "Sent Messages", "the first location wins");
+        assert_eq!(kept.uid, Some(226));
+        assert_eq!(kept.uidvalidity, 900, "and its generation with it");
+        assert_eq!(kept.updated_at, 30, "but the record is known to be fresh");
+
+        // A message with no id is settled under a key no server can own, and the same row settles to
+        // the same key — otherwise every pass would add another record.
+        let key = SentRecord::synthetic_key(13);
+        assert_eq!(key, "local+13@easyemail.invalid");
+        assert_eq!(SentRecord::synthetic_key(13), key);
+    }
+
+    /// The tombstone has to match the folder **generation**, or it hides mail the user never saw.
+    #[test]
+    fn a_tombstone_matches_the_generation_and_expires_as_a_backstop() {
+        let store = store();
+        store
+            .mark_deleted("t", "INBOX", 42, 900, Some("<m@x>"), 1_000)
+            .expect("mark");
+        assert!(store.is_deleted("t", "INBOX", 42, 900).expect("read"));
+        assert!(
+            !store.is_deleted("t", "INBOX", 42, 901).expect("read"),
+            "a recreated folder hands the same UID to different mail, so the mark must lapse"
+        );
+        assert!(!store.is_deleted("t", "INBOX", 43, 900).expect("read"));
+        assert!(!store.is_deleted("other", "INBOX", 42, 900).expect("read"));
+
+        store.clear_deleted_mark("t", "INBOX", 42).expect("clear");
+        assert!(!store.is_deleted("t", "INBOX", 42, 900).expect("read"));
+
+        // The backstop: a mark whose operation never came back must not live for ever.
+        store
+            .mark_deleted("t", "INBOX", 7, 900, None, 1_000)
+            .expect("mark");
+        let month = 30 * 24 * 3600;
+        assert_eq!(
+            store
+                .prune_deleted_marks(1_000 + month - 1, month)
+                .expect("prune"),
+            0,
+            "not yet"
+        );
+        assert_eq!(
+            store
+                .prune_deleted_marks(1_000 + month + 1, month)
+                .expect("prune"),
+            1
+        );
+        assert!(!store.is_deleted("t", "INBOX", 7, 900).expect("read"));
+    }
+
+    /// A file written by v4 gains both tables on open, and its existing rows are untouched.
+    #[test]
+    fn a_v4_database_gains_the_settled_send_tables_on_open() {
+        let path = temp_path("v5");
+        {
+            let store = UserStore::open(&path).expect("open");
+            assert_eq!(
+                store.schema_version().expect("version"),
+                USER_SCHEMA_VERSION
+            );
+        }
+        {
+            let db = crate::db::Db::open(
+                &path,
+                crate::db::DbKind::User,
+                crate::db::DbOptions::for_kind(crate::db::DbKind::User),
+            )
+            .expect("db");
+            db.write_blocking(|conn: &Connection| {
+                conn.execute_batch(
+                    "drop table sent_records; drop table deleted_marks; pragma user_version = 4;",
+                )?;
+                Ok(())
+            })
+            .expect("downgrade");
+        }
+
+        let upgraded = UserStore::open(&path).expect("open a v4 file");
+        assert_eq!(
+            upgraded.schema_version().expect("version"),
+            USER_SCHEMA_VERSION
+        );
+        upgraded
+            .insert_sent_record(&settled("<old@x>"))
+            .expect("the new table must be usable");
+        upgraded
+            .mark_deleted("t", "INBOX", 1, 900, None, 5)
+            .expect("the tombstone table must be usable");
+        assert!(upgraded.is_deleted("t", "INBOX", 1, 900).expect("read"));
+        drop(upgraded);
+        let _ = std::fs::remove_file(&path);
     }
 }

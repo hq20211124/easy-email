@@ -705,6 +705,11 @@ select o.account_id, o.sent_message_id,
 ```
 
 - **`sent_index` 在另一个库（`cache.db`）**，迁移不能 join。上面那条 join 是**概念图**：实际实现是先从 `cache.db` 读出 `(account_id, message_id) → (folder, uid, uidvalidity)` 一张小表，再在 `user.db` 里做匹配。两张表都小（发件数），一次全读可行。
+
+  **实现时改得更省（2026-11-01）**：迁移只建表（v5），**搬行不写第二份实现** —— 存量行由
+  `settle_stale_sent_rows()` 在**启动时**跑一遍，用的就是 ⓿ 每轮用的那个函数（§14.6.3）。
+  这样"迁移的搬移"和"每轮的兜底"在代码里是同一件事，不可能漂移；代价是升级后要等一次启动
+  （而不是"打开文件的那一刻"），而这正是验收里数得出来的那个数。
 - **只搬 `spool_path is null` 的行**。spool 非空的行下一轮会被归档轮次处理，**处理完必须由 D7 结案**；迁移不该替它结案，也不该把它删掉（删了就是丢信）。
 - **没有真 Message-ID 的存量行**（M1a-8 之前入队的）：给合成键 `local+<outbox.id>@easyemail.invalid`，`synthetic = 1`。这些行**不参与**"查看副本"，但**必须活着**——用户的历史不该因为我们加了一列就消失。
 - 迁移完删掉被搬走的那些 outbox 行（`state='sent' and spool_path is null`），**不是**删所有 `state='sent'`。
@@ -737,6 +742,7 @@ settle_sent_row(outbox_row):
 **可证伪**：跑完一轮归档后 `select count(*) from outbox where state='sent'` 必须为 0；且上一条"`folder=''` 的数 == 真没有副本的数"仍然成立。
 
 **spool 孤儿清扫（v5 新增，§14.0 第 8 条）**：启动时扫 spool 目录，删掉**没有任何 `outbox` 行引用、且 mtime > 24 h** 的文件。④ 放在最后是对的（它是"还没归档"的证据），代价就是 ③ 与 ④ 之间崩溃会留下一个失去引用的文件——单封上限 25 MB，不扫就是永久泄漏。**可证伪**：造一个无引用的 spool 文件（mtime 改到 25 h 前）⇒ 启动后被删；mtime 是 1 h 前的 ⇒ **不**被删（避免删掉正在写的那一封）。
+**实现（2026-11-01）**：`Spool::sweep_orphans(referenced, now, max_age)`，在 `setup` 里、`AppState` 建好之前调用一次（引用集合来自 `list_outbox`）。测试不伪造 mtime，而是把 `now` 往后推 25 h——同一个判断，少一个依赖。
 
 ### 14.7 四步顺序（v5：⓿ 走 `settle_sent_row`；跨库没有事务，所以顺序就是正确性）
 
@@ -787,14 +793,14 @@ settle_sent_row(outbox_row):
 ```
 -1. D-1 诊断（§14.3）                                     ✅ 2026-11-01：分支 A（§14.3.1）
  0. cache v11：`sent_index.uidvalidity` + `messages.to_addrs`（D0a/D0b）   ✅ 2026-11-01：两列都落地
- 1. user.db v5：sent_records + deleted_marks + 存量行 + settle_sent_row   纯后端，可独立验收
+ 1. user.db v5：sent_records + deleted_marks + 存量行 + settle_sent_row    ✅ 2026-11-01：表 + 结案 + 墓碑 + spool 清扫
  2a. 【A / A′ / B】修根因（改 `fetch_headers_since` 或游标那三处）        ✅ 2a-A 已做：改用 `UID FETCH … (UID)`
  2b. 【C】D0c（message_id + 部分索引 + 四填充点）+ D3 + D6                 **不做**（诊断结果是 A，不是 C）
  3. 列表合并 + 分段控件 + 状态批查（按 (folder, uid)）+ 事件 + spool 清扫   前端 + 一个新命令
  4. 侧栏 IA（`12` §16）                                    纯展示层，可与 -1..1 并行（见 `12` §16.5）
 ```
 
-**当前进度（2026-11-01）**：-1、0、2a 完成，下一步是 1（`user.db` v5）→ 3。
+**当前进度（2026-11-01）**：-1、0、1、2a 完成，下一步是 3（界面那半：分段控件 / 状态标签 / 事件）。
 2b 因诊断结论为 A 而**永久关闭**，除非哪天在别的服务商上又看到"服务器说有、我们这边没有"。
 
 **第 0 步落地时的两处判断**：
@@ -818,15 +824,15 @@ settle_sent_row(outbox_row):
 **A. 离线可证伪**（`cargo test` / loopback / node 门禁；当前环境 `cargo test --workspace` 有 LNK1104 限制，按第 102 轮记录的办法跑 `-p mail-core --lib`）
 
 - [x] **cache v11**（2026-11-01 已做）：老库打开后 `sent_index` 有 `uidvalidity` 列（已有行的值是 0 = 未知，**不是**被猜成当前值）、`messages` 有 `to_addrs` 列；新同步一封信后该行的 `to_addrs` 非空（loopback：`a_synced_row_carries_its_recipients_without_fetching_the_body`）。
-- [ ] 迁移：`count(outbox where state='sent' and spool_path is null)` == 迁移后 `sent_records` 行数（含 synthetic）；**少一行即失败**。
-- [ ] 迁移：`count(sent_records where folder='')` == "spool 空且 `sent_index` 查不到"的行数。**真库上应当是 0**（11/12/14 三条有 226/209/207）。大于 0 就是把已知写成了未知。
-- [ ] 结案：造一条无 Sent 文件夹的账号，发一封 ⇒ 跑一轮归档 ⇒ `count(outbox where state='sent')` == 0，且 `sent_records` 里有一条 `folder=''`。
-- [ ] 结案（v5 新增）：造一条 `failed` + spool 为空的 outbox 行 ⇒ 走「删除这条记录」⇒ `count(outbox)` 减一，`n` 归零，**且不写 `sent_records`**（它从来没发出去，不是"已发送"）。
+- [x] 迁移（2026-11-01）：`count(outbox where state='sent' and spool_path is null)` == 迁移后 `sent_records` 行数（含 synthetic）；**少一行即失败**。真库上 **3 == 3**（`tests/real_settle.rs`）。
+- [x] 迁移（2026-11-01）：`count(sent_records where folder='')` == "spool 空且 `sent_index` 查不到"的行数。**真库上是 0** —— 三条存量行结案后分别落在 `Sent Messages` 226/209/207，不是空串。大于 0 就是把已知写成了未知。
+- [x] 结案（2026-11-01）：造一条无 Sent 文件夹的账号，发一封 ⇒ 跑一轮归档 ⇒ `count(outbox where state='sent')` == 0，且 `sent_records` 里有一条 `folder=''`（`an_account_with_no_sent_folder_is_settled_not_retried`）。
+- [ ] 结案（v5 新增）：造一条 `failed` + spool 为空的 outbox 行 ⇒ 走「删除这条记录」⇒ `count(outbox)` 减一，`n` 归零，**且不写 `sent_records`**（它从来没发出去，不是"已发送"）。**未做**：后端 `delete_outbox` 已在，缺的是界面上的那个出口（第 3 步）。
 - [ ] 幂等：同一 Message-ID 归档两次，`messages` 仍只有一行、`sent_index` 仍只有一行；`settle_sent_row` 连跑两次，`folder` 不被第二次调用改回 `''`。
 - [ ] **分支 C 专属**：`message_id` 非空行数 ≥ `sent_index` 行数；`sent_index` 每行都能在 `messages` 找到 `(folder, uid)`；判等三结局三条单测；`seen` 权威（D3 写 1 后跑一轮同步 ⇒ 本地变 0，**断言这是期望行为**）；`summarise()` 产出的摘要带 `message_id` 与 `to_addrs`（loopback 断言非空）。
 - [ ] 墓碑：离线删除 ⇒ 跑一轮同步 ⇒ 行**没有**回来；`uidvalidity` 变了 ⇒ 墓碑失效、行可以回来；`pending_op` 成功后标记被删；**清空 cache 后墓碑仍在**（它在 `user.db`）。
 - [ ] `sent_index` 清理：删除后 `sent_copy(account, message_id)` 返回 `None`。
-- [ ] spool 孤儿：无引用且 mtime 25 h 前的文件被删；1 h 前的**不**被删。
+- [x] spool 孤儿（2026-11-01）：无引用且 25 h 前的文件被删；1 h 前的**不**被删；引用中的文件与非 `.eml` 文件都不动（`the_sweep_removes_only_old_unreferenced_files`）。
 - [ ] **变异测试**（去掉即必须变红）：去掉墓碑；去掉 `message_id` 判等（分支 C）；把 `coalesce` 改回赋值；把 ④ 移到 ② 之前；去掉 ⓿ 兜底搬移；**把 `settle_sent_row` 第 2 步（查 `sent_index`）删掉**；把 `deleted_marks` 放回 `cache.db`（清缓存后行复活 ⇒ 红）。
 
 **B. 该块的出口条件（真机，一次，附截图）**

@@ -27,7 +27,7 @@ use mail_core::{
     OutgoingAttachment, OutgoingMail, PushEvent, RecoveryReport, RecoveryRun, RunReport, SearchHit,
     SentCopy, Spool, SyncDriver, SyncOutcome, SyncWindow, account_with_endpoints, backfill_older,
     ensure_sent_copy, file_sent_copies, file_sha256, fill_thread_keys, prepare_attachments,
-    recover_in_flight, run_due, secret, smtp,
+    recover_in_flight, run_due, secret, settle_stale_sent_rows, smtp,
     userdb::{Draft, DraftMirror, UserStore},
     watch,
 };
@@ -4228,6 +4228,48 @@ pub fn run() {
                         .expect("the temp directory must be usable")
                 }
             };
+
+            // The settle order is "record, drop the queue row, drop the bytes" (`design/07` §14.7),
+            // so a crash between the last two leaves a spool file nothing points at. Nothing else
+            // would ever collect it: one file per interrupted send, up to 25 MB each. Only files no
+            // outbox row references **and** older than a day are removed — the age is what keeps this
+            // from deleting the file a send is writing right now.
+            {
+                let referenced: std::collections::HashSet<std::path::PathBuf> = user
+                    .list_outbox(None)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|item| item.spool_path.as_ref())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                let swept = spool.sweep_orphans(&referenced, now_seconds(), 24 * 3600);
+                if swept > 0 {
+                    log_line(&format!(
+                        "[easy-email] 清掉 {swept} 个没有队列行的发件暂存文件"
+                    ));
+                }
+            }
+
+            // Rows the old code abandoned — `state = 'sent'` with the spool already gone — are closed
+            // here, once, instead of waiting for the first filing tick. Two reasons: an upgrade should
+            // leave the queue clean immediately, and `count(outbox where state = 'sent') == 0` is the
+            // acceptance check for that (`design/07` §14.11). Idempotent, so a failure costs a retry.
+            for account in &accounts {
+                match settle_stale_sent_rows(&FilingRun {
+                    store: &user,
+                    spool: &spool,
+                    account_id: &account.id,
+                    cache: &cache,
+                    now: now_seconds(),
+                }) {
+                    Ok(0) => {}
+                    Ok(n) => log_line(&format!(
+                        "[easy-email] {} 结案 {n} 封已发送记录（副本位置按索引回填）",
+                        account.id
+                    )),
+                    Err(e) => log_line(&format!("[easy-email] 结案已发送记录失败：{e}")),
+                }
+            }
 
             app.manage(AppState {
                 accounts_path,

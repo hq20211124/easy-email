@@ -88,10 +88,11 @@ pub use sentcopy::{DraftMirrorReport, SentCopy, draft_to_mail, ensure_sent_copy,
 pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
 pub use threads::root_of;
-pub use userdb::{CleanupLog, Draft, DraftMirror, NewOutbox, OutboxItem, UserStore};
+pub use userdb::{CleanupLog, Draft, DraftMirror, NewOutbox, OutboxItem, SentRecord, UserStore};
 pub use worker::{
     DEFAULT_CRASH_RESEND_LIMIT, FilingReport, FilingRun, OutboxRun, Recovery, RecoveryQuestion,
     RecoveryReport, RecoveryRun, RunReport, file_sent_copies, recover_in_flight, run_due,
+    settle_stale_sent_rows,
 };
 
 /// Build a ready-to-use account from a provider preset.

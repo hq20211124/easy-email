@@ -7,8 +7,8 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **533**（mail-core lib 447 + 桌面壳 lib 21 + loopback 59 +
-  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107 轮加了 3 条，第 108 轮加了 3 条）。这 533 是**跑过的**条数；
+- **测试数量**：基线 116 → 现在 **538**（mail-core lib 452 + 桌面壳 lib 21 + loopback 59 +
+  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107/108/109 轮各加了 3/3/5 条）。这 538 是**跑过的**条数；
   另有 **12** 条 `#[ignore]` 的基准不在里面 —— 第 99 轮续加了两条：`cache::tests::p9_time_is_not_in_the_transaction_boundary`
   （P9 事务边界，约 30 秒，复现命令在 `reports/performance.md` §10.6）与
   `db::tests::the_watchdog_costs_less_than_the_read_it_measures`（第 5 项的计时代价，约 2 秒，§11.7）；
@@ -17,6 +17,44 @@
   60 秒，约 135 秒，§16.8）。
   `tools/check.ps1` **全绿**：**65 步**（第 101 轮给 2a/2b 各加一步；第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
   早已过期，只有"fmt + clippy -D warnings + build + test + PE=2"这几条一直是骨架）。
+
+### `user.db` v5：发件箱不再无限长，结案时先查副本索引（第 109 轮，2026-11-01）
+
+`design/07` §14.10 的第 1 步，纯后端、可独立验收。
+
+**表**：`sent_records`（结案的发件，主键 `(account_id, message_id)`，`message_id NOT NULL` —— SQLite
+主键对 NULL 不去重，可空键会让同一封失败的信每轮插一行）+ `deleted_marks`（墓碑，放 `user.db` 而不是
+`cache.db`：墓碑一进缓存，「清空缓存」就等于把用户删过的信全部复活）。
+
+**结案一个函数，四个调用点**：`settle_sent_row()` 写 `sent_records` → 删 outbox 行 → 删 spool（按顺序，
+spool 最后，因为它是"还没归档"的证据）。归档成功、没有 Sent 文件夹、字节丢了、上一轮遗留 —— 四条路都
+走它，所以"迁移搬行"和"每轮兜底"不可能漂移。`record_sent_copy` 从 `let _ =` 改成硬错误：三样写成功才
+允许删队列行。
+
+**第 2 步是这一步的要害**：`spool` 为空有三种来源（归档后被删 / 字节丢失 / 从来没建过），只有查
+`sent_index` 分得清。v4 的计划在这里栽过（把已知位置写成未知），所以**真库上专门验了一次**：
+
+```
+结案前：3 条 state=sent 且 spool 为空（outbox id 14/12/11）
+结案 3 条
+  id 14 → folder "Sent Messages" uid Some(226)
+  id 12 → folder "Sent Messages" uid Some(209)
+  id 11 → folder "Sent Messages" uid Some(207)
+sent_records 共 3 条
+```
+
+`count(sent_records where folder='')` 是 **0**，正是 §14.11 要的那个数（这条走的是复制出来的 profile，
+不碰用户正在用的文件）。
+
+**顺手补的两处**：`Spool::sweep_orphans()`（无引用 **且** mtime > 24 h 才删——只看"无引用"会删掉正在
+写的那一封），在 `setup` 里启动时跑一次；启动时也对每个账号跑一遍 `settle_stale_sent_rows()`，这样升级
+后的第一眼就是干净的队列，而不是等第一次 5 秒 tick。
+
+**数字**：lib **452**（+5：结案幂等/冲突不覆盖、墓碑按代匹配与 30 天兜底、v4→v5 迁移、遗留行按索引结案、
+spool 清扫）、loopback 59、桌面壳 21，合计 **538**；`clippy -D warnings` 干净；`check.ps1` **65/65**。
+
+**未做**：第 3 步（界面：`全部 | 待发 (n)` 分段控件、行上的状态标签、`sent-state-changed` 事件、
+D7 第 ③ 种终局的「删除这条记录」出口）。后端能力都在，界面还没用它们。
 
 ### cache v11 两列落地：`uidvalidity` 的 0 是"未知"，`to_addrs` 从头部就来（第 108 轮，2026-11-01）
 

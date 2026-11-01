@@ -422,6 +422,80 @@ pub struct FilingReport {
     pub skipped: usize,
     /// Messages to try again later — the account could not be reached, so nothing was decided.
     pub deferred: usize,
+    /// Rows an earlier pass left behind, closed before this one started (`design/07` §14.7 ⓿).
+    pub settled: usize,
+}
+
+/// Close out one send: write the fact, drop the queue row, drop the bytes (`design/07` §14.6.3).
+///
+/// **Step 2 is the one that must not be skipped.** An empty spool has three causes — filed and then
+/// deleted, bytes lost, never written — and only `sent_index` tells them apart. Treating "the spool is
+/// gone" as "there is no copy" writes a known location down as unknown, which is exactly the bug the
+/// v5 review found in the real profile (rows 11/12/14 had copies at 226/209/207 while their spool was
+/// already gone).
+///
+/// Idempotent by construction: the record is an upsert on `(account_id, message_id)` and both the row
+/// deletion and the file removal tolerate being run twice.
+fn settle_sent_row(
+    run: &FilingRun<'_>,
+    item: &OutboxItem,
+    known_message_id: Option<&str>,
+) -> Result<()> {
+    let (message_id, synthetic) = match known_message_id
+        .map(str::to_string)
+        .or_else(|| item.sent_message_id.clone())
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => (id, false),
+        None => (crate::userdb::SentRecord::synthetic_key(item.id), true),
+    };
+
+    let copy = run.cache.sent_copy(&item.account_id, &message_id)?;
+    let record = crate::userdb::SentRecord {
+        account_id: item.account_id.clone(),
+        message_id,
+        // No row in `sent_index` really does mean no copy — the index is written the moment one is
+        // filed, so "absent" is evidence rather than a guess.
+        folder: copy.as_ref().map(|c| c.folder.clone()).unwrap_or_default(),
+        uid: copy.as_ref().and_then(|c| c.uid),
+        uidvalidity: copy.as_ref().map(|c| c.uidvalidity).unwrap_or(0),
+        state: item.state.clone(),
+        attempts: item.attempts,
+        last_error: item.last_error.clone(),
+        synthetic,
+        created_at: item.created_at,
+        updated_at: run.now,
+    };
+
+    // ② the fact
+    run.store.insert_sent_record(&record)?;
+    // ③ the queue row
+    run.store.delete_outbox(item.id)?;
+    // ④ the bytes — last, because they are the evidence that this was not archived yet. A crash
+    // between ③ and ④ leaves an unreferenced file, which the startup sweep collects.
+    if let Some(path) = item.spool_path.as_deref() {
+        run.spool.remove(Path::new(path));
+    }
+    Ok(())
+}
+
+/// Close out every `sent` row whose spool is already gone (⓿, `design/07` §14.7).
+///
+/// These are the rows the old code abandoned: `sent_awaiting_copy` cannot see them (it requires a
+/// spool), the send queue skips them, and the outbox screen counts only pending work — so before this
+/// they were reachable from nowhere and stayed for ever.
+///
+/// Public because the desktop shell calls it **once at startup** as well: an upgrade should leave the
+/// queue clean immediately rather than after the first five-second tick, and the acceptance check is
+/// `count(outbox where state = 'sent') == 0`.
+pub fn settle_stale_sent_rows(run: &FilingRun<'_>) -> Result<usize> {
+    let mut settled = 0;
+    for item in run.store.settled_sent_rows(run.account_id)? {
+        if settle_sent_row(run, &item, None).is_ok() {
+            settled += 1;
+        }
+    }
+    Ok(settled)
 }
 
 /// Put the Sent copy of every delivered message where it belongs (`design/07` §5.4).
@@ -439,6 +513,14 @@ where
 {
     let mut report = FilingReport::default();
 
+    // ⓿ Close out what an earlier pass left behind (`design/07` §14.7).
+    //
+    // It has to run before the loop, not after: a `sent` row whose spool is already gone is invisible
+    // to `sent_awaiting_copy` (which requires a spool), so without this it sits in the queue for ever
+    // and `count(outbox where state = 'sent')` never reaches zero. Idempotent, so a crash here costs
+    // one repeated pass and nothing else.
+    report.settled += settle_stale_sent_rows(&run)?;
+
     for item in run.store.sent_awaiting_copy(run.account_id)? {
         let Some(path) = item.spool_path.clone() else {
             continue;
@@ -446,44 +528,58 @@ where
         let bytes = match run.spool.read(Path::new(&path)) {
             Ok(bytes) => bytes,
             Err(_) => {
-                // The bytes are gone, so there is nothing to file and nothing to retry. Clear the
-                // marker rather than looping over it at every pass.
-                run.store.clear_outbox_spool(item.id)?;
-                report.skipped += 1;
+                // The bytes are gone, so there is nothing left to file — but that is **not** the same
+                // as "there is no copy": they may have been removed after a successful archive, and
+                // the real profile had exactly that shape. `settle_sent_row` asks `sent_index` first.
+                if settle_sent_row(&run, &item, None).is_ok() {
+                    report.skipped += 1;
+                }
                 continue;
             }
         };
         let Some(message_id) = frozen_message_id(&bytes) else {
-            run.store.clear_outbox_spool(item.id)?;
-            report.skipped += 1;
+            if settle_sent_row(&run, &item, None).is_ok() {
+                report.skipped += 1;
+            }
             continue;
         };
 
         let filed_id = message_id.clone();
         match file_one(message_id, bytes).await {
             Ok(Some(copy)) => {
-                // Record where it is before forgetting the bytes: this row is the only way the UI can
-                // offer "查看已发送副本" later, and the spool is about to go. Best-effort on purpose —
-                // it is derived data, and failing to write it must not fail a send that already
-                // happened (the next pass files and records again).
-                let _ = run.cache.record_sent_copy(
-                    &item.account_id,
-                    &filed_id,
-                    &copy.folder,
-                    copy.uid,
-                    copy.uidvalidity,
-                    run.now,
-                );
-                run.spool.remove(Path::new(&path));
-                run.store.clear_outbox_spool(item.id)?;
+                // ① where it is. A hard error now, not `let _ =`: three writes have to succeed before
+                // the queue row may go, or the link disappears together with the bytes and the send
+                // can never be found again (`design/07` §14.7).
+                if run
+                    .cache
+                    .record_sent_copy(
+                        &item.account_id,
+                        &filed_id,
+                        &copy.folder,
+                        copy.uid,
+                        copy.uidvalidity,
+                        run.now,
+                    )
+                    .is_err()
+                {
+                    // Keep the row and the bytes: everything here is idempotent, so the next pass
+                    // files and records again.
+                    report.deferred += 1;
+                    continue;
+                }
+                // ②③④ through the same function the leftovers use, so the two paths cannot drift.
+                if settle_sent_row(&run, &item, Some(&filed_id)).is_err() {
+                    report.deferred += 1;
+                    continue;
+                }
                 report.filed += 1;
             }
             Ok(None) => {
                 // No Sent folder on this account: there is nowhere a copy could go, so this is
-                // settled rather than pending.
-                run.spool.remove(Path::new(&path));
-                run.store.clear_outbox_spool(item.id)?;
-                report.skipped += 1;
+                // settled rather than pending — and settled means recorded, not forgotten (D7 ①).
+                if settle_sent_row(&run, &item, Some(&filed_id)).is_ok() {
+                    report.skipped += 1;
+                }
             }
             Err(_) => report.deferred += 1,
         }
@@ -739,6 +835,101 @@ mod tests {
             store.sent_awaiting_copy("t").expect("awaiting").is_empty(),
             "and the row is not picked up again"
         );
+        // The fact moves out of the queue and into `sent_records` (`design/07` §14.5 D6): the outbox
+        // is a queue, and a queue that keeps every message ever sent is a table that only grows.
+        assert!(
+            store.outbox_item(id).expect("item").is_none(),
+            "the queue row is gone, not merely marked"
+        );
+        let settled = store
+            .sent_record("t", &filed_id)
+            .expect("read")
+            .expect("the send is still accounted for");
+        assert_eq!(settled.folder, "Sent");
+        assert_eq!(settled.uid, Some(4242));
+        assert_eq!(settled.uidvalidity, 77);
+        assert!(!settled.synthetic);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shape the real profile had (outbox ids 11/12/14): `state = sent`, spool already gone, and
+    /// the copy sitting at UID 226 in `Sent Messages`.
+    ///
+    /// **"The spool is empty" is not evidence of "there is no copy."** An empty spool has three causes
+    /// — filed and then deleted, bytes lost, never written — and settling on the first one writes a
+    /// known location down as unknown, which is exactly what the v5 review caught in the plan
+    /// (`design/07` §14.0 #2).
+    #[tokio::test]
+    async fn a_leftover_sent_row_is_settled_from_the_copy_index_not_from_the_missing_spool() {
+        let dir = temp_dir("settle-leftover");
+        let spool = Spool::open(&dir).expect("spool");
+        let (store, id) = queued(&spool, 0, 1_000);
+        let cfg = account();
+        let cache = Cache::open_in_memory().expect("cache");
+
+        run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
+            Ok(())
+        })
+        .await
+        .expect("run");
+        let message_id = store
+            .outbox_item(id)
+            .expect("item")
+            .expect("present")
+            .sent_message_id
+            .expect("the send recorded its id");
+
+        // What the old code left behind: the spool marker cleared, the row still there.
+        store.clear_outbox_spool(id).expect("clear");
+
+        // And the copy is on the server, where the index says it is.
+        cache
+            .record_sent_copy("t", &message_id, "Sent Messages", Some(226), 900, 1_000)
+            .expect("record");
+
+        let asked = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&asked);
+        let report = file_sent_copies(
+            FilingRun {
+                store: &store,
+                spool: &spool,
+                account_id: &cfg.id,
+                cache: &cache,
+                now: 1_000,
+            },
+            move |_, _| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    *counter.lock().expect("lock") += 1;
+                    Ok(None)
+                }
+            },
+        )
+        .await
+        .expect("file");
+
+        assert_eq!(report.settled, 1, "{report:?}");
+        assert_eq!(report.filed, 0, "there is nothing left to file");
+        assert_eq!(
+            *asked.lock().expect("lock"),
+            0,
+            "and the server is not asked"
+        );
+        assert!(
+            store.outbox_item(id).expect("item").is_none(),
+            "the leftover leaves the queue"
+        );
+        let record = store
+            .sent_record("t", &message_id)
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            record.folder, "Sent Messages",
+            "the known location survives: a missing spool says nothing about the copy"
+        );
+        assert_eq!(record.uid, Some(226));
+        assert_eq!(record.uidvalidity, 900);
+        assert_eq!(record.state, "sent");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -778,7 +969,7 @@ mod tests {
     async fn an_account_with_no_sent_folder_is_settled_not_retried() {
         let dir = temp_dir("file-no-folder");
         let spool = Spool::open(&dir).expect("spool");
-        let (store, _id) = queued(&spool, 0, 1_000);
+        let (store, id) = queued(&spool, 0, 1_000);
         let cfg = account();
         let cache = Cache::open_in_memory().expect("cache");
         run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
@@ -786,6 +977,12 @@ mod tests {
         })
         .await
         .expect("run");
+        let message_id = store
+            .outbox_item(id)
+            .expect("item")
+            .expect("present")
+            .sent_message_id
+            .expect("the send recorded its id");
 
         let report = file_sent_copies(
             FilingRun {
@@ -805,6 +1002,21 @@ mod tests {
             store.sent_awaiting_copy("t").expect("awaiting").is_empty(),
             "there is nowhere to file it, so retrying forever would be a loop with nothing in it"
         );
+        // Settled, not forgotten (D7 ①): the send still happened, and the record says so — with
+        // `folder = ''`, which is the honest answer to "where is the copy".
+        assert!(
+            store.list_outbox(Some("t")).expect("list").is_empty(),
+            "the queue row goes either way"
+        );
+        let settled = store
+            .sent_record("t", &message_id)
+            .expect("read")
+            .expect("a skipped send is still recorded");
+        assert_eq!(
+            settled.folder, "",
+            "there is no copy, and the record says so"
+        );
+        assert_eq!(settled.uid, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
