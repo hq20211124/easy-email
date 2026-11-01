@@ -2857,28 +2857,27 @@ function conversationRows(conversations) {
 
 /** Build one conversation row. The same markup as before windowing, per row. */
 /**
- * 「副本已归档 / 仅本地记录」 for one row, or nothing.
+ * 这封信「只在这台电脑上」时的一句话；其余情况**什么都不说** (`design/07` §14.5 D2).
  *
- * Two facts look identical in a list read from the cache: "the server holds this copy" and "this
- * machine is the only place it exists". Naming which one it is, on the row, is the difference
- * between a list that answers "did it go?" and one that makes the user open every message
- * (`design/07` §14.5 D2).
+ * The first version put a chip on every row: 「副本已归档」 or 「仅本地记录」. Both are our jargon,
+ * and both answer a question the user is not asking — a row in 已发送 already means "it was sent".
+ * The only thing worth interrupting them for is the bad news: **the server kept no copy**, so the
+ * message will not be in the webmail or on another machine.
+ *
+ * So the chip appears for `hasCopy === false` and nothing else:
+ *   * `true` — archived on the server. Normal. Silence.
+ *   * `null` — the record names the folder but the generation cannot confirm it. Unknown, and
+ *     silence is the honest answer (claiming 「只在这台电脑上」 here was a bug: it appeared on mail
+ *     sitting in the server's Sent folder).
+ *   * no record at all — every message sent before this feature. Silence.
+ *
+ * If the wording ever needs to change, change it here and nowhere else: the gate asserts that no
+ * other chip text is produced (`tools/sent_tabs_test.mjs`).
  */
 function sentStateChip(sentState) {
   if (!sentState) return '';
-  if (sentState.hasCopy === true) {
-    return '<span class="msg-sent-state" title="服务器上的副本已归档">副本已归档</span>';
-  }
-  if (sentState.hasCopy === false) {
-    return '<span class="msg-sent-state local" title="服务器上没有这封信的副本，只在这台电脑上">仅本地记录</span>';
-  }
-  // `null` = 记录说副本在这个文件夹，但拿不到能对上的文件夹编号，**证不了**。
-  //
-  // Saying nothing is the only honest answer here. The first version treated it as `false` and
-  // printed 「仅本地记录」 — a claim that the message exists nowhere but on this machine, made about
-  // mail sitting in the server's Sent folder. Every send from before the generation column existed
-  // lands in this case, so it was the *normal* label on old mail rather than an edge case.
-  return '';
+  if (sentState.hasCopy !== false) return '';
+  return '<span class="msg-sent-state local" title="服务器上没有这封信的副本：换电脑或登录网页版都看不到它">只在这台电脑上</span>';
 }
 
 function buildConversationRow(row) {

@@ -72,4 +72,32 @@ if (counterBody.includes("'sent'")) {
   fail('outboxPendingCount() must NOT count `sent`: a message that went out is not pending work');
 }
 
-console.log('两个档各读各的库：全部=cache、待发=outbox，sent 行只作为一行提示，计数不含 sent');
+// 5. 行上的小字只在「服务器上没有副本」时出现，其余一律不说 (2026-11-01, `design/07` §14.5 D2).
+//
+// The first version labelled every row 「副本已归档」 or 「仅本地记录」. Both are our jargon, and a
+// row in 已发送 already means "it was sent" — so the chip was noise, and the second label was
+// sometimes a lie. The decision now is *silence unless the news is bad*, and a decision like that
+// gets "restored" by the next reader of the design doc unless something checks it.
+const chipStart = source.indexOf('function sentStateChip(');
+if (chipStart < 0) {
+  fail('sentStateChip() is missing: the row label has one home');
+}
+const chipBody = source.slice(chipStart, source.indexOf('\n}', chipStart));
+// Comments explain *why* the old wording is gone and therefore contain it: strip them first, or the
+// check passes on the explanation (this exact false pass happened in round 117).
+const chipCode = chipBody.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+if (!chipCode.includes('hasCopy !== false')) {
+  fail('the chip must be produced ONLY for `hasCopy === false`: every other answer is silence');
+}
+if (chipCode.includes('副本已归档')) {
+  fail('the chip must not say 「副本已归档」 any more: a row in 已发送 already means it was sent');
+}
+if (chipCode.includes('仅本地记录')) {
+  fail('「仅本地记录」 is jargon — the row says 「只在这台电脑上」, in words a user can read');
+}
+const chips = (chipCode.match(/msg-sent-state/g) ?? []).length;
+if (chips !== 1) {
+  fail(`sentStateChip must produce exactly one chip (found ${chips}): two states were the problem`);
+}
+
+console.log('两个档各读各的库；行上的小字只在没副本时出现，其余一律不说');

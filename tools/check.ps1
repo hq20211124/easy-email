@@ -1974,10 +1974,13 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
-    Step '已发送的两个档各读各的库，永不混排' {
+    Step '已发送：两个档不混排，行上的小字只在没副本时出现' {
         # `design/07` §14.5 D5: 全部 只读 cache.messages，待发 只读 outbox。合并成一张列表是两个数据源
         # 同处一个滚动区 —— 队列里的信还没有 cache 行，它的位置只能靠发明，于是分页偏移、计数、排序
         # 立刻开始互相打架，而两边单独看都正常，截图看不出来。所以钉在源码结构上。
+        # 同一个脚本还钉住行上那行小字（§14.5 D2）：**只在服务器上没有副本时出现**，其余一律不说。
+        # 第一版给每行都贴了「副本已归档 / 仅本地记录」，那是我们的行话，而且第二句有时候是谎话；
+        # 这种"决定"最容易被下一个读设计文档的人恢复回去，所以要有一条会红的检查。
         if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
             Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
             $global:LASTEXITCODE = 0
@@ -1985,7 +1988,7 @@ try {
         }
         node tools/sent_tabs_test.mjs 2>&1
         if ($LASTEXITCODE -ne 0) {
-            Write-Host '待发档与全部档会混排，或者计数把 sent 也算成了待发' -ForegroundColor Red
+            Write-Host '两个档会混排、计数把 sent 算成待发，或者行上又贴起了看不懂的标签' -ForegroundColor Red
             $global:LASTEXITCODE = 1
             return
         }
