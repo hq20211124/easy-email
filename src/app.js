@@ -1862,7 +1862,9 @@ function renderDrafts(list) {
 
   for (const draft of state.drafts) {
     const row = document.createElement('div');
-    row.className = 'msg';
+    // `draft-row` opts this row out of `.msg`'s fixed height — see the note in `style.css`. Without
+    // it the 丢弃 button is clipped out of view and a draft cannot be deleted at all.
+    row.className = 'msg draft-row';
     row.dataset.draftId = draft.id;
     // A div rather than a button, because the row contains a button of its own ("丢弃") and a
     // button inside a button is invalid — the browser hoists it out and the layout breaks.

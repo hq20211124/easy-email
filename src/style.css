@@ -966,10 +966,16 @@ textarea {
   white-space: pre-wrap;
 }
 
-/* Outbox rows are not part of the virtualised list — there are a handful of them, and one can be
-   opened to show the whole record. The fixed height plus `overflow: hidden` above is what makes the
-   mail list cheap; here it would clip exactly the thing the user clicked to read. */
-.msg.outbox-row {
+/* Rows that are **not** part of the virtualised list: the outbox queue and the drafts.
+
+   `.msg` above is `height: var(--msg-height); overflow: hidden` — that fixed height is what makes
+   the mail list cheap, because the window arithmetic can multiply instead of measuring. A draft row
+   carries three blocks (sender, subject, the 丢弃 button) and measures about 63 px of content in a
+   44 px box, so the button was **clipped away entirely**: the user could see their draft and had no
+   way to delete it, with no error anywhere and nothing in the gate to notice. The outbox has the
+   same shape for the same reason (one of its rows opens into a whole record). */
+.msg.outbox-row,
+.msg.draft-row {
   height: auto;
   overflow: visible;
 }

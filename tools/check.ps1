@@ -903,6 +903,35 @@ try {
         if ($js -notmatch 'listWindowEl\.replaceChildren\(') {
             $problems += 'the window element must be the single commit point for mail rows (replaceChildren)'
         }
+        # **Rows outside the window must opt out of the fixed row height.**
+        #
+        # `.msg` is `height: var(--msg-height); overflow: hidden` — the fixed height is what makes the
+        # window arithmetic cheap. A draft row carries three blocks (sender, subject, the 丢弃 button)
+        # and needs about 63 px of content in a 44 px box, so the button was clipped away entirely:
+        # the user could see the draft and had no way to delete it. Nothing errored, and no test or
+        # screenshot in this repository could see it. Same shape as the outbox row, which opens into
+        # a whole record.
+        foreach ($pair in @(@('renderDrafts', 'draft-row'), @('renderPending', 'outbox-row'))) {
+            $fn = [regex]::Match($js, "(?s)function $($pair[0])\(.*?\n\}").Value
+            if ($fn.Length -eq 0) {
+                $problems += "$($pair[0]) is gone — the rows it draws are the ones this rule protects"
+                continue
+            }
+            # Comments stripped first. The comment above the assignment explains *why* the class is
+            # there and therefore contains its name: a check that matched the raw text passed on the
+            # comment alone when the assignment was removed (found by mutating it).
+            $code = ($fn -replace '(?m)^\s*//.*$', '') -replace '(?s)/\*.*?\*/', ''
+            if ($code -notmatch $pair[1]) {
+                $problems += "$($pair[0]) rows must carry the $($pair[1]) class: without it the fixed row height clips the action button out of view"
+            }
+        }
+        foreach ($cls in @('outbox-row', 'draft-row')) {
+            # `(?![-\w])` so a renamed class (`draft-row-gone`) does not satisfy the rule it removed.
+            $rule = [regex]::Match($css, "(?s)\.msg\.$cls(?![-\w])[^{]*\{[^}]*\}").Value
+            if ($rule -notmatch 'height:\s*auto') {
+                $problems += "style.css must give .msg.$cls height: auto — the fixed height clips those rows"
+            }
+        }
         # Rows already on screen must be *kept* while scrolling, not rebuilt. Measured on the real
         # window: a full rebuild costs 52 DOM changes per scroll frame against the 40-row budget in
         # `design/15` §4 (P3), 3 times out of 3 — and nothing but a scroll in a live window can see it,
