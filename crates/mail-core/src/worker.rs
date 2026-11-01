@@ -933,6 +933,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **Running the settle step twice must change nothing** (`design/07` §14.6.3).
+    ///
+    /// It runs on every filing pass *and* once at startup, so it will always meet its own leftovers
+    /// after a crash. The failure this pins is the nasty one: the second pass re-reads `sent_index`,
+    /// and if the index row were gone by then (or the code trusted "no spool ⇒ no copy") it would
+    /// rewrite a known location as `folder = ''` — turning 「副本已归档」 into 「仅本地记录」 on a message
+    /// that is sitting in the server's Sent folder. Idempotent means the second answer is the first.
+    #[tokio::test]
+    async fn settling_the_same_row_twice_keeps_the_location_it_found() {
+        let dir = temp_dir("settle-twice");
+        let spool = Spool::open(&dir).expect("spool");
+        let (store, id) = queued(&spool, 0, 1_000);
+        let cfg = account();
+        let cache = Cache::open_in_memory().expect("cache");
+
+        run_due(run(&store, &spool, &cfg, 1_000), |_, _, _, _| async {
+            Ok(())
+        })
+        .await
+        .expect("run");
+        let message_id = store
+            .outbox_item(id)
+            .expect("item")
+            .expect("present")
+            .sent_message_id
+            .expect("the send recorded its id");
+        store.clear_outbox_spool(id).expect("clear");
+        cache
+            .record_sent_copy("t", &message_id, "Sent Messages", Some(226), 900, 1_000)
+            .expect("record");
+
+        // The stale row, exactly as the first call sees it — then the **function** is called twice,
+        // not just the pass. Calling the pass twice would prove nothing here: it deletes the queue
+        // row, so the second pass never reaches `settle_sent_row` at all. The crash-and-retry shape
+        // this guards is the one where the same in-memory item is settled again.
+        let item = store.outbox_item(id).expect("item").expect("present");
+        let run = FilingRun {
+            store: &store,
+            spool: &spool,
+            account_id: &cfg.id,
+            cache: &cache,
+            now: 1_000,
+        };
+        settle_sent_row(&run, &item, None).expect("first settle");
+        settle_sent_row(&run, &item, None).expect("second settle");
+
+        let record = store
+            .sent_record("t", &message_id)
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            record.folder, "Sent Messages",
+            "the second pass must not downgrade a known location to 「没有副本」"
+        );
+        assert_eq!(record.uid, Some(226));
+        assert_eq!(record.uidvalidity, 900);
+        assert_eq!(
+            store.count_sent_records("t").expect("count"),
+            1,
+            "one message, one record — the second pass must not add a row"
+        );
+        assert!(
+            store.outbox_item(id).expect("item").is_none(),
+            "and the queue row stays gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn filing_defers_when_the_server_cannot_be_reached() {
         // Offline is not a decision. Keeping the bytes is what lets the next pass finish the job.

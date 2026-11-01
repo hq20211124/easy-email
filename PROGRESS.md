@@ -7,8 +7,8 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **548**（mail-core lib 461 + 桌面壳 lib 21 + loopback 60 +
-  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107/108/109/111/113 轮各加了 3/3/5/1/9 条）。这 548 是**跑过的**条数；
+- **测试数量**：基线 116 → 现在 **549**（mail-core lib 462 + 桌面壳 lib 21 + loopback 60 +
+  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107/108/109/111/113 轮各加了 3/3/5/1/10 条）。这 549 是**跑过的**条数；
   另有 **12** 条 `#[ignore]` 的基准不在里面 —— 第 99 轮续加了两条：`cache::tests::p9_time_is_not_in_the_transaction_boundary`
   （P9 事务边界，约 30 秒，复现命令在 `reports/performance.md` §10.6）与
   `db::tests::the_watchdog_costs_less_than_the_read_it_measures`（第 5 项的计时代价，约 2 秒，§11.7）；
@@ -62,6 +62,11 @@
 `\Deleted` 时不许文件夹级 EXPUNGE；夹具为此真的记起了 `\Deleted` 集合），桌面壳 21，合计 **548**；
 门禁 **68/68**。
 
+**顺带补的一条**（§14.11 幂等）：`settling_the_same_row_twice_keeps_the_location_it_found` ——
+`settle_sent_row` 连跑两次，`sent_records` 仍一行、`outbox` 仍空、`folder` 不被第二次调用改回 `''`。
+断言的是**函数**而不是那一轮 pass：pass 会删掉队列行，第二遍根本到不了这个函数，那样测等于没测。
+做过变异测试（把「spool 空 ⇒ folder=''」写回去 ⇒ 红）。
+
 **未做（如实记）**：
 - **`move_message` 没有墓碑路径**。它同样是「复制 + 标记删除 + expunge」，在无 UIDPLUS 且别人也有标记时
   源文件夹那封只会被标 `\Deleted`，下一轮同步把它放回源文件夹。`delete_message` 走通了，move 没有
@@ -70,7 +75,6 @@
 - **「放弃时删标记」没有入口**：`cancel_pending_op` 至今没有生产调用者（没有取消离线意图的界面），
   所以「用户撤回了删除意图、标记却没清」这条路现在不可能发生，也就没写。30 天兜底仍然在。
 - **没有真机目视**（本机 WebView2 CDP 起不来）：空态那句小字、删除后的两种提示，都只有结构断言。
-- **`settle_sent_row` 连跑两次的幂等断言**（§14.11 那条）仍未补。
 
 ### 侧栏：写邮件不再被滚走，队列只剩一个入口（第 112 轮，2026-11-01）
 

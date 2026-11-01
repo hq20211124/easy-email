@@ -37,7 +37,7 @@
 **这条线还剩两件（都不大）**：
 - `move_message` 没有墓碑路径：无 UIDPLUS 且别人也有 `\Deleted` 时，源文件夹那封只会被标、下一轮同步
   会把它放回源文件夹。要么给 move 也排补 EXPUNGE，要么无 UIDPLUS 时只用 `UID COPY`。
-- §14.11 里 `settle_sent_row` 连跑两次的幂等断言仍未补。
+- ~~§14.11 的 `settle_sent_row` 幂等断言~~ 已补（同一轮）。
 
 ### 还没做的（大块）
 
