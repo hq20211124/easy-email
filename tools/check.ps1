@@ -2682,7 +2682,27 @@ try {
     }
 
     Step 'cargo clippy (-D warnings)' {
-        cargo clippy --workspace --all-targets -- -D warnings 2>&1
+        # **One automatic retry, and only for the OS refusing a file.**
+        #
+        # `tauri::generate_context!` writes the bundled assets while it compiles, and on this machine
+        # that write is intermittently refused (`拒绝访问`, os error 5) — Defender or the indexer
+        # holding the file for a moment. cargo then exits 101 with no lint in the output at all, and
+        # an identical rerun passes. That is a six-minute tax per occurrence, and it happened on four
+        # of six runs in one session, so the documented "原样重跑即过" rule is now applied here.
+        #
+        # Deliberately narrow: a retry happens **only** when the first attempt exited 101 *and* the
+        # output carries the OS error. A real lint failure exits 101 with a `-D warnings` diagnostic
+        # and is reported immediately, exactly as before. The retry prints what it saw, so a human
+        # reading the log knows a second run happened.
+        $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        if ($code -eq 101 -and ($out -match '拒绝访问|Access is denied|os error 5')) {
+            Write-Host 'the OS refused a build file (os error 5); retrying once — see the note in this step' -ForegroundColor Yellow
+            $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
+            $code = $LASTEXITCODE
+        }
+        Write-Host $out
+        $global:LASTEXITCODE = $code
     }
 
     Step 'cargo build (catches linker-level warnings)' {
