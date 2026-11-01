@@ -35,8 +35,8 @@
 3. ✅ **`count_sent_records` 有消费者**：`sent_record_count` 命令 + 空态那行小字（只提示，不进列表）。
 
 **这条线还剩两件（都不大）**：
-- `move_message` 没有墓碑路径：无 UIDPLUS 且别人也有 `\Deleted` 时，源文件夹那封只会被标、下一轮同步
-  会把它放回源文件夹。要么给 move 也排补 EXPUNGE，要么无 UIDPLUS 时只用 `UID COPY`。
+- `move_message` 没有墓碑路径 —— 但**它今天不可达**：`src/app.js` 零 `invoke('move_message')`。接界面时
+  三件要一起做（删源缓存行 / 写墓碑 / 无 UIDPLUS 时把 `MarkedOnly` 报出来），拆开做会得到「移走了又出现」。
 - ~~§14.11 的 `settle_sent_row` 幂等断言~~ 已补（同一轮）。
 
 ### 还没做的（大块）
