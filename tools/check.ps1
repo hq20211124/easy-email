@@ -2691,13 +2691,21 @@ try {
         # of six runs in one session, so the documented "原样重跑即过" rule is now applied here.
         #
         # Deliberately narrow: a retry happens **only** when the first attempt exited 101 *and* the
-        # output carries the OS error. A real lint failure exits 101 with a `-D warnings` diagnostic
-        # and is reported immediately, exactly as before. The retry prints what it saw, so a human
-        # reading the log knows a second run happened.
+        # output carries the codegen asset-write failure. A real lint failure exits 101 with a
+        # `-D warnings` diagnostic and is reported immediately, exactly as before. The retry prints
+        # what it saw, so a human reading the log knows a second run happened.
+        #
+        # **Matched on `failed to write asset`, not on the OS message.** The first version matched
+        # `os error 5` / `拒绝访问` and therefore **never fired**: PowerShell 5.1 decodes a native
+        # program's UTF-8 output with the console codepage, so the Chinese arrives as mojibake
+        # (`鎷掔粷璁块棶`), and cargo wraps the number onto the next line (`os error\n 5`) so the two
+        # halves are never contiguous. The ASCII prefix of the same error has neither problem. Found
+        # by reading a failing run's log instead of trusting that the retry worked — a check that
+        # cannot fire is the exact failure mode this file keeps warning about.
         $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
         $code = $LASTEXITCODE
-        if ($code -eq 101 -and ($out -match '拒绝访问|Access is denied|os error 5')) {
-            Write-Host 'the OS refused a build file (os error 5); retrying once — see the note in this step' -ForegroundColor Yellow
+        if ($code -eq 101 -and $out -match 'failed to write asset') {
+            Write-Host 'the codegen asset write was refused (os error 5); retrying once — see the note in this step' -ForegroundColor Yellow
             $out = cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-String
             $code = $LASTEXITCODE
         }

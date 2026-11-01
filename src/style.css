@@ -1899,12 +1899,26 @@ textarea {
 
 /* ---------------------------------------------------------------- toast */
 
+/* 操作提示（「邮件已删除」这类）：**顶部居中**，不是右下角。
+
+   The first version put them bottom-right, which is the web convention and was never a decision —
+   and it is wrong for this window: every button the user presses (回复/转发/删除/发送) sits at the
+   **top left** of the reading pane or in the sidebar, so a message appearing in the far bottom-right
+   corner of a 1200 px window is both away from the eye and away from the pointer, and it is gone in
+   five seconds. The user said so before any of us noticed.
+
+   Top-centre puts it under the toolbar the click came from, without covering it (the pane headers
+   end around y=40). It does cover the first row or the subject line for a few seconds, which is the
+   cheaper of the two: what it covers is *content the user is about to read*, not the thing they
+   just clicked. */
 .toast-root {
   position: fixed;
-  right: 18px;
-  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  top: 14px;
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 8px;
   z-index: 60;
   max-width: 420px;
@@ -1943,10 +1957,12 @@ textarea {
   font-size: 12px;
 }
 
+/* Comes **down** from the top edge, because that is where it now is. The old one rose from below,
+   which was right for a bottom-anchored toast and would look like it came out of the content here. */
 @keyframes slide-in {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(-6px);
   }
 }
 
