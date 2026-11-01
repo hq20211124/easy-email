@@ -2575,6 +2575,25 @@ try {
         if (([regex]::Matches($probe, 'Verdict::Unknown')).Count -lt 2) {
             $problems += 'every failure of the probe must report Unknown, not a verdict guessed from an empty result'
         }
+        # **A GUI process must not flash a console.** The interpreter this probe starts is a
+        # console-subsystem program, so a `windows_subsystem = "windows"` app that starts one without
+        # CREATE_NO_WINDOW makes Windows allocate a console for the child — a black cmd window behind
+        # the app, on **every** launch, for as long as the query runs. That went unnoticed for months
+        # because this gate only ever asked what the probe *reads*; a user reported it the first time
+        # they installed a build. Checked on the `probe` body rather than the file, so a comment
+        # cannot satisfy it.
+        if ($probe -notmatch 'creation_flags\(CREATE_NO_WINDOW\)') {
+            $problems += 'the probe must pass creation_flags(CREATE_NO_WINDOW): without it every launch shows a cmd window behind the app'
+        }
+        if ($probe -notmatch 'CREATE_NO_WINDOW: u32 = 0x0800_0000') {
+            $problems += 'CREATE_NO_WINDOW must be spelled with its documented value (0x08000000), not guessed at'
+        }
+        # And it has to be the only console program this shell starts: a second one without the flag
+        # would put the window back without touching the probe.
+        $spawns = ([regex]::Matches($lib, 'Command::new\(')).Count
+        if ($spawns -gt 0) {
+            $problems += "src-tauri/src/lib.rs starts $spawns child process(es); the disk probe is the only one this app may run, and it lives in diskprotect.rs"
+        }
 
         # The elevated tool a deployment runs to produce the archival report. Same class, and the
         # three-way answer the acceptance asks for has to be *exit codes* — a deployment records the

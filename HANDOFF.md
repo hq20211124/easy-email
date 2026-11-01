@@ -54,7 +54,10 @@
    `str.replace` **静默不匹配**（本轮踩过一次，靠 `assert` 才没漏）。
 3. **Rust 字符串里的 SQL 注释不能用英文双引号**：会截断 `execute_batch` 的字符串，报错是一堆
    "invalid suffix"。用「」。
-4. 门禁现有 **68 步**，其中三步是结构断言（`tools/sent_tabs_test.mjs`、`tools/sidebar_structure.mjs`、
+4. **启动时不许弹控制台**：磁盘自检会起一个控制台子进程，GUI 进程起它必须带 `CREATE_NO_WINDOW`，
+   否则每次启动都在应用后面闪一个黑窗（第 115 轮修的就是这个，用户装了第一个真机包才发现）。
+   门禁里那三条钉着它，别「优化」掉。
+5. 门禁现有 **68 步**，其中三步是结构断言（`tools/sent_tabs_test.mjs`、`tools/sidebar_structure.mjs`、
    `tools/delete_path.mjs`）——
    它们断言的是**结构/协议形状**，不是文案，因为这类规则截图看不出来。
 

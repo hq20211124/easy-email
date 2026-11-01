@@ -235,10 +235,23 @@ pub const QUERY: &str = r#"Get-CimInstance -Namespace root/CIMV2/Security/Micros
 /// It is read-only by construction (`Get-CimInstance` of a status class), and every way it can fail —
 /// no PowerShell, access denied, WMI unavailable, output we cannot read — ends in `Unknown` with a
 /// note. Nothing here changes a protector, writes a key, or touches a volume.
+///
+/// **`CREATE_NO_WINDOW` is not an optimisation, it is the difference between "an app" and "an app
+/// that flashes a cmd window on every start".** `powershell.exe` is a *console* subsystem program:
+/// when a GUI process starts one without this flag, Windows allocates a console for it, and the user
+/// sees a black window appear behind the app for as long as the query runs — every single launch.
+/// This app is built with `windows_subsystem = "windows"` (`main.rs`), which is exactly why the
+/// allocation is not automatic and has to be suppressed here.
 #[cfg(windows)]
 pub fn probe() -> DiskProtectionReport {
+    use std::os::windows::process::CommandExt;
+
+    // winbase.h. `CREATE_NO_WINDOW` = 0x08000000: run the child with a console that is never shown.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let text = match std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", QUERY])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
     {
         Ok(out) => {
