@@ -575,11 +575,17 @@ function wireGlobalEvents() {
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
   $('btn-forward').addEventListener('click', () => openComposer({ mode: 'forward' }));
+  $('btn-resend').addEventListener('click', () => {
+    void resendSelected();
+  });
   // The conversation view has its own toolbar and acts on the **focused** message — which is exactly
   // what `state.detail` and `state.selectedFolder` hold in both views. Wiring them to the same
   // handlers is what keeps the two toolbars from drifting apart.
   $('btn-thread-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
   $('btn-thread-forward').addEventListener('click', () => openComposer({ mode: 'forward' }));
+  $('btn-thread-resend').addEventListener('click', () => {
+    void resendSelected();
+  });
   $('btn-thread-toggle-read').addEventListener('click', toggleRead);
   $('btn-thread-delete').addEventListener('click', deleteSelected);
   $('btn-thread-send').addEventListener('click', () => {
@@ -4108,7 +4114,53 @@ async function toggleRead() {
  * the user typed" promise (design/07 §3): the text reaches `user.db` whether the window is closed
  * on purpose, the app is killed, or the machine loses power.
  */
-function openComposer({ mode = 'new', draft = null } = {}) {
+/*
+  「再次发送」：把原信原样搬到写信界面 (`design/07` §5.1 的 compose 入口之一).
+
+  The user's reason is a real one: 「我不确定是否发送成功」. So this is not a forward — a forward
+  leaves the recipients empty and quotes the original, which is what you do when sending to somebody
+  *else*. Here the same people get the same mail again, and everything the user would have to retype
+  is already there.
+
+  **Attachments are fetched first, on purpose.** They live on the server, not on this machine, and
+  the composer sends files by path — so the dialog cannot be built until the bytes are somewhere.
+  Doing it before `openComposer` means the user sees 「正在取回附件…」 and then a complete dialog,
+  rather than a dialog that fills itself in while they are already typing. A failure here stops
+  before the composer opens: half a message with silently missing attachments is the one outcome
+  worse than not starting.
+*/
+async function resendSelected() {
+  const detail = state.detail;
+  if (!detail) return;
+
+  // Inline images are part of the body, not attachments — re-sending them as attachments would
+  // deliver the signature logo twice.
+  const files = (detail.attachments ?? []).filter((file) => !file.inline);
+  let staged = [];
+
+  if (files.length > 0) {
+    const fetched = await run('取回附件', async () => {
+      const out = [];
+      for (const file of files) {
+        const path = await invoke('stage_attachment', {
+          accountId: state.accountId,
+          mailbox: state.selectedFolder,
+          uid: detail.uid,
+          part: file.part,
+          name: file.name,
+        });
+        out.push({ name: file.name, mime: file.mime, size: file.size, path });
+      }
+      return out;
+    });
+    if (fetched === null) return;
+    staged = fetched;
+  }
+
+  openComposer({ mode: 'resend', staged });
+}
+
+function openComposer({ mode = 'new', draft = null, staged = null } = {}) {
   if (!state.accountId) {
     toast('请先添加一个邮箱账号。', 'err');
     return;
@@ -4162,6 +4214,16 @@ function openComposer({ mode = 'new', draft = null } = {}) {
   } else if (mode === 'forward' && detail) {
     subject = reply.forwardSubject(detail.subject);
     bodyText = quoteOriginal(detail);
+  } else if (mode === 'resend' && detail) {
+    // **Copy, not quote.** 「再次发送」 exists because the user is not sure the first one went out
+    // and wants the same mail again — so the recipients come back filled in, the subject keeps no
+    // `Re:`/`Fwd:` prefix, and the body is the original text without a 「-------- 原始邮件 --------」
+    // block stapled on top (that block is what a *forward* is for; on a re-send it would arrive as
+    // part of the message, twice over if it is re-sent again).
+    to = (detail.to ?? []).join(', ');
+    cc = (detail.cc ?? []).join(', ');
+    subject = detail.subject ?? '';
+    bodyText = detail.body_text || stripTags(detail.body_html || '');
   }
 
   const body = `
@@ -4202,7 +4264,12 @@ function openComposer({ mode = 'new', draft = null } = {}) {
 
   // Kept in this closure: the list belongs to one open composer and must not survive it. The shape
   // matches what `pick_attachments` returns plus an optional `sha256` (see payload.js).
-  let attachments = draft ? payload.parseAttachments(draft.attachments_json) : [];
+  // `staged` is what 「再次发送」 fetched from the server before opening this dialog (see
+  // `resendSelected`); it has the same shape `pick_attachments` returns, so everything downstream —
+  // the chips, the draft, the send payload — treats it like a file the user chose themselves.
+  let attachments = draft
+    ? payload.parseAttachments(draft.attachments_json)
+    : (staged ?? []);
 
   /** Everything the draft is built from. Read while the dialog is still in the DOM. */
   const readFields = (modal) => ({
@@ -4306,7 +4373,15 @@ function openComposer({ mode = 'new', draft = null } = {}) {
   };
 
   openModal({
-    title: draft ? '草稿' : mode === 'reply' ? '回复' : mode === 'forward' ? '转发' : '写邮件',
+    title: draft
+      ? '草稿'
+      : mode === 'reply'
+        ? '回复'
+        : mode === 'forward'
+          ? '转发'
+          : mode === 'resend'
+            ? '再次发送'
+            : '写邮件',
     bodyHtml: body,
     confirmLabel: '发送',
     onReady: (modal) => {

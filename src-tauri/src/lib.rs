@@ -3912,6 +3912,55 @@ async fn save_attachment(
     Ok(shown)
 }
 
+/// Where a 「再次发送」 attachment is parked while the composer is open.
+///
+/// **Not the user's Downloads folder.** `save_attachment` writes there because the user asked for
+/// that file; this one writes a throwaway copy that the outgoing message reads and that nothing
+/// will ever open. Putting it in Downloads would leave one duplicate of every attachment of every
+/// message somebody re-sent, in a folder they think of as theirs. Temp is where a copy belongs, and
+/// Windows already owns the policy for emptying it.
+fn resend_staging_dir() -> PathBuf {
+    std::env::temp_dir().join("easy-email-resend")
+}
+
+/// Fetch one attachment of an existing message into the staging directory, and return its path.
+///
+/// The composer sends files **by path** (`OutgoingAttachment`), so "re-send this mail with its
+/// attachments" needs the bytes on disk somewhere. The message is on the server, not on this
+/// machine, so this costs a download — which is why the UI asks before opening the composer rather
+/// than after: the dialog appearing half a second late is better than one that fills itself in while
+/// the user is already typing.
+#[tauri::command]
+async fn stage_attachment(
+    state: State<'_, AppState>,
+    account_id: String,
+    mailbox: String,
+    uid: u32,
+    part: u32,
+    name: String,
+) -> Result<String, String> {
+    let cfg = state.find(&account_id)?;
+    let password = secret_for(&state, &cfg).await?;
+
+    let directory = resend_staging_dir();
+    std::fs::create_dir_all(&directory).map_err(|e| format!("无法创建临时目录：{e}"))?;
+    // `unique_path` for the same reason `save_attachment` uses it: two re-sends of the same message
+    // must not overwrite each other's copy while both composers are open.
+    let path = unique_path(&directory, &safe_file_name(&name, part));
+
+    let written = pool_op!(state.pool, &cfg, &password, |client| {
+        client.select(&mailbox).await?;
+        client.save_attachment(uid, part, &path).await
+    })
+    .map_err(describe)?;
+
+    let shown = path.to_string_lossy().to_string();
+    log_line(&format!(
+        "[easy-email] 为再次发送取回附件 {shown}（{written} 字节）"
+    ));
+    Ok(shown)
+}
+
 /// Reduce a message-supplied filename to a single, safe path component.
 ///
 /// Rejects directory traversal by taking the last component, and replaces the characters Windows
@@ -4558,6 +4607,7 @@ pub fn run() {
             search_messages,
             sync_status,
             save_attachment,
+            stage_attachment,
             pick_attachments,
             watch_inbox,
             stop_watching,
@@ -4570,11 +4620,36 @@ pub fn run() {
 mod tests {
     use super::{
         BodyStorage, Cache, FailureKind, SyncFailure, UNIQUE_NAME_TRIES, account_id_for,
-        app_version, apply_stored_body_storage, failure_kind, safe_file_name, slow_query_delta,
-        startup_body_storage, unique_path,
+        app_version, apply_stored_body_storage, failure_kind, resend_staging_dir, safe_file_name,
+        slow_query_delta, startup_body_storage, unique_path,
     };
     use mail_core::db::DbStats;
     use mail_core::userdb::UserStore;
+
+    /// A re-sent attachment is a **throwaway copy**, and it must not land in the user's Downloads.
+    ///
+    /// `save_attachment` writes there because the user asked for that file. This one writes a copy
+    /// the outgoing message reads and nothing ever opens, so a folder full of duplicates is the only
+    /// possible outcome of putting it there. Temp is where a copy belongs.
+    #[test]
+    fn a_staged_attachment_goes_to_temp_and_cannot_escape_it() {
+        let dir = resend_staging_dir();
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "staged copies must live under the system temp dir: {}",
+            dir.display()
+        );
+
+        // The name comes from the message, i.e. from whoever sent it. `safe_file_name` takes the last
+        // path component, so a traversal attempt stays a file *inside* the staging directory.
+        let escaped = unique_path(&dir, &safe_file_name("../../evil.exe", 3));
+        assert_eq!(
+            escaped.parent(),
+            Some(dir.as_path()),
+            "a crafted attachment name must not steer the write out of the staging directory"
+        );
+        assert!(!escaped.to_string_lossy().contains(".."));
+    }
 
     /// The startup rule has to reach the handle, not stop at the decision.
     ///

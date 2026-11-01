@@ -209,7 +209,10 @@ pub struct DeliveryStatus { pub final_recipient: Option<String>, pub action: Str
 openComposer(mode)
   ├ new        → 空正文 + 默认签名 + 默认身份
   ├ reply/all  → quote_for_reply + reply_targets + In-Reply-To/References
-  └ forward    → forward_payload（附件转发，内嵌图降级为附件）
+  ├ forward    → forward_payload（附件转发，内嵌图降级为附件）
+  └ resend     → **原信照抄**（2026-11-01 加）：收件人/抄送/主题/正文原样搬过来，**不加 Re:/Fwd:、
+                 不引用原文**；附件先从服务器取回到临时目录再挂上（`stage_attachment`）。它存在的
+                 理由是「我不确定第一封发出去没有」——不是转发，收件人是同一批人
         │
         ├─ 本地草稿（2 s 去抖）→ user.db.drafts（脏标记）
         ├─ 每 30 s 或失焦 → draft_mirror 到服务器 Drafts（best-effort）
