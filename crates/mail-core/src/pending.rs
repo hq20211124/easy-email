@@ -82,17 +82,6 @@ pub async fn replay_pending_ops(
         match applier.apply(&op).await {
             Ok(()) => {
                 run.store.finish_pending_op(op.id, run.now)?;
-                // **The tombstone goes when the server agrees, and only then.** It is the only
-                // record that says "this message must not come back"; clearing it on a failure
-                // would resurrect a message the user deleted, one sync later (`design/07` §14.9).
-                // Done here rather than in the shell's applier so every applier — including the
-                // fakes in this file's tests — gets the same behaviour.
-                if op.kind == Some(PendingOpKind::Delete)
-                    && let Some(uid) = op.uid.and_then(|uid| u32::try_from(uid).ok())
-                {
-                    run.store
-                        .clear_deleted_mark(&op.account_id, &op.folder, uid)?;
-                }
                 report.applied += 1;
             }
             Err(e) => {
@@ -300,78 +289,6 @@ mod tests {
         .expect("pass");
         assert_eq!((report.applied, report.failed, report.remaining), (0, 0, 0));
         assert_eq!(applier.calls, 0);
-    }
-
-    /// **The tombstone lives exactly as long as the server disagrees.**
-    ///
-    /// A confirmed delete clears it; a failed one must not, or the next sync puts the message back
-    /// (`design/07` §14.9). The clear happens in the replay rather than in the shell's applier so
-    /// every applier gets it — including this fake one.
-    #[tokio::test]
-    async fn a_confirmed_delete_clears_its_tombstone_and_a_failed_one_keeps_it() {
-        let store = store();
-        store
-            .mark_deleted("acc", "INBOX", 5, 9, None, 1)
-            .expect("mark");
-        seed(&store, PendingOpKind::Delete);
-        let mut applier = FlakyApplier::new(1);
-
-        let first = replay_pending_ops(
-            ReplayRun {
-                store: &store,
-                now: 10,
-                limit: 20,
-            },
-            &mut applier,
-        )
-        .await
-        .expect("first pass");
-        assert_eq!(first.failed, 1);
-        assert!(
-            store.is_deleted("acc", "INBOX", 5, 9).expect("read"),
-            "the server has not agreed yet, so the message must stay hidden"
-        );
-
-        let delay = crate::outbox::next_attempt_delay_secs(1);
-        let second = replay_pending_ops(
-            ReplayRun {
-                store: &store,
-                now: 10 + delay,
-                limit: 20,
-            },
-            &mut applier,
-        )
-        .await
-        .expect("second pass");
-        assert_eq!(second.applied, 1);
-        assert!(
-            !store.is_deleted("acc", "INBOX", 5, 9).expect("read"),
-            "the server confirmed, so the mark has done its job and must go"
-        );
-    }
-
-    /// A mark belongs to a *delete*. Applying a flag change must not clear one, or a queued
-    /// "mark read" would quietly resurrect a message the user deleted.
-    #[tokio::test]
-    async fn a_confirmed_flag_change_does_not_clear_a_tombstone() {
-        let store = store();
-        store
-            .mark_deleted("acc", "INBOX", 5, 9, None, 1)
-            .expect("mark");
-        seed(&store, PendingOpKind::MarkRead);
-        let mut applier = FlakyApplier::new(0);
-
-        replay_pending_ops(
-            ReplayRun {
-                store: &store,
-                now: 2,
-                limit: 20,
-            },
-            &mut applier,
-        )
-        .await
-        .expect("pass");
-        assert!(store.is_deleted("acc", "INBOX", 5, 9).expect("read"));
     }
 
     #[tokio::test]

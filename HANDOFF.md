@@ -18,26 +18,26 @@
 |---|---|
 | -1 D-1 诊断 | ✅ **分支 A**：QQ 的 `UID SEARCH 210:*` 返回空，同区间的 `UID FETCH` 能取到 226（真机实测，`tests/sent_uid_probe.rs`）。于是 v5 里最贵的 D0c+D3 **永久关闭** |
 | 0 cache v11 | ✅ `sent_index.uidvalidity`（存量行 = 0「未知」，不猜）+ `messages.to_addrs` 头部同步就写 |
-| 1 `user.db` v5 | ✅ `sent_records` + `deleted_marks` + `settle_sent_row()`（真库三条遗留行结案到 226/209/207，`folder=''` 为 0）+ spool 孤儿清扫 |
+| 1 `user.db` v5 | ✅ `sent_records` + ~~`deleted_marks`~~（v6 已 drop）+ `settle_sent_row()`（真库三条遗留行结案到 226/209/207，`folder=''` 为 0）+ spool 孤儿清扫 |
 | 2a 修根因 | ✅ `fetch_headers_since` 改用 `UID FETCH <after+1>:* (UID)` 枚举；真机复验一次同步新增 17 封、游标落在 226 |
 | 3 界面 | ✅ 待发档 / 计数 / `sent-state-changed` / D7③ 出口 / 行上「副本已归档·仅本地记录」 |
 | 4 侧栏 IA | ✅ A 批（写邮件固定头、删「发件箱」入口、隐藏 `\Drafts`、空分组隐藏） |
 
-**这条线剩下的三件已在第 113 轮全部做完**（2026-11-01）：
+**这条线的三件已在第 113 轮做完，其中第 1 件在第 114 轮被整个撤掉**（2026-11-01）：
 
-1. ✅ **墓碑接上生产代码**：`delete_message` 按服务器实际结果决定写不写；`SyncDriver::start` 收
-   `&Tombstones`（必填，不是 `Option`）；`absorb` 写前过滤**并删掉残留行**，游标按整页推进；
-   `backfill_older` / `fill_thread_keys` 同一套；`replay_pending_ops` 只在成功分支清、只对 `Delete` 清；
-   启动时 30 天兜底。门禁 `tools/tombstone_wiring.mjs` 钉六条，四条做过变异测试。
-2. ✅ **删除的两处细节**：`cache.delete_message` 同一事务删 `sent_index`；无 UIDPLUS 时先
+1. ~~**墓碑接上生产代码**~~ → **撤掉了**。用户一句「我们这只是个客户端而已」，于是 `deleted_marks` 表、
+   `Tombstones`、`SyncDriver` 的参数、30 天清扫、7 条单测全部删除；`user.db` 5→6 用 `drop table` 清掉。
+   理由与**接受的代价**（离线删的信可能再出现，无 UIDPLUS 的文件夹会一直列着它，不报 `UIDVALIDITY` 的
+   服务器每轮都把它带回来）写在 `design/07` §14.9.1。**别再把它加回来**——`tools/delete_path.mjs` 会红。
+2. ✅ **删除的两处细节（保留）**：`cache.delete_message` 同一事务删 `sent_index`；无 UIDPLUS 时先
    `UID SEARCH DELETED` 数集合，只有恰好是目标才 EXPUNGE，否则 `MarkedOnly` + 补 EXPUNGE 进
    `pending_ops` + 界面如实说「已标记删除，服务器清理时生效」。
 3. ✅ **`count_sent_records` 有消费者**：`sent_record_count` 命令 + 空态那行小字（只提示，不进列表）。
 
-**这条线还剩两件（都不大）**：
+**这条线还剩一件**：
 - `move_message` 没有墓碑路径 —— 但**它今天不可达**：`src/app.js` 零 `invoke('move_message')`。接界面时
   三件要一起做（删源缓存行 / 写墓碑 / 无 UIDPLUS 时把 `MarkedOnly` 报出来），拆开做会得到「移走了又出现」。
-- ~~§14.11 的 `settle_sent_row` 幂等断言~~ 已补（同一轮）。
+  **注意**：墓碑既然撤了，这里第三件的做法要重新想——现在 delete 的答案是「再删一次」，move 没有等价动作。
 
 ### 还没做的（大块）
 
@@ -55,7 +55,7 @@
 3. **Rust 字符串里的 SQL 注释不能用英文双引号**：会截断 `execute_batch` 的字符串，报错是一堆
    "invalid suffix"。用「」。
 4. 门禁现有 **68 步**，其中三步是结构断言（`tools/sent_tabs_test.mjs`、`tools/sidebar_structure.mjs`、
-   `tools/tombstone_wiring.mjs`）——
+   `tools/delete_path.mjs`）——
    它们断言的是**结构/协议形状**，不是文案，因为这类规则截图看不出来。
 
 ---

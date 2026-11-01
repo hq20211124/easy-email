@@ -21,7 +21,7 @@
 //! data, which is `Send`, and callers open a connection for each synchronous phase:
 //!
 //! ```ignore
-//! let mut driver = SyncDriver::start(&open_cache()?, &account_id, &folder, &marks)?;
+//! let mut driver = SyncDriver::start(&open_cache()?, &account_id, &folder)?;
 //! let outcome = loop {
 //!     let page = driver.execute(&mut client).await?;    // the only await
 //!     if let Some(outcome) = driver.absorb(&open_cache()?, &page)? {
@@ -38,7 +38,6 @@ use crate::cache::Cache;
 use crate::error::Result;
 use crate::imap::{HeaderPage, ImapClient};
 use crate::model::MailboxInfo;
-use crate::userdb::Tombstones;
 
 /// How many headers a folder gets on its very first sync.
 ///
@@ -153,12 +152,6 @@ pub struct SyncOutcome {
     pub uidvalidity_changed: bool,
     /// Where the incremental cursor stands after this pass.
     pub last_uid: u32,
-    /// Headers the server sent that were **not** stored, because the user deleted them here.
-    ///
-    /// Reported rather than swallowed: "the server says 17, the list grew by 16" is exactly the kind
-    /// of silent disagreement this repository has been bitten by, and one integer in the log line
-    /// makes it visible without a debugger.
-    pub hidden_by_tombstone: usize,
 }
 
 /// The one fetch a pass needs.
@@ -183,28 +176,13 @@ pub struct SyncDriver {
     cached_uidvalidity: u32,
     /// Set once a generation change has been handled, so the restart cannot loop.
     restarted: bool,
-    /// Messages the user deleted on this machine (`design/07` §14.9).
-    ///
-    /// Carried by the driver rather than looked up inside [`SyncDriver::absorb`] because the two
-    /// live in different database files: the driver only ever touches `cache.db`, and reaching into
-    /// `user.db` from here would make this type hold two connections across an `await`.
-    tombstones: Tombstones,
 }
 
 impl SyncDriver {
     /// Read the cache and decide what to fetch next.
     ///
     /// Purely synchronous — the caller is expected to drop the connection before awaiting.
-    ///
-    /// `tombstones` is a **parameter, not an option**: a sync that does not know what the user
-    /// deleted is the bug this argument exists to make impossible to write by accident. Callers with
-    /// no `user.db` (the loopback fixtures) pass [`Tombstones::empty`] and say so out loud.
-    pub fn start(
-        cache: &Cache,
-        account_id: &str,
-        folder: &MailboxInfo,
-        tombstones: &Tombstones,
-    ) -> Result<Self> {
+    pub fn start(cache: &Cache, account_id: &str, folder: &MailboxInfo) -> Result<Self> {
         let state = cache.folder_state(account_id, &folder.name)?;
         let (fetch, cached_uidvalidity) = match state {
             // Nothing cached, or the folder was invalidated and its generation zeroed.
@@ -228,7 +206,6 @@ impl SyncDriver {
             fetch,
             cached_uidvalidity,
             restarted: false,
-            tombstones: tombstones.clone(),
         })
     }
 
@@ -270,31 +247,15 @@ impl SyncDriver {
 
         let previous = cache.folder_state(&self.account_id, &self.folder.name)?;
         cache.upsert_folder(&self.account_id, &self.folder, page.uidvalidity)?;
-
-        // **Check the tombstones before writing, not after.** A message the user deleted is still on
-        // the server until the delete reaches it (offline, a queued intent, a server that only
-        // flagged `\Deleted`), so every pass over it would otherwise re-create the row — the exact
-        // "删了又同步回来" bug, and it survived two rounds of storage work because nothing read the
-        // table (`design/07` §14.9).
+        // **No tombstone check here, on purpose** (`design/07` §14.9, decision 2026-11-01).
         //
-        // Two things must happen for a hidden message, and only one of them is obvious:
-        //   1. it is not stored;
-        //   2. any row that is *still there* (a crash between the local delete and this write, or a
-        //      delete that only cleared the list) is removed, so the tombstone is self-healing.
-        // The cursor is advanced from the **whole page**, hidden messages included — otherwise a
-        // deleted message that happens to be the newest one would pin the cursor below itself and
-        // every subsequent pass would re-fetch and re-hide it for ever.
-        let mut stored = Vec::with_capacity(page.summaries.len());
-        let mut hidden = 0usize;
-        for summary in &page.summaries {
-            if self.tombstones.hides(summary.uid, page.uidvalidity) {
-                hidden += 1;
-                cache.delete_message(&self.account_id, &self.folder.name, summary.uid)?;
-                continue;
-            }
-            stored.push(summary.clone());
-        }
-        cache.upsert_summaries(&self.account_id, &self.folder.name, &stored)?;
+        // A message the user deleted is still on the server until the delete reaches it, so a pass
+        // over it stores the row again and the message reappears. That is accepted: the server is
+        // the truth and this list is a copy of it, and the answer to a resurrected message is to
+        // delete it again. Keeping it hidden instead needed a table, a writer, a clearer, a 30-day
+        // expiry (which undid the feature a month later) and a gate rule — for a case no user has
+        // reported. See `UserStore::migrate`'s v6 note for the full reasoning.
+        cache.upsert_summaries(&self.account_id, &self.folder.name, &page.summaries)?;
 
         let last_uid = advance_cursor(previous, &page.summaries);
         cache.set_cursor(
@@ -309,7 +270,6 @@ impl SyncDriver {
             total_cached: cache.summary_count(&self.account_id, &self.folder.name)?,
             uidvalidity_changed: self.restarted,
             last_uid,
-            hidden_by_tombstone: hidden,
         }))
     }
 }
@@ -489,7 +449,7 @@ mod tests {
     #[test]
     fn a_cold_folder_asks_for_the_newest_window() {
         let cache = Cache::open_in_memory().unwrap();
-        let driver = SyncDriver::start(&cache, "acc", &folder(), &Tombstones::empty()).unwrap();
+        let driver = SyncDriver::start(&cache, "acc", &folder()).unwrap();
         assert_eq!(
             driver.fetch(),
             Fetch::Newest {
@@ -501,7 +461,7 @@ mod tests {
     #[test]
     fn a_known_folder_asks_for_everything_above_the_cursor() {
         let cache = Cache::open_in_memory().unwrap();
-        let mut driver = SyncDriver::start(&cache, "acc", &folder(), &Tombstones::empty()).unwrap();
+        let mut driver = SyncDriver::start(&cache, "acc", &folder()).unwrap();
         let page = HeaderPage {
             uidvalidity: 5,
             summaries: vec![summary(1), summary(2)],
@@ -509,7 +469,7 @@ mod tests {
         let outcome = driver.absorb(&cache, &page).unwrap().expect("done");
         assert_eq!(outcome.last_uid, 2);
 
-        let driver = SyncDriver::start(&cache, "acc", &folder(), &Tombstones::empty()).unwrap();
+        let driver = SyncDriver::start(&cache, "acc", &folder()).unwrap();
         assert_eq!(
             driver.fetch(),
             Fetch::Since {
@@ -522,7 +482,7 @@ mod tests {
     #[test]
     fn a_changed_generation_discards_the_folder_and_asks_for_a_fresh_window() {
         let cache = Cache::open_in_memory().unwrap();
-        let mut driver = SyncDriver::start(&cache, "acc", &folder(), &Tombstones::empty()).unwrap();
+        let mut driver = SyncDriver::start(&cache, "acc", &folder()).unwrap();
         driver
             .absorb(
                 &cache,
@@ -535,7 +495,7 @@ mod tests {
             .expect("done");
 
         // The server renumbers the folder.
-        let mut driver = SyncDriver::start(&cache, "acc", &folder(), &Tombstones::empty()).unwrap();
+        let mut driver = SyncDriver::start(&cache, "acc", &folder()).unwrap();
         assert!(
             driver
                 .absorb(
@@ -586,7 +546,7 @@ mod tests {
         // Some servers omit UIDVALIDITY. Treating that as a change would wipe the folder on every
         // single sync, so 0 must mean "cannot tell".
         let cache = Cache::open_in_memory().unwrap();
-        let mut driver = SyncDriver::start(&cache, "acc", &folder(), &Tombstones::empty()).unwrap();
+        let mut driver = SyncDriver::start(&cache, "acc", &folder()).unwrap();
         driver
             .absorb(
                 &cache,
@@ -603,106 +563,5 @@ mod tests {
             1,
             "a folder whose server reports no generation must not be wiped"
         );
-    }
-
-    // ============================================================== tombstones (round 113)
-
-    /// The whole bug in one test: delete locally, sync, and the message must **not** come back.
-    ///
-    /// The real path is `delete_message` (writes a mark) → a sync pass (reads it). Both halves are
-    /// exercised here against real SQLite files — `user.db` for the mark, `cache.db` for the rows —
-    /// because the interesting failure was never in either half alone: it was that nothing joined
-    /// them (`design/07` §14.9).
-    #[test]
-    fn a_message_deleted_here_does_not_come_back_when_the_server_still_lists_it() {
-        let store = crate::userdb::UserStore::open_in_memory().unwrap();
-        store
-            .mark_deleted("acc", "INBOX", 2, 5, None, 1_000)
-            .unwrap();
-        let marks = store.tombstones("acc", "INBOX").unwrap();
-        assert_eq!(marks.len(), 1);
-
-        let cache = Cache::open_in_memory().unwrap();
-        let mut driver = SyncDriver::start(&cache, "acc", &folder(), &marks).unwrap();
-        let outcome = driver
-            .absorb(
-                &cache,
-                &HeaderPage {
-                    uidvalidity: 5,
-                    summaries: vec![summary(1), summary(2), summary(3)],
-                },
-            )
-            .unwrap()
-            .expect("done");
-
-        assert_eq!(
-            cache.summary_count("acc", "INBOX").unwrap(),
-            2,
-            "the deleted message must not be stored again"
-        );
-        assert_eq!(outcome.hidden_by_tombstone, 1, "and the log says so");
-        assert_eq!(
-            outcome.fetched, 3,
-            "fetched counts what the server sent; hiding it is a separate number"
-        );
-        assert_eq!(
-            outcome.last_uid, 3,
-            "**the cursor must move past a hidden message**, or every pass re-fetches it for ever"
-        );
-    }
-
-    /// A row that survived a crash between the local delete and the write is removed, not just
-    /// skipped: the tombstone has to be able to clean up after the path that wrote it.
-    #[test]
-    fn a_row_that_outlived_its_tombstone_is_removed_by_the_next_sync() {
-        let cache = Cache::open_in_memory().unwrap();
-        let mut driver = SyncDriver::start(&cache, "acc", &folder(), &Tombstones::empty()).unwrap();
-        driver
-            .absorb(
-                &cache,
-                &HeaderPage {
-                    uidvalidity: 5,
-                    summaries: vec![summary(1), summary(2)],
-                },
-            )
-            .unwrap()
-            .expect("done");
-        assert_eq!(cache.summary_count("acc", "INBOX").unwrap(), 2);
-
-        let marks = Tombstones::from_marks(vec![(2, 5)]);
-        let mut driver = SyncDriver::start(&cache, "acc", &folder(), &marks).unwrap();
-        driver
-            .absorb(
-                &cache,
-                &HeaderPage {
-                    uidvalidity: 5,
-                    summaries: vec![summary(1), summary(2)],
-                },
-            )
-            .unwrap()
-            .expect("done");
-        assert_eq!(
-            cache.summary_count("acc", "INBOX").unwrap(),
-            1,
-            "a row the user deleted must not survive because the write path crashed half way"
-        );
-    }
-
-    /// `UIDVALIDITY` is half of the identity: a folder the server renumbered hands the same UID to
-    /// different mail, and a mark keyed on the number alone would hide a message nobody ever saw.
-    #[test]
-    fn a_mark_stops_matching_when_the_folder_is_renumbered() {
-        let marks = Tombstones::from_marks(vec![(2, 5)]);
-        assert!(marks.hides(2, 5));
-        assert!(
-            !marks.hides(2, 6),
-            "a different generation is a different message"
-        );
-        assert!(
-            !marks.hides(2, 0),
-            "an unknown generation matches nothing — the same rule sent_index.uidvalidity follows"
-        );
-        assert!(!marks.hides(3, 5));
-        assert!(!Tombstones::empty().hides(2, 5));
     }
 }

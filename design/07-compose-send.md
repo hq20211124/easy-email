@@ -783,10 +783,31 @@ settle_sent_row(outbox_row):
 | **删除：服务器不可达** | 本地立即消失，进 `pending_ops`（`kind = delete`，已有，`lib.rs:3395-3407`），界面如实说"已从本机删除，服务器副本待联网后删除" |
 | **删除：`uid` 为空** | 先按 Message-ID `SEARCH` 定位（`find_uid_by_message_id`，`imap.rs:1020`）；仍找不到 ⇒ 只删本地，**并在确认弹窗里事先说明这一点** |
 | **删除：没有 UIDPLUS 的服务器** | `EXPUNGE` 是**文件夹级**语义（`imap.rs:983`），会连带清掉别人标的 `\Deleted`。所以：先 `FETCH (FLAGS)` 数该文件夹的 `\Deleted` 集合，**只有集合恰好等于目标**才 EXPUNGE；否则只标 `\Deleted`，如实告诉用户"已标记删除，服务器清理时生效"，**并把补 EXPUNGE 放进 `pending_ops` 重试**（v4 补：否则这些信永远挂在 `\Deleted` 上） |
-| **删除后同步又看见它** | 加 `deleted_marks(account_id, folder, uid, uidvalidity, message_id, at)`，主键 `(account_id, folder, uid)`，**放 `user.db` v5**（v5 改：v4 放进 cache，而 cache 是用户点「清空缓存」就会清掉的那个库——墓碑一消失，下一轮同步就把删掉的信复活，这直接违背 D2 自己的理由）。同步 upsert 前先查，**命中必须同时匹配 `uidvalidity`**（UIDVALIDITY 一变，墓碑自动失效，比 30 天过期精确）；`pending_ops` 成功或放弃时删标记；启动时清掉超过 30 天的标记作兜底 |
+| **删除后同步又看见它** | ~~加 `deleted_marks` 墓碑~~ ⇒ **2026-11-01 撤销，改成「接受它会回来」**。理由与代价见 §14.9.1 |
 | **删除时本地清理** | `cache.delete_message` 现在只动 `search/messages/bodies`（`cache.rs:1359-1385`），**不清 `sent_index`** ⇒「查看副本」留下指向空行的链接。要求：同一次写事务里删掉 `sent_index` 里对应 `(folder, uid)` 的行 |
 | **归档成功但 `sent_records` 写失败** | 保留 outbox 行 + spool，下一轮重做（幂等）。**分支 C** 下这一封此时**同时**出现在列表（cache 行已写）与 outbox（`state=sent`、spool 在）——但它**不进「待发」计数**（D5），所以用户不会看到「已发送」和「待发」打架 |
 | **发出去了、副本还没归档（`sent` 且 spool 在）**（v5 新增） | 它在 `待发` 档末尾单列一行「已发出，副本待归档 (m)」，**m 不并入 n**。理由：离线时归档轮次根本跑不了，这封信既不进 `待发`（D5 排除 `sent`）、也不进「已发送」（A/B 分支下还没有 cache 行），用户会以为信丢了。它是**事实**（发出去了），只是副本还没到位，必须看得见 |
+
+#### 14.9.1 撤销墓碑（2026-11-01，实现之后又拆掉）
+
+v5 的上一行要求建一张 `deleted_marks` 墓碑表，写它、查它、成功时清它、30 天后过期。它**做完了、
+测过了、接上生产代码了**（第 113 轮），然后在同一天被拆掉。拆的理由不是做不出来，是**不值**：
+
+- **它记的事，`pending_ops` 已经有了。** 「这封信还没在服务器上删掉」就是队列里那条 `kind = delete`
+  的意图。墓碑是同一件事的第二份记录，于是要有写入、清除、过期三条生命周期，还要保证两边不打架。
+- **30 天过期自己反对自己。** 兜底清理会在用户删信一个月后把墓碑删掉，于是那封信又能回来——
+  这正是这张表存在的唯一目的。一个到期就撤销自己的功能。
+- **它挡的是一个没人报过的 bug。** 这个场景来自本文档自己的红队推演，不是用户反馈。而这是**客户端**：
+  服务器是真相，本地列表是它的副本；信回来了，再删一次，成本一秒。为了这一秒建表、写门禁、留维护
+  负担，不划算。
+- **代价写在明处**：① 离线删的信，联网前每次同步都可能又出现；② 无 UIDPLUS 且文件夹里别人也有标记
+  时，那封信会一直留在服务器上（`MarkedOnly`），同步也会把它列出来；③ 服务器不报 `UIDVALIDITY` 的
+  文件夹（每次同步退化成「取最新 500 封」）里，删掉的信每轮都会回来。三种都靠「再删一次」收场。
+
+**留下的四条不许丢**（`tools/delete_path.mjs` 钉住）：墓碑不许被重新建出来（`user.db` v6 用
+`drop table` 把它清掉，而不是留着当摆设）；`sent_index` 指针随行同事务删；无 UIDPLUS 时先数
+`\Deleted` 集合、只有恰好等于目标才 EXPUNGE；两种「信还在服务器上」的结局都必须进 `pending_ops` 重试
+——否则就变成「本机删了、服务器没删、而且没人记得」。
 
 ### 14.10 顺序与依赖（v5：D0 进分支，cache v11 缩成两列）
 
@@ -844,11 +865,11 @@ settle_sent_row(outbox_row):
 - [ ] 结案（v5 新增）：造一条 `failed` + spool 为空的 outbox 行 ⇒ 走「删除这条记录」⇒ `count(outbox)` 减一，`n` 归零，**且不写 `sent_records`**（它从来没发出去，不是"已发送"）。**未做**：后端 `delete_outbox` 已在，缺的是界面上的那个出口（第 3 步）。
 - [x] 幂等（**2026-11-01 已做**）：`settle_sent_row` 连跑两次，`sent_records` 仍一行、`outbox` 仍空、`folder` 不被第二次调用改回 `''`（`settling_the_same_row_twice_keeps_the_location_it_found`，且做过变异测试：把「spool 空 ⇒ folder=''」写回去 ⇒ 红）；`record_sent_copy` 同一 `Message-ID` 记两次仍是一行（`a_sent_copy_is_recorded_and_found_again`）。
 - [ ] **分支 C 专属**：`message_id` 非空行数 ≥ `sent_index` 行数；`sent_index` 每行都能在 `messages` 找到 `(folder, uid)`；判等三结局三条单测；`seen` 权威（D3 写 1 后跑一轮同步 ⇒ 本地变 0，**断言这是期望行为**）；`summarise()` 产出的摘要带 `message_id` 与 `to_addrs`（loopback 断言非空）。
-- [x] 墓碑（**2026-11-01 已做，第 113 轮**）：同步读墓碑并在写之前过滤（`a_message_deleted_here_does_not_come_back_when_the_server_still_lists_it`，同时钉住「游标必须越过被隐藏的那封」）；还在缓存里的残留行会被同一轮删掉（`a_row_that_outlived_its_tombstone_is_removed_by_the_next_sync`）；`uidvalidity` 变了 ⇒ 墓碑失效、行可以回来（`a_mark_stops_matching_when_the_folder_is_renumbered`）；`pending_op` 成功后标记被删、失败时**保留**（`a_confirmed_delete_clears_its_tombstone_and_a_failed_one_keeps_it`），且只有 `Delete` 能清（`a_confirmed_flag_change_does_not_clear_a_tombstone`）；**清空 cache 后墓碑仍在**由门禁钉住（`deleted_marks` 不许出现在 `cache.rs`）。
+- [~] ~~墓碑~~（2026-11-01 做过又撤销，见 §14.9.1）。撤销后这条的验收变成反向的：`user.db` v6 **删掉**那张表（`a_v5_database_loses_the_tombstone_table_on_open`），门禁 `tools/delete_path.mjs` 断言它不许被重新建出来。
 - [x] `sent_index` 清理（**2026-11-01 已做**）：删除后 `sent_copy(account, message_id)` 返回 `None`（`deleting_a_message_removes_the_pointer_to_its_sent_copy`），且别的文件夹同号的那条不受影响（`deleting_one_copy_leaves_another_folders_pointer_alone`）。
 - [x] 无 UIDPLUS 的 `EXPUNGE`（**2026-11-01 已做**）：先数 `\Deleted` 集合，只有恰好等于目标才 EXPUNGE；否则 `MarkedOnly`、界面如实说、补 EXPUNGE 进 `pending_ops`（loopback：`delete_leaves_someone_elses_deleted_mail_alone`）。
 - [x] spool 孤儿（2026-11-01）：无引用且 25 h 前的文件被删；1 h 前的**不**被删；引用中的文件与非 `.eml` 文件都不动（`the_sweep_removes_only_old_unreferenced_files`）。
-- [ ] **变异测试**（去掉即必须变红）：去掉墓碑；去掉 `message_id` 判等（分支 C）；把 `coalesce` 改回赋值；把 ④ 移到 ② 之前；去掉 ⓿ 兜底搬移；**把 `settle_sent_row` 第 2 步（查 `sent_index`）删掉**；把 `deleted_marks` 放回 `cache.db`（清缓存后行复活 ⇒ 红）。
+- [ ] **变异测试**（去掉即必须变红）：去掉 `message_id` 判等（分支 C）；把 `coalesce` 改回赋值；把 ④ 移到 ② 之前；去掉 ⓿ 兜底搬移；**把 `settle_sent_row` 第 2 步（查 `sent_index`）删掉**。~~去掉墓碑 / 把 `deleted_marks` 放回 `cache.db`~~ —— 墓碑已撤销（§14.9.1）；现在对应的一条是「把 `create table deleted_marks` 加回去 ⇒ 门禁红」，已做。
 
 **B. 该块的出口条件（真机，一次，附截图）**
 

@@ -24,7 +24,7 @@ use mail_core::smtp;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, Credential, Draft, DraftMirror, Endpoint, ImapClient,
     MailboxInfo, MessageSummary, NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent,
-    RecoveryRun, Security, Spool, SyncDriver, SyncOutcome, Tombstones, UserStore, ensure_sent_copy,
+    RecoveryRun, Security, Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy,
     index_bodies_pass, mirror_draft, pool_op, recover_in_flight, run_due, watch_every,
 };
 use mail_core::{
@@ -1662,7 +1662,6 @@ async fn the_backfill_stops_fetching_once_the_byte_budget_is_spent() {
             max_bytes: 1,
         },
         1_700_000_000,
-        &Tombstones::empty(),
     ))
     .await
     .expect("walk");
@@ -1722,7 +1721,6 @@ async fn the_page_that_spent_the_budget_is_still_stored() {
             max_bytes: 1,
         },
         1_700_000_000,
-        &Tombstones::empty(),
     ))
     .await
     .expect("walk");
@@ -2041,7 +2039,6 @@ async fn the_key_refresh_walks_back_and_fills_what_the_sync_will_never_touch() {
         "INBOX",
         3,
         10,
-        &Tombstones::empty(),
     ))
     .await
     .expect("refresh");
@@ -2888,22 +2885,7 @@ async fn sync_once(
     account_id: &str,
     folder: &MailboxInfo,
 ) -> SyncOutcome {
-    sync_once_with(client, cache, account_id, folder, &Tombstones::empty()).await
-}
-
-/// The same composition, with the tombstones the real command reads out of `user.db`.
-///
-/// Separate rather than an argument on `sync_once` so the twenty-odd existing call sites keep saying
-/// what they mean ("no deletions here"); the one test that cares names its marks explicitly.
-async fn sync_once_with(
-    client: &mut ImapClient,
-    cache: &Cache,
-    account_id: &str,
-    folder: &MailboxInfo,
-    tombstones: &Tombstones,
-) -> SyncOutcome {
-    let mut driver =
-        SyncDriver::start(cache, account_id, folder, tombstones).expect("plan the sync");
+    let mut driver = SyncDriver::start(cache, account_id, folder).expect("plan");
     loop {
         let page = within(driver.execute(client)).await.expect("fetch");
         if let Some(outcome) = driver.absorb(cache, &page).expect("absorb") {
@@ -4183,7 +4165,6 @@ async fn the_sync_window_decides_where_the_walk_stops() {
             SyncWindow::Count(20),
             BackfillBudget::generous(),
             NOW,
-            &Tombstones::empty(),
         ))
         .await
         .expect("backfill");
@@ -4235,7 +4216,6 @@ async fn the_sync_window_decides_where_the_walk_stops() {
             SyncWindow::Years(2),
             BackfillBudget::generous(),
             NOW,
-            &Tombstones::empty(),
         ))
         .await
         .expect("backfill");

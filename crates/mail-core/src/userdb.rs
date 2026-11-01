@@ -22,7 +22,9 @@ use crate::sync::SyncWindow;
 ///
 /// 2 added `quota_ledger` (`design/04` §5.7). Additive: `migrate` runs `create table if not
 /// exists` for every table it owns, so an existing file picks the new one up on the next open.
-pub const USER_SCHEMA_VERSION: i64 = 5;
+/// 5 added `sent_records` + `deleted_marks`; **6 drops `deleted_marks` again** — the decision and
+/// the reasoning are in `migrate` and `design/07` §14.9.
+pub const USER_SCHEMA_VERSION: i64 = 6;
 
 /// How long a quota window lasts.
 ///
@@ -343,51 +345,6 @@ impl PendingOp {
     /// The payload, or `None` when the stored JSON is not one.
     pub fn payload(&self) -> Option<PendingPayload> {
         serde_json::from_str(&self.payload_json).ok()
-    }
-}
-
-/// The tombstones for one folder, as a value a sync can carry.
-///
-/// **This is the whole point of `deleted_marks`:** a message the user deleted must not come back the
-/// next time the server mentions it. Before this type the table and its four methods existed and
-/// nothing called them, so the resurrection bug was alive and well — the storage was there, the
-/// decision was not (`design/07` §14.9).
-///
-/// It is a set of `(uid, generation)` pairs rather than a set of UIDs because a UID only identifies a
-/// message *inside one generation of a folder*. `hides` takes the generation the page came back with,
-/// so a folder the server renumbered silently voids every mark in it — precisely, and without a
-/// timer. A mark stored with generation `0` ("we did not know") matches nothing: the same rule
-/// `sent_index.uidvalidity` follows, for the same reason (`design/07` §14.4 D0a).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Tombstones {
-    marks: Vec<(u32, u32)>,
-}
-
-impl Tombstones {
-    /// No marks — what a folder with no deletions has, and what a test that does not care passes.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    pub fn from_marks(marks: Vec<(u32, u32)>) -> Self {
-        Self { marks }
-    }
-
-    /// Would a page from generation `uidvalidity` be showing a message the user deleted?
-    pub fn hides(&self, uid: u32, uidvalidity: u32) -> bool {
-        uidvalidity != 0
-            && self
-                .marks
-                .iter()
-                .any(|&(u, v)| u == uid && v == uidvalidity)
-    }
-
-    pub fn len(&self) -> usize {
-        self.marks.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.marks.is_empty()
     }
 }
 
@@ -2143,122 +2100,6 @@ impl UserStore {
         Ok(items)
     }
 
-    // ------------------------------------------------------------------ tombstones (v5)
-
-    /// Every tombstone this account holds for one folder, ready to hand to a sync.
-    ///
-    /// **Read as a set, not as a query per message.** A sync page is up to five hundred rows, and
-    /// asking "was this one deleted?" five hundred times is five hundred trips to a different
-    /// database file — the same mistake `sent_states` was written to avoid. The set is small (one
-    /// entry per message the user deleted and the server has not confirmed yet).
-    ///
-    /// The generation travels with each mark rather than being filtered here: the folder's current
-    /// `UIDVALIDITY` is only authoritative **when the page comes back** (`HeaderPage.uidvalidity`),
-    /// and comparing before that would mean trusting the cache's copy of a number the server is
-    /// about to correct. A mark whose generation differs — or is `0` — simply never matches
-    /// (`Tombstones::hides`), which is how "the folder was rebuilt, the mark is void" happens
-    /// without a single delete.
-    pub fn tombstones(&self, account_id: &str, folder: &str) -> Result<Tombstones> {
-        let guard = self.db.read_guard();
-        let conn: &Connection = &guard;
-        let mut stmt = conn.prepare(
-            "select uid, uidvalidity from deleted_marks where account_id = ?1 and folder = ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![account_id, folder], |row| {
-            Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32))
-        })?;
-        let mut marks = Vec::new();
-        for row in rows {
-            marks.push(row?);
-        }
-        Ok(Tombstones::from_marks(marks))
-    }
-
-    /// Remember that the user deleted this message here, so the next sync does not bring it back.
-    ///
-    /// `uidvalidity` is recorded because it is half of the identity: a folder deleted and recreated
-    /// hands the same UID to different mail, and a tombstone keyed on the number alone would hide a
-    /// message the user has never seen (`design/07` §14.9).
-    pub fn mark_deleted(
-        &self,
-        account_id: &str,
-        folder: &str,
-        uid: u32,
-        uidvalidity: u32,
-        message_id: Option<&str>,
-        at: i64,
-    ) -> Result<()> {
-        let account_id = account_id.to_string();
-        let folder = folder.to_string();
-        let message_id = message_id.map(str::to_string);
-        self.db.write_blocking(move |conn| {
-            conn.execute(
-                "insert into deleted_marks (account_id, folder, uid, uidvalidity, message_id, at)
-                 values (?1, ?2, ?3, ?4, ?5, ?6)
-                 on conflict(account_id, folder, uid) do update set
-                     uidvalidity = excluded.uidvalidity,
-                     message_id = coalesce(excluded.message_id, deleted_marks.message_id),
-                     at = excluded.at",
-                rusqlite::params![
-                    account_id,
-                    folder,
-                    i64::from(uid),
-                    i64::from(uidvalidity),
-                    message_id,
-                    at
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Is this message one the user deleted? Requires the same folder generation it was deleted in.
-    pub fn is_deleted(
-        &self,
-        account_id: &str,
-        folder: &str,
-        uid: u32,
-        uidvalidity: u32,
-    ) -> Result<bool> {
-        let guard = self.db.read_guard();
-        let conn: &Connection = &guard;
-        let n: i64 = conn.query_row(
-            "select count(*) from deleted_marks
-              where account_id = ?1 and folder = ?2 and uid = ?3 and uidvalidity = ?4",
-            rusqlite::params![account_id, folder, i64::from(uid), i64::from(uidvalidity)],
-            |row| row.get(0),
-        )?;
-        Ok(n > 0)
-    }
-
-    /// Forget a tombstone — the server has agreed, or the intent was abandoned.
-    pub fn clear_deleted_mark(&self, account_id: &str, folder: &str, uid: u32) -> Result<()> {
-        let account_id = account_id.to_string();
-        let folder = folder.to_string();
-        self.db.write_blocking(move |conn| {
-            conn.execute(
-                "delete from deleted_marks where account_id = ?1 and folder = ?2 and uid = ?3",
-                rusqlite::params![account_id, folder, i64::from(uid)],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Drop tombstones older than `max_age_secs`, as a backstop for one that never got cleared.
-    ///
-    /// A backstop, not the mechanism: the normal path clears the mark when the server confirms the
-    /// deletion. This exists for the case where it never does (offline for a month, the operation was
-    /// dropped), so the table cannot grow for ever. Thirty days is the design's number.
-    pub fn prune_deleted_marks(&self, now: i64, max_age_secs: i64) -> Result<u32> {
-        self.db.write_blocking(move |conn| {
-            let removed = conn.execute(
-                "delete from deleted_marks where at < ?1",
-                [now - max_age_secs],
-            )?;
-            Ok(removed as u32)
-        })
-    }
-
     /// Test seam: rewrite a row's kind to something this build cannot read.
     ///
     /// `#[cfg(test)]` because no production path needs it — the point of the tests that use it is
@@ -2487,30 +2328,24 @@ impl UserStore {
                      primary key (account_id, message_id)
                  );
                  create index if not exists sent_records_by_account
-                     on sent_records(account_id, updated_at desc);
-
-                 -- **Tombstones for mail the user deleted here** (`design/07` §14.9). Without them the
-                 -- next sync sees the message still on the server and puts it back — the user deletes
-                 -- the same mail every day and the client undoes it every hour.
-                 --
-                 -- In `user.db`, not `cache.db`: the cache is the file 「清空缓存」 empties, and a
-                 -- tombstone that disappears with it would resurrect everything the user deleted. That
-                 -- is the same rule as 「state is a fact, not a derivative」.
-                 --
-                 -- `uidvalidity` is part of the match, not decoration: a folder that was deleted and
-                 -- recreated hands the same UID to different mail, and a tombstone keyed on the number
-                 -- alone would hide a message the user never saw.
-                 create table if not exists deleted_marks (
-                     account_id  text    not null,
-                     folder      text    not null,
-                     uid         integer not null,
-                     uidvalidity integer not null default 0,
-                     message_id  text,
-                     at          integer not null,
-                     primary key (account_id, folder, uid)
-                 );
-                 create index if not exists deleted_marks_by_age on deleted_marks(at);",
+                     on sent_records(account_id, updated_at desc);",
             )?;
+
+            // **v6 removes `deleted_marks`** (`design/07` §14.9, decision 2026-11-01).
+            //
+            // It was a second copy of a fact `pending_ops` already holds — 「this message is still
+            // waiting to be deleted on the server」 — and it needed a writer, a clearer, a 30-day
+            // expiry and a gate rule of its own. The 30-day expiry was the worst part: it *undid*
+            // the thing the table existed for, one month after the user deleted the mail.
+            //
+            // This is a client: the server is the truth and the local list is a copy of it. A
+            // message that comes back because the delete never reached the server is answered by
+            // deleting it again, which costs the user one click and us nothing.
+            //
+            // `drop` rather than 「leave it there, unused」: a table nobody writes is a table the
+            // next reader will trust. The upgrade is destructive **of nothing else** — every row in
+            // it was a derived note about an intent that `pending_ops` still holds.
+            conn.execute_batch("drop table if exists deleted_marks;")?;
 
             // `draft_mirrors` gained `account_id` after the table had already shipped in a release.
             // `create table if not exists` cannot add a column: an existing file keeps the shape it
@@ -4137,7 +3972,7 @@ mod tests {
         assert_eq!(store.cleanup_logs(0).expect("list").len(), 0);
     }
 
-    // ------------------------------------------------- v5: settled sends and tombstones
+    // ------------------------------------------------- v5: settled sends
 
     fn settled(message_id: &str) -> SentRecord {
         SentRecord {
@@ -4193,82 +4028,6 @@ mod tests {
         let key = SentRecord::synthetic_key(13);
         assert_eq!(key, "local+13@easyemail.invalid");
         assert_eq!(SentRecord::synthetic_key(13), key);
-    }
-
-    /// The tombstone has to match the folder **generation**, or it hides mail the user never saw.
-    #[test]
-    fn a_tombstone_matches_the_generation_and_expires_as_a_backstop() {
-        let store = store();
-        store
-            .mark_deleted("t", "INBOX", 42, 900, Some("<m@x>"), 1_000)
-            .expect("mark");
-        assert!(store.is_deleted("t", "INBOX", 42, 900).expect("read"));
-        assert!(
-            !store.is_deleted("t", "INBOX", 42, 901).expect("read"),
-            "a recreated folder hands the same UID to different mail, so the mark must lapse"
-        );
-        assert!(!store.is_deleted("t", "INBOX", 43, 900).expect("read"));
-        assert!(!store.is_deleted("other", "INBOX", 42, 900).expect("read"));
-
-        store.clear_deleted_mark("t", "INBOX", 42).expect("clear");
-        assert!(!store.is_deleted("t", "INBOX", 42, 900).expect("read"));
-
-        // The backstop: a mark whose operation never came back must not live for ever.
-        store
-            .mark_deleted("t", "INBOX", 7, 900, None, 1_000)
-            .expect("mark");
-        let month = 30 * 24 * 3600;
-        assert_eq!(
-            store
-                .prune_deleted_marks(1_000 + month - 1, month)
-                .expect("prune"),
-            0,
-            "not yet"
-        );
-        assert_eq!(
-            store
-                .prune_deleted_marks(1_000 + month + 1, month)
-                .expect("prune"),
-            1
-        );
-        assert!(!store.is_deleted("t", "INBOX", 7, 900).expect("read"));
-    }
-
-    /// The read side a sync actually uses: one query, a value it can carry across an `await`.
-    #[test]
-    fn the_folder_snapshot_carries_every_mark_and_its_generation() {
-        let store = store();
-        store
-            .mark_deleted("t", "INBOX", 5, 900, None, 1)
-            .expect("mark");
-        store
-            .mark_deleted("t", "INBOX", 6, 900, None, 2)
-            .expect("mark");
-        // A different folder, and a different account: neither belongs in this snapshot.
-        store
-            .mark_deleted("t", "Sent", 7, 900, None, 3)
-            .expect("mark");
-        store
-            .mark_deleted("other", "INBOX", 8, 900, None, 4)
-            .expect("mark");
-
-        let marks = store.tombstones("t", "INBOX").expect("snapshot");
-        assert_eq!(marks.len(), 2);
-        assert!(marks.hides(5, 900));
-        assert!(marks.hides(6, 900));
-        assert!(!marks.hides(7, 900), "another folder's mark is not ours");
-        assert!(
-            !marks.hides(5, 901),
-            "the same number in another generation is another message"
-        );
-
-        assert!(
-            store
-                .tombstones("t", "Archive")
-                .expect("snapshot")
-                .is_empty(),
-            "a folder with no deletions must cost nothing to check"
-        );
     }
 
     /// The page query behind the row labels (`design/07` §14.5 D2).
@@ -4329,7 +4088,7 @@ mod tests {
         assert!(unknown.iter().all(|(_, _, copy)| !*copy));
     }
 
-    /// A file written by v4 gains both tables on open, and its existing rows are untouched.
+    /// A file written by v4 gains `sent_records` on open, and its existing rows are untouched.
     #[test]
     fn a_v4_database_gains_the_settled_send_tables_on_open() {
         let path = temp_path("v5");
@@ -4348,9 +4107,7 @@ mod tests {
             )
             .expect("db");
             db.write_blocking(|conn: &Connection| {
-                conn.execute_batch(
-                    "drop table sent_records; drop table deleted_marks; pragma user_version = 4;",
-                )?;
+                conn.execute_batch("drop table sent_records; pragma user_version = 4;")?;
                 Ok(())
             })
             .expect("downgrade");
@@ -4364,10 +4121,68 @@ mod tests {
         upgraded
             .insert_sent_record(&settled("<old@x>"))
             .expect("the new table must be usable");
-        upgraded
-            .mark_deleted("t", "INBOX", 1, 900, None, 5)
-            .expect("the tombstone table must be usable");
-        assert!(upgraded.is_deleted("t", "INBOX", 1, 900).expect("read"));
+        drop(upgraded);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v6 **drops** `deleted_marks` (`design/07` §14.9, decision 2026-11-01).
+    ///
+    /// A table nobody writes is worse than no table: the next reader sees `deleted_marks` in the
+    /// schema and assumes something maintains it. So the upgrade removes it, and this is the test
+    /// that says the removal actually happened on a file that had it — a fresh database never had
+    /// the table, so nothing else would notice if the `drop` were deleted.
+    #[test]
+    fn a_v5_database_loses_the_tombstone_table_on_open() {
+        let path = temp_path("v6");
+        {
+            let store = UserStore::open(&path).expect("open");
+            assert_eq!(
+                store.schema_version().expect("version"),
+                USER_SCHEMA_VERSION
+            );
+        }
+        // Recreate the v5 shape: the table, with a row in it, at user_version 5.
+        {
+            let db = crate::db::Db::open(
+                &path,
+                crate::db::DbKind::User,
+                crate::db::DbOptions::for_kind(crate::db::DbKind::User),
+            )
+            .expect("db");
+            db.write_blocking(|conn: &Connection| {
+                conn.execute_batch(
+                    "create table deleted_marks (
+                         account_id  text    not null,
+                         folder      text    not null,
+                         uid         integer not null,
+                         uidvalidity integer not null default 0,
+                         message_id  text,
+                         at          integer not null,
+                         primary key (account_id, folder, uid)
+                     );
+                     insert into deleted_marks values ('t', 'INBOX', 5, 900, null, 1);
+                     pragma user_version = 5;",
+                )?;
+                Ok(())
+            })
+            .expect("downgrade to v5");
+        }
+
+        let upgraded = UserStore::open(&path).expect("open a v5 file");
+        assert_eq!(
+            upgraded.schema_version().expect("version"),
+            USER_SCHEMA_VERSION
+        );
+        let left: i64 = upgraded
+            .db
+            .read_guard()
+            .query_row(
+                "select count(*) from sqlite_master where type = 'table' and name = 'deleted_marks'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the table must be gone");
+        assert_eq!(left, 0, "the upgrade must drop the tombstone table");
         drop(upgraded);
         let _ = std::fs::remove_file(&path);
     }

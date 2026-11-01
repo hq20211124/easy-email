@@ -644,17 +644,12 @@ async fn refresh_folder(
         detail,
     })?;
 
-    // What the user deleted on this machine, read **before** the connection is taken: `user.db` and
-    // `cache.db` are separate files, and the driver is handed the answer rather than reaching for it
-    // (`design/07` §14.9). Reading it here also means one query per folder refresh, not one per page.
-    let tombstones = state.user.tombstones(&cfg.id, mailbox).map_err(failed)?;
-
     // The driver is built *inside* the block, which matters twice over: the block runs more than
     // once for the pool's retry, and rebuilding the driver is what makes a retry safe —
     // `SyncDriver::start` re-reads the cursor, so a half-applied first attempt is simply resumed.
     // Everything here works in `mail_core::Result`, so `?` maps nothing.
     let outcome = pool_op!(pool, cfg, &password, |client| {
-        let mut driver = SyncDriver::start(cache, &cfg.id, &info, &tombstones)?;
+        let mut driver = SyncDriver::start(cache, &cfg.id, &info)?;
         loop {
             let page = driver.execute(&mut client).await?;
             if let Some(outcome) = driver.absorb(cache, &page)? {
@@ -666,7 +661,7 @@ async fn refresh_folder(
     .map_err(failed)?;
 
     log_line(&format!(
-        "[easy-email] 同步 {}：新增 {} 封，缓存共 {} 封{}{}",
+        "[easy-email] 同步 {}：新增 {} 封，缓存共 {} 封{}",
         mailbox,
         outcome.fetched,
         outcome.total_cached,
@@ -674,17 +669,6 @@ async fn refresh_folder(
             "（服务器重新编号，已重建）"
         } else {
             ""
-        },
-        // A deleted message the server still lists is not a failure and not a new mail: it is the
-        // tombstone doing its job. Saying the number is what keeps "17 fetched, 16 shown" from
-        // looking like a bug in the log six months from now.
-        if outcome.hidden_by_tombstone > 0 {
-            format!(
-                "，另有 {} 封已在本机删除、未写回",
-                outcome.hidden_by_tombstone
-            )
-        } else {
-            String::new()
         }
     ));
     Ok(outcome)
@@ -1006,13 +990,6 @@ async fn backfill_to_window(
         budget.max_bytes = remaining.max(0) as u64;
     }
 
-    // A walk backwards re-fetches pages the user may already have deleted from: without this, one
-    // click on 加载更多 puts a deleted message back in the list (`design/07` §14.9).
-    let tombstones = state
-        .user
-        .tombstones(&account_id, &mailbox)
-        .map_err(describe)?;
-
     let report = pool_op!(&state.pool, &cfg, &password, |client| {
         backfill_older(
             &mut client,
@@ -1022,7 +999,6 @@ async fn backfill_to_window(
             window,
             budget,
             now_seconds(),
-            &tombstones,
         )
         .await
     })
@@ -1397,13 +1373,6 @@ async fn refresh_thread_keys(
     // A few pages rather than one: the newest page covers what is on screen, and the pages below it
     // are where a conversation that started weeks ago still has keyless members. Bounded, because
     // every page is a round trip (`design/04`'s budget applies to this too).
-    // Same rule as the backfill: this pass re-reads pages that may contain messages the user has
-    // already deleted here, and re-storing them would resurrect them.
-    let tombstones = state
-        .user
-        .tombstones(&account_id, &mailbox)
-        .map_err(describe)?;
-
     let filled = pool_op!(&state.pool, &cfg, &password, |client| {
         fill_thread_keys(
             &mut client,
@@ -1412,7 +1381,6 @@ async fn refresh_thread_keys(
             &mailbox,
             THREAD_KEY_PAGES,
             mail_core::sync::INITIAL_SYNC,
-            &tombstones,
         )
         .await
     })
@@ -3309,8 +3277,7 @@ async fn pending_replay_pass(app: &AppHandle) -> Result<(), String> {
                                 mail_core::imap::DeleteOutcome::Expunged => Ok(()),
                                 // Flagged, not gone: somebody else has mail flagged in this folder,
                                 // so the folder-wide EXPUNGE is still not ours to run. Reporting it
-                                // as **not done** is what keeps the tombstone (the mark is only
-                                // cleared when a replay succeeds) and keeps the retry alive — and
+                                // as **not done** keeps the retry alive with the shared backoff, and
                                 // it is honest: the user asked for the message to be gone, and it
                                 // is not gone yet.
                                 mail_core::imap::DeleteOutcome::MarkedOnly => {
@@ -3512,34 +3479,28 @@ async fn delete_message(
     let cfg = state.find(&account_id)?;
     let password = secret_for(&state, &cfg).await?;
 
-    // The folder's generation, read **before** anything is removed: a tombstone is only meaningful
-    // inside one generation of a folder, and this is the only moment the cache still knows which one
-    // the user was looking at.
-    let uidvalidity = state
-        .cache
-        .clone()
-        .folder_state(&account_id, &mailbox)
-        .map_err(describe)?
-        .map_or(0, |state| state.uidvalidity);
-
     let outcome = pool_op!(state.pool, &cfg, &password, |client| {
         client.delete_message(&mailbox, uid).await
     });
 
-    // **Whether the server still lists this message decides whether a tombstone is written.**
+    // Two outcomes, and only one of them means "it is gone".
     //
-    //  * `Expunged` — it is gone. A mark would be a lie that outlives the truth, and the 30-day
-    //    sweep would be the only thing to remove it.
-    //  * `MarkedOnly` — a server without UIDPLUS, where somebody else has mail flagged: the message
-    //    is still there, so the next sync would bring it back. This is the exact case §14.9 asks for.
-    //  * Network failure — queued for replay, and still listed. Same reasoning.
+    //  * `Expunged` — removed from the mailbox. Nothing else to do.
+    //  * `MarkedOnly` — a server without UIDPLUS whose folder has somebody else's mail flagged: the
+    //    message is only marked `\Deleted` and is **still on the server**. The follow-up goes on the
+    //    queue (the next pass re-flags and re-checks, and expunges once the set is ours alone), and
+    //    the UI is told the truth rather than 「已删除」.
+    //  * Network failure — same queue, same truth.
+    //
+    // **No tombstone, on purpose** (`design/07` §14.9, decision 2026-11-01). In both of the latter
+    // cases the next sync will list the message again and it will come back into the list. That is
+    // the accepted cost: this is a client, the server is the truth, and the answer to a resurrected
+    // message is to delete it again. Hiding it needed a table, a writer, a clearer, a 30-day expiry
+    // and a gate rule — for a case nobody has reported.
     let mut expunged = false;
-    let mut may_still_be_listed = false;
     match outcome {
         Ok(mail_core::imap::DeleteOutcome::Expunged) => expunged = true,
         Ok(mail_core::imap::DeleteOutcome::MarkedOnly) => {
-            // The folder-wide EXPUNGE was not safe to run, so the follow-up goes on the queue: the
-            // next pass re-flags and re-checks, and expunges once the set is ours alone.
             queue_offline_intent(
                 &state,
                 &account_id,
@@ -3547,7 +3508,6 @@ async fn delete_message(
                 Some(uid),
                 mail_core::userdb::PendingOpKind::Delete,
             )?;
-            may_still_be_listed = true;
         }
         Err(error) => {
             if !error.is_network() {
@@ -3560,24 +3520,6 @@ async fn delete_message(
                 Some(uid),
                 mail_core::userdb::PendingOpKind::Delete,
             )?;
-            may_still_be_listed = true;
-        }
-    }
-
-    if may_still_be_listed {
-        if uidvalidity == 0 {
-            // No generation means no identity for the mark: `Tombstones::hides` would match nothing
-            // (or, worse, everything if it matched on the number alone). Saying nothing is the
-            // honest option — the message may reappear, and that is a visible, explainable failure
-            // rather than a hidden one caused by a guessed number.
-            log_line(&format!(
-                "[easy-email] 删除 {mailbox}/{uid}：文件夹代号未知，不写墓碑（下次同步可能又看到它）"
-            ));
-        } else {
-            state
-                .user
-                .mark_deleted(&account_id, &mailbox, uid, uidvalidity, None, now_secs())
-                .map_err(describe)?;
         }
     }
 
@@ -4422,19 +4364,6 @@ pub fn run() {
                         "[easy-email] 清掉 {swept} 个没有队列行的发件暂存文件"
                     ));
                 }
-            }
-
-            // Tombstones are a **backstop**, not a mechanism: the normal path clears one when the
-            // server confirms the deletion (`pending::replay_pending_ops`). This only exists for the
-            // mark that never gets confirmed — a month offline, an intent the user cancelled, a
-            // folder that no longer exists — so the table cannot grow for ever. Thirty days is the
-            // design's number (`design/07` §14.9), and it is measured from the delete, not from the
-            // last sync: a mark that keeps being useful is a mark the server has not acted on yet,
-            // and expiring it early would put the message back.
-            match user.prune_deleted_marks(now_seconds(), 30 * 24 * 3600) {
-                Ok(0) => {}
-                Ok(n) => log_line(&format!("[easy-email] 清掉 {n} 条超过 30 天的删除标记")),
-                Err(e) => log_line(&format!("[easy-email] 清理删除标记失败：{e}")),
             }
 
             // Rows the old code abandoned — `state = 'sent'` with the spool already gone — are closed

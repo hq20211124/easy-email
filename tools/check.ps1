@@ -1962,18 +1962,19 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
-    Step '墓碑接上生产代码：删掉的信不会被同步带回来' {
-        # `design/07` §14.9。表和四个方法都存在了两轮，**生产代码零调用** —— 于是它们要修的 bug（删了
-        # 又同步回来）一直活着，而且没有测试变红，因为每个测试都是关于存储的，不是关于接线的。这条钉的
-        # 是**调用点**：同步读墓碑、驱动必须收、删信清 sent_index、成功才清标记、空态只说一句。
+    Step '删除路径：墓碑不许回来，指针同事务清，文件夹级 EXPUNGE 先数集合' {
+        # `design/07` §14.9。这一条的前身钉的是「墓碑接上生产代码」；2026-11-01 决定把墓碑整个撤掉
+        # （这是客户端，服务器才是真相），于是同一位置改成钉**撤掉之后仍然不许丢的四条**：墓碑不许被
+        # 重新建出来、`sent_index` 指针随行同事务删、无 UIDPLUS 时先数 `\Deleted` 集合、两种「信还在
+        # 服务器上」都必须排队重试。都是**调用点**，不是定义 —— 这个仓库栽过「表建好了没人调用」。
         if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
             Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
             $global:LASTEXITCODE = 0
             return
         }
-        node tools/tombstone_wiring.mjs 2>&1
+        node tools/delete_path.mjs 2>&1
         if ($LASTEXITCODE -ne 0) {
-            Write-Host '墓碑又变成没人调用的死代码，或者失败时把标记清掉了（信会复活）' -ForegroundColor Red
+            Write-Host '删除路径少了一条：墓碑回来了、指针没清、文件夹级 EXPUNGE 会误删别人的信，或者没排队重试' -ForegroundColor Red
             $global:LASTEXITCODE = 1
             return
         }
