@@ -105,6 +105,16 @@ const state = {
    * every page boundary would then disagree with the count (`design/07` §14.5 D5).
    */
   sentTab: 'all',
+  /**
+   * Settled-send state per UID for the page on screen, in 「已发送」 only.
+   *
+   * `Map<uid, {state, hasCopy}>`. Read from `user.db` once per page (`design/07` §14.5 D2): a row in
+   * this folder looks the same whether the copy is on the server or this machine is the only place
+   * it exists, and that difference is the whole question a sent list raises.
+   */
+  sentStates: new Map(),
+  /** The UIDs `sentStates` was fetched for, so a repaint does not re-ask. */
+  sentStatesKey: '',
   /** The sync window the user chose; `null` until it has been read. */
   syncWindow: null,
   /**
@@ -437,6 +447,9 @@ async function wirePushEvents() {
   await listen('sent-state-changed', () => {
     refreshOutbox();
     if (state.view === 'mail' && state.sentTab === 'all' && looksLikeSentFolder(state.mailbox)) {
+      // The rows themselves may not have moved, but their *state* just did: a copy landed, or a send
+      // was settled for good. Dropping the key is what makes the next paint ask again.
+      state.sentStatesKey = '';
       loadMessages({ reset: false, refresh: false });
     }
   });
@@ -2021,6 +2034,41 @@ async function selectSentTab(tab) {
   }
 }
 
+/**
+ * Read the settled-send state for the page on screen, once per page.
+ *
+ * Only 「已发送」 has anything to say here: every other folder's rows were never sent by this machine,
+ * so asking would return nothing and cost a round trip. The key is the UID list, which is what makes
+ * a repaint (selection, fold, theme) free and a page change (scroll, folder) a single query.
+ */
+async function loadSentStates() {
+  if (state.view !== 'mail' || !looksLikeSentFolder(state.mailbox)) return;
+  const uids = state.messages.map((message) => message.uid);
+  if (uids.length === 0) return;
+
+  const key = `${state.accountId}|${state.mailbox}|${uids.join(',')}`;
+  if (key === state.sentStatesKey) return;
+  state.sentStatesKey = key;
+
+  const rows = await invoke('sent_states', {
+    accountId: state.accountId,
+    folder: state.mailbox,
+    uids,
+  }).catch(() => null);
+
+  // A failed read must leave the list alone and allow a retry: clearing the key is what makes the
+  // next render ask again instead of remembering "we already tried" for ever.
+  if (rows === null) {
+    state.sentStatesKey = '';
+    return;
+  }
+
+  const next = new Map();
+  for (const row of rows) next.set(row.uid, { state: row.state, hasCopy: row.has_copy });
+  state.sentStates = next;
+  renderMessages({ keepScroll: true });
+}
+
 function renderOutbox(list, { tab = false } = {}) {
   $('list-footer').hidden = true;
 
@@ -2531,6 +2579,9 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
     state.historyDone = false;
     // And 「已发送」 opens on the cache half: the queue is something the user asks for by name.
     state.sentTab = 'all';
+    // The per-row state is keyed by UID, and a UID means a different message in every folder.
+    state.sentStates = new Map();
+    state.sentStatesKey = '';
     renderHistoryButton();
     renderReader();
   }
@@ -2560,6 +2611,9 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
   if (cacheShown) {
     state.messages = cached.slice();
     renderMessages();
+    // 「已发送」 rows carry a state the cache does not hold, so the page is decorated from `user.db`
+    // right after it is painted — the list itself never waits for it (`design/07` §14.5 D2).
+    void loadSentStates();
   }
 
   if (!refresh) {
@@ -2619,6 +2673,9 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
   // sort. It also fought the paging below, which appends the backend's order rather than re-sorting.
   state.messages = messages.slice();
   renderMessages();
+  // Same decoration as the cache paint above: a fresh page of 「已发送」 still needs `user.db` to say
+  // which rows have their copy on the server.
+  void loadSentStates();
   // Tell the user whether this list is fresh or cached, and why. The refresh just ran, so this is
   // the one moment the answer is current; doing it before the list would paint a stale banner over
   // a fresh one.
@@ -2794,6 +2851,9 @@ function conversationRows(conversations) {
       // subject is how a list starts lying about what needs attention.
       unread: conversation.messages.some((entry) => !entry.seen),
       folded,
+      // The newest message's record speaks for the row (`design/07` §14.5 D2). A conversation made
+      // of several sends shows the last one's answer, which is the one the user is asking about.
+      sentState: state.sentStates.get(message.uid) ?? null,
     });
     if (folded) {
       // The rest of the conversation, oldest last. Each is a real row the user can open: a fold that
@@ -2807,6 +2867,22 @@ function conversationRows(conversations) {
 }
 
 /** Build one conversation row. The same markup as before windowing, per row. */
+/**
+ * 「副本已归档 / 仅本地记录」 for one row, or nothing.
+ *
+ * Two facts look identical in a list read from the cache: "the server holds this copy" and "this
+ * machine is the only place it exists". Naming which one it is, on the row, is the difference
+ * between a list that answers "did it go?" and one that makes the user open every message
+ * (`design/07` §14.5 D2).
+ */
+function sentStateChip(sentState) {
+  if (!sentState) return '';
+  if (sentState.hasCopy) {
+    return '<span class="msg-sent-state" title="服务器上的副本已归档">副本已归档</span>';
+  }
+  return '<span class="msg-sent-state local" title="服务器上没有这封信的副本，只在这台电脑上">仅本地记录</span>';
+}
+
 function buildConversationRow(row) {
   const { message, extra, unread, folded } = row;
   const button = document.createElement('button');
@@ -2836,7 +2912,7 @@ function buildConversationRow(row) {
     </div>
     <div class="msg-subject">${escapeHtml(message.subject)}${
       extra > 0 ? `<span class="msg-count" title="这个会话里的邮件数">${extra + 1}</span>` : ''
-    }</div>`;
+    }${sentStateChip(row.sentState)}</div>`;
 
   // The caret toggles the fold; the rest of the row opens the newest message. Keeping those two
   // apart matters: "read the newest" is what a click on a row means everywhere else in the app.

@@ -1189,6 +1189,52 @@ async fn list_outbox(
         .map_err(describe)
 }
 
+/// Which rows of one 「已发送」 page have a settled record, and how it ended.
+///
+/// One call per page, keyed on the page's own `(folder, uid)` (`design/07` §14.5 D2). The renderer
+/// needs it to answer the only question that row raises: "is this copy on the server, or is this
+/// machine the only place it exists?" — the two cases look identical in a list read from the cache.
+#[derive(serde::Serialize)]
+struct SentRowState {
+    uid: u32,
+    /// `sent` / `failed` / `needs_attention` / `cancelled`.
+    state: String,
+    /// True when the copy really is in the folder being listed; false when the record says the
+    /// server has no copy of this message at all.
+    has_copy: bool,
+}
+
+#[tauri::command]
+async fn sent_states(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    uids: Vec<u32>,
+) -> Result<Vec<SentRowState>, String> {
+    // The page's own folder generation, so a record written for an older generation of the same
+    // folder is not read as "the copy is here" (`design/07` §14.4 D0a). `0` = the server has never
+    // told us, which also cannot confirm anything.
+    let generation = state
+        .cache
+        .folder_state(&account_id, &folder)
+        .ok()
+        .flatten()
+        .map(|folder| folder.uidvalidity)
+        .unwrap_or(0);
+    let rows = state
+        .user
+        .sent_states(&account_id, &folder, &uids, generation)
+        .map_err(describe)?;
+    Ok(rows
+        .into_iter()
+        .map(|(uid, state, has_copy)| SentRowState {
+            uid,
+            state,
+            has_copy,
+        })
+        .collect())
+}
+
 /// Call a queued send back. False means it was already on its way — the UI says so rather than
 /// pretending the message was stopped (`design/07` §5.2).
 #[tauri::command]
@@ -4443,6 +4489,7 @@ pub fn run() {
             retry_send,
             discard_outbox,
             sent_copy,
+            sent_states,
             load_more_messages,
             fetch_message,
             mark_seen,

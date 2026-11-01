@@ -909,6 +909,27 @@ textarea {
   color: var(--accent);
 }
 
+/* 「副本已归档 / 仅本地记录」 on a row of 「已发送」 (`design/07` §14.5 D2). Small and right-aligned:
+   it is an answer to a question the user only asks when they go looking, so it must not compete with
+   the subject — but it must be readable without opening the message. */
+.msg-sent-state {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-muted);
+  background: var(--surface-2, var(--bg-soft));
+  border: 1px solid var(--border);
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+.msg-sent-state.local {
+  color: var(--text-muted);
+  border-style: dashed;
+}
+
 /* 「已发出，副本待归档 (m)」: a fact that belongs to neither tab's list, so it sits above the rows as
    a line rather than pretending to be a row (it has no uid, no date order, and no reader). */
 .outbox-awaiting {

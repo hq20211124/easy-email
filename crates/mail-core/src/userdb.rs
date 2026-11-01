@@ -2024,6 +2024,59 @@ impl UserStore {
         Ok(n as u32)
     }
 
+    /// Which of these messages have a settled record, by UID: `(uid, state, has_copy)`.
+    ///
+    /// The list asks once per page (`design/07` §14.5 D2) and never per row: fifty round trips to
+    /// SQLite to decorate fifty rows would be the same mistake the message list already paid for.
+    ///
+    /// **Filtered here rather than with an `IN (?,?,…)` clause.** This table holds one row per
+    /// message the account ever sent — thousands at worst, and it is read at human speed — so a scan
+    /// of it costs less than generating SQL with fifty placeholders. If it ever grows into a table
+    /// that needs the index, this is the line to revisit.
+    pub fn sent_states(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uids: &[u32],
+        folder_uidvalidity: u32,
+    ) -> Result<Vec<(u32, String, bool)>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: std::collections::HashSet<u32> = uids.iter().copied().collect();
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        // `folder = ''` is the "settled, but there is no copy" record (`design/07` §14.6.1), and it
+        // is the half that makes 「仅本地记录」 possible: without it, a row with no record and a row
+        // that is known to have no copy would look the same.
+        let mut stmt = conn.prepare(
+            "select uid, folder, uidvalidity, state from sent_records
+              where account_id = ?1 and uid is not null and (folder = ?2 or folder = '')",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![account_id, folder], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u32,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u32,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (uid, copy_folder, recorded_generation, state) = row?;
+            if !wanted.contains(&uid) {
+                continue;
+            }
+            // **A UID only means this message inside one generation of the folder.** If either side
+            // is unknown (`0`), or the two disagree, the row is not labelled at all: saying nothing
+            // is the honest answer, and claiming 「副本已归档」 on a recycled number is exactly the
+            // mistake `sent_index.uidvalidity` was added to prevent (`design/07` §14.4 D0a).
+            let confirmed = recorded_generation != 0 && recorded_generation == folder_uidvalidity;
+            out.push((uid, state, copy_folder == folder && confirmed));
+        }
+        Ok(out)
+    }
+
     /// Leftovers for the settle step (⓿): `state = 'sent'` rows whose spool is already gone.
     ///
     /// These are the rows the old code abandoned. `sent_awaiting_copy` cannot see them (it requires a
@@ -4105,6 +4158,64 @@ mod tests {
             1
         );
         assert!(!store.is_deleted("t", "INBOX", 7, 900).expect("read"));
+    }
+
+    /// The page query behind the row labels (`design/07` §14.5 D2).
+    ///
+    /// Three answers have to stay distinct: *archived* (a copy is in this folder), *local only* (a
+    /// record exists and says the server has no copy), and *no record at all* — which is every
+    /// message sent before this feature, and must not be labelled as either.
+    #[test]
+    fn the_page_query_separates_archived_copies_from_local_only_records() {
+        let store = store();
+        store
+            .insert_sent_record(&settled("<a@x>"))
+            .expect("archived");
+
+        let mut local = settled("<b@x>");
+        local.folder = String::new();
+        local.uid = Some(227);
+        store.insert_sent_record(&local).expect("local only");
+
+        let rows = store
+            .sent_states("t", "Sent Messages", &[226, 227, 999], 900)
+            .expect("states");
+        assert_eq!(rows.len(), 2, "999 has no record and must not be invented");
+        assert!(
+            rows.iter()
+                .any(|(uid, state, copy)| *uid == 226 && *copy && state == "sent"),
+            "226 has its copy in this folder: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(uid, state, copy)| *uid == 227 && !*copy && state == "sent"),
+            "227 is a real send with no copy: {rows:?}"
+        );
+
+        // A page from another folder gets nothing, even though the message ids match: a UID means a
+        // different message in every folder, which is why the folder is part of the question.
+        assert!(
+            store
+                .sent_states("t", "INBOX", &[226], 900)
+                .expect("states")
+                .is_empty()
+        );
+
+        // A different folder generation is not a match: the same UID can point at another message,
+        // so the row comes back (it is still a send) but never as "the copy is here".
+        let rebuilt = store
+            .sent_states("t", "Sent Messages", &[226], 4242)
+            .expect("states");
+        assert!(
+            rebuilt.iter().all(|(_, _, copy)| !*copy),
+            "a changed generation must not claim the copy is archived: {rebuilt:?}"
+        );
+
+        // And "unknown on either side" is not a match either.
+        let unknown = store
+            .sent_states("t", "Sent Messages", &[226], 0)
+            .expect("states");
+        assert!(unknown.iter().all(|(_, _, copy)| !*copy));
     }
 
     /// A file written by v4 gains both tables on open, and its existing rows are untouched.
