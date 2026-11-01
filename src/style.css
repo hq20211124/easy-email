@@ -1951,6 +1951,23 @@ textarea {
   line-height: 1.7;
 }
 
+/*
+  The line under an empty list that says why it is empty (`design/07` §14.8).
+
+  Smaller and closer to the text above than `.empty` is, because it is a footnote to that sentence
+  rather than a second statement — and muted, because it is a fact about this machine, not an error.
+  No border and no background: it must not read as a banner, which is what the sync notice already
+  looks like, and two things that look like alerts in one pane is one too many.
+*/
+.empty-note {
+  padding: 0 18px 24px;
+  margin-top: -12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: 0.85;
+}
+
 .spinner {
   display: inline-block;
   width: 13px;

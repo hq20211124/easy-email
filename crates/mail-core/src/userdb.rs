@@ -346,6 +346,51 @@ impl PendingOp {
     }
 }
 
+/// The tombstones for one folder, as a value a sync can carry.
+///
+/// **This is the whole point of `deleted_marks`:** a message the user deleted must not come back the
+/// next time the server mentions it. Before this type the table and its four methods existed and
+/// nothing called them, so the resurrection bug was alive and well — the storage was there, the
+/// decision was not (`design/07` §14.9).
+///
+/// It is a set of `(uid, generation)` pairs rather than a set of UIDs because a UID only identifies a
+/// message *inside one generation of a folder*. `hides` takes the generation the page came back with,
+/// so a folder the server renumbered silently voids every mark in it — precisely, and without a
+/// timer. A mark stored with generation `0` ("we did not know") matches nothing: the same rule
+/// `sent_index.uidvalidity` follows, for the same reason (`design/07` §14.4 D0a).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tombstones {
+    marks: Vec<(u32, u32)>,
+}
+
+impl Tombstones {
+    /// No marks — what a folder with no deletions has, and what a test that does not care passes.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn from_marks(marks: Vec<(u32, u32)>) -> Self {
+        Self { marks }
+    }
+
+    /// Would a page from generation `uidvalidity` be showing a message the user deleted?
+    pub fn hides(&self, uid: u32, uidvalidity: u32) -> bool {
+        uidvalidity != 0
+            && self
+                .marks
+                .iter()
+                .any(|&(u, v)| u == uid && v == uidvalidity)
+    }
+
+    pub fn len(&self) -> usize {
+        self.marks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.marks.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod kind_tests {
     use super::*;
@@ -2099,6 +2144,35 @@ impl UserStore {
     }
 
     // ------------------------------------------------------------------ tombstones (v5)
+
+    /// Every tombstone this account holds for one folder, ready to hand to a sync.
+    ///
+    /// **Read as a set, not as a query per message.** A sync page is up to five hundred rows, and
+    /// asking "was this one deleted?" five hundred times is five hundred trips to a different
+    /// database file — the same mistake `sent_states` was written to avoid. The set is small (one
+    /// entry per message the user deleted and the server has not confirmed yet).
+    ///
+    /// The generation travels with each mark rather than being filtered here: the folder's current
+    /// `UIDVALIDITY` is only authoritative **when the page comes back** (`HeaderPage.uidvalidity`),
+    /// and comparing before that would mean trusting the cache's copy of a number the server is
+    /// about to correct. A mark whose generation differs — or is `0` — simply never matches
+    /// (`Tombstones::hides`), which is how "the folder was rebuilt, the mark is void" happens
+    /// without a single delete.
+    pub fn tombstones(&self, account_id: &str, folder: &str) -> Result<Tombstones> {
+        let guard = self.db.read_guard();
+        let conn: &Connection = &guard;
+        let mut stmt = conn.prepare(
+            "select uid, uidvalidity from deleted_marks where account_id = ?1 and folder = ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![account_id, folder], |row| {
+            Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32))
+        })?;
+        let mut marks = Vec::new();
+        for row in rows {
+            marks.push(row?);
+        }
+        Ok(Tombstones::from_marks(marks))
+    }
 
     /// Remember that the user deleted this message here, so the next sync does not bring it back.
     ///
@@ -4158,6 +4232,43 @@ mod tests {
             1
         );
         assert!(!store.is_deleted("t", "INBOX", 7, 900).expect("read"));
+    }
+
+    /// The read side a sync actually uses: one query, a value it can carry across an `await`.
+    #[test]
+    fn the_folder_snapshot_carries_every_mark_and_its_generation() {
+        let store = store();
+        store
+            .mark_deleted("t", "INBOX", 5, 900, None, 1)
+            .expect("mark");
+        store
+            .mark_deleted("t", "INBOX", 6, 900, None, 2)
+            .expect("mark");
+        // A different folder, and a different account: neither belongs in this snapshot.
+        store
+            .mark_deleted("t", "Sent", 7, 900, None, 3)
+            .expect("mark");
+        store
+            .mark_deleted("other", "INBOX", 8, 900, None, 4)
+            .expect("mark");
+
+        let marks = store.tombstones("t", "INBOX").expect("snapshot");
+        assert_eq!(marks.len(), 2);
+        assert!(marks.hides(5, 900));
+        assert!(marks.hides(6, 900));
+        assert!(!marks.hides(7, 900), "another folder's mark is not ours");
+        assert!(
+            !marks.hides(5, 901),
+            "the same number in another generation is another message"
+        );
+
+        assert!(
+            store
+                .tombstones("t", "Archive")
+                .expect("snapshot")
+                .is_empty(),
+            "a folder with no deletions must cost nothing to check"
+        );
     }
 
     /// The page query behind the row labels (`design/07` §14.5 D2).

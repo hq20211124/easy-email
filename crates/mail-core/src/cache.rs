@@ -1409,6 +1409,11 @@ impl Cache {
     }
 
     /// Remove a message (deleted or moved) from the cache.
+    ///
+    /// **`sent_index` goes with it.** That table is a pointer from a `Message-ID` to "the copy we
+    /// filed at `(folder, uid)`", and the 「查看副本」 link follows it. Leaving the row behind after
+    /// the message is gone gives the user a link to an empty row — a dangling pointer that looks
+    /// like a working one, which is worse than no link at all (`design/07` §14.9).
     pub fn delete_message(&self, account_id: &str, folder: &str, uid: u32) -> Result<()> {
         let account_id = account_id.to_string();
         let folder = folder.to_string();
@@ -1428,6 +1433,13 @@ impl Cache {
             )?;
             conn.execute(
                 "delete from bodies where account_id = ?1 and folder = ?2 and uid = ?3",
+                params![account_id, folder, i64::from(uid)],
+            )?;
+            // Same transaction, same folder+uid: the pointer cannot outlive what it points at.
+            // Scoped to this account on purpose — two accounts can file the same `Message-ID`
+            // (a forward, a shared alias), and each has its own copy.
+            conn.execute(
+                "delete from sent_index where account_id = ?1 and folder = ?2 and uid = ?3",
                 params![account_id, folder, i64::from(uid)],
             )?;
             Ok(())
@@ -3988,6 +4000,56 @@ mod tests {
             .expect("present");
         assert_eq!(found.uid, None);
         assert_eq!(found.folder, "Sent Messages");
+    }
+
+    /// Deleting a message must take its `sent_index` pointer with it (`design/07` §14.9).
+    ///
+    /// The pointer is what 「查看副本」 follows. Left behind, it survives the message and offers a link
+    /// to a row that no longer exists — a dangling pointer that looks like a working one, which is
+    /// worse than offering nothing at all.
+    #[test]
+    fn deleting_a_message_removes_the_pointer_to_its_sent_copy() {
+        let cache = Cache::open_in_memory().expect("open");
+        cache
+            .upsert_summaries("acc", "Sent Messages", &[summary(226, "回执", "a@b.c", 1)])
+            .expect("store");
+        cache
+            .record_sent_copy("acc", "<copy@x>", "Sent Messages", Some(226), 900, 10)
+            .expect("record");
+        assert!(cache.sent_copy("acc", "<copy@x>").expect("read").is_some());
+
+        cache
+            .delete_message("acc", "Sent Messages", 226)
+            .expect("delete");
+
+        assert_eq!(
+            cache.sent_copy("acc", "<copy@x>").expect("read"),
+            None,
+            "the pointer must not outlive the row it points at"
+        );
+        assert_eq!(
+            cache.summary_count("acc", "Sent Messages").expect("count"),
+            0
+        );
+    }
+
+    /// ...but only for the folder it belongs to: another folder's copy of the same `Message-ID` is a
+    /// different copy, filed under a different UID.
+    #[test]
+    fn deleting_one_copy_leaves_another_folders_pointer_alone() {
+        let cache = Cache::open_in_memory().expect("open");
+        cache
+            .record_sent_copy("acc", "<copy@x>", "Sent Messages", Some(226), 900, 10)
+            .expect("record");
+
+        cache
+            .delete_message("acc", "INBOX", 226)
+            .expect("delete a different message with the same number");
+
+        assert!(
+            cache.sent_copy("acc", "<copy@x>").expect("read").is_some(),
+            "a UID only means something inside one folder"
+        );
     }
 
     /// `design/07` §14.4 D0a: a v10 cache gains `sent_index.uidvalidity`, and the rows it already

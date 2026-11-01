@@ -2755,6 +2755,8 @@ function renderMessages({ keepScroll = false } = {}) {
     state.listWindow = null;
     state.listWindowRows = null;
     $('list-footer').hidden = true;
+    // 已发送 是唯一一个「缓存里空着」和「本机有记录」可以同时成立的地方 (`design/07` §14.8).
+    noteSentRecordsOnEmpty(list);
     return;
   }
 
@@ -3998,6 +4000,43 @@ function buildSandboxedDocument(html, allowRemoteImages) {
 </head><body>${html}</body></html>`;
 }
 
+/*
+  「已发送」空着，但本机明明记着发过信 (`design/07` §14.8).
+
+  A cache wipe empties the list while `user.db` still holds one settled record per message sent from
+  this machine — and an empty table saying nothing is how a user concludes the app lost their mail.
+  So the empty state gets one small line. It is a **hint, not a list source**: the number never enters
+  paging, sorting or the pending count, because a second source for rows is the two-source merge the
+  design rejected.
+
+  Three guards, all of them about a race the user can create by switching folders while the answer is
+  in flight: the account and folder must be the same ones asked about, the list must still be empty,
+  and the empty state must still be the thing on screen.
+*/
+async function noteSentRecordsOnEmpty(list) {
+  if (!state.accountId || !looksLikeSentFolder(state.mailbox)) return;
+  const accountId = state.accountId;
+  const folder = state.mailbox;
+
+  // Deliberately **not** through `run()`: that one reports every failure as a toast, and a hint that
+  // could not be read is not an error the user has to deal with. The empty state simply says less.
+  let count = 0;
+  try {
+    count = await invoke('sent_record_count', { accountId });
+  } catch {
+    return;
+  }
+  if (!count) return;
+  if (state.accountId !== accountId || state.mailbox !== folder) return;
+  if (state.messages.length !== 0 || state.sentTab === 'pending') return;
+  if (!list.querySelector('.empty')) return;
+
+  const note = document.createElement('div');
+  note.className = 'empty-note';
+  note.textContent = `本机记录显示有 ${count} 封已发送（服务器副本未同步）。`;
+  list.appendChild(note);
+}
+
 /* ---------------------------------------------------------------- message actions */
 
 async function deleteSelected() {
@@ -4008,17 +4047,23 @@ async function deleteSelected() {
   const message = state.selectedMessage;
   if (!confirm(`删除这封邮件？\n\n${message ? message.subject : ''}`)) return;
 
-  const ok = await run('删除邮件', async () => {
-    await invoke('delete_message', {
+  // The command answers with **what actually happened on the server**, not just "ok". On a server
+  // without UIDPLUS whose folder has somebody else's mail flagged, the message is only marked
+  // `\Deleted`; saying 「邮件已删除」 there would be a lie the next sync exposes (`design/07` §14.9).
+  const report = await run('删除邮件', () =>
+    invoke('delete_message', {
       accountId: state.accountId,
       mailbox: state.selectedFolder,
       uid: state.selectedUid,
-    });
-    return true;
-  });
+    })
+  );
 
-  if (ok) {
-    toast('邮件已删除', 'ok');
+  if (report) {
+    if (report.expunged) {
+      toast('邮件已删除', 'ok');
+    } else {
+      toast('已标记删除，服务器清理时生效（本机已不再显示）', 'info', 9000);
+    }
     state.messages = state.messages.filter(
       (m) => !(m.uid === state.selectedUid && state.selectedFolder === state.mailbox)
     );

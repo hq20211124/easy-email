@@ -802,7 +802,8 @@ settle_sent_row(outbox_row):
  4. 侧栏 IA（`12` §16）                                    纯展示层，可与 -1..1 并行（见 `12` §16.5）
 ```
 
-**当前进度（2026-11-01）**：-1、0、1、2a、3 全部完成；只剩 4（侧栏 IA）。
+**当前进度（2026-11-01）**：-1、0、1、2a、3、4 全部完成；§14.9 的墓碑接线与两处删除细节也已落地
+（第 113 轮），剩下的未做项在 §14.11 里逐条标着（`settle_sent_row` 幂等断言、`move_message` 的墓碑路径）。
 2b 因诊断结论为 A 而**永久关闭**，除非哪天在别的服务商上又看到"服务器说有、我们这边没有"。
 
 **3b 的落地细节**：`sent_states(accountId, folder, uids)` 一次问一页（≤50），由 `user.db` 的
@@ -843,8 +844,9 @@ settle_sent_row(outbox_row):
 - [ ] 结案（v5 新增）：造一条 `failed` + spool 为空的 outbox 行 ⇒ 走「删除这条记录」⇒ `count(outbox)` 减一，`n` 归零，**且不写 `sent_records`**（它从来没发出去，不是"已发送"）。**未做**：后端 `delete_outbox` 已在，缺的是界面上的那个出口（第 3 步）。
 - [ ] 幂等：同一 Message-ID 归档两次，`messages` 仍只有一行、`sent_index` 仍只有一行；`settle_sent_row` 连跑两次，`folder` 不被第二次调用改回 `''`。
 - [ ] **分支 C 专属**：`message_id` 非空行数 ≥ `sent_index` 行数；`sent_index` 每行都能在 `messages` 找到 `(folder, uid)`；判等三结局三条单测；`seen` 权威（D3 写 1 后跑一轮同步 ⇒ 本地变 0，**断言这是期望行为**）；`summarise()` 产出的摘要带 `message_id` 与 `to_addrs`（loopback 断言非空）。
-- [ ] 墓碑：离线删除 ⇒ 跑一轮同步 ⇒ 行**没有**回来；`uidvalidity` 变了 ⇒ 墓碑失效、行可以回来；`pending_op` 成功后标记被删；**清空 cache 后墓碑仍在**（它在 `user.db`）。
-- [ ] `sent_index` 清理：删除后 `sent_copy(account, message_id)` 返回 `None`。
+- [x] 墓碑（**2026-11-01 已做，第 113 轮**）：同步读墓碑并在写之前过滤（`a_message_deleted_here_does_not_come_back_when_the_server_still_lists_it`，同时钉住「游标必须越过被隐藏的那封」）；还在缓存里的残留行会被同一轮删掉（`a_row_that_outlived_its_tombstone_is_removed_by_the_next_sync`）；`uidvalidity` 变了 ⇒ 墓碑失效、行可以回来（`a_mark_stops_matching_when_the_folder_is_renumbered`）；`pending_op` 成功后标记被删、失败时**保留**（`a_confirmed_delete_clears_its_tombstone_and_a_failed_one_keeps_it`），且只有 `Delete` 能清（`a_confirmed_flag_change_does_not_clear_a_tombstone`）；**清空 cache 后墓碑仍在**由门禁钉住（`deleted_marks` 不许出现在 `cache.rs`）。
+- [x] `sent_index` 清理（**2026-11-01 已做**）：删除后 `sent_copy(account, message_id)` 返回 `None`（`deleting_a_message_removes_the_pointer_to_its_sent_copy`），且别的文件夹同号的那条不受影响（`deleting_one_copy_leaves_another_folders_pointer_alone`）。
+- [x] 无 UIDPLUS 的 `EXPUNGE`（**2026-11-01 已做**）：先数 `\Deleted` 集合，只有恰好等于目标才 EXPUNGE；否则 `MarkedOnly`、界面如实说、补 EXPUNGE 进 `pending_ops`（loopback：`delete_leaves_someone_elses_deleted_mail_alone`）。
 - [x] spool 孤儿（2026-11-01）：无引用且 25 h 前的文件被删；1 h 前的**不**被删；引用中的文件与非 `.eml` 文件都不动（`the_sweep_removes_only_old_unreferenced_files`）。
 - [ ] **变异测试**（去掉即必须变红）：去掉墓碑；去掉 `message_id` 判等（分支 C）；把 `coalesce` 改回赋值；把 ④ 移到 ② 之前；去掉 ⓿ 兜底搬移；**把 `settle_sent_row` 第 2 步（查 `sent_index`）删掉**；把 `deleted_marks` 放回 `cache.db`（清缓存后行复活 ⇒ 红）。
 

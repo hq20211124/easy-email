@@ -345,6 +345,21 @@ fn id_command() -> String {
     )
 }
 
+/// What one `delete_message` actually achieved on the server.
+///
+/// The two outcomes are **not** the same user-visible fact, and the difference is invisible to a
+/// caller that only gets `Ok(())`: `Expunged` means the message is gone; `MarkedOnly` means it is
+/// flagged `\Deleted` and will disappear when the server cleans up — or when our own retry runs.
+/// A caller that treats the second as the first leaves the message on the server, and the next sync
+/// puts it back in the list (`design/07` §14.9, the no-UIDPLUS row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// Removed from the mailbox.
+    Expunged,
+    /// Flagged `\Deleted` only. The folder-wide `EXPUNGE` was not safe to run.
+    MarkedOnly,
+}
+
 /// An authenticated IMAP connection.
 pub struct ImapClient {
     session: Session<Transport>,
@@ -1151,13 +1166,22 @@ impl ImapClient {
         Ok(())
     }
 
-    /// Mark one message `\Deleted` and expunge just that message.
+    /// Mark one message `\Deleted` and expunge it — exactly it, or not at all.
     ///
     /// `UID EXPUNGE` (RFC 4315) removes only the given UID. A plain `EXPUNGE` would also destroy
     /// anything else already flagged `\Deleted` — by the user, or by another client — which is a
     /// destructive surprise. So the precise form is used whenever the server advertises UIDPLUS,
     /// which is decided by capability rather than by trial and error (see `uidplus`).
-    async fn flag_deleted_and_expunge(&mut self, uid: u32) -> Result<()> {
+    ///
+    /// **Without UIDPLUS, `EXPUNGE` is folder-wide and the decision is not ours to make quietly.**
+    /// The old code called it anyway: deleting one message in a folder where another client had
+    /// flagged something would permanently destroy that something, and the user would never know
+    /// which action did it (`design/07` §14.9). So the folder's `\Deleted` set is counted first,
+    /// and the plain `EXPUNGE` runs **only when that set is exactly the message we just flagged**.
+    /// Otherwise the message stays flagged and the caller is told, because "it will go away when the
+    /// server cleans up" is true and "it is gone" is not — and the follow-up is queued as a retry
+    /// (`PendingOpKind::Delete`), so it is not a promise nobody keeps.
+    async fn flag_deleted_and_expunge(&mut self, uid: u32) -> Result<DeleteOutcome> {
         self.session
             .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
             .await
@@ -1167,10 +1191,19 @@ impl ImapClient {
             .map_err(imap_err)?;
 
         if self.uidplus {
-            self.expunge_uid(uid).await
-        } else {
-            self.expunge_all().await
+            self.expunge_uid(uid).await?;
+            return Ok(DeleteOutcome::Expunged);
         }
+
+        // `SEARCH DELETED` takes no range, so this is one of the few searches whose answer cannot be
+        // affected by the server's range interpretation (`design/07` §14.3 branch A).
+        let flagged: std::collections::HashSet<u32> =
+            self.session.uid_search("DELETED").await.map_err(imap_err)?;
+        if flagged.len() == 1 && flagged.contains(&uid) {
+            self.expunge_all().await?;
+            return Ok(DeleteOutcome::Expunged);
+        }
+        Ok(DeleteOutcome::MarkedOnly)
     }
 
     /// Expunge exactly one UID. Only valid on servers that advertise UIDPLUS.
@@ -1193,7 +1226,11 @@ impl ImapClient {
     }
 
     /// Permanently delete one message.
-    pub async fn delete_message(&mut self, mailbox: &str, uid: u32) -> Result<()> {
+    ///
+    /// The return value matters: on a server without UIDPLUS, `MarkedOnly` means the message is
+    /// flagged `\Deleted` but **still on the server** — the caller must keep its tombstone and queue
+    /// the follow-up, or the next sync brings the message back into the list.
+    pub async fn delete_message(&mut self, mailbox: &str, uid: u32) -> Result<DeleteOutcome> {
         timed(async {
             self.select_to(mailbox).await?;
             self.flag_deleted_and_expunge(uid).await
@@ -1255,6 +1292,12 @@ impl ImapClient {
     }
 
     /// Move a message to another mailbox (used for "Move to Trash").
+    ///
+    /// The outcome of the expunge is **discarded here, and that is a known gap**: on a server without
+    /// UIDPLUS where somebody else has mail flagged, the source copy stays flagged `\Deleted` and
+    /// visible, and the next sync puts it back in the source folder. `delete_message` handles that
+    /// case (the caller keeps a tombstone and queues a retry); a move has no such path yet. Recorded
+    /// in `PROGRESS.md` rather than silently pretended away.
     pub async fn move_message(&mut self, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
         timed(async {
             self.select_to(mailbox).await?;
@@ -1262,7 +1305,7 @@ impl ImapClient {
                 .uid_copy(uid.to_string(), dest)
                 .await
                 .map_err(imap_err)?;
-            self.flag_deleted_and_expunge(uid).await
+            self.flag_deleted_and_expunge(uid).await.map(|_| ())
         })
         .await
     }

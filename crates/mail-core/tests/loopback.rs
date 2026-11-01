@@ -24,7 +24,7 @@ use mail_core::smtp;
 use mail_core::{
     AccountConfig, Cache, ConnectionPool, Credential, Draft, DraftMirror, Endpoint, ImapClient,
     MailboxInfo, MessageSummary, NewOutbox, OutboxRun, OutgoingAttachment, OutgoingMail, PushEvent,
-    RecoveryRun, Security, Spool, SyncDriver, SyncOutcome, UserStore, ensure_sent_copy,
+    RecoveryRun, Security, Spool, SyncDriver, SyncOutcome, Tombstones, UserStore, ensure_sent_copy,
     index_bodies_pass, mirror_draft, pool_op, recover_in_flight, run_due, watch_every,
 };
 use mail_core::{
@@ -360,6 +360,14 @@ struct Server {
     /// fall back to fetching one message at a time rather than losing the mail — and the only way to
     /// test that fallback is a server that actually objects.
     refuse_uid_sets: bool,
+    /// UIDs already flagged `\Deleted` by *somebody else* (another client, the webmail).
+    ///
+    /// Server-side state, shared by every connection, because that is what a folder's flag set is.
+    /// It exists for one decision: on a server without UIDPLUS a plain `EXPUNGE` is folder-wide, so
+    /// the client may only run it when the `\Deleted` set is exactly the message it just flagged.
+    /// Without a way to plant somebody else's flag, that branch can only be tested by deleting
+    /// real mail on a real server (`design/07` §14.9).
+    others_deleted: Arc<Mutex<std::collections::HashSet<u32>>>,
 }
 
 impl Default for Server {
@@ -376,6 +384,7 @@ impl Default for Server {
             require_select: false,
             reverse_fetch_order: false,
             refuse_uid_sets: false,
+            others_deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -385,6 +394,23 @@ impl Default for Server {
 async fn spawn_imap(uidplus: bool) -> (SocketAddr, Transcript) {
     spawn_server(Server {
         uidplus,
+        ..Server::default()
+    })
+    .await
+}
+
+/// A server whose folder already has somebody else's `\Deleted` flags on it.
+///
+/// The only way to exercise "a folder-wide EXPUNGE is not safe here" without deleting real mail: the
+/// flag set has to exist *before* the client looks at it.
+async fn spawn_imap_with_foreign_deleted(
+    uidplus: bool,
+    foreign: &[u32],
+) -> (SocketAddr, Transcript) {
+    let flagged: std::collections::HashSet<u32> = foreign.iter().copied().collect();
+    spawn_server(Server {
+        uidplus,
+        others_deleted: Arc::new(Mutex::new(flagged)),
         ..Server::default()
     })
     .await
@@ -413,6 +439,7 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
             let require_select = server.require_select;
             let reverse_fetch_order = server.reverse_fetch_order;
             let refuse_uid_sets = server.refuse_uid_sets;
+            let others_deleted = Arc::clone(&server.others_deleted);
             tokio::spawn(async move {
                 let _ = serve_imap(
                     stream,
@@ -428,6 +455,7 @@ async fn spawn_server(server: Server) -> (SocketAddr, Transcript) {
                     require_select,
                     reverse_fetch_order,
                     refuse_uid_sets,
+                    others_deleted,
                 )
                 .await;
             });
@@ -454,6 +482,7 @@ async fn serve_imap(
     require_select: bool,
     reverse_fetch_order: bool,
     refuse_uid_sets: bool,
+    others_deleted: Arc<Mutex<std::collections::HashSet<u32>>>,
 ) -> std::io::Result<()> {
     let (read_half, mut write) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -589,6 +618,25 @@ async fn serve_imap(
                             ok(&mut write, &tag, "UID SEARCH completed").await?;
                             continue;
                         }
+                        // `SEARCH DELETED` is answered from the folder's real flag set, not from a
+                        // range: it is how the client decides whether a plain `EXPUNGE` would take
+                        // somebody else's mail with it (`design/07` §14.9). A fixture that answered
+                        // this with the whole mailbox would make that decision look safe every time.
+                        let key = tokens.get(3).copied().unwrap_or("");
+                        if key.eq_ignore_ascii_case("DELETED") {
+                            let mut flagged: Vec<String> = others_deleted
+                                .lock()
+                                .expect("flag set")
+                                .iter()
+                                .map(u32::to_string)
+                                .collect();
+                            flagged.sort_by_key(|v| v.parse::<u32>().unwrap_or(0));
+                            write
+                                .write_all(format!("* SEARCH {}\r\n", flagged.join(" ")).as_bytes())
+                                .await?;
+                            ok(&mut write, &tag, "UID SEARCH completed").await?;
+                            continue;
+                        }
                         // Honour the range: a real server answers `UID SEARCH 1:100` with those UIDs
                         // only, and `UID SEARCH ALL` with the whole mailbox. Returning everything for
                         // any query (as this fixture used to) hides bugs in a caller that trusts the
@@ -697,7 +745,22 @@ async fn serve_imap(
                             .and_then(|(_, rest)| rest.split_once(')'))
                             .map(|(inner, _)| inner.to_string())
                             .unwrap_or_default();
+                        // Track `\Deleted` for real: `SEARCH DELETED` below answers from this set,
+                        // and the client's whole "is a plain EXPUNGE safe?" decision reads it.
+                        let touching_deleted = flags.to_ascii_lowercase().contains("\\deleted");
+                        let removing = tokens
+                            .get(3)
+                            .map(|_| trimmed.to_ascii_uppercase().contains("-FLAGS"))
+                            .unwrap_or(false);
                         for uid in parse_uid_set(set, available()) {
+                            if touching_deleted {
+                                let mut flagged = others_deleted.lock().expect("flag set");
+                                if removing {
+                                    flagged.remove(&uid);
+                                } else {
+                                    flagged.insert(uid);
+                                }
+                            }
                             write
                                 .write_all(
                                     format!("* {uid} FETCH (UID {uid} FLAGS ({flags}))\r\n")
@@ -730,6 +793,8 @@ async fn serve_imap(
                 }
             }
             "EXPUNGE" => {
+                // A folder-wide expunge really does clear every `\Deleted` flag it acted on.
+                others_deleted.lock().expect("flag set").clear();
                 write.write_all(b"* 1 EXPUNGE\r\n").await?;
                 ok(&mut write, &tag, "EXPUNGE completed").await?;
             }
@@ -1597,6 +1662,7 @@ async fn the_backfill_stops_fetching_once_the_byte_budget_is_spent() {
             max_bytes: 1,
         },
         1_700_000_000,
+        &Tombstones::empty(),
     ))
     .await
     .expect("walk");
@@ -1656,6 +1722,7 @@ async fn the_page_that_spent_the_budget_is_still_stored() {
             max_bytes: 1,
         },
         1_700_000_000,
+        &Tombstones::empty(),
     ))
     .await
     .expect("walk");
@@ -1974,6 +2041,7 @@ async fn the_key_refresh_walks_back_and_fills_what_the_sync_will_never_touch() {
         "INBOX",
         3,
         10,
+        &Tombstones::empty(),
     ))
     .await
     .expect("refresh");
@@ -2232,9 +2300,13 @@ async fn receive_loop_works_against_a_real_imap_exchange() {
 
     // --- flag / delete
     within(client.mark_seen(2, true)).await.expect("UID STORE");
-    within(client.delete_message("INBOX", 2))
-        .await
-        .expect("delete");
+    assert_eq!(
+        within(client.delete_message("INBOX", 2))
+            .await
+            .expect("delete"),
+        mail_core::imap::DeleteOutcome::Expunged,
+        "a UIDPLUS server gets the precise expunge, so the message really is gone"
+    );
 
     let log = transcript(&log);
     assert!(
@@ -2259,9 +2331,14 @@ async fn delete_uses_plain_expunge_when_uidplus_is_missing() {
     let mut client = within(ImapClient::connect(&cfg, "x"))
         .await
         .expect("connect");
-    within(client.delete_message("INBOX", 1))
+    let outcome = within(client.delete_message("INBOX", 1))
         .await
         .expect("delete must still succeed when UIDPLUS is missing");
+    assert_eq!(
+        outcome,
+        mail_core::imap::DeleteOutcome::Expunged,
+        "nothing else is flagged, so the folder-wide EXPUNGE takes exactly our message"
+    );
 
     let log = transcript(&log);
     let upper: Vec<String> = log.iter().map(|l| l.to_ascii_uppercase()).collect();
@@ -2275,6 +2352,50 @@ async fn delete_uses_plain_expunge_when_uidplus_is_missing() {
             .iter()
             .any(|l| l.trim_end().ends_with("EXPUNGE") && !l.contains("UID EXPUNGE")),
         "should fall back to plain EXPUNGE: {log:?}"
+    );
+}
+
+/// **The folder-wide `EXPUNGE` is not ours to run when somebody else has mail flagged.**
+///
+/// `design/07` §14.9: on a server without UIDPLUS, `EXPUNGE` deletes *every* `\Deleted` message in
+/// the folder, not just the one we asked about. Running it anyway destroys another client's pending
+/// deletion, and nothing in the UI would ever explain where that mail went. So the client counts the
+/// set first and only expunges when the set is exactly its own message; otherwise it leaves the flag
+/// in place, says so (`MarkedOnly`), and the caller keeps the tombstone and queues the retry.
+#[tokio::test]
+async fn delete_leaves_someone_elses_deleted_mail_alone() {
+    // UID 3 was flagged `\Deleted` by another client before we arrived.
+    let (addr, log) = spawn_imap_with_foreign_deleted(false, &[3]).await;
+    let cfg = account(addr, addr);
+
+    let mut client = within(ImapClient::connect(&cfg, "x"))
+        .await
+        .expect("connect");
+
+    let outcome = within(client.delete_message("INBOX", 1))
+        .await
+        .expect("delete must still succeed — the message is flagged either way");
+    assert_eq!(
+        outcome,
+        mail_core::imap::DeleteOutcome::MarkedOnly,
+        "a folder-wide EXPUNGE would take UID 3 with it, so it must not run"
+    );
+
+    let log = transcript(&log);
+    let upper: Vec<String> = log.iter().map(|l| l.to_ascii_uppercase()).collect();
+    assert!(
+        upper.iter().any(|l| l.contains("SEARCH DELETED")),
+        "the client must ask what is already flagged before a folder-wide expunge: {log:?}"
+    );
+    assert!(
+        !upper
+            .iter()
+            .any(|l| l.trim_end().ends_with("EXPUNGE") && !l.contains("UID EXPUNGE")),
+        "and must not run the folder-wide EXPUNGE once the answer is 'not just mine': {log:?}"
+    );
+    assert!(
+        upper.iter().any(|l| l.contains("+FLAGS (\\DELETED)")),
+        "the message is still flagged, which is the half we did do: {log:?}"
     );
 }
 
@@ -2767,7 +2888,22 @@ async fn sync_once(
     account_id: &str,
     folder: &MailboxInfo,
 ) -> SyncOutcome {
-    let mut driver = SyncDriver::start(cache, account_id, folder).expect("plan");
+    sync_once_with(client, cache, account_id, folder, &Tombstones::empty()).await
+}
+
+/// The same composition, with the tombstones the real command reads out of `user.db`.
+///
+/// Separate rather than an argument on `sync_once` so the twenty-odd existing call sites keep saying
+/// what they mean ("no deletions here"); the one test that cares names its marks explicitly.
+async fn sync_once_with(
+    client: &mut ImapClient,
+    cache: &Cache,
+    account_id: &str,
+    folder: &MailboxInfo,
+    tombstones: &Tombstones,
+) -> SyncOutcome {
+    let mut driver =
+        SyncDriver::start(cache, account_id, folder, tombstones).expect("plan the sync");
     loop {
         let page = within(driver.execute(client)).await.expect("fetch");
         if let Some(outcome) = driver.absorb(cache, &page).expect("absorb") {
@@ -4047,6 +4183,7 @@ async fn the_sync_window_decides_where_the_walk_stops() {
             SyncWindow::Count(20),
             BackfillBudget::generous(),
             NOW,
+            &Tombstones::empty(),
         ))
         .await
         .expect("backfill");
@@ -4098,6 +4235,7 @@ async fn the_sync_window_decides_where_the_walk_stops() {
             SyncWindow::Years(2),
             BackfillBudget::generous(),
             NOW,
+            &Tombstones::empty(),
         ))
         .await
         .expect("backfill");

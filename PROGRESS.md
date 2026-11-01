@@ -7,16 +7,70 @@
 - 仓库原本**没有 git**，开工前建了基线提交 `83c1b0c`。每一步都可回滚
   （`git log --oneline` / `git diff <sha>`）。
 - 设计文档在 `design/`；审计脚本 `python design/tools/audit.py`（当前 0 失败）。
-- **测试数量**：基线 116 → 现在 **539**（mail-core lib 453 + 桌面壳 lib 21 + loopback 59 +
-  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107/108/109/111 轮各加了 3/3/5/1 条）。这 539 是**跑过的**条数；
+- **测试数量**：基线 116 → 现在 **548**（mail-core lib 461 + 桌面壳 lib 21 + loopback 60 +
+  reachability 4 + bench_fixture 1 + oauth_flow 1；第 107/108/109/111/113 轮各加了 3/3/5/1/9 条）。这 548 是**跑过的**条数；
   另有 **12** 条 `#[ignore]` 的基准不在里面 —— 第 99 轮续加了两条：`cache::tests::p9_time_is_not_in_the_transaction_boundary`
   （P9 事务边界，约 30 秒，复现命令在 `reports/performance.md` §10.6）与
   `db::tests::the_watchdog_costs_less_than_the_read_it_measures`（第 5 项的计时代价，约 2 秒，§11.7）；
   第 100 轮的 P8b 吞吐基准 `bench_p8_body_prefetch_throughput` 是第 11 条（三档延迟，约 70 秒，§16.2）；
   第 100 轮续的持续速率基准 `bench_p8b_sustained_backfill_rate` 是第 12 条（改之前那一臂真的要等两轮
   60 秒，约 135 秒，§16.8）。
-  `tools/check.ps1` **全绿**：**67 步**（第 112 轮加了「侧栏结构」一步，第 110 轮加了「两个档各读各的库」一步；第 101 轮给 2a/2b 各加一步；第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
+  `tools/check.ps1` **全绿**：**68 步**（第 113 轮加了「墓碑接线」一步；第 112 轮加了「侧栏结构」一步，第 110 轮加了「两个档各读各的库」一步；第 101 轮给 2a/2b 各加一步；第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
   早已过期，只有"fmt + clippy -D warnings + build + test + PE=2"这几条一直是骨架）。
+
+### 墓碑接上生产代码：删掉的信不会再被同步带回来（第 113 轮，2026-11-01）
+
+`design/07` §14.9 最实的一条，加上 §14.9 的两处删除细节与 §14.8 的空态提示。
+
+**这一轮的核心事实是「表在那儿、没人调用」**：`deleted_marks` 的四个方法、迁移、索引、单测，第 109 轮
+全写好了，而**生产代码零调用** —— 删除路径不写墓碑、同步 upsert 前不查。于是它们要修的那个 bug
+（删了又同步回来）一直活着，而且**没有一条测试会红**，因为每条测试都在测存储，没有一条在测接线。
+这就是这一轮新门禁存在的理由：它断言的是**调用点**。
+
+- **写**：`delete_message` 命令现在按服务器**实际做到哪一步**决定写不写墓碑。`Expunged`（真的没了）⇒
+  **不写** —— 写一条比事实活得久的记录，只是让 30 天清扫多个活儿。`MarkedOnly`（无 UIDPLUS 且别人也有
+  邮件标了 `\Deleted`）和网络失败（进了离线队列）⇒ 写，因为服务器下一次同步**还会**列出它。
+  文件夹代号未知（0）时不写并记一行日志：墓碑按 `(folder, uid, uidvalidity)` 认人，代未知时写进去要么
+  永不命中、要么命中错的东西。
+- **查**：`UserStore::tombstones(account, folder)` 一次读成一个 `Tombstones` 值（`(uid, 代号)` 集合），
+  `SyncDriver::start` 把它作为**必填参数**（不是 `Option` —— 可选就等于允许下一个调用者悄悄退出，
+  这个 bug 就是这么来的）。`absorb` 在写之前过滤：不写；**并且把还在缓存里的那行删掉**（崩在本地删除与
+  这次写之间时，墓碑要能收拾自己留下的残局）。
+- **游标必须越过被隐藏的那封**：`advance_cursor` 用的是**整页**而不是过滤后的页。否则被删的那封一旦是
+  最新的，游标就永远卡在它下面，每一轮都重取重藏。
+- **`backfill_older` / `fill_thread_keys` 也接了**（同一个 `store_page()`）：点「加载更多」会重取用户可能
+  已经删掉的那几页，不接就是换个入口复活。
+- **清**：只在 `replay_pending_ops` 的**成功分支**清，且只对 `Delete` 这一种 kind。失败时清掉 = 下一轮
+  同步把信放回来；标记读操作也清 = 一个排队的「标已读」顺手复活一封删掉的信。启动时 `prune_deleted_marks`
+  30 天兜底（正常路径用不到它）。
+- **删除的两处细节**（§14.9 第 7-8 行）：① `cache.delete_message` 现在**同一个写事务里**删 `sent_index`
+  对应行 —— 否则「查看副本」留一个指向空行的链接，一个看起来能用的死链比没有链接更糟；② 无 UIDPLUS 时
+  `EXPUNGE` 是**文件夹级**，所以先 `UID SEARCH DELETED` 数集合，**只有集合恰好等于目标**才 EXPUNGE；
+  否则只标 `\Deleted`，`delete_message` 返回 `MarkedOnly`，界面如实说「已标记删除，服务器清理时生效」，
+  并把补 EXPUNGE 放进 `pending_ops`（重放时仍是 `MarkedOnly` ⇒ 报「未完成」⇒ 保留墓碑、继续退避重试）。
+- **`count_sent_records` 有消费者了**（§14.8）：新命令 `sent_record_count`，只服务「已发送」的空态 ——
+  「本机记录显示有 N 封已发送（服务器副本未同步）」。它**不是列表来源**：不进分页、不排序、不计入 `n`。
+  读失败就什么都不说（这条提示不该变成一条错误 toast）。
+
+**机器断言**（新门禁步骤，68 步）：`tools/tombstone_wiring.mjs` 钉六条 —— 同步读墓碑并交给驱动、
+`start` 收的是 `&Tombstones` 而非 `Option`、`delete_message` 在同一闭包里删 `sent_index`、只在成功分支
+清标记且只对 `Delete`、`deleted_marks` **不许出现在 `cache.rs`**（清缓存复活）、空态问计数且不把数字塞进
+`state.messages`。**做过变异测试**：把驱动参数换成 `Tombstones::empty()`、在失败分支清标记、把
+`sent_index` 那条 delete 改成空语句、把 `deleted_marks` 字样写进 cache.rs —— 四条都变红。
+
+**数字**：lib **461**（+8：同步 3、userdb 1、pending 2、cache 2）、loopback **60**（+1：别人标了
+`\Deleted` 时不许文件夹级 EXPUNGE；夹具为此真的记起了 `\Deleted` 集合），桌面壳 21，合计 **548**；
+门禁 **68/68**。
+
+**未做（如实记）**：
+- **`move_message` 没有墓碑路径**。它同样是「复制 + 标记删除 + expunge」，在无 UIDPLUS 且别人也有标记时
+  源文件夹那封只会被标 `\Deleted`，下一轮同步把它放回源文件夹。`delete_message` 走通了，move 没有
+  —— 因为 move 的成功语义是「到了目标文件夹」，那半条路已经完成，把整次移动报成失败是另一种谎。
+  留给下一轮（要么给 move 也排一个补 EXPUNGE，要么在无 UIDPLUS 时干脆只用 `UID COPY` + 让用户自己清）。
+- **「放弃时删标记」没有入口**：`cancel_pending_op` 至今没有生产调用者（没有取消离线意图的界面），
+  所以「用户撤回了删除意图、标记却没清」这条路现在不可能发生，也就没写。30 天兜底仍然在。
+- **没有真机目视**（本机 WebView2 CDP 起不来）：空态那句小字、删除后的两种提示，都只有结构断言。
+- **`settle_sent_row` 连跑两次的幂等断言**（§14.11 那条）仍未补。
 
 ### 侧栏：写邮件不再被滚走，队列只剩一个入口（第 112 轮，2026-11-01）
 

@@ -18,7 +18,35 @@
 use crate::cache::Cache;
 use crate::error::Result;
 use crate::imap::ImapClient;
+use crate::model::MessageSummary;
 use crate::sync::{INITIAL_SYNC, SyncWindow};
+use crate::userdb::Tombstones;
+
+/// Store a page, minus the messages the user deleted here.
+///
+/// Every server-facing writer in this module goes through this one function, because "which rows may
+/// be written" is the same question in all three places and three answers would drift. The tombstone
+/// check lives here rather than in `Cache::upsert_summaries` for one reason: `cache.db` has no
+/// business knowing about `user.db`, and giving the cache a second database handle would make every
+/// cache test pay for a feature none of them exercise (`design/07` §14.9).
+fn store_page(
+    cache: &Cache,
+    account_id: &str,
+    folder: &str,
+    page: &[MessageSummary],
+    tombstones: &Tombstones,
+    uidvalidity: u32,
+) -> Result<()> {
+    if tombstones.is_empty() {
+        return cache.upsert_summaries(account_id, folder, page);
+    }
+    let kept: Vec<MessageSummary> = page
+        .iter()
+        .filter(|m| !tombstones.hides(m.uid, uidvalidity))
+        .cloned()
+        .collect();
+    cache.upsert_summaries(account_id, folder, &kept)
+}
 
 /// How much work one call may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +132,7 @@ pub async fn fill_thread_keys(
     folder: &str,
     pages: u32,
     page_size: usize,
+    tombstones: &Tombstones,
 ) -> Result<u32> {
     let mut filled = 0u32;
 
@@ -118,8 +147,18 @@ pub async fn fill_thread_keys(
         .filter(|summary| summary.thread_key.is_some())
         .count() as u32;
     if !newest.summaries.is_empty() {
-        cache.upsert_summaries(account_id, folder, &newest.summaries)?;
+        store_page(
+            cache,
+            account_id,
+            folder,
+            &newest.summaries,
+            tombstones,
+            newest.uidvalidity,
+        )?;
     }
+    // Older pages carry no generation of their own, so the one the newest page just reported is
+    // used for all of them. It is the same folder, one `SELECT` earlier in the same walk.
+    let uidvalidity = newest.uidvalidity;
     let mut before = newest
         .summaries
         .iter()
@@ -149,7 +188,7 @@ pub async fn fill_thread_keys(
             .map(|summary| summary.uid)
             .min()
             .unwrap_or(before);
-        cache.upsert_summaries(account_id, folder, &page)?;
+        store_page(cache, account_id, folder, &page, tombstones, uidvalidity)?;
         before = oldest.saturating_sub(1);
     }
 
@@ -159,6 +198,7 @@ pub async fn fill_thread_keys(
 /// Page backwards until the window is satisfied, history ends, or the budget is spent.
 ///
 /// `now` is a parameter rather than a clock read so a test can pin the date boundary.
+#[allow(clippy::too_many_arguments)]
 pub async fn backfill_older(
     client: &mut ImapClient,
     cache: &Cache,
@@ -167,8 +207,15 @@ pub async fn backfill_older(
     window: SyncWindow,
     budget: BackfillBudget,
     now: i64,
+    tombstones: &Tombstones,
 ) -> Result<BackfillReport> {
     let page_size = INITIAL_SYNC;
+    // The generation this walk's pages belong to. Read once: a folder renumbered mid-walk makes the
+    // marks void, and that is the *safe* direction — a deleted message may come back, but nothing
+    // that was never deleted is ever hidden.
+    let uidvalidity = cache
+        .folder_state(account_id, folder)?
+        .map_or(0, |state| state.uidvalidity);
     let mut pages = 0u32;
     let mut fetched = 0u32;
     let mut bytes = 0u64;
@@ -220,7 +267,7 @@ pub async fn backfill_older(
         // that discarded it would re-fetch the same page next time.
         let newest_in_page = page.iter().filter_map(|m| m.date).max();
         let page_bytes: u64 = page.iter().map(|m| u64::from(m.size.unwrap_or(0))).sum();
-        cache.upsert_summaries(account_id, folder, &page)?;
+        store_page(cache, account_id, folder, &page, tombstones, uidvalidity)?;
         pages += 1;
         fetched += page.len() as u32;
         bytes += page_bytes;

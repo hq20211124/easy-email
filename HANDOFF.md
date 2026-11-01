@@ -23,13 +23,21 @@
 | 3 界面 | ✅ 待发档 / 计数 / `sent-state-changed` / D7③ 出口 / 行上「副本已归档·仅本地记录」 |
 | 4 侧栏 IA | ✅ A 批（写邮件固定头、删「发件箱」入口、隐藏 `\Drafts`、空分组隐藏） |
 
-**这条线还剩三件**（按收益排序）：
+**这条线剩下的三件已在第 113 轮全部做完**（2026-11-01）：
 
-1. **墓碑没接线**——`deleted_marks` 的四个 API 都写好了，但**生产代码零调用**：删除路径不写墓碑、
-   同步 upsert 前不查。所以"删了又同步回来"这个 bug 现在**依然存在**。这是 `design/07` §14.9 最实的一条。
-2. 删除的两处细节：`cache.delete_message` 不清 `sent_index`（「查看副本」会指向空行）；无 UIDPLUS 时
-   `EXPUNGE` 是文件夹级，要先数 `\Deleted` 集合。
-3. `count_sent_records` 没有界面消费者（「已发送为空但本机有 N 封记录」那句提示还没接）。
+1. ✅ **墓碑接上生产代码**：`delete_message` 按服务器实际结果决定写不写；`SyncDriver::start` 收
+   `&Tombstones`（必填，不是 `Option`）；`absorb` 写前过滤**并删掉残留行**，游标按整页推进；
+   `backfill_older` / `fill_thread_keys` 同一套；`replay_pending_ops` 只在成功分支清、只对 `Delete` 清；
+   启动时 30 天兜底。门禁 `tools/tombstone_wiring.mjs` 钉六条，四条做过变异测试。
+2. ✅ **删除的两处细节**：`cache.delete_message` 同一事务删 `sent_index`；无 UIDPLUS 时先
+   `UID SEARCH DELETED` 数集合，只有恰好是目标才 EXPUNGE，否则 `MarkedOnly` + 补 EXPUNGE 进
+   `pending_ops` + 界面如实说「已标记删除，服务器清理时生效」。
+3. ✅ **`count_sent_records` 有消费者**：`sent_record_count` 命令 + 空态那行小字（只提示，不进列表）。
+
+**这条线还剩两件（都不大）**：
+- `move_message` 没有墓碑路径：无 UIDPLUS 且别人也有 `\Deleted` 时，源文件夹那封只会被标、下一轮同步
+  会把它放回源文件夹。要么给 move 也排补 EXPUNGE，要么无 UIDPLUS 时只用 `UID COPY`。
+- §14.11 里 `settle_sent_row` 连跑两次的幂等断言仍未补。
 
 ### 还没做的（大块）
 
@@ -46,7 +54,8 @@
    `str.replace` **静默不匹配**（本轮踩过一次，靠 `assert` 才没漏）。
 3. **Rust 字符串里的 SQL 注释不能用英文双引号**：会截断 `execute_batch` 的字符串，报错是一堆
    "invalid suffix"。用「」。
-4. 门禁现有 **67 步**，其中两步是结构断言（`tools/sent_tabs_test.mjs`、`tools/sidebar_structure.mjs`）——
+4. 门禁现有 **68 步**，其中三步是结构断言（`tools/sent_tabs_test.mjs`、`tools/sidebar_structure.mjs`、
+   `tools/tombstone_wiring.mjs`）——
    它们断言的是**结构/协议形状**，不是文案，因为这类规则截图看不出来。
 
 ---

@@ -1962,6 +1962,23 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step '墓碑接上生产代码：删掉的信不会被同步带回来' {
+        # `design/07` §14.9。表和四个方法都存在了两轮，**生产代码零调用** —— 于是它们要修的 bug（删了
+        # 又同步回来）一直活着，而且没有测试变红，因为每个测试都是关于存储的，不是关于接线的。这条钉的
+        # 是**调用点**：同步读墓碑、驱动必须收、删信清 sent_index、成功才清标记、空态只说一句。
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/tombstone_wiring.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '墓碑又变成没人调用的死代码，或者失败时把标记清掉了（信会复活）' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
     Step 'the first paint comes from the cache, and a failed refresh keeps it' {
         # The folder view used to await `list_messages` alone — refresh over IMAP, then read the cache —
         # so 「正在收取邮件…」 covered rows that were already on this machine. Painting the cache first

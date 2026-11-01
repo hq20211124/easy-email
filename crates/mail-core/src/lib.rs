@@ -88,7 +88,9 @@ pub use sentcopy::{DraftMirrorReport, SentCopy, draft_to_mail, ensure_sent_copy,
 pub use spool::Spool;
 pub use sync::{Fetch, SyncDriver, SyncOutcome, SyncWindow};
 pub use threads::root_of;
-pub use userdb::{CleanupLog, Draft, DraftMirror, NewOutbox, OutboxItem, SentRecord, UserStore};
+pub use userdb::{
+    CleanupLog, Draft, DraftMirror, NewOutbox, OutboxItem, SentRecord, Tombstones, UserStore,
+};
 pub use worker::{
     DEFAULT_CRASH_RESEND_LIMIT, FilingReport, FilingRun, OutboxRun, Recovery, RecoveryQuestion,
     RecoveryReport, RecoveryRun, RunReport, file_sent_copies, recover_in_flight, run_due,

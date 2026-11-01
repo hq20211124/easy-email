@@ -225,7 +225,13 @@ async fn one_sync_moves_the_cursor_onto_the_copy_the_outbox_claims() {
         selectable: true,
     };
 
-    let mut driver = SyncDriver::start(&cache, &live.account.id, &folder).expect("plan");
+    let mut driver = SyncDriver::start(
+        &cache,
+        &live.account.id,
+        &folder,
+        &mail_core::userdb::Tombstones::empty(),
+    )
+    .expect("plan");
     let outcome: SyncOutcome = loop {
         let page = driver
             .execute(&mut live.client)
