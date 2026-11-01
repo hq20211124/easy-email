@@ -1907,15 +1907,18 @@ textarea {
    corner of a 1200 px window is both away from the eye and away from the pointer, and it is gone in
    five seconds. The user said so before any of us noticed.
 
-   Top-centre puts it under the toolbar the click came from, without covering it (the pane headers
-   end around y=40). It does cover the first row or the subject line for a few seconds, which is the
-   cheaper of the two: what it covers is *content the user is about to read*, not the thing they
-   just clicked. */
+   Then the user asked for the middle of the window, which is the third position this has had: the
+   point is not "which corner" but "wherever the eye already is", and the eye is on the message they
+   just acted on. Centred covers a little of that message for the few seconds the notice lives, and
+   that is the trade the user chose after seeing the alternative.
+
+   Centred on both axes, so a stack of two or three notices grows outwards from the middle rather
+   than pushing off one edge. */
 .toast-root {
   position: fixed;
   left: 50%;
-  transform: translateX(-50%);
-  top: 14px;
+  top: 50%;
+  transform: translate(-50%, -50%);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1933,7 +1936,7 @@ textarea {
   padding: 11px 14px;
   font-size: 13px;
   white-space: pre-wrap;
-  animation: slide-in 0.16s ease;
+  animation: toast-in 0.16s ease;
 }
 
 .toast.ok {
@@ -1957,12 +1960,13 @@ textarea {
   font-size: 12px;
 }
 
-/* Comes **down** from the top edge, because that is where it now is. The old one rose from below,
-   which was right for a bottom-anchored toast and would look like it came out of the content here. */
-@keyframes slide-in {
+/* A centred notice has no edge to come from, so it fades up in place with a barely-there scale.
+   Sliding is what a corner-anchored toast does; in the middle of the window it would look like the
+   message was thrown at the user. */
+@keyframes toast-in {
   from {
     opacity: 0;
-    transform: translateY(-6px);
+    transform: scale(0.98);
   }
 }
 
