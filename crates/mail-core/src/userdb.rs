@@ -2041,7 +2041,7 @@ impl UserStore {
         folder: &str,
         uids: &[u32],
         folder_uidvalidity: u32,
-    ) -> Result<Vec<(u32, String, bool)>> {
+    ) -> Result<Vec<(u32, String, Option<bool>)>> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
@@ -2069,12 +2069,29 @@ impl UserStore {
             if !wanted.contains(&uid) {
                 continue;
             }
-            // **A UID only means this message inside one generation of the folder.** If either side
-            // is unknown (`0`), or the two disagree, the row is not labelled at all: saying nothing
-            // is the honest answer, and claiming 「副本已归档」 on a recycled number is exactly the
-            // mistake `sent_index.uidvalidity` was added to prevent (`design/07` §14.4 D0a).
-            let confirmed = recorded_generation != 0 && recorded_generation == folder_uidvalidity;
-            out.push((uid, state, copy_folder == folder && confirmed));
+            // **Three answers, and the middle one is the point.**
+            //
+            //  * `Some(false)` — the record says `folder = ''`, i.e. the server has no copy of this
+            //    message. That is 「仅本地记录」, a fact the record states.
+            //  * `Some(true)` — the record names this folder **and** the generation agrees, so the
+            //    UID still means this message.
+            //  * `None` — the record names this folder but either side's generation is unknown (`0`)
+            //    or they disagree. The copy is very likely there; we cannot prove it, and the honest
+            //    answer is **silence**.
+            //
+            // The bug this replaces: `None` used to be reported as `false`, and the list rendered
+            // that as 「仅本地记录」 — a positive claim that the message exists nowhere but on this
+            // machine, made about a message sitting in the server's Sent folder. Every record from
+            // before `sent_index.uidvalidity` existed has generation 0, so this was the *normal*
+            // case for old mail, not an edge (`design/07` §14.4 D0a, §14.5 D2).
+            let has_copy = if copy_folder.is_empty() {
+                Some(false)
+            } else if recorded_generation != 0 && recorded_generation == folder_uidvalidity {
+                Some(true)
+            } else {
+                None
+            };
+            out.push((uid, state, has_copy));
         }
         Ok(out)
     }
@@ -4032,9 +4049,11 @@ mod tests {
 
     /// The page query behind the row labels (`design/07` §14.5 D2).
     ///
-    /// Three answers have to stay distinct: *archived* (a copy is in this folder), *local only* (a
-    /// record exists and says the server has no copy), and *no record at all* — which is every
-    /// message sent before this feature, and must not be labelled as either.
+    /// Four answers have to stay distinct: *archived* (`Some(true)`), *local only* (`Some(false)`),
+    /// *unknown* (`None` — the record names this folder but the generation cannot confirm it), and
+    /// *no record at all* — every message sent before this feature. The last two must render as
+    /// **nothing**; collapsing `None` into `false` is what produced 「仅本地记录」 on mail that is
+    /// sitting in the server's Sent folder.
     #[test]
     fn the_page_query_separates_archived_copies_from_local_only_records() {
         let store = store();
@@ -4053,13 +4072,13 @@ mod tests {
         assert_eq!(rows.len(), 2, "999 has no record and must not be invented");
         assert!(
             rows.iter()
-                .any(|(uid, state, copy)| *uid == 226 && *copy && state == "sent"),
+                .any(|(uid, state, copy)| *uid == 226 && *copy == Some(true) && state == "sent"),
             "226 has its copy in this folder: {rows:?}"
         );
         assert!(
             rows.iter()
-                .any(|(uid, state, copy)| *uid == 227 && !*copy && state == "sent"),
-            "227 is a real send with no copy: {rows:?}"
+                .any(|(uid, state, copy)| *uid == 227 && *copy == Some(false) && state == "sent"),
+            "227 is a real send whose record says the server has no copy: {rows:?}"
         );
 
         // A page from another folder gets nothing, even though the message ids match: a UID means a
@@ -4077,15 +4096,39 @@ mod tests {
             .sent_states("t", "Sent Messages", &[226], 4242)
             .expect("states");
         assert!(
-            rebuilt.iter().all(|(_, _, copy)| !*copy),
+            rebuilt
+                .iter()
+                .all(|(_, _, copy)| *copy == Some(false) || copy.is_none()),
             "a changed generation must not claim the copy is archived: {rebuilt:?}"
         );
+        assert!(
+            rebuilt.iter().all(|(_, _, copy)| copy.is_none()),
+            "and it must not claim 「仅本地记录」 either — the record names this folder, so the              answer is *unknown*, which the UI renders as nothing: {rebuilt:?}"
+        );
 
-        // And "unknown on either side" is not a match either.
+        // Same for a folder whose own generation we never learned.
         let unknown = store
             .sent_states("t", "Sent Messages", &[226], 0)
             .expect("states");
-        assert!(unknown.iter().all(|(_, _, copy)| !*copy));
+        assert!(
+            unknown.iter().all(|(_, _, copy)| copy.is_none()),
+            "an unknown generation is not evidence of anything: {unknown:?}"
+        );
+
+        // The real profile's shape: a legacy record (generation 0) whose copy is in fact archived.
+        let mut legacy = settled("<c@x>");
+        legacy.uidvalidity = 0;
+        legacy.uid = Some(228);
+        store.insert_sent_record(&legacy).expect("legacy");
+        let legacy_rows = store
+            .sent_states("t", "Sent Messages", &[228], 1579573363)
+            .expect("states");
+        assert_eq!(
+            legacy_rows,
+            vec![(228, "sent".to_string(), None)],
+            "a record from before the generation column existed says nothing about where the copy \
+             is — labelling it 「仅本地记录」 is a lie the user can see"
+        );
     }
 
     /// A file written by v4 gains `sent_records` on open, and its existing rows are untouched.

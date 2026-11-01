@@ -1199,9 +1199,16 @@ struct SentRowState {
     uid: u32,
     /// `sent` / `failed` / `needs_attention` / `cancelled`.
     state: String,
-    /// True when the copy really is in the folder being listed; false when the record says the
-    /// server has no copy of this message at all.
-    has_copy: bool,
+    /// Three answers, and the middle one is why this is not a `bool`:
+    ///
+    /// * `Some(true)` — the copy really is in the folder being listed (record and generation agree).
+    /// * `Some(false)` — the record itself says the server has no copy of this message.
+    /// * `None` — the record names this folder but the generation cannot confirm the UID still means
+    ///   this message. **The UI must render nothing for it.** Reporting `false` here (which is what
+    ///   the first version did) told the user 「仅本地记录」 about mail that is sitting in the
+    ///   server's Sent folder — and every record written before `sent_index.uidvalidity` existed has
+    ///   generation 0, so it was the common case rather than an edge.
+    has_copy: Option<bool>,
 }
 
 #[tauri::command]

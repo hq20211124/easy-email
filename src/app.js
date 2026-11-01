@@ -2866,10 +2866,19 @@ function conversationRows(conversations) {
  */
 function sentStateChip(sentState) {
   if (!sentState) return '';
-  if (sentState.hasCopy) {
+  if (sentState.hasCopy === true) {
     return '<span class="msg-sent-state" title="服务器上的副本已归档">副本已归档</span>';
   }
-  return '<span class="msg-sent-state local" title="服务器上没有这封信的副本，只在这台电脑上">仅本地记录</span>';
+  if (sentState.hasCopy === false) {
+    return '<span class="msg-sent-state local" title="服务器上没有这封信的副本，只在这台电脑上">仅本地记录</span>';
+  }
+  // `null` = 记录说副本在这个文件夹，但拿不到能对上的文件夹编号，**证不了**。
+  //
+  // Saying nothing is the only honest answer here. The first version treated it as `false` and
+  // printed 「仅本地记录」 — a claim that the message exists nowhere but on this machine, made about
+  // mail sitting in the server's Sent folder. Every send from before the generation column existed
+  // lands in this case, so it was the *normal* label on old mail rather than an edge case.
+  return '';
 }
 
 function buildConversationRow(row) {
