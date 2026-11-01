@@ -129,6 +129,18 @@
           </div>
         </header>
         <!--
+          「已发送」holds two different things, and mixing them in one list is how the two sources of
+          truth (the cache and the queue) start disagreeing (`design/07` §14.5 D5). So the list head
+          has a switch: `全部` reads only `cache.messages`, `待发` reads only `user.db`'s outbox.
+          Never both in one list, never a row whose position depends on which source it came from.
+        -->
+        <div id="sent-tabs" class="sent-tabs" role="tablist" aria-label="已发送与待发" hidden>
+          <button id="sent-tab-all" class="sent-tab active" role="tab" aria-selected="true" type="button">全部</button>
+          <button id="sent-tab-pending" class="sent-tab" role="tab" aria-selected="false" type="button">
+            待发<span id="sent-tab-pending-count" class="count"></span>
+          </button>
+        </div>
+        <!--
           Says out loud that what is on screen came from the cache, not from the server, and why.
           Without it a stale inbox reads as an up-to-date one, which is the failure this whole cache
           exists to avoid (`design/20-v0.2-plan.md` V2-B). The wording comes from the backend's

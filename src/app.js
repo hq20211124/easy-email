@@ -97,6 +97,14 @@ const state = {
   drafts: [],
   /** Queued and finished sends for the current account, newest first. */
   outbox: [],
+  /**
+   * Which half of 「已发送」 the list is showing: `all` (the cache) or `pending` (the queue).
+   *
+   * Two tabs rather than one merged list, because a merged list is two sources of truth in one
+   * scroll: a queued message has no cache row yet, so its position would have to be invented, and
+   * every page boundary would then disagree with the count (`design/07` §14.5 D5).
+   */
+  sentTab: 'all',
   /** The sync window the user chose; `null` until it has been read. */
   syncWindow: null,
   /**
@@ -420,6 +428,18 @@ async function wirePushEvents() {
     refreshOutbox();
     refreshDrafts();
   });
+
+  // The filing pass finished something: a copy was archived, or a send was settled for good.
+  //
+  // Separate from `outbox:changed` because it is about the *other* half of 「已发送」 — the cache
+  // rows. Without it the user sits on 全部, the copy lands, and the list keeps saying there is
+  // nothing there until they touch something (`design/07` §14.5 D5).
+  await listen('sent-state-changed', () => {
+    refreshOutbox();
+    if (state.view === 'mail' && state.sentTab === 'all' && looksLikeSentFolder(state.mailbox)) {
+      loadMessages({ reset: false, refresh: false });
+    }
+  });
 }
 
 /**
@@ -533,6 +553,8 @@ function wireGlobalEvents() {
   });
   $('btn-drafts').addEventListener('click', showDrafts);
   $('btn-outbox').addEventListener('click', showOutbox);
+  $('sent-tab-all').addEventListener('click', () => selectSentTab('all'));
+  $('sent-tab-pending').addEventListener('click', () => selectSentTab('pending'));
   $('btn-sync-window').addEventListener('click', openSyncWindowPicker);
   $('btn-about').addEventListener('click', openAbout);
   $('btn-log').addEventListener('click', openLog);
@@ -1525,10 +1547,11 @@ function syncMailboxRows() {
   $('btn-outbox').classList.toggle('active', state.view === 'outbox');
   // Empty rather than "0": a badge reading 0 is noise on a list that is already visibly empty.
   $('drafts-count').textContent = state.drafts.length > 0 ? String(state.drafts.length) : '';
-  // Only the still-open sends: the table keeps sent and cancelled rows as history, and counting
-  // those would leave a badge on screen forever.
-  const open = state.outbox.filter((item) => item.state === 'queued' || item.state === 'sending');
-  $('outbox-count').textContent = open.length > 0 ? String(open.length) : '';
+  // One definition of "pending" for the sidebar and for the 待发 tab (`design/07` §14.5 D5). Counting
+  // only queued+sending here would show 0 while a failed message still needs the user, which is the
+  // number that made 「待发 (n)」 lie.
+  const open = outboxPendingCount();
+  $('outbox-count').textContent = open > 0 ? String(open) : '';
 
   for (const row of document.querySelectorAll('#mailbox-list .row')) {
     row.classList.toggle('active', state.view === 'mail' && row.dataset.mailbox === state.mailbox);
@@ -1928,18 +1951,101 @@ async function refreshOutbox() {
 
   state.outbox = items;
   syncMailboxRows();
-  if (state.view === 'outbox') renderMessages();
+  syncSentTabs();
+  if (state.view === 'outbox' || (state.view === 'mail' && state.sentTab === 'pending')) {
+    renderMessages({ keepScroll: true });
+  }
 }
 
-function renderOutbox(list) {
+/**
+ * How many sends are still the user's problem.
+ *
+ * `queued` / `sending` / `failed` / `needs_attention` — and deliberately **not** `sent`
+ * (`design/07` §14.5 D5). A message that went out is a fact, not pending work; counting it here is
+ * how 「待发 (n)」 would never reach zero on an account whose Sent folder cannot be reached.
+ */
+function outboxPendingCount() {
+  return state.outbox.filter((item) =>
+    ['queued', 'sending', 'failed', 'needs_attention'].includes(item.state)
+  ).length;
+}
+
+/**
+ * Sends that left the machine but whose copy is not archived yet.
+ *
+ * Its own number, never folded into the pending count: the message is gone from the queue's point of
+ * view (it went out) and absent from 「全部」 (no cache row yet), so without this line it is visible
+ * nowhere and the user concludes it was lost (`design/07` §14.9).
+ */
+function outboxAwaitingCopyCount() {
+  return state.outbox.filter((item) => item.state === 'sent' && item.spool_path).length;
+}
+
+/**
+ * Show the 全部 / 待发 switch only where it means something, and keep its numbers current.
+ *
+ * Only inside 「已发送」: that is the one folder where "what is in the cache" and "what is still in
+ * the queue" are two halves of the same question.
+ */
+function syncSentTabs() {
+  const tabs = $('sent-tabs');
+  const visible = state.view === 'mail' && looksLikeSentFolder(state.mailbox);
+  tabs.hidden = !visible;
+  if (!visible) return;
+
+  const pending = outboxPendingCount();
+  $('sent-tab-pending-count').textContent = pending > 0 ? String(pending) : '';
+  const onAll = state.sentTab === 'all';
+  $('sent-tab-all').classList.toggle('active', onAll);
+  $('sent-tab-pending').classList.toggle('active', !onAll);
+  $('sent-tab-all').setAttribute('aria-selected', onAll ? 'true' : 'false');
+  $('sent-tab-pending').setAttribute('aria-selected', onAll ? 'false' : 'true');
+}
+
+/**
+ * Switch halves of 「已发送」.
+ *
+ * The queue half re-reads `user.db` on the way in rather than trusting what the last pass left in
+ * `state.outbox`: the whole reason to look is "did it go?", and an answer from a minute ago is not
+ * one.
+ */
+async function selectSentTab(tab) {
+  if (state.sentTab === tab) return;
+  state.sentTab = tab;
+  syncSentTabs();
+  if (tab === 'pending') {
+    await refreshOutbox();
+    renderMessages();
+  } else {
+    renderMessages({ keepScroll: true });
+  }
+}
+
+function renderOutbox(list, { tab = false } = {}) {
   $('list-footer').hidden = true;
 
-  if (state.outbox.length === 0) {
-    list.innerHTML = '<div class="empty">发件箱是空的。发送的邮件会先排在这里，再一封封送出去。</div>';
+  // In the 待发 tab, `sent` rows are the 「副本待归档」 line above, not rows: they are not pending
+  // work, and listing them here would make the count and the list disagree (`design/07` §14.5 D5).
+  const items = tab ? state.outbox.filter((item) => item.state !== 'sent') : state.outbox;
+
+  if (items.length === 0) {
+    list.innerHTML = tab
+      ? '<div class="empty">没有待发的信。</div>'
+      : '<div class="empty">发件箱是空的。发送的邮件会先排在这里，再一封封送出去。</div>';
     return;
   }
 
-  for (const item of state.outbox) {
+  // 「已发出，副本待归档」is a third fact: not pending (it went out) and not in the list above (no
+  // cache row yet). Said out loud so it is not mistaken for a lost message (`design/07` §14.9).
+  const awaiting = outboxAwaitingCopyCount();
+  if (tab && awaiting > 0) {
+    const note = document.createElement('div');
+    note.className = 'outbox-awaiting';
+    note.textContent = `已发出，副本待归档 (${awaiting})`;
+    list.appendChild(note);
+  }
+
+  for (const item of items) {
     const state_ = item.state;
     const preview = outboxPreview(item);
     const row = document.createElement('div');
@@ -2262,7 +2368,17 @@ async function retrySend(id) {  const queued = await run('重新发送', () => i
 }
 
 async function discardOutboxItem(id) {
-  if (!confirm('删除这条发件记录？\n删除后这封信不会再尝试发送。')) return;
+  const item = state.outbox.find((row) => row.id === id);
+  // D7 ③ (`design/07` §14.5): a failed send whose frozen bytes are gone can never succeed — a retry
+  // reads the spool, and the spool is the thing that is missing. Saying that is the difference
+  // between "this button does nothing" and "this one is over"; without the exit, 「待发 (n)」 never
+  // reaches zero and the user has no move left.
+  const noBytes =
+    item && !item.spool_path && (item.state === 'failed' || item.state === 'needs_attention');
+  const message = noBytes
+    ? '删除这条记录？\n这封信没有发出去，也没有留下内容——重试不可能成功。'
+    : '删除这条发件记录？\n删除后这封信不会再尝试发送。';
+  if (!confirm(message)) return;
   const removed = await run('删除发件记录', () => invoke('discard_outbox', { id }));
   if (removed === null) return;
   toast('已删除', 'ok');
@@ -2413,11 +2529,14 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
     // A new folder (or a refresh) starts over: whatever we learned about the bottom of the previous
     // one does not apply here.
     state.historyDone = false;
+    // And 「已发送」 opens on the cache half: the queue is something the user asks for by name.
+    state.sentTab = 'all';
     renderHistoryButton();
     renderReader();
   }
 
   $('mailbox-title').textContent = mailboxTitleText(state.mailboxLabel);
+  syncSentTabs();
 
   const list = $('message-list');
   const seq = ++state.listLoadSeq;
@@ -2583,6 +2702,13 @@ function renderMessages({ keepScroll = false } = {}) {
   // And fourth: the outbox, which is also local-only.
   if (state.view === 'outbox') {
     renderOutbox(list);
+    return;
+  }
+
+  // 「已发送」的第二个档: the queue. A different source from the rows below (`design/07` §14.5 D5),
+  // so it is rendered *instead of* them — never beside, never interleaved, never sorted together.
+  if (state.sentTab === 'pending' && looksLikeSentFolder(state.mailbox)) {
+    renderOutbox(list, { tab: true });
     return;
   }
 

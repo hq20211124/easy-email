@@ -2041,6 +2041,18 @@ async fn outbox_pass(app: &AppHandle) -> Result<(RunReport, FilingReport), Strin
         filed.filed += filing.filed;
         filed.skipped += filing.skipped;
         filed.deferred += filing.deferred;
+        filed.settled += filing.settled;
+
+        // Something about 「已发送」 moved: a copy was archived, a send was settled, or a leftover was
+        // closed. The window listens and re-reads, because the *other* half of that folder is the
+        // cache, and a cache row that appears without a repaint leaves the user staring at a list
+        // that says "nothing here" about mail they just sent (`design/07` §14.5 D5).
+        //
+        // Deferred work is not a change: nothing was decided, and waking the window every five
+        // seconds for an unreachable server would be noise.
+        if filing.filed + filing.skipped + filing.settled > 0 {
+            let _ = app.emit("sent-state-changed", ());
+        }
     }
 
     Ok((total, filed))

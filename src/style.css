@@ -619,6 +619,50 @@ textarea {
   text-align: center;
 }
 
+/* 「已发送」的两个档 (`design/07` §14.5 D5). A switch, not two lists: `全部` reads only the cache,
+   `待发` reads only the outbox, and nothing ever mixes the two sources in one list. Kept quiet and
+   in the list header rather than in the sidebar, because it changes what this pane is showing — not
+   where you are. */
+.sent-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 10px 6px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--surface-2, var(--bg-soft));
+  border: 1px solid var(--border);
+  flex: none;
+}
+
+.sent-tab {
+  flex: 1;
+  border: 0;
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.sent-tab:hover {
+  color: var(--text);
+}
+
+.sent-tab.active {
+  color: var(--text);
+  background: var(--bg);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 12%);
+}
+
+.sent-tab .count {
+  margin-left: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 /* "This is cached data, and here is why." Deliberately quieter than a toast: it stays until the
    next successful refresh, so it must not shout, and it must not look like an error the user
    caused. Only the auth wording gets the danger colour, because that one is actionable. */
@@ -863,6 +907,16 @@ textarea {
   margin-top: 2px;
   font-size: 11px;
   color: var(--accent);
+}
+
+/* 「已发出，副本待归档 (m)」: a fact that belongs to neither tab's list, so it sits above the rows as
+   a line rather than pretending to be a row (it has no uid, no date order, and no reader). */
+.outbox-awaiting {
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  flex: none;
 }
 
 .outbox-error {
