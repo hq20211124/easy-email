@@ -2206,6 +2206,30 @@ try {
         }
         $global:LASTEXITCODE = 0
     }
+    Step '设计审计：活文件之间不许互相矛盾（第 124 轮）' {
+        # `design/tools/audit.py` 从第一轮红队之后就有了，但**从来没有进过门禁** —— 于是它自己烂掉了：
+        # 第 123 轮才发现 A3/A4 两份文档缺"红队/验收/未决"三项，而 PROGRESS 开头那句"当前 0 失败"
+        # 已经过期好几个月。这正是一个"看起来跑过、其实没人跑"的检查，比没有检查更糟。
+        # 它需要 python 与 node（第 5/6 项分别用 sqlite3 与 node），缺任何一个就跳过并说明。
+        if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            Write-Host "python not found on PATH; skipping. Install Python to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        python design/tools/audit.py --quiet 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host 'design 文档之间互相矛盾，或者与代码不一致（逐项见 audit.py 的输出）' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+        $global:LASTEXITCODE = 0
+    }
+
     Step 'the auth axis keeps its promises (no token in a log, PKCE, no embedded webview)' {
         # `design/05` §10 lists these as gate items, and they are the kind of thing that is true today
         # and quietly stops being true: somebody adds a debug log with the token in it, or reaches for
