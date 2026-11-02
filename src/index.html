@@ -27,9 +27,7 @@
   </head>
   <body>
     <div id="app">
-      <!--
-        The window's own title bar, drawn here because the native one is off (`decorations: false`).
-        Two reason      <!-- ---------------------------------------------------------------- accounts + folders -->
+      <!-- ---------------------------------------------------------------- accounts + folders -->
       <aside id="sidebar">
         <!--
           Fixed head (`design/12` §16.4.4): the brand row and 写邮件 do not scroll. The compose button
@@ -71,40 +69,23 @@
         </div>
 
         <!--
-          Everything that used to be a flat 「本地」 group: one heading that meant "not a folder",
-          which is not a thing the user thinks. These are settings, and they say so.
+          One row, not four.
+
+          These used to be four rows sitting open under a 设置 heading: 同步窗口 / 查看日志 / 存储与清理
+          / 关于. That made the *least* used part of the window the tallest thing in the sidebar — the
+          folder list, which is what the sidebar is for, got pushed down by settings nobody opened on
+          purpose. A settings area is a place you go, not a list you read, so it is now one row that
+          opens them (`openSettings`), and the whole area is behind that one click.
+
+          The sync window stays on the row as its value, because it is the one of the four that says
+          something about *now*: "今天额度已用完" is the answer to "why has nothing arrived", and hiding
+          that behind a click would bring back the exact confusion the row was added for
+          (`design/04` §5.7). The label is a state, not the setting.
         -->
         <div class="section">
-          <div class="section-title">设置</div>
-          <button id="btn-sync-window" class="row" type="button" title="决定客户端往回取多少邮件">
-            <span class="label">同步窗口</span>
+          <button id="btn-settings" class="row" type="button" title="同步窗口、查看日志、存储与清理、关于">
+            <span class="label">设置</span>
             <span id="sync-window-value" class="count"></span>
-          </button>
-          <!--
-            The log, readable. Rotation (8 MB, seven files) only means something to the user if they
-            can look at the thing being rotated; otherwise the cap is a promise about a file nobody
-            sees.
-          -->
-          <button id="btn-log" class="row" type="button" title="查看最近的程序日志（最多 500 行，内容已脱敏）">
-            <span class="label">查看日志</span>
-          </button>
-          <!--
-            What the cache costs, and the one place it can be trimmed. The cache only ever grows, and
-            the only way out of a full disk used to be deleting it and syncing again — so this shows
-            the size, offers a dry run, and keeps a log of what a cleanup actually did.
-          -->
-          <button id="btn-storage" class="row" type="button" title="缓存占了多少空间、能清什么、清过什么">
-            <span class="label">存储与清理</span>
-          </button>
-          <!--
-            Which build this is, and how to get a newer one. The version had no home in the UI at all
-            before this: the only place it existed was the installer's filename, which is not
-            something a user reporting a bug can be asked to read out. It is a settings row, not a
-            group of its own — one row under a heading is a container with nothing to hold.
-          -->
-          <button id="btn-about" class="row" type="button">
-            <span class="label">关于</span>
-            <span id="about-version" class="count"></span>
           </button>
         </div>
 

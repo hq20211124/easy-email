@@ -118,6 +118,13 @@ const state = {
   /** The sync window the user chose; `null` until it has been read. */
   syncWindow: null,
   /**
+   * This build's version, read once at boot.
+   *
+   * In state rather than in a DOM node: it is shown in the 设置 → 关于 row, and that row only exists
+   * while the dialog is open — a `textContent` write at boot would have nothing to write to.
+   */
+  appVersion: '',
+  /**
    * Bytes this account may send, or `null` before it has been read.
    *
    * Read from the backend rather than kept here as a constant: the cap is a policy about providers
@@ -203,6 +210,21 @@ const state = {
   threadFocus: null,
   /** Bodies already fetched for the open conversation, keyed `folder|uid`. */
   threadBodies: new Map(),
+  /**
+   * Replies sent from the conversation's own box that the cache cannot show yet.
+   *
+   * The send path is: outbox → worker → SMTP → the Sent copy is filed and synced. Until that last step
+   * the message exists nowhere the conversation is read from, so a reply sent here used to leave the
+   * thread looking untouched — the user's own words were not in the conversation they were just
+   * looking at, which reads as "the send did not happen". These entries are the outbox row drawn where
+   * the reply was typed, and they are dropped as soon as the conversation is loaded again (see
+   * `loadConversation`), at which point the real copy is in the cache or the queue is still visible in
+   * 「已发送 → 待发」.
+   *
+   * Shape: `{ key, outboxId, state, text, summary }` — `state` mirrors the outbox row, so the bubble
+   * says 发送中 / 已发送 / 发送失败 rather than guessing.
+   */
+  threadLocal: [],
   /**
    * Which reading view the user chose — one switch for the whole app, remembered across restarts.
    *
@@ -371,10 +393,10 @@ async function boot() {
   // One timer for the whole window, rather than one per open composer or per outbox row: it is a
   // text update on whatever countdown is on screen, and it does nothing when none is.
   setInterval(updateUndoCountdowns, 1000);
-  // The version is compile-time in Rust; showing it here means the one number a bug report needs
-  // is on screen without anyone having to open a dialog.
-  $('about-version').textContent =
-    (await run('读取版本号', () => invoke('app_version'))) ?? '';
+  // The version is compile-time in Rust; keeping it here means the one number a bug report needs is
+  // reachable without opening a dialog, and the 设置 dialog reads it from state rather than from the
+  // DOM — the 关于 row only exists while that dialog is open.
+  state.appVersion = (await run('读取版本号', () => invoke('app_version'))) ?? '';
 
   if (state.accounts.length === 0) {
     openAccountWizard();
@@ -567,10 +589,10 @@ function wireGlobalEvents() {
   $('btn-drafts').addEventListener('click', showDrafts);
   $('sent-tab-all').addEventListener('click', () => selectSentTab('all'));
   $('sent-tab-pending').addEventListener('click', () => selectSentTab('pending'));
-  $('btn-sync-window').addEventListener('click', openSyncWindowPicker);
-  $('btn-about').addEventListener('click', openAbout);
-  $('btn-log').addEventListener('click', openLog);
-  $('btn-storage').addEventListener('click', openStoragePanel);
+  // The four settings entries live inside the 设置 dialog now, so the sidebar has exactly one thing to
+  // wire: the row that opens it. Their own listeners are attached there, per opening — see
+  // `openSettings` for why they are not wired here.
+  $('btn-settings').addEventListener('click', openSettings);
   $('btn-load-more').addEventListener('click', loadOlder);
   $('btn-compose').addEventListener('click', () => openComposer({}));
   $('btn-reply').addEventListener('click', () => openComposer({ mode: 'reply' }));
@@ -1937,6 +1959,8 @@ async function refreshOutbox() {
   if (items === null) return;
 
   state.outbox = items;
+  // The conversation's own pending bubbles are outbox rows; this is where they learn they moved.
+  syncThreadPendingStates();
   syncMailboxRows();
   syncSentTabs();
   if (state.view === 'mail' && state.sentTab === 'pending') {
@@ -2332,6 +2356,9 @@ async function cancelSend(id) {
   const cancelled = await run('撤销发送', () => invoke('cancel_send', { id }));
   if (cancelled === null) return;
 
+  // The bubble in the conversation is the outbox row, so undoing the send has to take it back out —
+  // otherwise the conversation keeps showing a reply that was deliberately never sent.
+  if (cancelled) forgetSentReply(id);
   toast(cancelled ? '已撤销，这封信没有发出去' : '已经交给服务器了，撤不回来了', cancelled ? 'ok' : 'err');
   await refreshOutbox();
 }
@@ -2563,6 +2590,7 @@ async function loadMessages({ reset = false, refresh = true } = {}) {
     state.threadFocus = null;
     state.threadKey = null;
     state.threadBodies = new Map();
+    state.threadLocal = [];
     // Folds belong to the rows on screen; a different folder or a search is a different list.
     state.expandedThreads.clear();
     // A new folder (or a refresh) starts over: whatever we learned about the bottom of the previous
@@ -3135,6 +3163,7 @@ async function openMessage(message, folder = state.mailbox) {
   state.threadFocus = null;
   state.threadKey = null;
   state.threadBodies = new Map();
+  state.threadLocal = [];
   // Opening a letter changes which row is highlighted, not which rows exist — so the list stays where
   // the user put it (task #10, round 100: it used to snap back to the top, 2 200 px → 0).
   renderMessages({ keepScroll: true });
@@ -3189,6 +3218,11 @@ async function loadConversation(message) {
   state.threadMembers = [];
   state.threadFocus = null;
   state.threadKey = null;
+  // Re-reading the conversation is the one moment the cache gets to speak for the whole thread again:
+  // a reply sent a minute ago is either in it now (the Sent copy synced) or still in the queue, where
+  // 「已发送 → 待发」 shows it. Keeping the local bubble past this point would be a second copy of the
+  // same reply the moment the sync lands.
+  state.threadLocal = [];
   if (state.readerMode !== 'thread') return;
 
   if (message.thread_key) {
@@ -3346,13 +3380,20 @@ function renderAttachmentBar(detail) {
  */
 function renderThreadReader() {
   const members = state.threadMembers;
+  // Replies this window sent that the cache cannot show yet, drawn after the real messages — they are
+  // the newest thing in the conversation by definition, because they were written a moment ago.
+  const shown = [...members, ...state.threadLocal];
   const focusedKey = state.threadFocus;
-  const newest = members[members.length - 1];
+  const newest = shown[shown.length - 1];
 
-  $('thread-subject').textContent = newest.summary.subject || '(无主题)';
-  const people = [...new Set(members.map((member) => member.summary.from_addr).filter(Boolean))];
+  $('thread-subject').textContent = newest?.summary.subject || '(无主题)';
+  const people = [...new Set(shown.map((member) => member.summary.from_addr).filter(Boolean))];
+  // The count is the cache's messages; the pending ones are named separately rather than folded in —
+  // they are not in the conversation yet, they are on their way out of it.
+  const pendingCount = shown.length - members.length;
   $('thread-meta').textContent =
     `共 ${members.length} 封　${people.join('、')}` +
+    (pendingCount > 0 ? `　·　${pendingCount} 封正在发送` : '') +
     (focusedKey ? '' : '　·　点任意一封展开');
 
   // Park the shared surface in the reader *before* clearing the list: it lives inside the expanded
@@ -3364,10 +3405,10 @@ function renderThreadReader() {
   list.innerHTML = '';
 
   let focusedBubble = null;
-  for (const member of members) {
+  for (const member of shown) {
     const key = bubbleKey(member);
-    const bubble = renderBubble(member, key === focusedKey);
-    if (key === focusedKey) focusedBubble = bubble;
+    const bubble = member.local ? renderPendingBubble(member) : renderBubble(member, key === focusedKey);
+    if (!member.local && key === focusedKey) focusedBubble = bubble;
     list.appendChild(bubble);
   }
 
@@ -3447,6 +3488,58 @@ function renderBubble(member, expanded) {
     void toggleBubble(key);
   });
   return bubble;
+}
+
+/**
+ * One bubble for a reply this window just sent, before the cache has the Sent copy.
+ *
+ * Not a placeholder and not clickable: it *is* the outbox row, shown where the user was typing. The
+ * text is the text they wrote, in full — the point of showing it is to answer "did my reply go out?",
+ * and a four-line preview would hide the end of the sentence they are checking.
+ */
+function renderPendingBubble(entry) {
+  const bubble = document.createElement('div');
+  bubble.className =
+    'bubble mine pending' + (entry.state === 'failed' ? ' failed' : '');
+  bubble.dataset.key = entry.key;
+
+  const head = document.createElement('div');
+  head.className = 'bubble-head';
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = '我';
+  const state = document.createElement('span');
+  state.className = 'state';
+  state.textContent = pendingSendLabel(entry.state);
+  head.append(who, state);
+  bubble.appendChild(head);
+
+  const preview = document.createElement('div');
+  preview.className = 'bubble-preview';
+  preview.textContent = entry.text;
+  bubble.appendChild(preview);
+
+  if (entry.state === 'failed') {
+    // Where the rest of the story is. The queue is the one place that can retry, and it says why.
+    bubble.title = '这封还没有发出去。可以在「已发送 → 待发」里查看原因并重试。';
+  }
+  return bubble;
+}
+
+/** The outbox's word for a send, in the conversation's own bubble. */
+function pendingSendLabel(sendState) {
+  switch (sendState) {
+    case 'sent':
+      return '已发送';
+    case 'failed':
+    case 'needs_attention':
+      return '发送失败';
+    case 'sending':
+      return '正在发送…';
+    default:
+      // `queued`, or a row that is already gone from the queue: the worker owns it from here.
+      return '发送中…';
+  }
 }
 
 /** The body of one message of the conversation, fetched once and kept for the life of the thread. */
@@ -3663,26 +3756,105 @@ async function sendThreadReply() {
     attachments: [],
   });
 
-  const ok = await run('加入发件箱', async () => {
+  // The outbox id comes back, and it is what the bubble below is keyed by: the reply is in the queue
+  // from this moment, so it can be drawn before the worker has done anything.
+  const queuedId = await run('加入发件箱', async () => {
     // Through the outbox like every other send: that is what the undo window and the "survives a
     // crash mid-transfer" guarantee come from. The worker owns delivery from here.
-    await invoke('enqueue_send', {
+    return invoke('enqueue_send', {
       accountId: state.accountId,
       mail: outgoing,
       // No draft: this box is a reply, not a document to come back to. The outbox keeps the copy.
       draftId: null,
       undoSeconds: UNDO_SECONDS,
     });
-    return true;
   });
-  if (!ok) return;
+  if (queuedId === null) return;
 
   box.value = '';
+  showSentReplyInThread(queuedId, text, headers.subject);
   toast(`已加入发件箱（${UNDO_SECONDS} 秒内可撤销）`, 'ok', 6000, {
     label: '撤销',
     onClick: () => cancelNewestSend(),
   });
   refreshOutbox();
+}
+
+/**
+ * Draw a reply that was just handed to the outbox at the bottom of the conversation.
+ *
+ * Why this exists: the reply travels outbox → worker → SMTP → Sent copy → sync, and until the last
+ * step the cache — which is what the conversation is read from — knows nothing about it. So the user
+ * typed, pressed 发送, and the thread looked exactly as it had a second earlier. That is
+ * indistinguishable from "nothing happened", and it is what this bubble answers: the text is on
+ * screen where they wrote it, labelled with what the queue says about it.
+ *
+ * It is deliberately **not** inserted into `state.threadMembers`: that array is the cache's answer and
+ * is replaced wholesale by the next `loadConversation`, so mixing the two would make a refresh
+ * silently resurrect or duplicate a message.
+ */
+function showSentReplyInThread(outboxId, text, subject) {
+  if ($('thread-view').hidden) return;
+  const account = state.accounts.find((entry) => entry.id === state.accountId) ?? null;
+  const key = `local|${outboxId}`;
+  if (state.threadLocal.some((entry) => entry.key === key)) return;
+
+  state.threadLocal.push({
+    key,
+    // A folder name no real mailbox can have: `bubbleKey` needs one, and "local" cannot collide with
+    // a server folder for the same reason it is not in the sidebar.
+    folder: 'local',
+    outboxId,
+    state: 'queued',
+    text,
+    local: true,
+    summary: {
+      uid: -outboxId,
+      subject: subject || '',
+      from_name: account?.email ?? '',
+      from_addr: account?.email ?? '',
+      date: nowSeconds(),
+      seen: true,
+    },
+  });
+  renderThreadReader();
+
+  // The new bubble is the last one, so bring it into view: the reply box is pinned to the bottom, and
+  // the conversation above it may be long enough that the bubble would otherwise land off screen —
+  // which is the same "nothing happened" the bubble was added to fix.
+  const list = $('thread-bubbles');
+  requestAnimationFrame(() => {
+    list.scrollTop = list.scrollHeight;
+  });
+}
+
+/** Take a sent reply back out of the conversation, after 撤销. */
+function forgetSentReply(outboxId) {
+  const before = state.threadLocal.length;
+  state.threadLocal = state.threadLocal.filter((entry) => entry.outboxId !== outboxId);
+  if (state.threadLocal.length !== before && !$('thread-view').hidden) renderThreadReader();
+}
+
+/**
+ * Keep the bubbles in step with the queue.
+ *
+ * Called from `refreshOutbox`, which is what every outbox event ends in — so the label changes when
+ * the worker moves the row, without the conversation asking the backend anything of its own. A row
+ * that has left the queue keeps its last state: it either went out (the Sent copy will arrive with
+ * the next sync) or was undone, and undo removes the bubble directly (`forgetSentReply`).
+ */
+function syncThreadPendingStates() {
+  if (state.threadLocal.length === 0) return;
+  let changed = false;
+  for (const entry of state.threadLocal) {
+    const row = state.outbox.find((item) => item.id === entry.outboxId);
+    if (!row) continue;
+    if (row.state !== entry.state) {
+      entry.state = row.state;
+      changed = true;
+    }
+  }
+  if (changed && !$('thread-view').hidden) renderThreadReader();
 }
 
 /**
@@ -5040,8 +5212,74 @@ async function refreshStorageHistory(modal) {
   host.textContent = lines.join('\n');
 }
 
+/**
+ * The one 设置 entrance: a dialog listing the four things that used to be four sidebar rows.
+ *
+ * Why a dialog and not an expander in the sidebar: a settings list is a place the user *goes*, and the
+ * sidebar belongs to the folders. Opening it as an overlay also means the folder list never moves —
+ * which is the whole reason this changed (the four rows pushed 收件箱 and everything below it down on
+ * a short window).
+ *
+ * The entries' listeners are attached per opening rather than once at boot, because the buttons only
+ * exist while the dialog is open. Each entry closes this dialog first: two dialogs stacked would leave
+ * the settings list behind a dialog with no way back to it, and `openModal` owns a single `#modal-root`.
+ */
+function openSettings() {
+  const current = state.syncWindow ?? { kind: 'years', value: 2 };
+  const account = state.accounts.find((entry) => entry.id === state.accountId) ?? null;
+  const paused = quotaPaused(state.quota);
+  // The same honesty as the sidebar row: the sync entry says what the window *is*, and adds the one
+  // reason syncing may have stopped, when there is one.
+  const windowText = `${windowLabel(current)}${paused ? ` · ${paused}` : ''}`;
+
+  openModal({
+    title: '设置',
+    bodyHtml: `
+      <div class="settings-menu">
+        <button id="btn-sync-window" class="row" type="button" title="决定客户端往回取多少邮件">
+          <span class="label">同步窗口</span>
+          <span class="count">${escapeHtml(windowText)}</span>
+          <span class="chevron">›</span>
+        </button>
+        <button id="btn-log" class="row" type="button" title="查看最近的程序日志（最多 500 行，内容已脱敏）">
+          <span class="label">查看日志</span>
+          <span class="chevron">›</span>
+        </button>
+        <button id="btn-storage" class="row" type="button" title="缓存占了多少空间、能清什么、清过什么">
+          <span class="label">存储与清理</span>
+          <span class="chevron">›</span>
+        </button>
+        <button id="btn-about" class="row" type="button" title="版本号、更新与诊断包">
+          <span class="label">关于</span>
+          <span class="count">${escapeHtml(state.appVersion || '')}</span>
+          <span class="chevron">›</span>
+        </button>
+      </div>
+      <span class="hint">${
+        account ? `当前账号：${escapeHtml(account.email)}` : '还没有账号。'
+      }</span>`,
+    confirmLabel: '完成',
+    onReady: (modal) => {
+      // Close first, then open: the next dialog replaces this one in the same root, and doing it in
+      // this order means its `onClose` (if it has one) runs while its own fields are still readable.
+      const handoff = (open) => () => {
+        closeModal();
+        open();
+      };
+      modal
+        .querySelector('#btn-sync-window')
+        .addEventListener('click', handoff(openSyncWindowPicker));
+      modal.querySelector('#btn-log').addEventListener('click', handoff(openLog));
+      modal.querySelector('#btn-storage').addEventListener('click', handoff(openStoragePanel));
+      modal.querySelector('#btn-about').addEventListener('click', handoff(openAbout));
+    },
+    onConfirm: async () => true,
+  });
+}
+
 function openAbout() {
-  const version = $('about-version').textContent || '未知';  openModal({
+  const version = state.appVersion || '未知';
+  openModal({
     title: '关于 Easy Email',
     bodyHtml: `
       <p class="about-line">当前版本 <strong>${escapeHtml(version)}</strong></p>

@@ -1439,8 +1439,13 @@ try {
         if ($tail -notmatch 'redact::redact') {
             $problems += 'log_tail must redact on the way out too: a second pass that changes text is a bug, and it must be able to say so'
         }
-        if ($html -notmatch 'id="btn-log"') {
-            $problems += 'the sidebar must have a row for the log'
+        # Round 122: the log row moved into the 设置 dialog (one sidebar entrance instead of four), so
+        # it is app.js that has to carry the row now. The sidebar's own entrance is #btn-settings.
+        if ($html -notmatch 'id="btn-settings"') {
+            $problems += 'the sidebar must have one 设置 row'
+        }
+        if ($js -notmatch 'id="btn-log"') {
+            $problems += 'the settings dialog must have a row for the log'
         }
         if ($js -notmatch 'btn-log') {
             $problems += 'app.js must wire the row'
@@ -1851,7 +1856,7 @@ try {
         $problems = @()
 
         # The panel exists, and its dry-run button leads to the write button.
-        if ($html -notmatch 'id="btn-storage"') { $problems += 'index.html must have the storage row' }
+        if ($js -notmatch 'id="btn-storage"') { $problems += 'the settings dialog must have the storage row' }
         if ($js -notmatch 'btn-storage-dry') { $problems += 'app.js must have the dry-run button' }
         if ($js -notmatch 'btn-storage-run') { $problems += 'app.js must have the clean-up button' }
         if ($js -notmatch 'openStoragePanel') { $problems += 'the row must open the panel' }
@@ -2718,7 +2723,24 @@ try {
         # `cdylib` crate type once produced one on every single build.
         $out = cargo build --workspace --message-format short 2>&1 | Out-String
         $code = $LASTEXITCODE
-        $warnings = @($out -split "`n" | Where-Object { $_ -match '^warning' })
+        # One warning is not about this code at all: cargo failing to *delete* an incremental lock file
+        # (`os error 5`, 拒绝访问) because antivirus or the search indexer is holding it. It appears and
+        # disappears between runs on an unchanged tree — round 122 hit it on a frontend-only change,
+        # where nothing could possibly have produced a Rust warning.
+        #
+        # Its trailing "generated 1 warning" summary has to be let through as well, or the step fails on
+        # the count of the very line it just excused (that is exactly what happened on the first try).
+        # Dropping summaries is safe: every real warning also arrives as its own `warning: …` line, and
+        # those are still counted.
+        $all = @($out -split "`n" | Where-Object { $_ -match '^warning' })
+        $warnings = @($all | Where-Object {
+            $_ -notmatch '^warning: error deleting lock file for incremental compilation session directory' -and
+            $_ -notmatch '^warning: `.*` \(.*\) generated \d+ warnings?\s*$'
+        })
+        $skipped = $all.Count - $warnings.Count
+        if ($skipped -gt 0) {
+            Write-Host "ignored $skipped transient incremental-lock warning(s) from cargo (os error 5)" -ForegroundColor Yellow
+        }
         if ($warnings.Count -gt 0) {
             Write-Host ($warnings -join "`n") -ForegroundColor Red
             $global:LASTEXITCODE = 1
@@ -2827,6 +2849,60 @@ try {
             return
         }
         Write-Host 'host detection runs on 5.1; every read is explicit UTF-8; Chinese scripts carry a BOM'
+        $global:LASTEXITCODE = 0
+    }
+
+    Step 'primary 按钮悬浮时仍然看得见字（第 122 轮）' {
+        # 一个纯 CSS 的层叠陷阱：`.btn:hover:not(:disabled)` 是 (0,3,0) 且**排在前面**，`.btn.primary`
+        # 只有 (0,2,0) —— 于是悬浮时通用规则赢了，把背景刷成 `--surface-2`（近白），而 primary 的
+        # `color: #fff` 还在：白字白底，按钮在鼠标底下变成一块空白。这类"看着像没字"的 bug 截图对比
+        # 也看不出来（要悬浮），所以钉在源码上：primary 的悬浮规则必须自己把底色写回来。
+        $css = Get-Content 'src/style.css' -Raw -Encoding UTF8
+        $problems = @()
+
+        $generic = [regex]::Match($css, '(?s)\.btn:hover:not\(:disabled\)\s*\{.*?\}')
+        if (-not $generic.Success) { $problems += '.btn:hover:not(:disabled) disappeared — re-check what this step pins' }
+        $primary = [regex]::Match($css, '(?s)\.btn\.primary:hover:not\(:disabled\)\s*\{.*?\}')
+        if (-not $primary.Success) {
+            $problems += '.btn.primary:hover:not(:disabled) is missing'
+        } else {
+            if ($primary.Value -notmatch 'background:\s*var\(--accent\)') {
+                $problems += 'the primary hover rule must restate its background, or the generic .btn:hover repaints it near-white under white text'
+            }
+            if ($generic.Success -and $css.IndexOf($primary.Value) -lt $css.IndexOf($generic.Value)) {
+                $problems += 'the primary hover rule must come after the generic one'
+            }
+        }
+        # 字色也得钉住：把 primary 的 color 换成深色"看起来也能过"，但那是在改设计。
+        $primaryBase = [regex]::Match($css, '(?s)\.btn\.primary\s*\{.*?\}')
+        if (-not $primaryBase.Success -or $primaryBase.Value -notmatch 'color:\s*#fff') {
+            $problems += '.btn.primary must keep its white label'
+        }
+
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            $global:LASTEXITCODE = 1
+            return
+        }
+        Write-Host 'primary 按钮悬浮后仍是蓝底白字'
+        $global:LASTEXITCODE = 0
+    }
+
+    Step '会话里刚发的回复当场出现在对话里（第 122 轮）' {
+        # 用户报的第三件：在会话底部的输入框回了一句，按发送之后对话没有任何变化。原因是发送要走
+        # 发件箱 → SMTP → 服务器 Sent 副本 → 同步，而对话是**从缓存读**的：在最后一步之前，线程里
+        # 根本没有这条消息，看起来就像"什么都没发生"。检查项全在结构上，见脚本头注释。
+        if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "node not found on PATH; skipping. Install Node.js to enable this check." -ForegroundColor Yellow
+            $global:LASTEXITCODE = 0
+            return
+        }
+        node tools/thread_reply_echo_test.mjs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '刚发出的回复没有当场出现在会话里，或者撤销之后还留着' -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
         $global:LASTEXITCODE = 0
     }
 

@@ -77,8 +77,27 @@ if (app.includes('还没有保存的搜索')) {
 }
 
 // 5. And the sections that must exist are still reachable.
-for (const id of ['btn-compose', 'btn-drafts', 'mailbox-list', 'btn-about']) {
+for (const id of ['btn-compose', 'btn-drafts', 'mailbox-list', 'btn-settings']) {
   if (!html.includes(`id="${id}"`)) fail(`#${id} disappeared from the sidebar`);
 }
 
-console.log('写邮件在固定头里，队列只有「已发送」一个入口，空的分组不再占位');
+// 6. 设置 is one entrance, not four rows. Four rows sitting open under a 设置 heading made the least
+// used part of the window the tallest thing in the sidebar, pushing the folder list down. The rows
+// still exist — inside the dialog `openSettings` builds — so the question is where they are, not
+// whether they are.
+for (const id of ['btn-sync-window', 'btn-log', 'btn-storage', 'btn-about']) {
+  if (html.includes(`id="${id}"`)) {
+    fail(`#${id} is back in the sidebar — the four settings entries live in the 设置 dialog (round 122)`);
+  }
+  if (!app.includes(`id="${id}"`)) {
+    fail(`#${id} is gone entirely — openSettings must still offer it`);
+  }
+}
+if (!/function openSettings\(/.test(app)) {
+  fail('openSettings is missing: the 设置 row would open nothing');
+}
+if (!/openSettings\)/.test(app) || !app.includes("$('btn-settings')")) {
+  fail('#btn-settings is not wired to openSettings');
+}
+
+console.log('写邮件在固定头里，队列只有「已发送」一个入口，设置只有一行');

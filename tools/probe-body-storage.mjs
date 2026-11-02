@@ -74,7 +74,9 @@
     return null;
   };
 
-  /* The panel, clicked. */
+  /* The panel, clicked. Round 122: 设置 is one sidebar row now, so the storage entry is one click in. */
+  document.querySelector('#btn-settings').click();
+  await wait(300);
   document.querySelector('#btn-storage').click();
   await wait(1500);
   const modal = document.querySelector('#modal-root .modal');

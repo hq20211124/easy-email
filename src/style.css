@@ -391,7 +391,18 @@ textarea {
   font-weight: 600;
 }
 
+/*
+  A primary button keeps its accent on hover — `background` here is not redundant.
+
+  `.btn:hover:not(:disabled)` above is specificity (0,3,0) and comes *earlier*, while `.btn.primary`
+  is only (0,2,0): so on hover the generic rule won and repainted the button with `--surface-2` — a
+  near-white — while the primary rule's `color: #fff` stayed. The label went white on white: the
+  button read as "empty" exactly when the pointer was on it. Restating the accent here (0,4,0, later)
+  is what keeps the paint; the brightness is then the only thing that changes.
+*/
 .btn.primary:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
   filter: brightness(1.08);
 }
 
@@ -484,6 +495,25 @@ textarea {
   border-radius: 50%;
   background: var(--unread);
   flex: none;
+}
+
+/* The 设置 dialog's list of entries. Same `.row` shape as the sidebar, because it is the same kind
+   of thing — a line you click — but it needs a little more air and a chevron saying "this opens
+   something", which a sidebar folder row does not need. */
+.settings-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-menu .row {
+  padding: 9px 10px;
+}
+
+.settings-menu .row .chevron {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 /* ---------------------------------------------------------------- message list */
@@ -1540,6 +1570,41 @@ textarea {
   font-size: 11.5px;
   color: var(--text-muted);
   font-style: italic;
+}
+
+/*
+  A reply that was just sent from the conversation's own box, before the cache has its Sent copy.
+
+  It is drawn like one of the user's bubbles (`.mine`) so it lands on the right, where the eye already
+  is, but it is not clickable and not a placeholder for a message: it is the outbox row, shown where
+  the user was typing. The dashed edge is what says "this is not on the server yet" — and it stops
+  saying that (the state text changes) when the queue moves, so the bubble never claims more than the
+  outbox knows.
+*/
+.bubble.pending {
+  cursor: default;
+  border-style: dashed;
+}
+
+.bubble.pending.failed {
+  border-color: var(--danger);
+}
+
+.bubble.pending .bubble-head .state {
+  flex: none;
+  font-size: 11px;
+}
+
+.bubble.pending.failed .bubble-head .state {
+  color: var(--danger);
+}
+
+/* The whole reply, not a preview: the user just wrote it and is checking it went out. Four clamped
+   lines would hide the end of the very sentence they are looking for. */
+.bubble.pending .bubble-preview {
+  display: block;
+  overflow: visible;
+  white-space: pre-wrap;
 }
 
 .bubble-body {
