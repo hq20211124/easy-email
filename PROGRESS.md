@@ -18,6 +18,28 @@
   `tools/check.ps1` **全绿**：**71 步**（第 124 轮把设计审计 `design/tools/audit.py` 塞进了门禁 —— 它存在了一百多轮却从没被跑过，于是自己烂掉了；第 122 轮加了「primary 按钮悬浮看得见字」与「会话里刚发的回复当场出现」两步；第 113 轮加了「墓碑接线」一步，第 114 轮把它换成了「删除路径」；第 112 轮加了「侧栏结构」一步，第 110 轮加了「两个档各读各的库」一步；第 101 轮给 2a/2b 各加一步；第 98 轮续的那把尺子是其中一步；下面那串 15 步的括号是最早的清单，
   早已过期，只有"fmt + clippy -D warnings + build + test + PE=2"这几条一直是骨架）。
 
+### Issue 分诊：21 个 OPEN 里 5 条早就修好了（第 125 轮，2026-11-04）
+
+21 个 issue 全部来自 2026-10-16 那次评审，一直挂着 `needs-triage`。逐条对着代码核对的结果：
+**5 条已在后续轮次修好但从没关**（C1 发件箱账号过滤、H1 令牌键大小写、H3 `cc:` 搜索、
+H4 client_secret 明文、M8 无效 Date），**16 条仍成立**。
+
+- 关掉的 5 条每条都附了 `文件:行` 与回归测试名，不是"看着像修了"。最典型的是 **#1（C1 严重）**：
+  三条 worker 取件查询现在都把 `account_id` 当必填参数，`every_outbox_pass_query_is_scoped_to_one_account`
+  扫这三条 SQL。
+- 仍成立的 12 条贴 `ready-for-agent`、4 条贴 `ready-for-human`（#10 接口契约要选、#16 关
+  `withGlobalTauri` 要重排桥接面且必须真窗口验证、#19 Linux AEAD 本机没环境、#21 六条低危混在一起）。
+- **核对过程改了三条的优先级**：#8 `write_retry` 无事务但**全库没有调用者**（潜伏）；
+  #9 `CleanupPolicy::default()` **只被测试用**（生产路径显式传两个字段）；#17 `srcset` **部分已修**
+  （`app.js` 已计入图片计数，只剩净化侧）。三条都在 issue 里补了说明。
+- **一条要更正我自己的话**：#3（SVG `xlink:href`）我上一轮说"已修"，**那是错的** ——
+  `sanitize.rs:462` 只是把它列进 URL 属性，`drop_attribute` 仍只丢弃**危险 scheme**，
+  `https://evil.example` 的 `xlink:href` 原样保留。它现在是 `ready-for-agent` 里最该先修的一条。
+
+完整对照表在 **[reports/issue-triage-2026-11-04.md](reports/issue-triage-2026-11-04.md)**。
+
+**没验什么**：只读代码与跑已有测试，没有为任何一条写新测试，也没有改一行实现。
+
 ### 补齐 A3/A4 缺的三节，并把设计审计塞进门禁（第 124 轮，2026-11-02）
 
 上一轮发现 `python design/tools/audit.py` 有 2 项失败：`A3-local-store-protection.md` 与
