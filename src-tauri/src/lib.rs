@@ -2018,6 +2018,62 @@ async fn sweep_draft_mirrors(app: &AppHandle) -> usize {
 
     removed
 }
+/// Run one maintenance tick and hand back the sentence the log would get.
+///
+/// The command exists so the tick can be driven from a test or from the UI later; the unattended path
+/// is [`start_maintenance_worker`], because a maintenance pass nobody schedules is the bug this was
+/// filed for (issue #6, `design/16` §4.2).
+#[tauri::command]
+async fn maintenance_tick(app: AppHandle) -> Result<String, String> {
+    let (accounts, cache) = {
+        let state = app.state::<AppState>();
+        (state.snapshot(), state.cache.clone())
+    };
+    let ids: Vec<String> = accounts.into_iter().map(|account| account.id).collect();
+    let report = mail_core::maintenance::tick(&cache, &ids).map_err(|e| e.to_string())?;
+    let line = report.summary();
+    log_line(&format!("[easy-email] {line}"));
+    Ok(line)
+}
+
+/// The daily maintenance tick, on a timer.
+///
+/// **Why a timer and not a button:** `design/16` §4.2 asks for heal / FTS consistency / vacuum to run
+/// "every 24 h or when idle", and until now nothing ran them — the pieces existed and the UI drove
+/// them, so a drifted index stayed drifted and freed pages never came back. That is the silent half:
+/// search simply stops finding some mail, with no error anywhere.
+///
+/// **Why the first run waits:** the window has just opened and is doing its own work (first paint,
+/// folder list, the first sync). A tick that starts at second zero competes with all of it for the
+/// same database. A minute in, the app is idle and the tick is invisible.
+///
+/// **Why a day:** the work is bounded (`REINDEX_STEP`) and idempotent, so the interval is a cost
+/// decision, not a correctness one. A cache that drifts and is repaired a day later costs one day of
+/// a few unsearchable messages — the alternative, ticking every minute, costs a rebuild attempt on
+/// every launch for the same result.
+fn start_maintenance_worker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        const FIRST_RUN_SECS: u64 = 60;
+        const INTERVAL_SECS: u64 = 24 * 60 * 60;
+        tokio::time::sleep(std::time::Duration::from_secs(FIRST_RUN_SECS)).await;
+        loop {
+            // Handles, not `State`: the loop must not hold the guard across a sleep.
+            let (accounts, cache) = {
+                let state = app.state::<AppState>();
+                (state.snapshot(), state.cache.clone())
+            };
+            let ids: Vec<String> = accounts.into_iter().map(|account| account.id).collect();
+            match mail_core::maintenance::tick(&cache, &ids) {
+                Ok(report) => log_line(&format!("[easy-email] {}", report.summary())),
+                // A failed tick must not kill the loop: the next one is a day away and the app is
+                // still perfectly usable without it.
+                Err(error) => log_line(&format!("[easy-email] 维护失败：{error}")),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(INTERVAL_SECS)).await;
+        }
+    });
+}
+
 /// Run one pass of the outbox worker for every configured account.
 ///
 /// One account at a time on purpose: the connection budget in `design/04` is per account, and a
@@ -4475,6 +4531,9 @@ pub fn run() {
             // A read-only question to the operating system, asked on its own thread so the window is
             // up and mailing before it answers (`design/A3` 选项 2's self-check half).
             start_disk_protection_check(app.handle().clone());
+            // The daily maintenance tick (`design/16` §4.2). Started after the workers above so its
+            // first run queues behind them rather than competing for the database.
+            start_maintenance_worker(app.handle().clone());
 
             // The tray icon. Built here rather than in config so the menu can drive the app.
             let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
@@ -4537,6 +4596,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_providers,
             suggest_provider,
+            maintenance_tick,
             build_account,
             endpoint_choices,
             list_accounts,

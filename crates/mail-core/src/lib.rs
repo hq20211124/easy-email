@@ -28,6 +28,7 @@ pub mod imap;
 pub mod index;
 pub mod links;
 pub mod logrot;
+pub mod maintenance;
 pub mod model;
 pub mod mutf7;
 pub mod oauth;

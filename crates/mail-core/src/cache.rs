@@ -2066,13 +2066,30 @@ impl Cache {
             report.orphans_deleted = removed as u32;
         }
 
-        // Either signal is enough, and the count one matters more: a row that went missing is the
-        // damage a user actually meets (the mail stops being findable) while a structurally corrupt
-        // index usually announces itself. The count is a trustworthy signal **because** every write
-        // path puts the message row and its index row in one transaction
-        // (`upsert_summaries`/`put_detail`), so a reader can never see the half that is missing.
-        // That is the fact this relies on; if a write path ever splits in two, this becomes a
-        // detector that repairs a race, which is why the comment is here.
+        let rebuilt = self.reindex_step(account_id, step)?;
+        report.rebuilt = rebuilt.rebuilt;
+        report.remaining = rebuilt.remaining;
+        Ok(report)
+    }
+
+    /// One bounded reindex step, **without touching `bodies`**.
+    ///
+    /// Split out for the maintenance tick (`maintenance::tick`), which runs unattended: rebuilding the
+    /// search index is safe at any time — it is derived data, and a half-finished rebuild is still a
+    /// better index than a missing one — but deleting orphaned bodies is not, because there is no
+    /// quarantine yet (`design/16` §5, issue #7). The unattended path therefore repairs the index and
+    /// only *reports* the orphans, leaving the deletion to the button the user presses.
+    ///
+    /// Either signal is enough, and the count one matters more: a row that went missing is the
+    /// damage a user actually meets (the mail stops being findable) while a structurally corrupt
+    /// index usually announces itself. The count is a trustworthy signal **because** every write
+    /// path puts the message row and its index row in one transaction
+    /// (`upsert_summaries`/`put_detail`), so a reader can never see the half that is missing.
+    /// That is the fact this relies on; if a write path ever splits in two, this becomes a
+    /// detector that repairs a race, which is why the comment is here.
+    pub fn reindex_step(&self, account_id: &str, step: usize) -> Result<HealReport> {
+        let mut report = HealReport::default();
+        let health = self.index_health(account_id)?;
         if !health.fts_ok || health.indexed < health.messages {
             self.rebuild_search_begin()?;
             let progress = self.rebuild_search_step(step)?;

@@ -1403,11 +1403,13 @@ fn summarise(fetch: &async_imap::types::Fetch) -> MessageSummary {
         Some(msg) => {
             let from = msg.from().and_then(|a| a.first());
             // The thread key comes from headers already in hand: the root of the `References` chain,
-            // or the message's own id. Computing it here — rather than when the list is read — is what
-            // lets the cache store it and the renderer group without the chain.
+            // `In-Reply-To` when there is no chain, or the message's own id. Computing it here — rather
+            // than when the list is read — is what lets the cache store it and the renderer group
+            // without the chain.
             let key = crate::threads::root_of(
                 msg.message_id().unwrap_or_default(),
                 msg.header_raw("References").unwrap_or_default(),
+                msg.header_raw("In-Reply-To").unwrap_or_default(),
             );
             (
                 msg.subject().unwrap_or("(无主题)").to_string(),

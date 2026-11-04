@@ -133,6 +133,8 @@ Windows 只出 NSIS 一个产物（`src-tauri/tauri.windows.conf.json:18`），�
 - **定时动作只有两个，都只连用户自己的邮件服务器**：文件夹的 IDLE 推送监听，和一个**打开着的写信窗口**
   每 30 秒把草稿镜像到服务器（`src/app.js:4000-4012`、`invoke('mirror_draft')` `:4233`）。写信窗口关掉
   就停（`:4020-4021`）。全应用只有两处 `setInterval`：这一处，和 `:347` 的撤销倒计时（纯本地、不联网）。
+  第 127 轮又加了一个 **Rust 侧的 24 h 维护定时器**（`start_maintenance_worker`）：它只读写本地两个
+  数据库（索引对账 + `incremental_vacuum`），**不连任何网络地址**，所以下面这张白名单表不受影响。
 - **渲染出的邮件内容拿不到网络**：正文 iframe 的 `sandbox` 属性**不带任何值**（脚本、同源、表单、顶层导航
   全禁），并且 `referrerpolicy="no-referrer"`（`src/index.html:258-263`）；帧内自己的 meta CSP 是
   `default-src 'none'`，未获用户许可时 `img-src data: blob:`（`src/app.js:3616-3626`）；外层壳的

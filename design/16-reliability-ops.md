@@ -142,6 +142,21 @@ maintenance_tick:
   └ 写 MaintenanceReport 进日志与 health()
 ```
 
+> **落地情况（第 127 轮，2026-11-04）**：上面这棵树在这一轮之前**一行都没实现** —— 零件都有，按钮也
+> 能驱动，但没有任何东西按时跑它。现在有了 `crates/mail-core/src/maintenance.rs` 的
+> `maintenance::tick`，由 `start_maintenance_worker` 在启动 60 秒后跑一次、之后每 24 h 一次。
+> **但它只做了这棵树的一半，另一半是有意不做的**：
+>
+> - 做了：索引与 `messages` 对账并**有界**重建（`REINDEX_STEP = 500`，进度存在库里，可续跑）、
+>   `pragma incremental_vacuum`、报告写进日志（`设置 → 查看日志` 与诊断包都能看到）。
+> - 没做 `quota::plan + apply`：本文写的是"必要时 apply"，但应用对用户承诺过**没有任何东西会自己删
+>   数据**（README「已知限制」）。无人值守地删正文来省空间，是拿承诺换磁盘 —— 清理仍然只在
+>   `设置 → 存储与清理` 里由人按下按钮。
+> - 没做孤儿 bodies 的删除：`heal_index` 会删，但 `design/16 §5` 要求的 `heal-quarantine/` 还不存在
+>   （issue #7）。所以 tick 走的是 `Cache::reindex_step`（只修索引），孤儿**只报不删**。
+> - 没做过期行清理：这里点名的 `sync_jobs` / `notification_log` / `import_dedupe` **三张表在这个
+>   版本里都不存在**，没有东西可过期。等它们落地时，位置就在这里。
+
 ### 4.3 失败分类与重试策略（统一表）
 
 | 类别 | 例子 | 重试 | 用户可见 | 动作 |

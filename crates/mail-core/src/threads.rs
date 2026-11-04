@@ -18,15 +18,18 @@
 /// An empty answer is deliberate rather than a made-up key: a message with neither a `Message-ID`
 /// nor a `References` chain (a malformed header, or a server that strips them) has nothing to match
 /// on, and inventing a key would fold unrelated mail together.
-pub fn root_of(message_id: &str, references: &str) -> String {
-    // `References` is a whitespace-separated list, oldest first; anything non-`<...>` in it (a
-    // display name, a client that wrote it without brackets) is not an id.
-    if let Some(first) = references
-        .split_whitespace()
-        .map(str::trim)
-        .find(|token| !token.is_empty())
-    {
-        return normalise(first);
+///
+/// `in_reply_to` is the **fallback**, not a second opinion: it is only consulted when `References` is
+/// empty. Some clients send a reply with `In-Reply-To` alone, and ignoring that field split one
+/// conversation into two threads — the exact failure `design/08` §4.1 names as the strongest signal
+/// being wasted (2026-11-04, issue #15). `References` still wins when both are present, because it is
+/// the whole chain and therefore the only one that can name the *oldest* message.
+pub fn root_of(message_id: &str, references: &str, in_reply_to: &str) -> String {
+    if let Some(root) = first_message_id(references) {
+        return root;
+    }
+    if let Some(root) = first_message_id(in_reply_to) {
+        return root;
     }
 
     let own = message_id.trim();
@@ -34,6 +37,19 @@ pub fn root_of(message_id: &str, references: &str) -> String {
         return String::new();
     }
     normalise(own)
+}
+
+/// The first real id in a whitespace-separated header, normalised.
+///
+/// Both headers are lists of ids in the same shape; anything non-`<...>` (a display name, a client
+/// that wrote it without brackets) is not an id but is still normalised rather than skipped, because
+/// dropping it would fall through to the message's own id and silently split a thread.
+fn first_message_id(header: &str) -> Option<String> {
+    header
+        .split_whitespace()
+        .map(str::trim)
+        .find(|token| !token.is_empty())
+        .map(normalise)
 }
 
 /// The canonical form of one message id: wrapped in angle brackets, as `References` requires.
@@ -125,11 +141,12 @@ mod tests {
     fn a_reply_and_its_original_agree_on_one_key() {
         // The whole point: the reply lists the original in `References`, so both compute the same
         // root and a client that has seen only one of them still puts it in the right thread.
-        let original = root_of("<original@example.com>", "");
-        let reply = root_of("<reply@example.com>", "<original@example.com>");
+        let original = root_of("<original@example.com>", "", "");
+        let reply = root_of("<reply@example.com>", "<original@example.com>", "");
         let deep = root_of(
             "<third@example.com>",
             "<original@example.com> <reply@example.com>",
+            "",
         );
         assert_eq!(original, "<original@example.com>");
         assert_eq!(reply, original);
@@ -140,11 +157,11 @@ mod tests {
     fn brackets_are_not_part_of_the_identity() {
         // Servers and clients disagree about the brackets; the same message must not land in two
         // threads because of it.
-        assert_eq!(root_of("a@b", ""), "<a@b>");
-        assert_eq!(root_of("<a@b>", ""), "<a@b>");
-        assert_eq!(root_of("  <a@b>  ", ""), "<a@b>");
+        assert_eq!(root_of("a@b", "", ""), "<a@b>");
+        assert_eq!(root_of("<a@b>", "", ""), "<a@b>");
+        assert_eq!(root_of("  <a@b>  ", "", ""), "<a@b>");
         assert_eq!(
-            root_of("<x@y>", "a@b <c@d>"),
+            root_of("<x@y>", "a@b <c@d>", ""),
             "<a@b>",
             "an unbracketed reference is still the root"
         );
@@ -153,17 +170,51 @@ mod tests {
     #[test]
     fn a_message_with_no_identity_gets_no_key() {
         // Not a made-up key: folding every malformed message into one thread would hide mail.
-        assert_eq!(root_of("", ""), "");
-        assert_eq!(root_of("   ", "   "), "");
+        assert_eq!(root_of("", "", ""), "");
+        assert_eq!(root_of("   ", "   ", ""), "");
     }
 
     #[test]
     fn a_self_reference_does_not_change_the_root() {
         // Some clients include the message's own id in `References`; the root is still the oldest.
         assert_eq!(
-            root_of("<b@x>", "<a@x> <b@x>"),
+            root_of("<b@x>", "<a@x> <b@x>", ""),
             "<a@x>",
             "the chain wins over the message's own id"
+        );
+    }
+
+    /// Issue #15 (2026-11-04): a reply that only carries `In-Reply-To` still belongs to its parent.
+    ///
+    /// Ignoring that header split one conversation into two threads — the reply got its own id as the
+    /// key, the original kept its own, and the list showed two rows for one exchange.
+    #[test]
+    fn a_reply_with_only_in_reply_to_joins_its_parent() {
+        let parent = root_of("<original@example.com>", "", "");
+        let reply = root_of("<reply@example.com>", "", "<original@example.com>");
+        assert_eq!(reply, parent, "In-Reply-To is a fact too");
+
+        // Brackets are not part of the identity here either.
+        assert_eq!(
+            root_of("<reply@example.com>", "", "original@example.com"),
+            "<original@example.com>"
+        );
+
+        // `References` wins when both are present: only the chain can name the *oldest* message.
+        assert_eq!(
+            root_of(
+                "<third@example.com>",
+                "<original@example.com>",
+                "<reply@example.com>"
+            ),
+            "<original@example.com>",
+            "the chain outranks the immediate parent"
+        );
+
+        // A message with neither header still gets its own id — unchanged behaviour.
+        assert_eq!(
+            root_of("<lonely@example.com>", "", ""),
+            "<lonely@example.com>"
         );
     }
 

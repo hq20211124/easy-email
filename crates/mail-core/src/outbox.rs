@@ -148,13 +148,47 @@ pub enum Verdict {
     GiveUp { needs_attention: bool },
 }
 
+/// Wording that means "the credential or the account policy is wrong".
+///
+/// Needed because **lettre does not always hand back a status code**. An authentication rejection can
+/// arrive as a bare sentence (the client raises its own error before the server's status is parsed),
+/// and a tenant policy refusal is often prose only. Those used to fall through to [`Verdict::Retry`],
+/// so a user who pasted their login password instead of the app password got a message that retried
+/// every six hours — forever — instead of one that says "this needs you" (2026-11-04, issue #20).
+///
+/// The vocabulary is the same one `MailError::classify_smtp` uses to decide what to tell the user, on
+/// purpose: two lists that drift apart would mean a failure that is explained correctly in the error
+/// banner and handled wrongly by the queue.
+fn looks_like_credential_or_policy(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    const PHRASES: [&str; 10] = [
+        "authentication",
+        "authorization",
+        "invalid credentials",
+        "username and password not accepted",
+        "login fail",
+        // Enhanced status codes that name a credential or tenant-policy problem specifically.
+        "5.7.8",
+        "5.7.60",
+        "5.7.139",
+        "smtpclientauthentication is disabled",
+        "does not have permissions to send as this sender",
+    ];
+    PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
 /// Read a failure message and decide.
 ///
 /// The default is [`Verdict::Retry`], deliberately: anything we cannot classify is *not* proof that
 /// the message is undeliverable, and dropping queued mail is the one failure this feature exists to
 /// prevent. The cost of being wrong in that direction is a message that keeps trying every six
 /// hours, which the user can cancel.
+///
+/// The one exception is a **credential or policy** failure with no status code: retrying it is not
+/// "waiting for the network", it is asking a server the same question it has already refused, and the
+/// only thing that can change the answer is the user (`design/16` §4.3).
 pub fn verdict_for_failure(message: &str) -> Verdict {
+    let needs_attention = looks_like_credential_or_policy(message);
     if let Some(code) = status_code(message) {
         // "Message too large" can only fail again, and the fix is a decision (compress, send a
         // link, drop the attachment), which is exactly what needs_attention is for.
@@ -164,10 +198,14 @@ pub fn verdict_for_failure(message: &str) -> Verdict {
             };
         }
         if is_permanent_failure(code) {
-            return Verdict::GiveUp {
-                needs_attention: false,
-            };
+            return Verdict::GiveUp { needs_attention };
         }
+        // A transient code stays transient even when the sentence mentions authentication: a 454 is
+        // the server asking for TLS, not a rejected password.
+        return Verdict::Retry;
+    }
+    if needs_attention {
+        return Verdict::GiveUp { needs_attention };
     }
     Verdict::Retry
 }
@@ -311,6 +349,52 @@ mod tests {
         assert_eq!(
             verdict_for_failure("connection reset by peer"),
             Verdict::Retry
+        );
+    }
+
+    /// Issue #20 (2026-11-04): a credential failure with no status code is not a retry.
+    ///
+    /// `lettre` raises its own error before the server's status is parsed in several paths, so the
+    /// queue saw a bare sentence, could not find a three-digit code, and defaulted to `Retry` — every
+    /// six hours, forever, for a password the user was never asked to fix. A transient *code* stays
+    /// transient (a 454 is "use TLS", not "your password is wrong"), which is why the code path is
+    /// checked first.
+    #[test]
+    fn a_credential_failure_without_a_code_asks_the_user() {
+        let asks = Verdict::GiveUp {
+            needs_attention: true,
+        };
+        assert_eq!(verdict_for_failure("authentication failed"), asks);
+        assert_eq!(
+            verdict_for_failure("Invalid credentials, please check your username"),
+            asks
+        );
+        assert_eq!(
+            verdict_for_failure("Username and password not accepted"),
+            asks
+        );
+        assert_eq!(
+            verdict_for_failure("SMTPClientAuthentication is disabled for this tenant"),
+            asks
+        );
+        assert_eq!(
+            verdict_for_failure("5.7.60 sender does not have permissions to send as this sender"),
+            asks
+        );
+        // A 535 is permanent *and* a credential problem: the user has to act, so it is not merely
+        // "failed" — the outbox offers the re-login path for `needs_attention` rows.
+        assert_eq!(verdict_for_failure("535 5.7.8 authentication failed"), asks);
+        // A transient code wins over the wording: 454 asks for TLS, and that can succeed on retry.
+        assert_eq!(
+            verdict_for_failure("454 4.7.0 authentication required"),
+            Verdict::Retry
+        );
+        // And a permanent failure that says nothing about credentials keeps its old meaning.
+        assert_eq!(
+            verdict_for_failure("550 5.1.1 no such user"),
+            Verdict::GiveUp {
+                needs_attention: false
+            }
         );
     }
 }
