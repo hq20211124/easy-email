@@ -357,10 +357,15 @@ fn rebuild_tag(original: &str, tag: &Tag) -> String {
 
     // An `href` on a link decides the target, and it is decided **before** the loop: attribute order
     // belongs to the sender, so a `data-ee-href` placed first must not win over the real `href`.
+    //
+    // `xlink:href` counts as the same thing. SVG links are written `<a xlink:href="…">`, and a
+    // sanitiser that only knows `href` leaves them followable: the reading frame cannot navigate its
+    // *parent*, but it can navigate **itself**, so a click would paint the sender's page inside the
+    // pane with no URL shown — exactly the hole `href` removal exists to close (2026-11-04, issue #3).
     let href_attr = if anchor {
-        tag.attrs
-            .iter()
-            .find(|a| a.name == "href" && a.has_value && !a.value.starts_with('#'))
+        tag.attrs.iter().find(|a| {
+            (a.name == "href" || a.name == "xlink:href") && a.has_value && !a.value.starts_with('#')
+        })
     } else {
         None
     };
@@ -387,10 +392,21 @@ fn rebuild_tag(original: &str, tag: &Tag) -> String {
                 && !is_dangerous_url(&attr.value);
             cut = !usable;
             kept_existing_target = usable;
-        } else if anchor && attr.name == "href" {
-            // A fragment cannot leave the document, so "jump to the footnote" keeps working;
-            // anything else never stays followable.
-            cut = !attr.value.starts_with('#');
+        } else if attr.name == "href" || attr.name == "xlink:href" {
+            // A fragment cannot leave the document, so "jump to the footnote" keeps working, and an
+            // SVG `<use xlink:href="#icon">` keeps drawing. Anything else never stays followable:
+            //
+            //  * on a **link** it has already been turned into `data-ee-href` above, so the attribute
+            //    itself is redundant *and* dangerous — a second, followable copy of the target;
+            //  * on an **SVG reference** (`<use>`, `<image>`) there is no `data-ee-href` to offer, and
+            //    an external reference is a fetch the user never asked for, so it is cut outright.
+            //
+            // `data:` is inline and cannot reach the network, so a `data:` image reference survives
+            // (same reasoning as `img src="data:…"`, which is kept) — but never on a link, where
+            // `data:` is a *navigation* target and that is the thing being removed.
+            let fragment = attr.value.starts_with('#');
+            let inline = !anchor && attr.value.starts_with("data:");
+            cut = !(fragment || inline);
         }
 
         if cut {
@@ -748,6 +764,66 @@ mod tests {
         // The escaped form survives a round trip, i.e. sanitising twice is still a no-op.
         let once = sanitize_mail_html(r#"<a href="https://example.com/a?b=c&amp;d=e">link</a>"#);
         assert_eq!(sanitize_mail_html(&once), once);
+    }
+
+    /// Issue #3 (2026-11-04): an SVG link is still a link.
+    ///
+    /// `<svg><a xlink:href="https://evil.example">` used to survive untouched — `xlink:href` was
+    /// only dropped when the scheme itself was dangerous — and a click navigated the reading frame to
+    /// the sender's page with no URL shown. The same `<a href>` is degraded to `data-ee-href`; the
+    /// SVG spelling has to be too, or the hole is one attribute name away.
+    #[test]
+    fn an_svg_link_loses_its_xlink_href_as_well() {
+        // Degraded exactly like `href`, so the renderer still offers the target as a labelled action.
+        assert_eq!(
+            sanitize_mail_html(r#"<svg><a xlink:href="https://evil.example">x</a></svg>"#),
+            r#"<svg><a data-ee-href="https://evil.example">x</a></svg>"#
+        );
+        // A dangerous scheme gets neither a followable attribute nor a target.
+        assert_eq!(
+            sanitize_mail_html(r#"<svg><a xlink:href="javascript:alert(1)">x</a></svg>"#),
+            "<svg><a>x</a></svg>"
+        );
+        // Two spellings, one target: the `href` wins and the second one never becomes followable.
+        assert_eq!(
+            sanitize_mail_html(
+                r#"<a href="https://good.example" xlink:href="https://evil.example">x</a>"#
+            ),
+            r#"<a data-ee-href="https://good.example">x</a>"#
+        );
+        // An in-page fragment cannot leave the document, so an SVG sprite reference keeps working.
+        assert_eq!(
+            sanitize_mail_html(r##"<svg><use xlink:href="#icon"/></svg>"##),
+            r##"<svg><use xlink:href="#icon"/></svg>"##
+        );
+        // An external SVG reference is a fetch nobody asked for; it is cut, not degraded.
+        assert_eq!(
+            sanitize_mail_html(r#"<svg><use xlink:href="https://evil.example/x.svg#i"/></svg>"#),
+            r#"<svg><use/></svg>"#
+        );
+        // The SVG2 spelling (`href` on `<use>`) is the same question and gets the same answer.
+        assert_eq!(
+            sanitize_mail_html(r#"<svg><use href="https://evil.example/x.svg#i"/></svg>"#),
+            r#"<svg><use/></svg>"#
+        );
+        // A `data:` image reference is inline and cannot reach the network, so it survives.
+        assert_eq!(
+            sanitize_mail_html(r#"<svg><image xlink:href="data:image/png;base64,AAAA"/></svg>"#),
+            r#"<svg><image xlink:href="data:image/png;base64,AAAA"/></svg>"#
+        );
+        // …and every one of those outputs is a fixed point.
+        for input in [
+            r#"<svg><a xlink:href="https://evil.example">x</a></svg>"#,
+            r##"<svg><use xlink:href="#icon"/></svg>"##,
+            r#"<svg><image xlink:href="data:image/png;base64,AAAA"/></svg>"#,
+        ] {
+            let once = sanitize_mail_html(input);
+            assert_eq!(
+                sanitize_mail_html(&once),
+                once,
+                "not a fixed point: {input}"
+            );
+        }
     }
 
     #[test]

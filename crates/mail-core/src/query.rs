@@ -286,6 +286,14 @@ pub fn parse_date(input: &str) -> Option<i64> {
     let year: i32 = date.next()?.parse().ok()?;
     let month: u32 = date.next()?.parse().ok()?;
     let day: u32 = date.next()?.parse().ok()?;
+    // **Bounded before it is used as a loop bound.** The day count below walks `1970..year`, so an
+    // unbounded year is a denial of service the user can type: `after:2000000000-01-01` asked for two
+    // billion iterations inside a command handler, and the window simply stops answering. Below 1970
+    // the loop is empty, which used to make `1960-01-01` silently mean 1970 — a wrong answer instead
+    // of a refusal. Neither is a date this app can store, so both are `None` (2026-11-04, issue #13).
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
         return None;
     }
@@ -427,6 +435,26 @@ mod tests {
         // Leap days exist, which is why the arithmetic is worth the four lines.
         assert_eq!(parse_date("2024-02-29"), Some(1_709_164_800));
         assert_eq!(parse_date("2023-02-29"), None);
+    }
+
+    /// Issue #13 (2026-11-04): the year is a loop bound, so it has to be bounded first.
+    ///
+    /// Two failures, both silent: `after:2000000000-01-01` walked two billion iterations inside the
+    /// command handler (the window stops answering), and `1960-01-01` produced an *empty* loop and was
+    /// then treated as 1970 — a wrong answer instead of "that is not a date".
+    ///
+    /// The assertion is on the answer, not on the clock: a test that times this would pass on a fast
+    /// machine for the wrong reason.
+    #[test]
+    fn a_year_outside_the_range_is_refused_instead_of_looping() {
+        assert_eq!(parse_date("2000000000-01-01"), None);
+        assert_eq!(parse_date("1960-01-01"), None, "before 1970 is not 1970");
+        assert_eq!(parse_date("9999-12-31"), Some(253_402_214_400));
+        assert_eq!(
+            parse_date("10000-01-01"),
+            None,
+            "and the upper bound is inclusive at 9999"
+        );
     }
 
     #[test]

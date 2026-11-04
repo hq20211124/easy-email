@@ -2774,7 +2774,21 @@ try {
     }
 
     Step 'cargo test (offline)' {
-        cargo test --workspace 2>&1
+        # One retry, and only for one failure: `LNK1104` ("cannot open the test .exe") happens when
+        # antivirus or the indexer still holds the previous binary. Round 126 hit it on a run where
+        # every test then passed on the immediate retry — and a gate that goes red for that teaches
+        # people to ignore it. The retry is narrow on purpose: a real assertion failure never matches
+        # this pattern, so it is reported the first time.
+        $out = cargo test --workspace 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        if ($code -ne 0 -and $out -match 'LNK1104') {
+            Write-Host 'the linker could not open the test binary (held by another process); retrying once' -ForegroundColor Yellow
+            Start-Sleep -Seconds 2
+            $out = cargo test --workspace 2>&1 | Out-String
+            $code = $LASTEXITCODE
+        }
+        $out
+        $global:LASTEXITCODE = $code
     }
 
     Step 'desktop binary is a GUI subsystem (no console window)' {
